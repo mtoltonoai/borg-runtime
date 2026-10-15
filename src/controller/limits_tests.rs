@@ -1,0 +1,529 @@
+//! Actual controller admission/replay tests; no model, provider or worker process.
+use super::*;
+use crate::{
+    limits::{ExecutionLimitOverrides, RuntimeLimits},
+    protocol::*,
+};
+use std::sync::atomic::{AtomicU64, Ordering};
+static NEXT: AtomicU64 = AtomicU64::new(1);
+fn path() -> PathBuf {
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "borg-controller-metadata-{}-{stamp}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path.join("tasks.db")
+}
+
+// Match the existing integration fixture's bounded ownership handoff. Dropping
+// Controller closes the command channel; the SQL owner drains asynchronously.
+async fn controller_owner_released(path: &std::path::Path) {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".controller-lock");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            if file.try_lock().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("actual previous owner must drain and release");
+}
+
+fn coding(limits: &RuntimeLimits, agent: &str) -> TaskInput {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    TaskInput {
+        resolved_limits: None,
+        repository_read: None,
+        instruction: "metadata-only admission fixture".into(),
+        definition: Definition {
+            limit_overrides: None,
+            execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
+            inference: Some(InferenceSettings::selected()),
+            id: agent.into(),
+            revision: "r1".into(),
+            executor: ExecutorKind::Coding,
+        },
+        repository: Some(Repository {
+            registration: Some(crate::repository_catalogue::Revision {
+                repository_id: "metadata-fixture".into(),
+                registration_revision: "1".into(),
+            }),
+            url: String::new(),
+            start_commit: "a".repeat(40),
+            checkpoint_remote: String::new(),
+        }),
+        acceptance_commands: vec![],
+        output_schema: None,
+        limits: limits.task_defaults.at(now).unwrap(),
+        dependencies: vec![],
+        native_workflow: None,
+    }
+}
+async fn register_fixture(controller: &Controller) {
+    let registration = crate::repository_catalogue::Registration {
+        repository_id: "metadata-fixture".into(),
+        registration_revision: "1".into(),
+        display_name: "Metadata fixture".into(),
+        source_endpoint: "https://example.invalid/repo.git".into(),
+        checkpoint_endpoint: "origin".into(),
+        source_store_key: "source.git".into(),
+        checkpoint_store_key: "checkpoint.git".into(),
+    };
+    let reply = command(
+        controller,
+        Operation::RegisterRepository {
+            operation_id: "register-metadata-fixture".into(),
+            registration,
+        },
+    )
+    .await;
+    assert!(matches!(
+        reply.outcome,
+        Outcome::Ok {
+            data: Data::RepositoryRegistration(_)
+        }
+    ));
+}
+async fn command(controller: &Controller, operation: Operation) -> Reply {
+    controller
+        .handle(Request {
+            protocol_revision: WIRE_REVISION,
+            request_id: format!("metadata-request-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            command: operation,
+        })
+        .await
+}
+fn task(reply: &Reply) -> Task {
+    match &reply.outcome {
+        Outcome::Ok {
+            data: Data::Task(t),
+        } => (**t).clone(),
+        v => panic!("expected task: {v:?}"),
+    }
+}
+fn config(metadata: RuntimeLimits) -> ControllerConfig {
+    ControllerConfig {
+        limits: Arc::new(metadata),
+        ..ControllerConfig::default()
+    }
+}
+
+#[test]
+fn metadata_is_closed_and_missing_policy_does_not_acquire_rust_defaults() {
+    let seed = RuntimeLimits::seed().unwrap();
+    let mut value = serde_json::to_value(&seed).unwrap();
+    value["controller"]
+        .as_object_mut()
+        .unwrap()
+        .remove("queue_capacity");
+    assert!(RuntimeLimits::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    let mut value = serde_json::to_value(&seed).unwrap();
+    value["controller"]["unregistered_policy"] = serde_json::json!(1);
+    assert!(RuntimeLimits::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+#[tokio::test]
+// Traceability scope: Restart and exact original-operation replay preserve the serialized accepted input; a new task acquires later defaults.
+//= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+//= type=test
+//# An accepted task MUST retain its resolved execution-limit values.
+async fn accepted_snapshot_and_original_receipt_survive_changed_global_defaults() {
+    let p = path();
+    let mut first = RuntimeLimits::seed().unwrap();
+    first.revision = "global-before".into();
+    let original = coding(&first, "agent-snapshot");
+    let op = Operation::SubmitTask {
+        operation_id: "submit-original".into(),
+        input: original.clone(),
+    };
+    let c = Controller::open_with_config(&p, config(first.clone())).unwrap();
+    register_fixture(&c).await;
+    let committed = command(&c, op.clone()).await;
+    let accepted = task(&committed);
+    assert!(original.resolved_limits.is_none());
+    assert_eq!(
+        accepted
+            .input
+            .resolved_limits
+            .as_ref()
+            .unwrap()
+            .global_metadata
+            .as_ref(),
+        &first
+    );
+    let exact = serde_json::to_vec(&accepted.input).unwrap();
+    drop(c);
+    controller_owner_released(&p).await;
+    let mut later = first.clone();
+    later.revision = "global-after".into();
+    later.execution.native.context_bytes *= 2;
+    let c = Controller::open_with_config(&p, config(later.clone())).unwrap();
+    register_fixture(&c).await;
+    let replay = command(&c, op).await;
+    assert_eq!(replay.outcome, committed.outcome);
+    assert_eq!(replay.commit, committed.commit);
+    assert_eq!(serde_json::to_vec(&task(&replay).input).unwrap(), exact);
+    let next = task(
+        &command(
+            &c,
+            Operation::SubmitTask {
+                operation_id: "submit-later".into(),
+                input: coding(&later, "agent-later"),
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        next.input
+            .resolved_limits
+            .as_ref()
+            .unwrap()
+            .global_metadata
+            .as_ref(),
+        &later
+    );
+    assert_eq!(
+        accepted
+            .input
+            .execution_limits()
+            .unwrap()
+            .native
+            .context_bytes,
+        first.execution.native.context_bytes
+    );
+}
+#[tokio::test]
+// Traceability scope: Accepts an override and refuses different override values under the same agent definition revision.
+//= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+//= type=test
+//# An agent definition MUST carry the execution-limit overrides specific to that agent revision.
+async fn supplied_snapshot_refuses_and_agent_override_is_exact_immutable_revision_data() {
+    let metadata = RuntimeLimits::seed().unwrap();
+    let c = Controller::open_with_config(path(), config(metadata.clone())).unwrap();
+    register_fixture(&c).await;
+    let mut forged = coding(&metadata, "agent-forged");
+    forged.resolved_limits = Some(metadata.resolve_task(&forged).unwrap());
+    let refusal = command(
+        &c,
+        Operation::SubmitTask {
+            operation_id: "forged".into(),
+            input: forged,
+        },
+    )
+    .await;
+    assert!(matches!(refusal.outcome,Outcome::Refused{ref code,..} if code=="invalid_input"));
+    let mut input = coding(&metadata, "agent-override");
+    let mut native = metadata.execution.native.clone();
+    native.function_calls_per_response = 2;
+    native.context_bytes *= 2;
+    input.definition.limit_overrides = Some(Box::new(ExecutionLimitOverrides {
+        native: Some(native.clone()),
+        ..ExecutionLimitOverrides::default()
+    }));
+    let accepted = task(
+        &command(
+            &c,
+            Operation::SubmitTask {
+                operation_id: "override".into(),
+                input: input.clone(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(&accepted.input.execution_limits().unwrap().native, &native);
+    assert_eq!(
+        accepted
+            .input
+            .resolved_limits
+            .as_ref()
+            .unwrap()
+            .global_metadata
+            .as_ref(),
+        &metadata
+    );
+    input
+        .definition
+        .limit_overrides
+        .as_mut()
+        .unwrap()
+        .native
+        .as_mut()
+        .unwrap()
+        .function_calls_per_response = 3;
+    let conflict = command(
+        &c,
+        Operation::SubmitTask {
+            operation_id: "same-revision-other-policy".into(),
+            input,
+        },
+    )
+    .await;
+    assert!(
+        matches!(conflict.outcome,Outcome::Refused{ref code,..} if code=="definition_conflict")
+    );
+}
+#[tokio::test]
+async fn explicit_admission_metadata_changes_effective_command_bound() {
+    let mut selected = RuntimeLimits::seed().unwrap();
+    selected.controller.max_acceptance_commands = 1;
+    let c = Controller::open_with_config(path(), config(selected.clone())).unwrap();
+    register_fixture(&c).await;
+    let mut input = coding(&selected, "agent-command-bound");
+    input.acceptance_commands = vec![vec!["a".into()], vec!["b".into()]];
+    let refusal = command(
+        &c,
+        Operation::SubmitTask {
+            operation_id: "two-commands".into(),
+            input: input.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(refusal.outcome,Outcome::Refused{ref code,..} if code=="invalid_input"));
+    input.acceptance_commands.pop();
+    let accepted = command(
+        &c,
+        Operation::SubmitTask {
+            operation_id: "one-command".into(),
+            input,
+        },
+    )
+    .await;
+    assert_eq!(task(&accepted).input.acceptance_commands.len(), 1);
+}
+
+#[tokio::test]
+// Traceability scope: A previously committed refusal replays the same outcome and commit even when the later MCP input cap would reject that request.
+//= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+//= type=test
+//# A retained operation MUST NOT be discarded solely because a later limit configuration is lower.
+async fn retained_call_replay_ignores_new_mcp_policy_and_limits_view_separates_current_from_accepted()
+ {
+    let p = path();
+    let mut first = RuntimeLimits::seed().unwrap();
+    first.revision = "mcp-before".into();
+    let c = Controller::open_with_config(&p, config(first.clone())).unwrap();
+    register_fixture(&c).await;
+    let original = task(
+        &command(
+            &c,
+            Operation::SubmitTask {
+                operation_id: "mcp-task".into(),
+                input: coding(&first, "agent-mcp"),
+            },
+        )
+        .await,
+    );
+    // A committed refusal is an original outcome too. No worker process or
+    // active-call authority is fabricated by this queued-task fixture.
+    let call = crate::mcp::Invocation {
+        operation_id: "retained-call".into(),
+        logical_call_id: "logical-call".into(),
+        caller: crate::mcp::Caller {
+            task_id: original.id.clone(),
+            attempt_id: "absent-attempt".into(),
+            generation: 1,
+            worker_id: "absent-worker".into(),
+            incarnation: "absent-incarnation".into(),
+        },
+        tool: "collab_memory_set".into(),
+        arguments: serde_json::json!({"key":"example","value":"x".repeat(2048)}),
+    };
+    assert!(call.validate(&first).is_ok());
+    let op = Operation::CallCollaboration { call: call.clone() };
+    let recorded = command(&c, op.clone()).await;
+    assert!(matches!(recorded.outcome, Outcome::Refused { .. }));
+    assert!(recorded.commit.is_some());
+    drop(c);
+    controller_owner_released(&p).await;
+    let mut later = first.clone();
+    later.revision = "mcp-after".into();
+    later.interface.mcp_call_bytes = 512;
+    assert!(call.validate(&later).is_err());
+    let cfg = config(later.clone());
+    let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
+    register_fixture(&c).await;
+    let replay = command(&c, op).await;
+    assert_eq!(replay.outcome, recorded.outcome);
+    assert_eq!(replay.commit, recorded.commit);
+    // The independent read-only connection must not race a live exclusive SQL
+    // owner. Observe actual owner-lock release rather than assuming drop is sync.
+    drop(c);
+    controller_owner_released(&p).await;
+    // Exercise the same borrowed accepted-policy store used by MCP, while the
+    // current service configuration intentionally has a distinct revision.
+    let sql = rusqlite::Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let bound = database::StoreContext::new(&sql, &first);
+    let view = collaboration_queries::apply(
+        &bound,
+        &crate::collaboration::Query::Limits {
+            task_id: Some(original.id),
+        },
+        &cfg,
+    )
+    .unwrap();
+    let crate::collaboration::QueryResult::Limits { global, execution } = view else {
+        panic!("limits view missing")
+    };
+    assert_eq!(*global, later);
+    assert_eq!(*execution.unwrap().global_metadata, first);
+}
+
+#[test]
+fn minimum_complete_result_reserve_matches_actual_encoder_and_overflow_refuses() {
+    let mut transport = RuntimeLimits::seed().unwrap().transport;
+    for identity_bytes in [1, 17, 256] {
+        transport.identity_bytes = identity_bytes;
+        let bound = minimum_collaboration_result_bytes(&transport).unwrap();
+        let actual = crate::mcp::CallResult {
+            requires_quiescence: false,
+            reply: Reply {
+                request_id: "\\".repeat(identity_bytes),
+                commit: Some(MutationCommit {
+                    operation_id: "\\".repeat(identity_bytes),
+                    controller_revision: i64::MAX as u64,
+                }),
+                observed_controller_revision: Some(i64::MAX as u64),
+                outcome: metadata::complete_call_refusal(),
+            },
+        };
+        assert_eq!(bound, serde_json::to_vec(&actual).unwrap().len());
+    }
+    transport.identity_bytes = usize::MAX;
+    assert!(minimum_collaboration_result_bytes(&transport).is_err());
+}
+
+#[tokio::test]
+async fn list_tasks_uses_list_page_bytes_independently_of_command_page_bytes() {
+    for small_list in [false, true] {
+        let mut selected = RuntimeLimits::seed().unwrap();
+        if small_list {
+            selected.controller.list_page_bytes = 1;
+        } else {
+            selected.controller.command_page_bytes = 1;
+        }
+        let c = Controller::open_with_config(path(), config(selected.clone())).unwrap();
+        register_fixture(&c).await;
+        let accepted = task(
+            &command(
+                &c,
+                Operation::SubmitTask {
+                    operation_id: "list-policy-task".into(),
+                    input: coding(&selected, "list-policy-agent"),
+                },
+            )
+            .await,
+        );
+        let listed = command(
+            &c,
+            Operation::ListTasks {
+                after: None,
+                limit: 1,
+            },
+        )
+        .await;
+        let Outcome::Ok {
+            data: Data::Tasks(tasks),
+        } = listed.outcome
+        else {
+            panic!("expected bounded task page: {:?}", listed.outcome);
+        };
+        if small_list {
+            assert!(
+                tasks.is_empty(),
+                "list metadata must stop an oversized item"
+            );
+        } else {
+            assert_eq!(
+                tasks.len(),
+                1,
+                "command metadata must not truncate task lists"
+            );
+            assert_eq!(tasks[0].id, accepted.id);
+            assert_eq!(tasks[0].input, accepted.input);
+        }
+    }
+}
+
+fn assert_limiting_field(reply: &Reply, expected_code: &str, field: &str) {
+    let Outcome::Refused { code, message } = &reply.outcome else {
+        panic!("expected refusal: {reply:?}")
+    };
+    assert_eq!(code, expected_code);
+    assert!(message.contains(field), "missing {field} in {message}");
+}
+#[tokio::test]
+async fn admission_refusals_identify_the_exact_limiting_metadata_field() {
+    for case in 0..8 {
+        let mut selected = RuntimeLimits::seed().unwrap();
+        let mut input = coding(&selected, "field-agent");
+        let (code, field) = match case {
+            0 => {
+                selected.controller.max_task_input_bytes = 1;
+                ("capacity", "controller.max_task_input_bytes")
+            }
+            1 => {
+                input.limits.output_bytes = selected.controller.max_task_output_bytes + 1;
+                ("invalid_input", "controller.max_task_output_bytes")
+            }
+            2 => {
+                input.limits.result_bytes = selected.controller.max_task_result_bytes + 1;
+                ("invalid_input", "controller.max_task_result_bytes")
+            }
+            3 => {
+                selected.controller.max_delegation_depth = 1;
+                selected.task_defaults.max_delegation_depth = 1;
+                input.limits.max_delegation_depth = 2;
+                ("invalid_input", "controller.max_delegation_depth")
+            }
+            4 => {
+                selected.controller.max_dependencies = 1;
+                input.dependencies = vec!["missing-one".into(), "missing-two".into()];
+                ("invalid_input", "controller.max_dependencies")
+            }
+            5 => {
+                selected.controller.max_acceptance_commands = 1;
+                input.acceptance_commands = vec![vec!["a".into()], vec!["b".into()]];
+                ("invalid_input", "controller.max_acceptance_commands")
+            }
+            6 => {
+                selected.controller.max_acceptance_arguments = 1;
+                input.acceptance_commands = vec![vec!["a".into(), "b".into()]];
+                ("invalid_input", "controller.max_acceptance_arguments")
+            }
+            7 => {
+                selected.controller.max_acceptance_argument_bytes = 1;
+                input.acceptance_commands = vec![vec!["ab".into()]];
+                ("invalid_input", "controller.max_acceptance_argument_bytes")
+            }
+            _ => unreachable!(),
+        };
+        let c = Controller::open_with_config(path(), config(selected)).unwrap();
+        register_fixture(&c).await;
+        let op = Operation::SubmitTask {
+            operation_id: "field-submit".into(),
+            input,
+        };
+        let original = command(&c, op.clone()).await;
+        assert_limiting_field(&original, code, field);
+        assert!(original.commit.is_some());
+        let replay = command(&c, op).await;
+        assert_eq!(replay.outcome, original.outcome);
+        assert_eq!(replay.commit, original.commit);
+    }
+}

@@ -1,0 +1,14 @@
+# Generated coverage reports: regenerable, not authoritative source.
+/reports/
+
+# Ad-hoc `duvet extract -o` output: regenerable scratch, never committed.
+/requirements/
+
+# The coverage snapshot is a per-build artifact: its coverage tags come from the
+# citations in the implementation code, so it is only reproducible on the machine
+# that ran the build and churns as the code grows. It stays a useful LOCAL
+# coverage-regression check, but is not a durable, shareable baseline, so it is
+# not committed.
+/snapshot.txt
+
+# Committed on purpose (do NOT ignore): config.toml: the gate configuration.

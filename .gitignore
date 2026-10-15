@@ -1,0 +1,14 @@
+/target/
+/artifacts/
+/.tools/
+__pycache__/
+**/target/
+**/artifacts/
+**/.cargo-home/
+/qualification/coverage/.rustup/
+/qualification/*/results/
+
+/.build/
+/planning-inputs/
+/reset-receipts/
+/docs/retrospective/

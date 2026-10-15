@@ -1,0 +1,100 @@
+# Building v2 from a fresh checkout
+
+`tooling/build_v2.py` prepares the selected SQLite 3.54.0 static library from the
+pinned official source archive. It uses existing system Python, GCC 13.3.0,
+Binutils 2.42, pkgconf 1.8.1 and the exact selected Rust/Cargo 1.99 binaries. It
+installs nothing and changes no global configuration. The selected inputs are
+specified in the sibling Borg repository's `spec/impl/v2/dependency-profile.md`.
+
+The runtime checkout must contain its ordinary `Cargo.lock`. Use the existing
+managed Cargo registry and its normal configured access; this tool does not
+replace the registry or create credentials. The original `spec-lock.json` and
+copied `spec-snapshot/` are not touched.
+
+From the runtime checkout, build the complete application:
+
+```sh
+python3 -B tooling/build_v2.py --cargo build --release
+```
+
+The default archive location is `.build/sqlite-amalgamation-3540000.zip`. A
+matching local archive is reused. Otherwise the tool downloads the exact official
+HTTPS archive and verifies its pinned SHA3-256 before extracting anything. It
+extracts only `sqlite3.c`, `sqlite3.h` and `sqlite3ext.h`; it does not extract or
+build the supplied command-line shell. There is no system-SQLite fallback.
+
+For an offline machine with the selected archive and Cargo dependencies already
+available:
+
+```sh
+python3 -B tooling/build_v2.py \
+  --archive /absolute/path/sqlite-amalgamation-3540000.zip \
+  --build-dir .build/sqlite-repro \
+  --offline --cargo build --release
+```
+
+Omit `--cargo` to prepare/check only SQLite, without compiling the Rust runtime.
+`--cargo check` and `--cargo test` are also supported, always with `--locked`.
+`--offline` applies to both archive acquisition and Cargo. This tool does not
+silently fetch missing dependencies in offline mode.
+
+The output contains `env.sh`, `pkgconfig/sqlite3.pc`, the static library and a
+`build-receipt.json`. The receipt binds the archive, three extracted source files,
+actual tool binaries/versions, exact compiler flags, command logs and output
+hashes. A small C probe links the private archive by its explicit pathname and
+checks the exact SQLite version/source identity, threading and selected compile
+options. These checks establish the prepared C library, not the eventual Rust
+binary's link or the application's durability guarantees.
+
+To run another ordinary Cargo command after preparing the library:
+
+```sh
+. .build/sqlite-repro/env.sh
+cargo test --locked --offline --test controller
+```
+
+Source the environment only in that command shell. It supplies the private
+SQLite library/include/pkg-config paths and selected Rust compiler; it does not
+modify a login profile, service or Cargo registry. The crate build script's
+`bundled_bindings` feature refers to its pregenerated Rust bindings, not to a
+bundled SQLite engine. The actual Rust link, used APIs and transaction/restart
+behavior still need their tests.
+
+For the complete local regression profile without the separate installed-Codex
+probe or opt-in live journeys:
+
+```sh
+cargo test --locked --offline --no-fail-fast -- \
+  --test-threads=1 --skip actual_pinned_codex_handshake_without_a_model_turn
+```
+
+The native helper-lifecycle tests deliberately hold the same process-wide pool
+of four validator slots while exercising short execution deadlines. Running
+unrelated test cases concurrently can expire a fixture before its required live
+helper has started. Serial libtest scheduling preserves those deadlines and the
+live-child/cleanup assertions. It does not serialize the application or the
+concurrent actors inside each test. Individual targets without this shared
+fixture constraint can run with libtest's ordinary parallel scheduling. The
+[explicit mixed-load check](v2-local-load.md) separately exercises application
+concurrency. No compiler, runtime limit or global configuration is changed by
+the regression command.
+
+Build directories and archive paths must contain no whitespace, symlinks or
+shell/pkg-config metacharacters. Existing nonempty output directories are accepted
+only when their tool-created receipt, build profile and output hashes match.
+The earlier manually prepared `.build/sqlite` may have no such receipt: use a
+fresh directory such as `.build/sqlite-repro` instead of overwriting it. Failed
+preparations retain their logs and failure receipt; rerun into a fresh directory.
+Known compiler/linker override environment variables cause refusal rather than
+silently changing the profile. Another installed location for the exact selected
+Rust/Cargo binaries can be passed with `--toolchain-dir`. By default the tool
+uses `RUSTUP_HOME/toolchains/stable-x86_64-unknown-linux-gnu/bin` when
+`RUSTUP_HOME` is set, otherwise the same path under `~/.rustup`. This preserves
+the selected toolchain when a worker has a fresh private `HOME`; the worker
+already passes its existing `RUSTUP_HOME`. Exact binary hash checks still apply.
+
+The optional Cargo command gets its own log and receipt in a fresh `cargo-*`
+subdirectory. Source changes, provider requests, browser acceptance and rollout
+are separate operations. A local successful build does not authorize deployment,
+prove the four-host capacity target, or replace the protected checker and final
+human rollout approval required by the implementation specification.
