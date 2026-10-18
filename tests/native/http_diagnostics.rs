@@ -719,7 +719,7 @@ async fn native_selected_throttle_shapes_use_original_header_delay_without_messa
         }));
         assert_eq!(result.request_exposure, RequestExposure::HttpResponseReceived);
         assert_eq!(result.usage, UsageObservation::Unknown);
-        let text = result.result.unwrap_err();
+        let text = result.result.err().expect("expected HTTP refusal");
         assert!(!text.contains("PRIVATE_PROMPT"));
         assert!(!text.contains("999s"));
         assert!(!text.contains("classification_refused"));
@@ -752,7 +752,7 @@ async fn native_unknown_throttle_shapes_explain_only_fixed_refusal_reason() {
         assert_eq!(result.usage, UsageObservation::Unknown);
         let facts = result.diagnostic.as_ref().unwrap();
         assert_eq!(facts.http.as_ref().unwrap().category, borg_runtime::native::CategoryDiagnostic::Absent);
-        let text = result.result.unwrap_err();
+        let text = result.result.err().expect("expected HTTP refusal");
         assert!(text.contains(&format!("classification_refused={reason}")), "{text}");
         for private in [credential.as_str(), "PRIVATE_ROOT_FIELD", "PRIVATE_ERROR_FIELD", "PRIVATE_PROMPT", "PRIVATE_PARAM", "PRIVATE_CODE"] {
             assert!(!text.contains(private), "provider text leaked");
@@ -769,6 +769,6 @@ async fn native_unknown_throttle_shapes_explain_only_fixed_refusal_reason() {
         fixture.finish().await;
         assert_eq!(result.provider_outcome, ProviderOutcome::Unknown);
         assert_eq!(result.usage, UsageObservation::Unknown);
-        assert!(!result.result.unwrap_err().contains("category=rate_limited"));
+        assert!(!result.result.err().expect("expected HTTP refusal").contains("category=rate_limited"));
     }
 }
