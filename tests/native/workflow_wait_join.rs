@@ -1,6 +1,7 @@
 //! Nested child of native/workflow_join.rs; uses the actual owned controller,
 //! native worker and controlled loopback Responses peer. No synthetic reports.
 use super::*;
+use borg_runtime::charter::*;
 use borg_runtime::collaboration::questions::QuestionAnswer;
 use borg_runtime::collaboration::work::{WaitStatus, WorkQuery, WorkQueryResult, WorkView};
 use borg_runtime::collaboration::workflow::{
@@ -40,12 +41,44 @@ fn joined_receipt(connection: &rusqlite::Connection, id: &str) -> (Operation, Ou
 //# A committed resolution that makes a waiting task eligible MUST wake it through the existing platform command mechanism.
 
 async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input() {
-    let lab = workflow_lab("workflow-native-self-wait-join");
+    Box::pin(self_wait_scenario(false)).await;
+}
+
+// The same real wait/resume journey must close its original charter turn before
+// physical stop, without granting the new attempt authority over the old reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chartered_self_wait_closes_original_turn_before_same_session_resume() {
+    Box::pin(self_wait_scenario(true)).await;
+}
+
+fn wait_charter() -> CharterSource {
+    let sentence = "The agent MUST retain the waiting task purpose.";
+    CharterSource {
+        files: vec![CharterFile { file: "charter.md".into(), text: format!("# Purpose\n\n{sentence}\n") }],
+        clauses: vec![CharterClauseRef { file: "charter.md".into(), section: "Purpose".into(), sentence: sentence.into() }],
+    }
+}
+
+async fn self_wait_scenario(with_charter: bool) {
+    let mut lab = workflow_lab(if with_charter { "workflow-charter-self-wait-join" } else { "workflow-native-self-wait-join" });
+    if with_charter {
+        let mut limits = (*lab.limits).clone();
+        limits.charter = Some(borg_runtime::limits::CharterLimits {
+            record_bytes: 262_144, source_bytes: 65_536, files: 8, clauses: 32,
+            metadata_bytes: 16_384, references: 32, reply_items: 32, tool_calls: 8,
+            reference_depth: 8, records: 1024, page_items: 32, page_bytes: 262_144,
+        });
+        limits.validate().unwrap();
+        lab.limits = Arc::new(limits);
+        std::fs::write(lab.root.join("limits.json"), serde_json::to_vec_pretty(&*lab.limits).unwrap()).unwrap();
+    }
     let mut controller = lab.controller("controller").await;
     let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
     let mut input = lab.input(2);
     input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.definition.revision = "workflow-self-wait-v2".into();
+    if with_charter { input.definition.charter = Some(DefinitionCharter::Inline { source: wait_charter() }); }
+    let charter_reference = CharterSourceRef { definition_id: input.definition.id.clone(), definition_revision: input.definition.revision.clone() };
     let task = submit(&api, input).await;
     assert_eq!(task.input.resolved_limits.as_ref().unwrap().global_metadata.workflow.as_ref(),
         lab.limits.workflow.as_ref());
@@ -63,6 +96,7 @@ async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input(
         let next_release = next_release.clone();
         let wait_arguments = wait_arguments.clone();
         let final_released = final_released.clone();
+        let charter_reference = charter_reference.clone();
         move |index, _request| {
             let first_entered = first_entered.clone();
             let first_release = first_release.clone();
@@ -70,6 +104,7 @@ async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input(
             let next_release = next_release.clone();
             let wait_arguments = wait_arguments.clone();
             let final_released = final_released.clone();
+            let charter_reference = charter_reference.clone();
             async move {
                 if index == 0 {
                     first_entered.notify_one();
@@ -81,7 +116,11 @@ async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input(
                     next_entered.notify_one();
                     next_release.notified().await;
                     final_released.store(true, Ordering::SeqCst);
-                    Some(final_value())
+                    if with_charter {
+                        Some(envelope(json!([{"type":"message","role":"assistant","status":"completed",
+                            "content":[{"type":"output_text","text":json!({"charter_references":{
+                                "revision":charter_reference,"clauses":wait_charter().clauses},"result":7}).to_string()}]}])))
+                    } else { Some(final_value()) }
                 }
             }
         }
@@ -168,6 +207,26 @@ async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input(
     assert_eq!(committed_wait.view.task.attempt.as_ref().unwrap().phase, AttemptPhase::StopRequested);
     assert!(!committed_wait.view.task.attempt.as_ref().unwrap().stopped);
 
+    let closed_charter = if with_charter {
+        let operation = Operation::QueryCharter { query: CharterQuery::Turn {
+            turn_id: format!("{}-charter-turn-1", first_attempt.id),
+        }};
+        let reply = api.call(operation.clone()).await.unwrap();
+        reply.validate_for(&operation).unwrap();
+        let Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Turn(turn)) } = reply.outcome
+        else { panic!("original self-wait charter turn unavailable: {reply:?}") };
+        assert_eq!(turn.boundary.caller, call.caller);
+        assert_eq!(turn.boundary.session_id, task.session_id);
+        assert_eq!(turn.boundary.request_index, 1);
+        assert_eq!(turn.boundary.effective, ResolvedCharter { reference: charter_reference.clone(), source: wait_charter() });
+        assert_eq!(turn.reply.as_ref().unwrap().observation.tool_call_ids, vec![call.logical_call_id.clone()]);
+        assert_eq!(turn.completed_by, Some(format!("{}-closed", turn.boundary.turn_id)));
+        assert_eq!(turn.delivered_results, vec![CharterResultReceipt::Collaboration {
+            call_id: call.logical_call_id.clone(), operation_id: call.operation_id.clone(),
+        }]);
+        Some(turn)
+    } else { None };
+
     // Answer only after the real worker has acknowledged physical stop.
     let answer_operation = Operation::MutateQuestion {
         operation_id: "answer-native-self-wait-question".into(),
@@ -243,12 +302,41 @@ async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input(
     let exact_text = before["pending"]["text"].as_str().unwrap();
     let requests = peer.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
-    assert!(!requests[0]["input"].as_array().unwrap().iter().any(|item| item["role"] == "developer"));
-    let delivered_inputs: Vec<_> = requests[1]["input"].as_array().unwrap().iter()
-        .filter(|item| item["role"] == "developer").collect();
-    assert_eq!(delivered_inputs.len(), 1);
-    assert_eq!(delivered_inputs[0]["content"], exact_text);
-    assert_eq!(requests[1]["input"][0]["content"], task.input.instruction);
+    if with_charter {
+        let encoded_source = serde_json::to_string(&json!({"revision":charter_reference,
+            "source":serde_json::to_string(&wait_charter()).unwrap()})).unwrap();
+        for (index, request) in requests.iter().enumerate() {
+            let items = request["input"].as_array().unwrap();
+            let charter_inputs: Vec<_> = items.iter().filter(|item| item["role"] == "developer"
+                && item["content"].as_str().is_some_and(|text| text.starts_with("Effective agent charter. "))).collect();
+            assert_eq!(charter_inputs.len(), 1);
+            assert!(charter_inputs[0]["content"].as_str().unwrap().contains(&encoded_source));
+            assert_eq!(items.iter().filter(|item| item["role"] == "user" && item["content"] == task.input.instruction).count(), 1);
+            assert_eq!(items.iter().filter(|item| item["role"] == "developer").count(), index + 1);
+        }
+        let delivered_inputs: Vec<_> = requests[1]["input"].as_array().unwrap().iter()
+            .filter(|item| item["role"] == "developer" && item["content"] == exact_text).collect();
+        assert_eq!(delivered_inputs.len(), 1);
+        let operation = Operation::QueryCharter { query: CharterQuery::Turn {
+            turn_id: format!("{}-charter-turn-1", fresh.id),
+        }};
+        let reply = api.call(operation.clone()).await.unwrap();
+        reply.validate_for(&operation).unwrap();
+        let Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Turn(turn)) } = reply.outcome
+        else { panic!("fresh self-wait charter turn unavailable: {reply:?}") };
+        assert_eq!(turn.boundary.caller.attempt_id, fresh.id);
+        assert_eq!(turn.boundary.caller.generation, fresh.generation);
+        assert_eq!(turn.boundary.session_id, task.session_id);
+        assert_eq!(turn.boundary.effective, closed_charter.as_ref().unwrap().boundary.effective);
+        assert!(turn.reply.is_none() && turn.completed_by.is_none());
+    } else {
+        assert!(!requests[0]["input"].as_array().unwrap().iter().any(|item| item["role"] == "developer"));
+        let delivered_inputs: Vec<_> = requests[1]["input"].as_array().unwrap().iter()
+            .filter(|item| item["role"] == "developer").collect();
+        assert_eq!(delivered_inputs.len(), 1);
+        assert_eq!(delivered_inputs[0]["content"], exact_text);
+        assert_eq!(requests[1]["input"][0]["content"], task.input.instruction);
+    }
     assert!(!requests[1]["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output"),
         "the old wait tool is closed by quiescence, not replayed as a fresh attempt's tool output");
     let delivered: Value = serde_json::from_str(exact_text).unwrap();
@@ -331,6 +419,26 @@ async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input(
     assert!(wait_revision < stop_revision && stop_revision < answer_revision
         && answer_revision < begin_revision && begin_revision < ack_revision,
         "original receipt order must prove wait commit, physical stop, answer, Begin, then ACK");
+
+    if let Some(turn) = &closed_charter {
+        let closure_id = turn.completed_by.as_ref().unwrap();
+        let (closure_operation, closure_outcome, closure_revision) = joined_receipt(&connection, closure_id);
+        let Operation::ObserveCharter { operation_id, caller, observation } = closure_operation
+        else { panic!("self-wait closure is not its original charter observation") };
+        assert_eq!(&operation_id, closure_id);
+        assert_eq!(caller, call.caller, "only the original caller closes the wait reply");
+        assert_eq!(observation, CharterObservation::CompleteTurn {
+            turn_id: turn.boundary.turn_id.clone(), results: turn.delivered_results.clone(),
+        });
+        let Outcome::Ok { data: Data::Charter(CharterOutcome::Turn(stored_turn)) } = closure_outcome
+        else { panic!("original self-wait closure did not commit") };
+        assert_eq!(&stored_turn, turn);
+        assert!(wait_revision < closure_revision && closure_revision < stop_revision,
+            "original wait result and charter closure must precede physical stop and successor admission");
+        assert_eq!(connection.query_row("SELECT count(*) FROM receipts WHERE id=?1",
+            [format!("{}-charter-prior-closed", fresh.id)], |row| row.get::<_, i64>(0)).unwrap(), 0,
+            "the fresh caller must not try to close the prior caller's charter turn");
+    }
 
     let mut association_query = connection.prepare(
         "SELECT attempt_id,body,input_ack FROM workflow_wait_consumptions WHERE task_id=?1 ORDER BY attempt_id LIMIT 3").unwrap();

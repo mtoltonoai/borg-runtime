@@ -358,6 +358,11 @@ fn admit_call_boundary(name:&str,args:&serde_json::Value,following:bool,index:u3
     if self_assignment&&following {
         return Err("self assignment must be the final call in its response; assignment not dispatched".into());
     }
+    let self_wait=name=="collab_task_wait"
+        &&args.get("task_id").and_then(serde_json::Value::as_str)==Some(attempt.task_id.as_str());
+    if self_wait&&following {
+        return Err("self wait must be the final call in its response; wait not dispatched".into());
+    }
     Ok(())
 }
 fn call_requires_quiescence(call: &mcp::Invocation, outcome: &Outcome) -> bool {
@@ -570,7 +575,13 @@ async fn quiesce(
     if let (Operation::CallCollaboration { call }, Some(outcome)) =
         (&journal.request, &journal.outcome)
     {
-        if mcp::assignment_quiescence(call, outcome) {
+        if mcp::assignment_quiescence(call, outcome)
+            || mcp::work::requires_quiescence(call, outcome)
+        {
+            // The exact committed self-wait, like self-assignment, ends this
+            // caller's turn. Close it before Stop releases a fresh attempt;
+            // question/review resolution is not a delegated child result that
+            // would authorize the successor to close the prior caller's turn.
             charter::close_assignment(reporter, state, &journal.limits, call).await?;
         }
     }
@@ -2484,6 +2495,24 @@ mod storage_barrier_tests {
         let mut other=self_args;other["task_id"]=serde_json::json!("another-task");
         assert!(admit_call_boundary("collab_task_assign",&other,true,1,&f.input,&f.reporter.attempt).is_ok());
         assert!(admit_call_boundary("collab_task_assign",&other,false,limit,&f.input,&f.reporter.attempt).is_err());
+        f.no_connection();
+    }
+
+    #[test]
+    fn self_wait_preflight_requires_final_call_and_preserves_other_task_and_budget() {
+        let f=Fixture::new();let limit=f.input.limits.model_requests;
+        let args=serde_json::json!({"task_id":f.reporter.attempt.task_id,"expected_revision":1,
+            "resolver":{"kind":"question","question_id":"question-1"}});
+        assert!(limit>1);
+        assert!(admit_call_boundary("collab_task_wait",&args,true,1,&f.input,&f.reporter.attempt)
+            .unwrap_err().contains("wait not dispatched"));
+        assert!(admit_call_boundary("collab_task_wait",&args,false,1,&f.input,&f.reporter.attempt).is_ok());
+        assert!(admit_call_boundary("collab_task_wait",&args,false,limit,&f.input,&f.reporter.attempt)
+            .unwrap_err().contains("task_model_requests"));
+        let mut other=args;other["task_id"]=serde_json::json!("another-task");
+        assert!(admit_call_boundary("collab_task_wait",&other,true,1,&f.input,&f.reporter.attempt).is_ok());
+        assert!(admit_call_boundary("collab_task_wait",&other,false,limit,&f.input,&f.reporter.attempt).is_err());
+        assert!(admit_call_boundary("collab_task_coordination_get",&other,true,1,&f.input,&f.reporter.attempt).is_ok());
         f.no_connection();
     }
 

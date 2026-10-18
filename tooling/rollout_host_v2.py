@@ -195,7 +195,7 @@ _PUBLICATION_UNION_CODEX_HOME_SOURCES = {
     'src/worker/machine_resources.rs': '7e34c7ec3bc87298a88cb42b216584cb16b70e82a14c96b1786e9048aea45775',
     'src/worker/mod.rs': 'e98160bfee5aa035bbf8ec72706aa4871f9dfef65e9bbe8ef6b4ed60b7af1bed',
     'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
-    'src/worker/native_loop.rs': 'e28e0d9c37aa48580816681d61bcd2ab23061392a53d1f9582ba9f1a42378edd',
+    'src/worker/native_loop.rs': '4c945994704602e2d28439899a6936fe0cfd5a1964f2b52260aae016255aa269',
     'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
     'src/worker/publication.rs': '972cda207bf324f5393dbee390b559089ad8798a6c920e00457e09a2dc0e7dc9',
     'src/worker/publication_requests.rs': '4c743a5e043ee8188438db7e13192c6abf39bef1fa5bc5f38722a6edcd775214',
@@ -1353,7 +1353,51 @@ class CodexHomePreservation:
     """
     def __init__(self,host,stop,current):
         self.host,self.stop,self.current=host,stop,current;self.checked={};self.observations={};self.retained={}
-        self.saved=stop.get('codex_homes',{})
+        self.saved=stop.get('codex_homes',{});self.outer_boundaries={}
+
+    def observe_outer_boundary(self,key,old_home,current_home,original_dirs,current_dirs):
+        """Observe only the selected cleanup reader's empty synchronization file.
+
+        Original rows remain exact. This never acquires the lock or claims that
+        a writer is absent, a task settled, or any cleanup became authorized.
+        """
+        if old_home==current_home and original_dirs==current_dirs:return None
+        h=self.host;base='codex/'+key;parent=base+'/collaboration-codex'
+        lock=parent+'/outer-boundary.lock';calls=parent+'/calls.json'
+        writers={name:_PUBLICATION_UNION_CODEX_HOME_SOURCES[name] for name in (
+            'src/worker/codex_mcp.rs','src/worker/cleanup_reads.rs',
+            'src/worker/process.rs','src/worker/cleanup.rs')}
+        if (not _same(c,h.p.get('formats',{}).get('after'),_PUBLICATION_UNION_CODEX_HOME_FORMATS)
+                or not h.selected_writer_sources(writers)):
+            raise ValueError('codex_outer_boundary_writer_unselected')
+        if (any(current_home.get(n)!=v for n,v in old_home.items())
+                or set(current_home)-set(old_home) not in (set(),{lock})
+                or calls not in old_home or lock not in current_home):
+            raise ValueError('codex_outer_boundary_original_rows_changed')
+        added=lock not in old_home
+        before=original_dirs.get(parent);after=current_dirs.get(parent)
+        if (before is None or after is None or len(before)!=9 or len(after)!=9
+                or before[:7]!=after[:7] or set(original_dirs)!=set(current_dirs)
+                or any(current_dirs[n]!=v for n,v in original_dirs.items() if n!=parent)
+                or before[2]!=h.h['service_uid'] or stat.S_IMODE(before[4])!=0o700
+                or after[8]<before[8] or (after[7]<before[7] if added else after[7]!=before[7])):
+            raise ValueError('codex_outer_boundary_directory_changed')
+        row=current_home[lock]
+        if (not isinstance(row,dict) or set(row)!={'sha256','identity'}
+                or not isinstance(row['identity'],list) or len(row['identity'])!=5
+                or row['identity'][0]!=before[0] or row['identity'][2:4]!=before[2:4]
+                or row['identity'][4]!=0o600 or row['sha256']!=c.digest(b'')
+                or _codex_read(h,lock,self.current,1)!=b''):
+            raise ValueError('codex_outer_boundary_lock_shape')
+        evidence={'kind':'selected_cleanup_outer_boundary_observation','path':lock,
+            'added_empty_lock':added,'row':copy.deepcopy(row),
+            'directory':copy.deepcopy(after),'original_directory':copy.deepcopy(before),
+            'writer_sources':writers,'original_file_rows_exact':True,
+            'actual_writer_attributed':False,'lock_held_claimed':False,
+            'canonical_settlement_claimed':False,'reclamation_claimed':False,
+            'host_effects':False,'simultaneous_snapshot':False}
+        self.outer_boundaries[key]=evidence
+        return evidence
 
     def validate(self,key):
         if key in self.checked:return self.checked[key]
@@ -1400,10 +1444,12 @@ class CodexHomePreservation:
                 raise ValueError('codex_copyout_home_replaced')
         expected_dirs=original['journal_directories']
         current_dirs={n:list(m) for n,m in dirs.items() if n.startswith(base+'/') and n[len(base)+1:].split('/')[0] in _CODEX_JOURNALS}
-        if current_dirs!=expected_dirs:raise ValueError('codex_copyout_journal_directories_changed')
         old_journals={n:v for n,v in self.stop['state'].items() if n.startswith(base+'/') and n[len(base)+1:].split('/')[0] in _CODEX_JOURNALS}
         current_journals={n:v for n,v in self.current.items() if n.startswith(base+'/') and n[len(base)+1:].split('/')[0] in _CODEX_JOURNALS}
-        if current_journals!=old_journals:raise ValueError('codex_copyout_journals_changed')
+        try:outer_boundary=self.observe_outer_boundary(key,old_journals,current_journals,expected_dirs,current_dirs)
+        except ValueError:
+            if current_dirs!=expected_dirs:raise ValueError('codex_copyout_journal_directories_changed') from None
+            raise ValueError('codex_copyout_journals_changed') from None
         if any(n.startswith(base+'/') and n[len(base)+1:].split('/')[0] not in _CODEX_JOURNALS for n in set(dirs)|set(self.current)):
             raise ValueError('codex_copyout_vendor_remainder')
         if (record['transcript_expected'] is not original['transcript_expected']
@@ -1461,7 +1507,8 @@ class CodexHomePreservation:
                 raise ValueError('codex_copyout_checkpoint_unacknowledged')
         self.checked[key]={'progress_sha256':self.current[name]['sha256'],'task_sha256':task['task_sha256'],
                            'archive_exports':record['exports'],'original_stopped_home':original,
-                           'authority_binding':authority['binding'],'current_content_verified':True}
+                           'authority_binding':authority['binding'],'current_content_verified':True,
+                           'outer_boundary_observation':outer_boundary}
         return self.checked[key]
 
     def observe_retained(self,name,old,new):
@@ -1522,9 +1569,11 @@ class CodexHomePreservation:
                 raise ValueError('codex_retained_home_replaced')
         old_home={n:v for n,v in self.stop['state'].items() if n.startswith(base+'/')}
         current_home={n:v for n,v in self.current.items() if n.startswith(base+'/')}
-        if current_home!=old_home:raise ValueError('codex_retained_original_home_rows_changed')
         journal_dirs={n:list(m) for n,m in dirs.items() if n.startswith(base+'/') and n[len(base)+1:].split('/')[0] in _CODEX_JOURNALS}
-        if journal_dirs!=original['journal_directories']:raise ValueError('codex_retained_journal_directories_changed')
+        try:outer_boundary=self.observe_outer_boundary(key,old_home,current_home,original['journal_directories'],journal_dirs)
+        except ValueError:
+            if current_home!=old_home:raise ValueError('codex_retained_original_home_rows_changed') from None
+            raise ValueError('codex_retained_journal_directories_changed') from None
         for source in original['transcript_sources']:
             rel=base+'/'+source['name'];row=self.current.get(rel);directory=dirs.get(rel);entry=None
             if directory is not None:entry={'name':source['name'],**_codex_id(directory),'kind':'directory'}
@@ -1547,6 +1596,7 @@ class CodexHomePreservation:
             'original_home_rows':len(old_home),'original_home_rows_sha256':c.digest(c.canonical(old_home)),
             'original_stopped_home':original,'current_reason':reason,'last_observed_ms':last,'next_due_ms':due,
             'current_not_started':True,'current_not_done':True,'original_home_file_rows_exact':True,
+            'outer_boundary_observation':outer_boundary,
             'old_progress_body_available':False,'unchanged_progress_fields_claimed':False,
             'canonical_settlement_claimed':False,'reclamation_claimed':False,'simultaneous_snapshot':False}
         self.retained[key]=evidence
@@ -1576,6 +1626,16 @@ class CodexHomePreservation:
                 if re.fullmatch(r'cleanup-codex/(?:[0-9a-f]{2})+\.json',name) is None:raise ValueError('codex_copyout_progress_path')
                 key=Path(name).stem
                 if key not in self.retained:self.validate(key)
+        for key,evidence in self.outer_boundaries.items():
+            _codex_deadline(self.host)
+            if _codex_read(self.host,evidence['path'],self.current,1)!=b'':
+                raise ValueError('codex_outer_boundary_lock_changed_after_read')
+            parent=Path(self.host.h['state']['root'])/Path(evidence['path']).parent
+            fd,metadata=_directory(parent,self.host.h['service_uid'])
+            try:
+                if list(_full(metadata))!=evidence['directory']:
+                    raise ValueError('codex_outer_boundary_directory_changed_after_read')
+            finally:os.close(fd)
         for key in self.retained:
             _codex_read(self.host,'cleanup-codex/'+key+'.json',self.current)
         # A readback claims a stable sample, never synchronization with a writer.
