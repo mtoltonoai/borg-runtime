@@ -378,3 +378,62 @@ class ActivePreflightTests(NoExternalEffects):
             self.assertNotIn('atomic_path_replacements', result['worker_inventory'])
             f.host.check_running.assert_not_called()
             self.assertEqual(held, [])
+
+
+    def test_current_installed_family_samples_actual_mutations_writer_and_keeps_stopped_strict(self):
+        with active_fixture() as f:
+            f.host.p['formats']['before'] = dict(hostmod._ACTIVE_PREFLIGHT_CURRENT_FORMATS)
+            f.host._verified_before_manifest = {'source': {'files': {
+                name: {'sha256': sha} for name, sha in hostmod._ACTIVE_PREFLIGHT_CURRENT_WRITERS.items()}}}
+            directory = f.root / 'mutations'; target = directory / 'await.json'
+            old = directory.stat()
+            def update():
+                atomic_write(target, target.read_bytes())
+                advance_directory_clock(directory)
+            with writer(update) as dispatch, after_directory_scan(directory, dispatch) as fired:
+                result = f.host.execute('preflight')
+            self.assertEqual(fired, [True])
+            current = directory.stat()
+            self.assertEqual(tuple(getattr(old, k) for k in ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink','st_size')),
+                             tuple(getattr(current, k) for k in ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink','st_size')))
+            self.assertNotEqual((old.st_mtime_ns, old.st_ctime_ns), (current.st_mtime_ns, current.st_ctime_ns))
+            sample = result['worker_inventory']
+            self.assertEqual(sample['installed_writer_sources'], hostmod._ACTIVE_PREFLIGHT_CURRENT_WRITERS)
+            self.assertGreater(sample['directory_time_changes'], 0)
+            self.assertFalse(sample['owned_snapshot']); self.assertFalse(sample['simultaneous_snapshot'])
+            self.assertFalse(sample['complete_historical_membership'])
+            f.host.state_size.assert_not_called()
+            with after_directory_scan(directory, update), self.assertRaisesRegex(ValueError, 'state_directory_changed'):
+                f.host.state_files()
+
+    def test_current_writer_family_requires_each_installed_pin_and_exact_before_formats(self):
+        for guard in (*hostmod._ACTIVE_PREFLIGHT_CURRENT_WRITERS, 'missing', 'formats'):
+            with self.subTest(guard=guard), active_fixture() as f:
+                f.host.p['formats']['before'] = dict(hostmod._ACTIVE_PREFLIGHT_CURRENT_FORMATS)
+                files = {name: {'sha256': sha} for name, sha in hostmod._ACTIVE_PREFLIGHT_CURRENT_WRITERS.items()}
+                f.host._verified_before_manifest = {'source': {'files': files}}
+                f.host._verified_manifest = copy.deepcopy(f.host._verified_before_manifest)
+                if guard == 'missing': del files['src/worker/mod.rs']
+                elif guard == 'formats': f.host.p['formats']['before']['worker_format'] = 20
+                else: files[guard]['sha256'] = '0' * 64
+                self.assertIsNone(hostmod.active_preflight_writers(f.host))
+                with self.assertRaisesRegex(ValueError, 'active sample installed writer differs'):
+                    hostmod.ActiveWorkerSample(f.host)
+                with self.assertRaisesRegex(AssertionError, 'one content traversal'):
+                    f.host.execute('preflight')
+
+    def test_current_family_cannot_authorize_candidate_only_or_mixed_historical_writer(self):
+        for guard in ('candidate_only', 'mixed'):
+            with self.subTest(guard=guard), active_fixture() as f:
+                f.host.p['formats']['before'] = dict(hostmod._ACTIVE_PREFLIGHT_CURRENT_FORMATS)
+                current = {'source': {'files': {name: {'sha256': sha}
+                    for name, sha in hostmod._ACTIVE_PREFLIGHT_CURRENT_WRITERS.items()}}}
+                f.host._verified_manifest = copy.deepcopy(current)
+                if guard == 'candidate_only':
+                    f.host._verified_before_manifest = {'source': {'files': {}}}
+                else:
+                    f.host._verified_before_manifest = current
+                    current['source']['files']['src/worker/cleanup.rs']['sha256'] = hostmod._ACTIVE_PREFLIGHT_WRITERS['src/worker/cleanup.rs']
+                self.assertIsNone(hostmod.active_preflight_writers(f.host))
+                with self.assertRaisesRegex(AssertionError, 'one content traversal'):
+                    f.host.execute('preflight')

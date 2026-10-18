@@ -159,7 +159,170 @@ def controller_receipt_rows(snapshot, name, bound):
     return result
 
 
-def controller_receipt_plan(profile, before, restart):
+# Immutable e20519 decoder and causal receipt producer family.
+COMPACT_RECEIPT_SOURCES = {'src/controller/application_schema.rs': 'f177e8ca7839e0f9e5130ee0a50ebe7eee78d30c7979e8d930dc9fb10ab7f783', 'src/controller/database.rs': '7a9d59f9b32775d75f754b192fbbd0853ac28da1970b9d42a9f8c849fc3dfb40', 'src/controller/metadata.rs': '126d141f05cf1d74de85008b08b19a79bdc90025c3335f79dd33eab7d42ad532', 'src/controller/operations/effects.rs': 'a818afb64d82048e563599159a7c982e200bd43437c00249d057c4316322e88a', 'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7', 'src/controller/read_retention.rs': '0def3401d029f1b14eab602b3d3f6520862da8ddb7a4022967030fce0d1b72f7', 'src/limits/retention.rs': 'd69614214efd380d62c7a6f5970a46f484b03c54943d8e18dcb0e7b4b972835d', 'src/mcp/mod.rs': '734eb4884aacd34acfb0ea14817d92a9241d11e59c59e4a200529cb2ab4f4d1e', 'src/protocol.rs': '9a04ea9917f388f10f055c1a341872f632da8626abf09092b5182e5edcd58fb6', 'src/read_page.rs': 'd386b2f8a310788e2bfe116878f47892382b5360ea89ca5a713754430c6e9a54', 'src/read_retention.rs': 'c1a069d41f3ff8d133b7929680d2b3f094e4d07a4331e6784427c64d9cc6a811', 'src/repository_view.rs': '08c9a14c273502223bed3888292e38d468280a6474169b00f33838f4ea2bb949'}
+COMPACT_READ_KINDS = {'collab_read_continue': 'page', 'collab_task_get': 'task', 'collab_memory_get': 'memory', 'collab_agent_get': 'agent', 'collab_tasks_list': 'list', 'collab_agents_list': 'list', 'collab_task_releases_list': 'list', 'collab_repository_tree': 'repository', 'collab_repository_read': 'repository', 'collab_repository_search': 'repository', 'collab_repository_diff': 'repository', 'collab_repository_history': 'repository', 'collab_document_get': 'document', 'collab_documents_list': 'document', 'collab_document_versions_list': 'document', 'collab_comments_list': 'document', 'collab_question_get': 'question', 'collab_questions_list': 'question', 'collab_question_answers': 'question', 'collab_question_actions': 'question', 'collab_decisions_list': 'question', 'collab_review_get': 'review', 'collab_reviews_list': 'review', 'collab_review_target_get': 'review', 'collab_task_coordination_get': 'work', 'collab_task_waits': 'work', 'collab_limits_get': 'collaboration', 'collab_session_get': 'collaboration', 'collab_sessions_list': 'collaboration', 'collab_definition_get': 'collaboration', 'collab_memory_list': 'collaboration', 'collab_task_history_list': 'collaboration', 'collab_workers_list': 'collaboration', 'collab_worker_get': 'collaboration', 'collab_machines_list': 'collaboration', 'collab_machine_get': 'collaboration', 'collab_task_attempts_list': 'collaboration', 'collab_task_checkpoints_list': 'collaboration', 'collab_release_get': 'collaboration', 'collab_release_checks_list': 'collaboration', 'collab_repositories_list': 'collaboration', 'collab_repository_get': 'collaboration'}
+
+
+def compact_receipt_sources(profile, manifest):
+    """Exact selected decoder/provenance producers, authenticated by Host.execute.
+
+    Format numbers alone do not admit a new receipt representation. This reader
+    does not enable retention or reconstruct the removed original body.
+    """
+    if profile.get('formats', {}).get('after') != {'wire':25,'controller_schema':26,'worker_format':20}:
+        raise ValueError('compact_receipt_format')
+    files = manifest.get('source', {}).get('files', {}) if isinstance(manifest, dict) else {}
+    if any(not isinstance(files.get(name), dict) or files[name].get('sha256') != sha
+           for name, sha in COMPACT_RECEIPT_SOURCES.items()):
+        raise ValueError('compact_receipt_authenticated_sources')
+    return dict(COMPACT_RECEIPT_SOURCES)
+
+
+def _compact_uint(value, label, maximum=(1 << 64) - 1, positive_only=False):
+    if type(value) is not int or not (int(positive_only) <= value <= maximum):
+        raise ValueError('compact_' + label)
+    return value
+
+
+def _compact_text(value, label):
+    if type(value) is not str or not value: raise ValueError('compact_' + label)
+    return value
+
+
+def _compact_receipt_record(identity, old, receipts):
+    """Join immutable saved receipts; the exact live runtime validates typed DTOs.
+
+    The nested typed source projection is preserved byte-for-value throughout
+    the evidence/release/live-record joins. Its Rust decoder remains the one
+    semantic authority; Python does not introduce another pagination decoder.
+    """
+    same = lambda left, right: canonical(left) == canonical(right)
+    def receipt(key, operation, data_kind):
+        row = receipts.get(key)
+        if not isinstance(row, dict): raise ValueError('compact_causal_receipt_missing')
+        revision = _compact_uint(row.get('controller_revision'), 'receipt_revision', (1 << 63)-1, True)
+        request, outcome = strict(row['request']), strict(row['outcome'])
+        fields(request, 'operation input', 'compact causal request')
+        fields(outcome, 'status data', 'compact causal outcome')
+        fields(outcome['data'], 'kind value', 'compact causal data')
+        if request['operation'] != operation or outcome['status'] != 'ok' or outcome['data']['kind'] != data_kind:
+            raise ValueError('compact_causal_receipt_kind')
+        return request['input'], outcome['data']['value'], revision
+
+    operation, outcome = strict(old['request']), strict(old['outcome'])
+    fields(operation, 'operation input', 'compact original request')
+    fields(operation['input'], 'call', 'compact original input')
+    if operation['operation'] != 'call_collaboration': raise ValueError('compact_original_not_read')
+    call = operation['input']['call']
+    fields(call, 'operation_id logical_call_id caller tool arguments', 'compact invocation')
+    caller = call['caller']
+    fields(caller, 'task_id attempt_id generation worker_id incarnation', 'compact caller')
+    for key in ('task_id','attempt_id','worker_id','incarnation'): _compact_text(caller[key], key)
+    _compact_uint(caller['generation'], 'generation', positive_only=True)
+    _compact_text(call['logical_call_id'], 'logical_call_id')
+    if call['operation_id'] != identity: raise ValueError('compact_original_identity')
+    fields(outcome, 'committed_read_reference', 'compact outcome')
+    compact = outcome['committed_read_reference']
+    fields(compact, 'evidence release_operation_id attempt_id session_id', 'compact reference')
+    evidence = compact['evidence']
+    fields(evidence, 'kind outcome_bytes outcome_sha256 source', 'compact evidence')
+    if (COMPACT_READ_KINDS.get(call['tool']) != evidence['kind'] or not _hex(evidence['outcome_sha256'])
+            or not isinstance(evidence['source'], dict) or not isinstance(call['arguments'], dict)):
+        raise ValueError('compact_read_classification_or_digest')
+    _compact_uint(evidence['outcome_bytes'], 'outcome_bytes', (1 << 63)-1, True)
+    source_fields = {'observation':'kind','page':'kind page','read_list':'kind items complete next_cursor',
+                     'repository':'kind source file','document':'kind version'}.get(evidence['source'].get('kind'))
+    if source_fields is None: raise ValueError('compact_source_kind')
+    fields(evidence['source'], source_fields, 'compact source')
+    _compact_text(compact['session_id'], 'session_id')
+    if compact['attempt_id'] != caller['attempt_id']: raise ValueError('compact_attempt')
+    release_id = _compact_text(compact['release_operation_id'], 'release_id')
+    release, result, release_revision = receipt(release_id, 'release_terminal_reads', 'terminal_read_release')
+    fields(release, 'operation_id caller command_id session_id terminal_revision first_safe_operation_id policy_revision policy custody custody_operation_id reads', 'compact release')
+    fields(result, 'attempt_id released body_bytes_before body_bytes_after first_safe_operation_id first_safe_ms eligible_at_ms', 'compact release result')
+    original_revision = _compact_uint(old['controller_revision'], 'original_revision', (1 << 63)-1, True)
+    if (release['operation_id'] != release_id or not same(release['caller'], caller) or release['session_id'] != compact['session_id']
+            or release_revision <= original_revision or result['attempt_id'] != caller['attempt_id']):
+        raise ValueError('compact_release_identity_or_order')
+    _compact_text(release['command_id'], 'command_id')
+    _compact_text(release['policy_revision'], 'policy_revision')
+    _compact_uint(release['terminal_revision'], 'terminal_revision', (1 << 63)-1, True)
+    policy = release['policy']
+    fields(policy, 'success_grace_ms failed_grace_ms cancelled_grace_ms idle_cache_grace_ms batch_entries filesystem_entries_per_yield operation_timeout_ms retry_delay_ms record_bytes', 'compact historical policy')
+    for key, value in policy.items():
+        _compact_uint(value, 'policy_' + key, (1 << 63)-1,
+                      key in ('batch_entries','filesystem_entries_per_yield','operation_timeout_ms','retry_delay_ms','record_bytes'))
+    custody = release['custody']
+    fields(custody, 'kind manifest_sha256 bytes files', 'compact custody')
+    if custody['kind'] not in ('native_journal','coding_copy') or not _hex(custody['manifest_sha256']):
+        raise ValueError('compact_custody_shape')
+    for key in ('bytes','files'): _compact_uint(custody[key], 'custody_' + key, positive_only=True)
+    reads = release['reads']
+    if not isinstance(reads, list) or not 0 < len(reads) <= policy['batch_entries']:
+        raise ValueError('compact_release_batch')
+    selected = {}
+    for item in reads:
+        fields(item, 'operation_id commit evidence', 'compact selected read')
+        key = _compact_text(item['operation_id'], 'read_id')
+        fields(item['commit'], 'operation_id controller_revision', 'compact selected commit')
+        _compact_uint(item['commit']['controller_revision'], 'read_revision', (1 << 63)-1, True)
+        if key in selected or key == release_id or item['commit']['operation_id'] != key:
+            raise ValueError('compact_release_selection')
+        selected[key] = item
+    if not same(selected.get(identity), {'operation_id':identity,
+            'commit':{'operation_id':identity,'controller_revision':original_revision},'evidence':evidence}):
+        raise ValueError('compact_original_evidence')
+    released = result['released']
+    if (not isinstance(released,list) or any(type(v) is not str for v in released)
+            or len(set(released)) != len(released) or identity not in released or not set(released) <= set(selected)):
+        raise ValueError('compact_released_membership')
+    before_bytes = _compact_uint(result['body_bytes_before'], 'before_bytes', (1 << 63)-1, True)
+    after_bytes = _compact_uint(result['body_bytes_after'], 'after_bytes', (1 << 63)-1, True)
+    if before_bytes <= after_bytes: raise ValueError('compact_release_size')
+    first_id = _compact_text(release['first_safe_operation_id'], 'first_safe_id')
+    first_request, first_result, first_revision = receipt(first_id, 'release_terminal_reads', 'terminal_read_release')
+    expected_first = dict(release, operation_id=first_id, first_safe_operation_id=None)
+    expected_result = dict(result, released=[], body_bytes_before=0, body_bytes_after=0)
+    if (not same(first_request, expected_first) or not same(first_result, expected_result)
+            or result['first_safe_operation_id'] != first_id or first_revision >= release_revision):
+        raise ValueError('compact_first_safe_binding_or_order')
+    custody_id = _compact_text(release['custody_operation_id'], 'custody_id')
+    report_input, task, custody_revision = receipt(custody_id, 'observe_worker', 'task')
+    fields(report_input, 'report', 'compact report input')
+    report = report_input['report']
+    fields(report, 'report_id worker_id incarnation task_id attempt_id generation observation', 'compact report')
+    fields(report['observation'], 'kind proof', 'compact custody observation')
+    expected_custody = dict(expected_first, operation_id=custody_id)
+    if (report['report_id'] != custody_id or not same(report['observation'], {'kind':'read_transcript_custody','proof':expected_custody})
+            or custody_revision >= first_revision
+            or any(not same(report[key], caller[key]) for key in ('worker_id','incarnation','task_id','attempt_id','generation'))):
+        raise ValueError('compact_custody_binding_or_order')
+    if (not isinstance(task,dict) or task.get('id') != caller['task_id'] or task.get('session_id') != release['session_id']
+            or not same(task.get('revision'), release['terminal_revision']) or task.get('pending_assignment') is not None
+            or task.get('waiting_child_id') is not None): raise ValueError('compact_terminal_task')
+    attempt = task.get('attempt')
+    if (not isinstance(attempt,dict) or attempt.get('id') != caller['attempt_id']
+            or attempt.get('task_id') != caller['task_id'] or attempt.get('session_id') != release['session_id']
+            or not same(attempt.get('generation'), caller['generation']) or attempt.get('worker_id') != caller['worker_id']
+            or attempt.get('worker_incarnation') != caller['incarnation'] or attempt.get('phase') != 'stopped'
+            or attempt.get('stopped') is not True or attempt.get('uncertain') is not False):
+        raise ValueError('compact_terminal_attempt')
+    grace_field = {'succeeded':'success_grace_ms','failed':'failed_grace_ms','cancelled':'cancelled_grace_ms'}.get(task.get('status'))
+    executor = task.get('input',{}).get('definition',{}).get('executor')
+    if grace_field is None or {'native':'native_journal','coding':'coding_copy'}.get(executor) != custody['kind']:
+        raise ValueError('compact_terminal_executor_or_status')
+    first_ms = _compact_uint(result['first_safe_ms'], 'first_safe_ms')
+    due_ms = _compact_uint(result['eligible_at_ms'], 'eligible_at_ms')
+    if first_ms + policy[grace_field] != due_ms: raise ValueError('compact_original_grace')
+    # No original body is synthesized or hashed here. Rust validates the saved
+    # source projection and causal provenance again for the exact live lookup.
+    return {'id':identity,'task_id':caller['task_id'],'attempt_id':caller['attempt_id'],
+        'generation':caller['generation'],'kind':'committed_read_reference','intended':operation,
+        'state':'original_read_body_unavailable','outcome':outcome}
+
+
+def controller_receipt_plan(profile, before, restart, *, manifest=None):
     """Keep raw migration proof separate from the live API's selected namespace.
 
     GetOperation selects external_operations before application receipts. A
@@ -176,7 +339,16 @@ def controller_receipt_plan(profile, before, restart):
                 or type(old.get('controller_revision')) is not int or old['controller_revision'] <= 0):
             raise ValueError('original_receipt_shape')
         request, outcome = strict(old['request']), strict(old['outcome'])
+        compact_record = None
+        if isinstance(outcome, dict) and 'committed_read_reference' in outcome:
+            if before['schema'] != 26: raise ValueError('compact_original_schema')
+            compact_receipt_sources(profile, manifest)
+            compact_record = _compact_receipt_record(operation_id, old, receipts)
         if operation_id in external: continue
+        if compact_record is not None:
+            plan.append({'id':operation_id,'namespace':'committed_read_reference','record':compact_record,
+                'commit':{'operation_id':operation_id,'controller_revision':old['controller_revision']}})
+            continue
         task_id = ''
         if outcome.get('status') == 'ok' and outcome.get('data', {}).get('kind') == 'task':
             task_id = outcome['data']['value']['id']
@@ -521,6 +693,34 @@ COMPOSED_SOURCES = AGENT_DIRECTORY_SOURCES | {
 }
 
 
+# This distinct boundary selects the recovered identity/read vocabulary. The
+# runtime validates retained records before changing schema25/worker19 markers;
+# this route permits no table/row or original worker-record rewriting.
+RECOVERED_KIND = 'validated-controller25-worker19-to-wire25-controller26-worker20/1'
+RECOVERED_BEFORE = {'wire':24,'controller_schema':25,'worker_format':19}
+RECOVERED_AFTER = {'wire':25,'controller_schema':26,'worker_format':20}
+RECOVERED_SOURCES = COMPOSED_SOURCES | {
+    'src/controller/identity_limit_fields.rs',
+    'src/controller/read_pages.rs',
+    'src/controller/read_pagination.rs',
+    'src/controller/read_retention.rs',
+    'src/protocol_identity_limit_fields.rs',
+    'src/protocol_read_pagination.rs',
+    'src/read_page.rs',
+    'src/read_retention.rs',
+    'src/mcp/read_recovery.rs',
+    'src/worker/identity_limit_fields.rs',
+    'src/worker/read_pagination.rs',
+    'src/worker/read_retention.rs',
+    'src/worker/cleanup_reads.rs',
+}
+
+
+def recovered_forward(profile):
+    transition=forward(profile)
+    return transition is not None and transition.get('kind')==RECOVERED_KIND
+
+
 def composed_forward(profile):
     transition=forward(profile)
     return transition is not None and transition.get('kind')==COMPOSED_KIND
@@ -532,7 +732,7 @@ def directory_forward(profile):
 
 
 def per_host_forward(profile):
-    return supplied_forward(profile) or directory_forward(profile) or composed_forward(profile)
+    return supplied_forward(profile) or directory_forward(profile) or composed_forward(profile) or recovered_forward(profile)
 
 
 def supplied_forward(profile):
@@ -542,7 +742,7 @@ def supplied_forward(profile):
 
 def supplied_before_hosts(profile):
     transition=forward(profile);hosts=profile['hosts'];proofs=transition['before_hosts']
-    before=COMPOSED_BEFORE if composed_forward(profile) else SUPPLIED_TURN_BEFORE
+    before=RECOVERED_BEFORE if recovered_forward(profile) else COMPOSED_BEFORE if composed_forward(profile) else SUPPLIED_TURN_BEFORE
     if (not isinstance(proofs,dict) or not isinstance(hosts,list)
             or len({h['id'] for h in hosts})!=len(hosts)
             or set(proofs)!={h['id'] for h in hosts}):
@@ -591,7 +791,7 @@ def forward(profile):
 def format_sources(profile):
     transition=forward(profile)
     if transition is None:return FORMAT_SOURCES
-    return COMPOSED_SOURCES if composed_forward(profile) else AGENT_DIRECTORY_SOURCES if transition['kind']==AGENT_DIRECTORY_KIND else SUPPLIED_TURN_SOURCES if transition['kind']==SUPPLIED_TURN_KIND else INSTRUCTION_SOURCE_SOURCES if transition['kind']==INSTRUCTION_SOURCE_KIND else PR_PUBLICATION_SOURCES if transition['kind']==PR_PUBLICATION_KIND else MEMORY_NOTICE_REMOVAL_SOURCES if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else CHARTER_ADOPTION_SOURCES if transition['kind']==CHARTER_ADOPTION_KIND else DIAGNOSTIC_SOURCES if transition['kind']==DIAGNOSTIC_KIND else LOSSLESS_SOURCES if transition['kind']==LOSSLESS_KIND else FORWARD_SOURCES
+    return RECOVERED_SOURCES if recovered_forward(profile) else COMPOSED_SOURCES if composed_forward(profile) else AGENT_DIRECTORY_SOURCES if transition['kind']==AGENT_DIRECTORY_KIND else SUPPLIED_TURN_SOURCES if transition['kind']==SUPPLIED_TURN_KIND else INSTRUCTION_SOURCE_SOURCES if transition['kind']==INSTRUCTION_SOURCE_KIND else PR_PUBLICATION_SOURCES if transition['kind']==PR_PUBLICATION_KIND else MEMORY_NOTICE_REMOVAL_SOURCES if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else CHARTER_ADOPTION_SOURCES if transition['kind']==CHARTER_ADOPTION_KIND else DIAGNOSTIC_SOURCES if transition['kind']==DIAGNOSTIC_KIND else LOSSLESS_SOURCES if transition['kind']==LOSSLESS_KIND else FORWARD_SOURCES
 
 
 def format_contract(profile):
@@ -601,8 +801,8 @@ def format_contract(profile):
         if f['before']!=f['after']: raise ValueError('incompatible state formats: qualified forward transition required')
         return
     fields(transition,'kind before_package_sha256 after_package_sha256 evidence'+(' before_hosts' if per_host_forward(profile) else ''),'forward transition')
-    expected=COMPOSED_AFTER if composed_forward(profile) else AGENT_DIRECTORY_AFTER if directory_forward(profile) else SUPPLIED_TURN_AFTER if supplied_forward(profile) else FORWARD_AFTER if transition['kind']==FORWARD_KIND else LOSSLESS_AFTER if transition['kind']==LOSSLESS_KIND else DIAGNOSTIC_AFTER if transition['kind']==DIAGNOSTIC_KIND else CHARTER_ADOPTION_AFTER if transition['kind']==CHARTER_ADOPTION_KIND else MEMORY_NOTICE_REMOVAL_AFTER if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else PR_PUBLICATION_AFTER if transition['kind']==PR_PUBLICATION_KIND else INSTRUCTION_SOURCE_AFTER if transition['kind']==INSTRUCTION_SOURCE_KIND else None
-    before=COMPOSED_BEFORE if composed_forward(profile) else AGENT_DIRECTORY_BEFORE if directory_forward(profile) else SUPPLIED_TURN_BEFORE if supplied_forward(profile) else FORWARD_BEFORE
+    expected=RECOVERED_AFTER if recovered_forward(profile) else COMPOSED_AFTER if composed_forward(profile) else AGENT_DIRECTORY_AFTER if directory_forward(profile) else SUPPLIED_TURN_AFTER if supplied_forward(profile) else FORWARD_AFTER if transition['kind']==FORWARD_KIND else LOSSLESS_AFTER if transition['kind']==LOSSLESS_KIND else DIAGNOSTIC_AFTER if transition['kind']==DIAGNOSTIC_KIND else CHARTER_ADOPTION_AFTER if transition['kind']==CHARTER_ADOPTION_KIND else MEMORY_NOTICE_REMOVAL_AFTER if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else PR_PUBLICATION_AFTER if transition['kind']==PR_PUBLICATION_KIND else INSTRUCTION_SOURCE_AFTER if transition['kind']==INSTRUCTION_SOURCE_KIND else None
+    before=RECOVERED_BEFORE if recovered_forward(profile) else COMPOSED_BEFORE if composed_forward(profile) else AGENT_DIRECTORY_BEFORE if directory_forward(profile) else SUPPLIED_TURN_BEFORE if supplied_forward(profile) else FORWARD_BEFORE
     if expected is None or canonical(f['before'])!=canonical(before) or canonical(f['after'])!=canonical(expected):
         raise ValueError('incompatible or unsupported forward transition')
     for key in ('before_package_sha256','after_package_sha256'):

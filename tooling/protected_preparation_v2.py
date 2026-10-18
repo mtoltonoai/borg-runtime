@@ -59,8 +59,8 @@ def validate_candidate(candidate, subject):
 
 def application_wire(profile):
     value=profile.get('application_wire_revision',8)
-    if type(value) is not int or value not in (8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24):
-        raise ValueError('explicit candidate application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 or 24')
+    if type(value) is not int or value not in (8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25):
+        raise ValueError('explicit candidate application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 or 25')
     return value
 
 

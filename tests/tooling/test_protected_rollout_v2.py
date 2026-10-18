@@ -1924,6 +1924,145 @@ class RolloutTests(unittest.TestCase):
             with self.subTest(marker=marker),self.assertRaisesRegex(ValueError,'worker format differs from exact phase'):
                 host.compatibility(pending_forward=True)
 
+    def test_recovered_forward_preserves_schema25_rows_and_original_worker_journals(self):
+        self.f.recovered_transition();worker=self.mixed_worker_baseline();self.f.bind_supplied_predecessors()
+        formats=self.f.profile['formats']
+        self.assertEqual(formats['before'],{'wire':24,'controller_schema':25,'worker_format':19})
+        self.assertEqual(formats['after'],{'wire':25,'controller_schema':26,'worker_format':20})
+        self.assertEqual(formats['forward']['kind'],common.RECOVERED_KIND)
+        self.assertNotEqual(worker['old_artifact']['package_sha256'],self.f.subject['installed_package_sha256'])
+        root=Path(worker['state']['root']);kept={}
+        for name in ('pull-requests/original.json','codex/61/completion/input.json','codex/61/supplied-charter/outer-0/intent.json'):
+            path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'{"original":"retained"}')
+            kept[path]=path.read_bytes()
+        subject=copy.deepcopy(self.f.subject)
+        result=self.runner().execute('apply');self.assertEqual(result['status'],'APPLIED',result)
+        work=next(Path(self.f.profile['hosts'][0]['state_root']).glob('action-*'))
+        before=common.strict((work/'stopped-copy/snapshot.json').read_bytes())
+        after=common.strict((work/'restart-copy/snapshot.json').read_bytes())
+        self.assertEqual((before['schema'],after['schema']),(25,26))
+        self.assertEqual(after['tables'],before['tables'])
+        self.assertEqual(before['tables']['session_inputs']['rows'][0][2],'retained accepted input bytes')
+        self.assertEqual(before['tables']['task_assignments']['rows'][0][-1],'retained pending handoff bytes')
+        self.assertEqual(common.strict(Path(worker['state']['format_file']).read_bytes()),{'format_revision':20})
+        self.assertEqual(self.full_host_proof(result,'controller')['preserved_controller_receipts'],['original'])
+        self.assertEqual(self.f.subject,subject);self.assertEqual({p:p.read_bytes() for p in kept},kept)
+        effects=copy.deepcopy(self.f.effects)
+        self.assertEqual(self.runner().execute('reconcile')['status'],'APPLIED');self.assertEqual(self.f.effects,effects)
+        self.assertEqual(sum(q['command']['operation']=='start_rollout' for q in self.peer.calls),1)
+
+    def test_recovered_forward_requires_exact_tuple_each_host_and_complete_source_inventory(self):
+        self.f.recovered_transition();self.mixed_worker_baseline()
+        result=self.runner().execute('apply');self.assertEqual(result['status'],'UNKNOWN')
+        self.assert_error_message(result,'supplied forward exact host binding')
+        self.assertEqual(self.f.effects,[])
+        self.assertFalse(any(q['command']['operation']=='start_rollout' for q in self.peer.calls))
+        self.f.bind_supplied_predecessors();common.validate(self.f.profile)
+        variants=[]
+        for side in ('before','after'):
+            for key in ('wire','controller_schema','worker_format'):
+                for delta in (-1,1):
+                    p=copy.deepcopy(self.f.profile);p['formats'][side][key]+=delta;variants.append(p)
+        p=copy.deepcopy(self.f.profile);del p['formats']['forward'];variants.append(p)
+        p=copy.deepcopy(self.f.profile);p['formats']['forward']['kind']=common.AGENT_DIRECTORY_KIND;variants.append(p)
+        p=copy.deepcopy(self.f.profile);p['formats']['forward']['kind']='unreviewed';variants.append(p)
+        p=copy.deepcopy(self.f.profile);p['formats']['forward']['after_package_sha256']=p['formats']['forward']['before_package_sha256'];variants.append(p)
+        p=copy.deepcopy(self.f.profile);del p['formats']['forward']['before_hosts']['worker'];variants.append(p)
+        for key,value in [('formats',dict(common.SUPPLIED_TURN_BEFORE)),('artifact',{}),('unit',{})]:
+            p=copy.deepcopy(self.f.profile);p['formats']['forward']['before_hosts']['worker'][key]=value;variants.append(p)
+        for name in common.SUPPLIED_TURN_BEFORE_SOURCES:
+            p=copy.deepcopy(self.f.profile);del p['formats']['forward']['before_hosts']['worker']['source_files'][name];variants.append(p)
+        for name in common.RECOVERED_SOURCES:
+            p=copy.deepcopy(self.f.profile);del p['formats']['source_files'][name];variants.append(p)
+        p=copy.deepcopy(self.f.profile);p['formats']['source_files']['foreign.rs']='f'*64;variants.append(p)
+        for index,p in enumerate(variants):
+            with self.subTest(variant=index),self.assertRaises(ValueError):common.validate(p)
+        self.assertEqual(self.f.effects,[])
+
+    def test_recovered_forward_verifies_each_installed_manifest_and_selected_package_sources(self):
+        self.f.recovered_transition();worker=self.mixed_worker_baseline();self.f.bind_supplied_predecessors()
+        release=Path(worker['release_root'])/worker['old_artifact']['package_sha256']
+        raw=(release/'manifest.json').read_bytes();common.verify_before_manifest(self.f.profile,worker,raw)
+        for name in common.SUPPLIED_TURN_BEFORE_SOURCES:
+            p=copy.deepcopy(self.f.profile);h=p['hosts'][1]
+            p['formats']['forward']['before_hosts']['worker']['source_files'][name]='f'*64
+            with self.subTest(name=name),self.assertRaisesRegex(ValueError,'baseline source binding'):
+                common.verify_before_manifest(p,h,raw)
+        p=copy.deepcopy(self.f.profile);p['formats']['source_files']['src/worker/read_retention.rs']='f'*64
+        save(self.f.profile_path,p);self.f.profile=p;self.f.profile_sha=common.digest(self.f.profile_path.read_bytes())
+        result=self.runner().execute('apply');self.assertEqual(result['status'],'UNKNOWN')
+        self.assertEqual(self.f.effects,[])
+        self.assertFalse(any(q['command']['operation']=='start_rollout' for q in self.peer.calls))
+
+    def test_recovered_forward_refuses_all_retained_table_row_shape_and_schema_changes(self):
+        self.f.recovered_transition();self.assertEqual(self.runner().execute('apply')['status'],'APPLIED')
+        work=next(Path(self.f.profile['hosts'][0]['state_root']).glob('action-*'))
+        before=common.strict((work/'stopped-copy/snapshot.json').read_bytes())
+        after=common.strict((work/'restart-copy/snapshot.json').read_bytes())
+        for table in ('receipts','sessions','session_inputs','task_assignments'):
+            p=copy.deepcopy(after);p['tables'][table]['rows'][0][-1]='rewritten'
+            with self.subTest(table=table),self.assertRaisesRegex(ValueError,'logical controller state'):
+                common.controller_retained(self.f.profile,before,p)
+        variants=[]
+        p=copy.deepcopy(after);del p['tables']['agent_retirements'];variants.append(p)
+        p=copy.deepcopy(after);p['tables']['agent_retirements']['columns']=['wrong'];variants.append(p)
+        p=copy.deepcopy(after);p['tables']['new_table']={'columns':[],'rows':[]};variants.append(p)
+        for p in variants:
+            with self.assertRaisesRegex(ValueError,'logical controller state'):common.controller_retained(self.f.profile,before,p)
+        p=copy.deepcopy(after);p['schema']=25
+        with self.assertRaisesRegex(ValueError,'schema differs'):common.controller_retained(self.f.profile,before,p)
+
+    def test_recovered_forward_crash_after_marker_commit_never_restarts_or_rolls_back(self):
+        self.f.recovered_transition();startup=self.f.on_start
+        def crash(host):
+            startup(host)
+            if host['role']=='controller':raise ValueError('controlled schema26 commit before crash')
+        self.f.on_start=crash
+        first=self.runner().execute('apply');self.assertEqual(first['status'],'UNKNOWN');self.assertFalse(first['automatic_rollback'])
+        effects=copy.deepcopy(self.f.effects);self.assertEqual(self.runner().execute('reconcile')['status'],'UNKNOWN');self.assertEqual(self.f.effects,effects)
+        con=sqlite3.connect(self.f.profile['hosts'][0]['state']['database'])
+        try:self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0],26)
+        finally:con.close()
+        self.assertEqual(sum(row[:2]==['controller','start'] for row in effects),1)
+        self.assertFalse(any(row[:2]==['worker','start'] for row in effects))
+
+    def test_recovered_forward_reads_only_wire24_then25(self):
+        self.f.recovered_transition();original=hostmod.Host.__mro__[1]
+        h=self.f.profile['hosts'][0];host=original(self.f.profile,h,self.f.subject,{'action_id':'recovered-wire','deadline_ms':common.now_ms()+60000})
+        seen=[]
+        def reply(address,port,raw,*rest):
+            q=common.strict(raw);seen.append(q['protocol_revision'])
+            return common.canonical({'request_id':q['request_id'],'status':'ok','observed_controller_revision':1,'commit':None,'data':{'kind':'tasks','value':[]}})
+        with patch.object(hostmod.c,'http_read',side_effect=reply):
+            host.api('list_tasks',{});host.after=True;host.api('list_tasks',{})
+        self.assertEqual(seen,[24,25]);self.assertEqual(self.f.effects,[])
+
+    def test_recovered_forward_lost_worker_ack_uses_original_marker20_completion(self):
+        self.f.recovered_transition();self.f.lost_phase=['worker','start']
+        self.assertEqual(self.runner().execute('apply')['status'],'UNKNOWN');effects=copy.deepcopy(self.f.effects)
+        worker=self.f.profile['hosts'][1];work=next(Path(worker['state_root']).glob('action-*'))
+        retained={name:(work/name).read_bytes() for name in ('start.intent.json','start.result.json')}
+        result=self.runner().execute('reconcile');self.assertEqual(result['status'],'APPLIED',result)
+        self.assertEqual(self.f.effects,effects);self.assertEqual({name:(work/name).read_bytes() for name in retained},retained)
+        self.assertEqual(self.full_host_proof(result,'worker')['phase_proofs']['start'],{'request':common.strict(retained['start.intent.json']),'result':common.strict(retained['start.result.json'])})
+        self.assertEqual(sum(row[:2]==['worker','start'] for row in effects),1)
+        self.assertEqual(common.strict(Path(worker['state']['format_file']).read_bytes()),{'format_revision':20})
+
+    def test_recovered_forward_waits_only_for_original19_and_rejects_other_markers(self):
+        self.f.recovered_transition();startup=self.f.on_start;worker=self.f.profile['hosts'][1];waits=[]
+        def delayed(host):
+            if host['role']=='controller':startup(host)
+        def advance(delay):waits.append(delay);startup(worker)
+        self.f.on_start=delayed
+        with patch.object(hostmod.time,'sleep',side_effect=advance):result=self.runner().execute('apply')
+        self.assertEqual(result['status'],'APPLIED',result);self.assertEqual(len(waits),1)
+        self.assertEqual(sum(row[:2]==['worker','start'] for row in self.f.effects),1)
+        host=hostmod.Host(self.f.profile,worker,self.f.subject,{'action_id':'wrong-marker','deadline_ms':common.now_ms()+60000});host.after=True
+        for marker in (18,21):
+            save(Path(worker['state']['format_file']),{'format_revision':marker})
+            with self.subTest(marker=marker),self.assertRaisesRegex(ValueError,'worker format differs from exact phase'):
+                host.compatibility(pending_forward=True)
+
 class ProcessCleanupTests(unittest.TestCase):
     def test_leader_exit_still_kills_owned_group_and_closes_streams(self):
         # No process is spawned. Model a reaped leader with surviving group.

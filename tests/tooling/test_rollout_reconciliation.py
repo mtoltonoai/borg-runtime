@@ -1261,18 +1261,14 @@ class CodexHomePreservationTests(NoExternalEffects):
         f.host.p['formats']['before']=dict(hostmod._COMPOSED_CODEX_HOME_FORMATS)
         f.host.p['formats']['after']=dict(hostmod._COMPOSED_CODEX_HOME_FORMATS)
 
-    def test_composed_cleanup_family_matches_actual_producers_and_formats(self):
-        selected=Path(hostmod.__file__).resolve().parent.parent
-        for name,digest in hostmod._COMPOSED_CODEX_HOME_SOURCES.items():
-            with self.subTest(source=name):
-                self.assertEqual(common.digest((selected/name).read_bytes()),digest)
+    def test_composed_cleanup_family_retains_historical_pins_and_formats(self):
+        # This immutable family identifies the qualified wire24/schema25/worker19
+        # producer. The selected worker20 source has its own current-source test.
+        self.assertEqual(len(hostmod._COMPOSED_CODEX_HOME_SOURCES),53)
+        self.assertEqual(common.digest(common.canonical(hostmod._COMPOSED_CODEX_HOME_SOURCES)),
+                         '42360fdc812de5653fc8965afea7eb2f2732a8208631b8b0a1436cc80e20a459')
         self.assertEqual(hostmod._COMPOSED_CODEX_HOME_FORMATS,
                          {'wire':24,'controller_schema':25,'worker_format':19})
-        self.assertIn(b'pub const WIRE_REVISION: u32 = 24;',(selected/'src/protocol.rs').read_bytes())
-        self.assertIn(b'const VERSION: i64 = 25;',(selected/'src/controller/application_schema.rs').read_bytes())
-        self.assertIn(b'const CURRENT_STATE_FORMAT: u32 = 19;',(selected/'src/worker/handoff.rs').read_bytes())
-        self.assertIn(b'const JOURNAL: &str = "borg-supplied-outer.json";',
-                      (selected/'src/worker/codex_retry.rs').read_bytes())
         with self.fixture() as f:
             self.select_composed(f);common.format_contract(f.host.p)
             self.assertTrue(f.host.codex_home_scope())

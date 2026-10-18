@@ -7,7 +7,7 @@ it never repeats install/start/stop, even when a prior response was lost.
 from __future__ import annotations
 import argparse, hashlib, importlib.util, json, os, shlex, stat, sys
 from pathlib import Path
-_COMMON_SHA = 'deed09974a62ca4b4d94892850d2eccc9006426f16a73f533618b24660911f21'
+_COMMON_SHA = '436dd20bfb545383f27c941e48f4e131b0d60e006db0cf4d2c627e3e2cfa39f2'
 
 def _common():
     p=Path(__file__).with_name('rollout_common_v2.py');raw=p.read_bytes()
