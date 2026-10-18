@@ -30,6 +30,7 @@ enum Mode {
     LossBefore,
     Uncommitted,
     Secret,
+    LargeRead,
 }
 struct State {
     calls: usize,
@@ -49,6 +50,9 @@ fn result(call: &Invocation, mode: Mode) -> CallResult {
             code: "capacity".into(),
             message: "known committed refusal".into(),
         },
+        Mode::LargeRead => Outcome::Ok {data:Data::Memory(Some(MemoryValue {
+            agent_id:"agent-1".into(),key:"fixture".into(),revision:1,value:json!("retained original ".repeat(1024)),
+        }))},
         Mode::Secret => Outcome::Ok {
             data: Data::Memory(Some(MemoryValue {
                 agent_id: "agent-1".into(),
@@ -692,7 +696,7 @@ async fn repository_reads_preserve_exact_host_caller_arguments_and_refusal() {
         assert_eq!(entry.invocation.arguments, arguments);
         assert_eq!(entry.invocation.logical_call_id, logical);
         assert!(matches!(
-            entry.outcome.as_ref().unwrap().reply.outcome,
+            entry.outcome.as_ref().unwrap().inline().unwrap().reply.outcome,
             Outcome::Refused { .. }
         ));
         bridge.delivered(index).unwrap();
@@ -1307,7 +1311,7 @@ async fn metadata_journal_above_former_byte_cap_reopens_exact_outcomes_without_r
         assert_eq!(entry.invocation.arguments, arguments);
         assert_eq!(entry.invocation.logical_call_id, logical);
         assert_eq!(entry.invocation.caller, selected.caller);
-        assert_eq!(entry.outcome, Some(result(&entry.invocation, Mode::Good)));
+        assert_eq!(entry.outcome, Some(result(&entry.invocation, Mode::Good).into()));
         bridge.delivered(index).unwrap();
         last_wire = Some(wire);
     }
@@ -1395,3 +1399,9 @@ async fn metadata_journal_above_former_byte_cap_reopens_exact_outcomes_without_r
 
 #[path = "codex_mcp_admission_tests.rs"]
 mod admission_tests;
+
+#[path = "codex_read_pagination_tests.rs"]
+mod read_pagination;
+
+#[path = "codex_mcp_retention_tests.rs"]
+mod retention_tests;

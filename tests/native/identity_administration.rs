@@ -609,7 +609,8 @@ async fn charter_creates_designer_and_requests_review_through_mcp() {
     let server = Server::new(&h).await;
     let client = client(&h, &server);
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 73);
+    assert_eq!(tools.len(), 74);
+    assert_eq!(tools.iter().filter(|tool| tool.name == "collab_read_continue").count(), 1);
     let mut previous = None;
     let designer = definition(&h.cfg.limits, "ui-designer", ExecutorKind::Native, false);
     let args = admin_args(&h.cfg.limits, json!({"definition":designer}));
@@ -696,4 +697,94 @@ async fn charter_creates_designer_and_requests_review_through_mcp() {
     assert_eq!(creation(&h, &review.id).await, provenance);
     assert_eq!(h.tasks().await.len(), 2);
     h.close().await;
+}
+
+// Controlled Responses select the real native call; the Coding peer runs the
+// real stdio bridge. Both reach the same canonical Controller operation layer.
+// This qualifies adapters and retained receipts, not a provider or Codex model.
+#[tokio::test]
+async fn identity_limit_fields_native_and_coding_share_schema_commits_and_original_replay() {
+    use borg_runtime::limits::DefinitionLimitField::{CodingFrameBytes, CollaborationJournalBytes};
+    let fields = [CodingFrameBytes, CollaborationJournalBytes];
+    let mut p = policy();
+    p.execution.coding.rate_limit_retry = Some(borg_runtime::supplied_outer::RetryPolicy {
+        initial_backoff_ms: 3000, backoff_multiplier: 2, max_backoff_ms: 60000, jitter_ms: 1000,
+    });
+    p.definition_updates.as_mut().unwrap().allowed_fields.extend(fields);
+    p.validate().unwrap();
+    let n = Harness::with_policy("fields-native", "charter", ExecutorKind::Native, true, p.clone()).await;
+    let c = Harness::with_policy("fields-coding", "charter", ExecutorKind::Coding, true, p).await;
+    let ns = Server::new(&n).await;
+    let cs = Server::new(&c).await;
+    let nc = client(&n, &ns);
+    let tools = nc.tools().await.unwrap();
+    let mut peer = CodingPeer::start(&c, &cs).await;
+    let coding_tools = peer.rpc("tools/list", json!({})).await;
+    let nschema = &tools.iter().find(|t| t.name == "collab_definition_update").unwrap().input_schema;
+    let cschema = &coding_tools["tools"].as_array().unwrap().iter()
+        .find(|t| t["name"] == "collab_definition_update").unwrap()["inputSchema"];
+    assert_eq!(nschema, cschema);
+    for name in ["coding.frame_bytes", "collaboration.journal_bytes"] {
+        assert_eq!(nschema["properties"]["changes"]["properties"][name], json!({"type":"integer","minimum":1}));
+    }
+    assert_eq!(nschema["properties"]["changes"]["additionalProperties"], false);
+    let ni = n.current().await.input;
+    let ci = c.current().await.input;
+    let mut previous = None;
+    let mut originals = Vec::new();
+    for (index, delta, classification) in [(1u32, 1isize, ConfigurationChangeClass::Widening), (2, -2, ConfigurationChangeClass::Narrowing)] {
+        let mut outcomes = Vec::new();
+        for (h, coding) in [(&n, false), (&c, true)] {
+            let before = selected(&h.c, "engineer").await.definition;
+            let limits = h.cfg.limits.resolve_definition(&before).unwrap();
+            let changes: std::collections::BTreeMap<_, _> = fields.iter().map(|f|
+                (*f, f.value(&limits).unwrap().checked_add_signed(delta).unwrap())).collect();
+            let args = json!({"agent_id":before.id,"expected_revision":before.revision,
+                "expected_global_revision":h.cfg.limits.revision,
+                "expected_policy_revision":h.cfg.limits.definition_updates.as_ref().unwrap().revision,"changes":changes});
+            let logical = format!("identity-limit-fields-{index}");
+            let result = if coding {
+                let first = peer.call("collab_definition_update", args.clone(), &logical).await;
+                assert_eq!(peer.call("collab_definition_update", args.clone(), &logical).await, first);
+                first
+            } else {
+                native_call(h, &nc, &tools, &mut previous, "collab_definition_update", args.clone(), index).await
+            };
+            let call = if coding {
+                let journal: Value = serde_json::from_slice(&std::fs::read(peer.config.directory().join("calls.json")).unwrap()).unwrap();
+                serde_json::from_value(journal["entries"].as_array().unwrap().iter()
+                    .find(|e| e["invocation"]["logical_call_id"] == logical).unwrap()["invocation"].clone()).unwrap()
+            } else { native_invocation(h, index, "collab_definition_update", args) };
+            let Outcome::Ok { data: Data::DefinitionUpdate(ref update) } = result.reply.outcome else { panic!("canonical update: {:?}", result.reply) };
+            assert_eq!(update.changed_fields, fields);
+            assert_eq!(update.classification, classification);
+            assert_eq!(update.effective_for, ConfigurationEffect::FutureSubmissions);
+            let after = h.cfg.limits.resolve_definition(&update.selected_definition).unwrap();
+            let mut expected = limits.clone();
+            for (field,value) in changes { field.set(&mut expected,value); }
+            assert_eq!(after, expected);
+            assert_eq!(after.coding.rate_limit_retry, limits.coding.rate_limit_retry);
+            assert_eq!(after.coding.model_context_window, limits.coding.model_context_window);
+            assert_eq!(after.collaboration.capabilities, limits.collaboration.capabilities);
+            assert_eq!(selected(&h.c, "engineer").await.definition, update.selected_definition);
+            outcomes.push(after);
+            originals.push((coding, call, result));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "same composed resource change across adapters");
+    }
+    assert_eq!(n.current().await.input, ni);
+    assert_eq!(c.current().await.input, ci);
+    peer.close().await;
+    ns.close().await; cs.close().await; drop(nc);
+    let ncfg = n.cfg.clone(); let ccfg = c.cfg.clone();
+    let n = n.reopen(ncfg).await; let c = c.reopen(ccfg).await;
+    for (coding, call, result) in originals {
+        let h = if coding { &c } else { &n };
+        let replay = h.invoke(&call).await;
+        assert_eq!(replay.outcome, result.reply.outcome);
+        assert_eq!(replay.commit, result.reply.commit);
+    }
+    assert_eq!(n.current().await.input, ni);
+    assert_eq!(c.current().await.input, ci);
+    n.close().await; c.close().await;
 }

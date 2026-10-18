@@ -131,6 +131,7 @@ fn validate_candidate(
         .limits
         .resolve_definition(d)
         .map_err(|e| Fault::Refused("invalid_limits", e))?;
+    super::definition_updates::validate_supplied_output(tx.limits, d, &effective)?;
     if effective.collaboration.capabilities.is_some()
         && !matches!(
             d.execution_profile,
@@ -355,6 +356,8 @@ fn validate_effective_change(
         CodingSummaryChars,
         CodingSummaryBytes,
         CollaborationCompleteResultBytes,
+        CodingFrameBytes,
+        CollaborationJournalBytes,
     ] {
         let old = field.value(before);
         let new = field.value(after);
@@ -508,8 +511,7 @@ pub(super) fn validate_existing(
         ));
     }
     for id in ids {
-        let r = super::metadata::read(tx, &id)?
-            .ok_or_else(|| Fault::Store("identity receipt disappeared".into()))?;
+        let Some(r) = super::metadata::scan_inline(tx, &id)? else { continue };
         if version < 25
             && (crate::protocol::requires_wire24(&r.request)
                 || crate::protocol::outcome_requires_wire24(&r.outcome))

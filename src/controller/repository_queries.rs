@@ -191,8 +191,14 @@ pub(super) fn observe(
     request: &crate::repository_view::Request,
     now: u64,
 ) -> database::Result<repository_view::Output> {
+    if matches!(request,repository_view::Request::ReadPage {..}) {
+        return super::read_pages::repository_observe(tx,context,original,request,now);
+    }
     let (selected, base, query) = request.parts();
     require_inner(tx, context, original, selected, base, query, now, true)
+}
+pub(super) fn observe_slice(tx:&database::StoreContext<'_>,context:&Context<'_>,original:&StoredTask,selected:Selector,query:Query,now:u64)->database::Result<repository_view::Output> {
+    require_inner(tx,context,original,selected,None,query,now,true)
 }
 pub(super) fn require(
     tx: &database::StoreContext<'_>,
@@ -219,6 +225,34 @@ fn require_inner(
         .validate(&context.limits.repository)
         .map_err(|e| Fault::Refused(e.code(), e.message("repository query refused")))?;
     let bound = binding(tx, &original.task, selected, base)?;
+    require_bound(context, original, bound, query, now, operator_observation)
+}
+
+/// Original recovery selects the retained resolved source, never today's head
+/// or checkpoint. The validated release provenance supplies the original input.
+pub(super) fn recover_original(
+    tx: &database::StoreContext<'_>, context: &Context<'_>, original: &StoredTask,
+    source: &repository_view::Source, query: Query, now: u64,
+) -> database::Result<repository_view::Output> {
+    query.validate(&context.limits.repository)
+        .map_err(|e| Fault::Refused(e.code(), e.message("original repository query refused")))?;
+    let accepted = original.task.input.resolved_limits.as_ref()
+        .ok_or_else(|| Fault::Store("original repository policy absent".into()))?;
+    let accepted_tx = tx.with_limits(&accepted.global_metadata);
+    let record = super::repositories::revision(&accepted_tx, &source.registration)?;
+    let store_key = if record.source_endpoint == source.repository { record.source_store_key }
+        else if record.checkpoint_endpoint == source.repository { record.checkpoint_store_key }
+        else { return database::refuse("original_read_body_unavailable", "recorded immutable repository is unavailable"); };
+    let bound = Binding { input:original.task.input.clone(), assigned_agent:original.task.assigned_agent_id.clone(),
+        checkpoint:None, source:Source { registration:source.registration.clone(), store_key,
+            repository:source.repository.clone(), commit:source.commit.clone(), base_commit:source.base_commit.clone() } };
+    require_bound(context, original, bound, query, now, true)
+}
+
+fn require_bound(
+    context: &Context<'_>, original: &StoredTask, bound: Binding,
+    query: Query, now: u64, operator_observation: bool,
+) -> database::Result<repository_view::Output> {
     let Some(proof) = context.repository else {
         let remaining = if operator_observation {
             Duration::from_millis(context.limits.repository.read_timeout_ms)

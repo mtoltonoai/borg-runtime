@@ -125,7 +125,7 @@ async fn read_lost_commit_reply_and_committed_refusal_retain_original_without_re
         assert_eq!(peer.seen.lock().unwrap().calls.len(), 1);
         let call = &bridge.journal.entries[index].invocation;
         assert_eq!(bridge.journal.entries[index].outcome,
-            peer.original.state.lock().unwrap().receipts.get(&call.operation_id).cloned());
+            peer.original.state.lock().unwrap().receipts.get(&call.operation_id).cloned().map(Into::into));
     }
 }
 
@@ -147,7 +147,7 @@ async fn original_commit_after_absent_snapshot_wins_before_read_redispatch() {
     assert_eq!(peer.original.state.lock().unwrap().lookups, 2);
     let call = &bridge.journal.entries[index].invocation;
     assert_eq!(bridge.journal.entries[index].outcome,
-        peer.original.state.lock().unwrap().receipts.get(&call.operation_id).cloned());
+        peer.original.state.lock().unwrap().receipts.get(&call.operation_id).cloned().map(Into::into));
 }
 
 #[tokio::test]

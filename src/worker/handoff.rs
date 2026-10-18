@@ -429,7 +429,9 @@ struct Format {
 // Outer17 fences supplied public outer-turn journals and output manifests.
 // Outer18 carries optional default-assignment metadata in accepted snapshots.
 // Outer19 fences identity/task, machine read and supplied retry vocabulary.
-const CURRENT_STATE_FORMAT: u32 = 19;
+// Outer20 jointly fences identity fields, paginated reads and retained-read references.
+const CURRENT_STATE_FORMAT: u32 = 20;
+const IDENTITY_STATE_FORMAT: u32 = 19;
 const DEFAULT_ASSIGNMENT_STATE_FORMAT: u32 = 18;
 const SUPPLIED_STATE_FORMAT: u32 = 17;
 const INSTRUCTION_SOURCE_STATE_FORMAT: u32 = 16;
@@ -465,32 +467,57 @@ fn read_state_format(state: &Path, limits: &WorkerLimits) -> Result<Format, Stri
     }
     let format: Format =
         serde_json::from_slice(&bytes).map_err(|_| "unsupported worker state format")?;
-    if !matches!(format.format_revision, INSTALLED_STATE_FORMAT | EARLIER_STATE_FORMAT | PREVIOUS_STATE_FORMAT | OUTPUT_CAP_STATE_FORMAT | OUTPUT_RETENTION_STATE_FORMAT | DIAGNOSTIC_STATE_FORMAT | PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT) {
+    if !matches!(format.format_revision, INSTALLED_STATE_FORMAT | EARLIER_STATE_FORMAT | PREVIOUS_STATE_FORMAT | OUTPUT_CAP_STATE_FORMAT | OUTPUT_RETENTION_STATE_FORMAT | DIAGNOSTIC_STATE_FORMAT | PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT) {
         return Err("unsupported worker state format; no migration performed".into());
     }
     Ok(format)
 }
 
 pub(super) fn admits_instruction_sources(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admits_supplied_turn_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admits_default_assignment(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
+pub(super) fn admits_read_pagination(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(read_state_format(state,limits)?.format_revision==CURRENT_STATE_FORMAT)}
+
 pub(super) fn admits_machine_resources(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(matches!(read_state_format(state, limits)?.format_revision, IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
+}
+
+pub(super) fn admits_identity_administration(state:&Path,limits:&WorkerLimits)->Result<bool,String> { Ok(matches!(read_state_format(state,limits)?.format_revision, IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT)) }
+
+pub(super) fn admits_identity_limit_fields(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
     Ok(read_state_format(state, limits)?.format_revision == CURRENT_STATE_FORMAT)
 }
 
-pub(super) fn admits_identity_administration(state:&Path,limits:&WorkerLimits)->Result<bool,String> { Ok(read_state_format(state,limits)?.format_revision==CURRENT_STATE_FORMAT) }
+pub(super) fn admit_retained_identity_limit_fields(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
+    use crate::protocol::identity_limit_fields as vocabulary;
+    for (_, receipt) in command_receipts(state, limits)? {
+        let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { continue; };
+        let path = path(state, attempt);
+        if path.exists() {
+            let saved = load(&path, attempt, task)?;
+            if vocabulary::operation_uses(&saved.request) || saved.outcome.as_ref().is_some_and(vocabulary::outcome_uses) {
+                return Err("retained handoff identity limit fields require worker20".into());
+            }
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn admits_pull_request_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
+}
+
+pub(super) fn admits_read_references(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(read_state_format(state, limits)?.format_revision == CURRENT_STATE_FORMAT)
 }
 
 pub(super) fn initialize_state(state: &Path, limits: &WorkerLimits) -> Result<(), String> {
@@ -530,7 +557,7 @@ fn write_current_state_format(state: &Path, limits: &WorkerLimits) -> Result<(),
 /// Call only after the existing local retained-policy, command, resource and
 /// stopped-journal admission checks, with this state's owner lease held, before
 /// any report replay or recovery request. Inner records keep their own readers
-/// and recovery gates; this is only the explicit outer 9-18 -> 19 migration.
+/// and recovery gates; this is only the explicit outer 9-19 -> 20 migration.
 /// A failure must exit before the ordinary shutdown report-flushing path.
 pub(super) fn finish_state_upgrade(
     state: &Path,
@@ -538,10 +565,13 @@ pub(super) fn finish_state_upgrade(
     _lease: &process::WorkerLease,
 ) -> Result<(), String> {
     read_state_format(state, &limits.worker)?;
+    crate::worker::read_retention::admit(state, limits)?;
     crate::worker::admit_default_assignment(state, limits)?;
     crate::worker::admit_identity_administration(state, limits)?;
     crate::worker::machine_resources::admit(state, limits)?;
     crate::worker::admit_supplied_retry(state, limits)?;
+    crate::worker::identity_limit_fields::admit(state, limits)?;
+    crate::worker::read_pagination::admit(state, limits)?;
     // Also re-persist the observed current marker: a prior rename may have succeeded before
     // its directory sync failed. Visibility alone is not a durable barrier.
     write_current_state_format(state, &limits.worker)
@@ -1482,7 +1512,7 @@ mod tests {
         Arc::new(limits)
     }
     fn historical_state(label: &str, revision: u32) -> (PathBuf, Vec<u8>) {
-        assert!(matches!(revision, 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18));
+        assert!(matches!(revision, 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19));
         let state = area(label);
         process::private_directory(&state.join("commands")).unwrap();
         process::private_directory(&state.join("mutations")).unwrap();
@@ -1598,7 +1628,7 @@ mod tests {
             b"{\"format_revision\":10,\"extra\":true}".to_vec(),
             b"{\"format_revision\":10,\"format_revision\":10}".to_vec(),
             b"{\"format_revision\":8}".to_vec(),
-            b"{\"format_revision\":20}".to_vec(),
+            b"{\"format_revision\":21}".to_vec(),
             vec![b' '; limits.state_format_bytes + 1],
         ].into_iter().enumerate() {
             let state = area(&format!("invalid-format-{i}"));
@@ -1800,7 +1830,7 @@ mod tests {
             std::fs::read(format_five.join("format.json")).unwrap(),
             original
         );
-        for revision in [6, 7, 8, 20] {
+        for revision in [6, 7, 8, CURRENT_STATE_FORMAT + 1] {
             let previous = root.join(format!("format-{revision}"));
             std::fs::create_dir(&previous).unwrap();
             let bytes = serde_json::to_vec(&json!({"format_revision":revision})).unwrap();
@@ -2151,7 +2181,7 @@ mod tests {
         initialize_state(&state).unwrap();assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);
         let lease=process::WorkerLease::claim(&state.join("worker-owner.json"),&metadata.worker).unwrap();
         finish_state_upgrade(&state,&metadata,&lease).unwrap();
-        assert_eq!(read_state_format(&state,&metadata.worker).unwrap().format_revision,19);
+        assert_eq!(read_state_format(&state,&metadata.worker).unwrap().format_revision,CURRENT_STATE_FORMAT);
         for (p,b) in originals {assert_eq!(std::fs::read(p).unwrap(),b)}
     }
     #[test]
@@ -2236,6 +2266,154 @@ mod tests {
         }
     }
 
+    // Real bounded local admission, no controller/provider/executor launch. The
+    // synthetic marker downgrade is an old-reader discriminator, not an old
+    // producer claim. Current admission never rewrites the retained records.
+    #[test]
+    fn identity_limit_fields_historical_coding_without_bridge_upgrades_but_orphan_journal_refuses() {
+        for orphan in [false, true] {
+            let (state, marker) = historical_state("identity-fields-no-bridge", 19);
+            let limits = historical_limits();
+            let mut command = default_assignment_command(&limits);
+            let WorkerCommand::RunAttempt { task, session, attempt, .. } = &mut command else { unreachable!() };
+            task.definition.executor = ExecutorKind::Coding;
+            task.resolved_limits = Some(limits.resolve_task(task).unwrap());
+            session.definition = task.definition.clone();
+            let root = codex::state_path(&state.join("codex"), &attempt.id);
+            let path = state.join("commands/original.json");
+            record_launch(&path, &command).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let journal = root.join("collaboration-codex/calls.json");
+            if orphan {
+                process::private_directory(journal.parent().unwrap()).unwrap();
+                atomic_json(&journal, &json!({"must":"remain unread without its original config"})).unwrap();
+            }
+            let before = orphan.then(|| std::fs::read(&journal).unwrap());
+            let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &limits.worker).unwrap();
+            if orphan {
+                assert_eq!(finish_state_upgrade(&state, &limits, &lease).unwrap_err(), "Coding journal lacks its original config");
+                assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+                assert_eq!(std::fs::read(&journal).unwrap(), before.unwrap());
+            } else {
+                finish_state_upgrade(&state, &limits, &lease).unwrap();
+                assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, CURRENT_STATE_FORMAT);
+                assert!(!root.exists(), "admission must not manufacture bridge state");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(!state.join("format.pending").exists());
+        }
+    }
+
+    #[test]
+    fn identity_limit_fields_policy_command_and_await_refuse19_without_rewriting_originals() {
+        use crate::limits::DefinitionLimitField::{CodingFrameBytes, CollaborationJournalBytes};
+        for field in [CodingFrameBytes, CollaborationJournalBytes] {
+            for carrier in ["policy", "command", "await"] {
+                let (state, marker) = historical_state("identity-fields-policy", 19);
+                let old = historical_limits();
+                let mut new = (*old).clone();
+                new.definition_updates.as_mut().unwrap().allowed_fields.push(field);
+                new.validate().unwrap();
+                let limits = if carrier == "policy" { &new } else { old.as_ref() };
+                let policy = state.join("limits.json");
+                atomic_json(&policy, limits).unwrap();
+                let command = default_assignment_command(if carrier == "policy" { &old } else { &new });
+                let path = if carrier == "await" {
+                    default_assignment_await(&state, &old, command)
+                } else {
+                    let path = state.join("commands/original.json");
+                    record_launch(&path, &command).unwrap(); path
+                };
+                let originals: Vec<_> = [policy, path].into_iter().map(|p| { let b = std::fs::read(&p).unwrap(); (p,b) }).collect();
+                let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &old.worker).unwrap();
+                let reason = finish_state_upgrade(&state, limits, &lease).unwrap_err();
+                assert!(reason.contains("worker20"), "{carrier}: {reason}");
+                assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+                for (p,b) in &originals { assert_eq!(std::fs::read(p).unwrap(), *b); }
+                atomic_json(&state.join("format.json"), &json!({"format_revision":CURRENT_STATE_FORMAT})).unwrap();
+                finish_state_upgrade(&state, limits, &lease).unwrap();
+                for (p,b) in originals { assert_eq!(std::fs::read(p).unwrap(), b); }
+            }
+        }
+    }
+
+    #[test]
+    fn identity_limit_fields_native_and_coding_pending_refused_and_nested_outcomes_keep_originals() {
+        use crate::limits::DefinitionLimitField::{CodingFrameBytes, CollaborationJournalBytes};
+        for coding in [false, true] {
+            for (field, carrier) in [(CodingFrameBytes, "pending"), (CollaborationJournalBytes, "refused"), (CodingFrameBytes, "outcome")] {
+                let (state, marker) = historical_state("identity-fields-journal", 19);
+                let limits = historical_limits();
+                let mut command = default_assignment_command(&limits);
+                let WorkerCommand::RunAttempt { task: input, session, attempt, .. } = &mut command else { unreachable!() };
+                if coding { input.definition.executor = ExecutorKind::Coding; }
+                // Spellings in ordinary instruction text are not typed tags.
+                input.instruction = "Inspect coding.frame_bytes and collaboration.journal_bytes".into();
+                input.resolved_limits = Some(limits.resolve_task(input).unwrap());
+                session.definition = input.definition.clone();
+                let caller = collaboration_caller(attempt);
+                let call = crate::mcp::Invocation {
+                    operation_id: "identity-field-call".into(), logical_call_id: "identity-field-logical".into(), caller,
+                    tool: if carrier == "outcome" { "collab_limits_get" } else { "collab_definition_update" }.into(),
+                    arguments: if carrier == "outcome" { json!({}) } else { json!({
+                        "agent_id":"target", "expected_revision":"r1", "expected_global_revision":limits.revision,
+                        "expected_policy_revision":limits.definition_updates.as_ref().unwrap().revision,
+                        "changes":serde_json::to_value(BTreeMap::from([(field, field.value(input.execution_limits().unwrap()).unwrap())])).unwrap()
+                    }) },
+                };
+                let outcome = match carrier {
+                    "pending" => None,
+                    "refused" => Some(Outcome::Refused { code:"configuration_policy".into(), message:"new field deliberately unselected".into() }),
+                    _ => {
+                        let mut retained = (*limits).clone();
+                        retained.definition_updates.as_mut().unwrap().allowed_fields.push(field);
+                        Some(Outcome::Ok { data: Data::Collaboration(crate::collaboration::QueryResult::Limits { global: Box::new(retained), execution: None }) })
+                    }
+                };
+                let context = outcome.as_ref().map(|_| CommitContext { commit: MutationCommit { operation_id:call.operation_id.clone(), controller_revision:1 }, observed_controller_revision:1 });
+                let config = codex_mcp::Config {
+                    instruction_source: input.instruction_source.clone(), execution_profile: None,
+                    runtime_limits:(*limits).clone(), limits:input.execution_limits().unwrap().collaboration.clone(), worker_limits:limits.worker.clone(),
+                    controller_url:"http://127.0.0.1:9".into(), caller:call.caller.clone(),
+                    deadline_unix_ms:attempt.deadline_unix_ms.min(input.limits.deadline_unix_ms),
+                    state:codex::state_path(&state.join("codex"), &attempt.id),
+                };
+                let path = if coding { config.directory().join("calls.json") }
+                    else { state.join("collaboration").join(component(&attempt.id)).join("0000000001.json") };
+                process::private_directory(path.parent().unwrap()).unwrap();
+                let mut paths = vec![path.clone()];
+                if coding {
+                    let result = outcome.clone().map(|outcome| crate::mcp::result(&call, Reply { request_id:"saved".into(), outcome,
+                        commit:context.as_ref().map(|c|c.commit.clone()), observed_controller_revision:Some(1) }).unwrap());
+                    atomic_json(&path, &json!({"instruction_source":null,"runtime_limits":&*limits,"limits":config.limits,"worker_limits":limits.worker,
+                        "revision":2,"caller":call.caller,"deadline_unix_ms":config.deadline_unix_ms,"controller_url":config.controller_url,
+                        "entries":[{"thread_id":"original-thread","session_id":"original-session","invocation":call,"outcome":result,"delivered":result.is_some()}]})).unwrap();
+                    let config_path = config.state.join("borg-collaboration-config.json");
+                    atomic_json(&config_path, &config).unwrap(); paths.push(config_path);
+                    config.validate().unwrap();
+                } else {
+                    let mut journal = mutations::prepare(call.operation(), 0, &limits).unwrap();
+                    journal.outcome = outcome; journal.outcome_context = context; journal.consumed = journal.outcome.is_some();
+                    mutations::persist(&path, &journal).unwrap();
+                    mutations::read(&path, &limits).unwrap().unwrap();
+                }
+                let command_path = state.join("commands/original.json"); record_launch(&command_path, &command).unwrap(); paths.push(command_path);
+                let originals: Vec<_> = paths.into_iter().map(|p| { let b=std::fs::read(&p).unwrap(); (p,b) }).collect();
+                let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &limits.worker).unwrap();
+                let reason = finish_state_upgrade(&state, &limits, &lease).unwrap_err();
+                assert!(reason.contains("worker20") || reason == "retained native outcome requires its original worker marker" || reason == "retained Coding outcome requires its original worker marker", "{coding}/{carrier}: {reason}");
+                assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+                for (p,b) in &originals { assert_eq!(std::fs::read(p).unwrap(), *b); }
+                atomic_json(&state.join("format.json"), &json!({"format_revision":CURRENT_STATE_FORMAT})).unwrap();
+                finish_state_upgrade(&state, &limits, &lease).unwrap();
+                if coding {
+                    assert_eq!(codex_mcp::outcome_disposition(&config).unwrap(), if carrier == "pending" { codex_mcp::OutcomeDisposition::Unresolved } else { codex_mcp::OutcomeDisposition::Committed });
+                }
+                for (p,b) in originals { assert_eq!(std::fs::read(p).unwrap(), b); }
+            }
+        }
+    }
+
 }
 
-pub(super) fn admits_supplied_retry(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(read_state_format(state,limits)?.format_revision==CURRENT_STATE_FORMAT)}
+pub(super) fn admits_supplied_retry(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(matches!(read_state_format(state,limits)?.format_revision, IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))}

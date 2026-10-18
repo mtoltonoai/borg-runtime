@@ -25,6 +25,7 @@ pub(crate) fn apply(
 ) -> Result<(Data, bool)> {
     let limits = tx.limits;
     match op {
+        Operation::ReleaseTerminalReads(request) => super::read_retention::apply(tx,request,cfg,now),
         Operation::AdministerIdentity { operation_id, input } => super::identity_administration::apply(tx, operation_id, input, cfg, now),
         Operation::ReportMachineResources { .. } => refuse(
             "observation_boundary", "machine reports must enter the controller observation boundary"),
@@ -102,7 +103,7 @@ pub(crate) fn apply(
         Operation::GetCollaborationCall {
             caller,
             operation_id,
-        } => super::collaboration_calls::lookup(tx, caller, operation_id),
+        } => super::collaboration_calls::lookup(tx, caller, operation_id, validation, now),
         Operation::QueryCollaboration {
             query: crate::collaboration::Query::Repository { task_id, request },
         } => {

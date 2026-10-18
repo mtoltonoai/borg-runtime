@@ -11,6 +11,13 @@ pub enum SourceSelector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    ReadPage {
+        source: SourceSelector, path: String, start_line: usize, max_lines: usize,
+        #[serde(default, skip_serializing_if="Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if="Option::is_none")]
+        max_bytes: Option<usize>,
+    },
     Tree {
         source: SourceSelector,
         path: String,
@@ -47,6 +54,8 @@ impl Request {
         repository_read::Query,
     ) {
         match self {
+            Self::ReadPage { source,path,start_line,max_lines,.. } => (*source,None,
+                repository_read::Query::ReadFileSlice { path:path.clone(),start_line:*start_line,max_lines:*max_lines,offset:0 }),
             Self::Tree {
                 source,
                 path,
@@ -122,6 +131,12 @@ pub struct Output {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Data {
+    ReadPage(Box<crate::read_page::ReadPage>),
+    /// Internal bounded helper carrier; the controller must project it before
+    /// any public response. It is never an executable source ticket.
+    FileSlice { path: String, object: String, start_line: usize, max_lines: usize,
+        total_lines: usize, next_line: Option<usize>, offset: usize,
+        total_bytes: usize, digest: String, text: String },
     Tree {
         entries: Vec<Entry>,
         next_after: Option<String>,
@@ -153,6 +168,8 @@ impl From<repository_read::Output> for Output {
             base_commit: value.source.base_commit,
         };
         let data = match value.data {
+            repository_read::Data::FileSlice {path,object,start_line,max_lines,total_lines,next_line,offset,total_bytes,digest,text} =>
+                Data::FileSlice {path,object,start_line,max_lines,total_lines,next_line,offset,total_bytes,digest,text},
             repository_read::Data::Tree {
                 entries,
                 next_after,

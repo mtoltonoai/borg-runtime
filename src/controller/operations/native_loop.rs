@@ -289,12 +289,12 @@ fn evidence(tx: &Connection<'_>, task: &Task, total: u32, final_response: Option
                 || !valid_id(tx.limits, &call.logical_call_id) || !logical.insert(&call.logical_call_id) {
                 return refuse("source_mismatch", "native call identity or ordinal differs");
             }
-            let receipt = super::super::metadata::read(tx, &call.operation_id)?.ok_or_else(|| Fault::Refused("source_mismatch", "native call receipt missing".into()))?;
+            let receipt = super::super::metadata::read_retained(tx, &call.operation_id)?.ok_or_else(|| Fault::Refused("source_mismatch", "native call receipt missing".into()))?;
             let Operation::CallCollaboration { call: original } = &receipt.request else { return refuse("source_mismatch", "native evidence is not an actual collaboration occurrence"); };
             if original.caller != c || original.logical_call_id != call.logical_call_id || original.operation_id != call.operation_id
                 || receipt.commit.controller_revision <= previous || receipt.commit.controller_revision >= next
-                || !matches!(receipt.outcome, Outcome::Ok { .. } | Outcome::Refused { .. })
-                || (original.tool == "collab_task_delegate" && matches!(receipt.outcome, Outcome::Ok { .. })) {
+                || !matches!(receipt.outcome, super::super::metadata::RetainedOutcome::Inline(Outcome::Ok { .. } | Outcome::Refused { .. }) | super::super::metadata::RetainedOutcome::ReadReference(_))
+                || (original.tool == "collab_task_delegate" && matches!(receipt.outcome, super::super::metadata::RetainedOutcome::Inline(Outcome::Ok { .. }))) {
                 return refuse("source_mismatch", "native call owner/outcome/reservation order differs");
             }
             previous = receipt.commit.controller_revision;

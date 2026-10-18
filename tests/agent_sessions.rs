@@ -746,7 +746,8 @@ async fn sessions_http_catalogue_and_closed_query_association() {
     let server = tokio::spawn(async move { borg_runtime::server::serve(cc, listener, bb).await });
     let client = borg_runtime::mcp::Client::new(&base, actor(&a), c.limits().clone()).unwrap();
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 33);
+    assert_eq!(tools.len(), 34);
+    assert!(tools.iter().any(|tool| tool.name == "collab_read_continue"));
     assert!(tools.iter().any(|tool| tool.name == "collab_definition_update"));
     assert!(tools.iter().any(|tool| tool.name == "collab_limits_get"));
     assert_eq!(tools, borg_runtime::mcp::catalogue(c.limits()));

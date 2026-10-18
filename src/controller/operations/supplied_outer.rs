@@ -708,8 +708,7 @@ pub(crate) fn validate_existing(
             ));
         }
         let id: String = row.get(0)?;
-        let r = super::super::metadata::read(tx, &id)?
-            .ok_or_else(|| Fault::Store("supplied original receipt absent".into()))?;
+        let Some(r) = super::super::metadata::scan_inline(tx, &id)? else {continue};
         if !supported
             && (contract::operation_uses(&r.request) || contract::outcome_uses(&r.outcome))
         {

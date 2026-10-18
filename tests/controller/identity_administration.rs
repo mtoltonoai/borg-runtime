@@ -481,7 +481,7 @@ fn native_host(h: &Harness, input: &TaskInput) -> borg_runtime::native::Validati
 #[tokio::test]
 async fn old_readers_and_current_reopen_are_exact() {
     let h = Harness::new("versions", "charter", ExecutorKind::Native, true).await;
-    assert_eq!(WIRE_REVISION, 24);
+    assert_eq!(WIRE_REVISION, 25);
     let refused_call = invocation(&h.caller, "collab_task_create", json!({"agent_id":null}));
     assert_eq!(refused(h.invoke(&refused_call).await), "invalid_input");
     assert!(requires_wire24(&refused_call.operation()));
@@ -495,7 +495,7 @@ async fn old_readers_and_current_reopen_are_exact() {
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        25
+        26
     );
     connection.pragma_update(None, "user_version", 24).unwrap();
     drop(connection);
@@ -507,7 +507,7 @@ async fn old_readers_and_current_reopen_are_exact() {
             .unwrap(),
         24
     );
-    connection.pragma_update(None, "user_version", 25).unwrap();
+    connection.pragma_update(None, "user_version", 26).unwrap();
     drop(connection);
     let c = Controller::open_with_config(&db, cfg).unwrap();
     assert_eq!(

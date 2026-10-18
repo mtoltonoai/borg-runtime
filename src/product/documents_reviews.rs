@@ -343,10 +343,17 @@ async fn get_inner(controller:&Controller,path:&str,raw_query:&str)->Result<Opti
             return Ok(Some(versions(&id,&p)))
         }
         if kind=="document"&&action.is_empty() {
-            let f=query_fields(raw_query,&["version"],limits)?;
+            let f=query_fields(raw_query,&["version","part","cursor","max_bytes"],limits)?;
             let version=match f.get("version"){None=>None,Some(value)=>{let n:u64=value.parse().map_err(|_|error(400,"Invalid document version"))?;if n==0||n.to_string()!=*value{return Err(error(400,"Invalid document version"))}Some(n)}};
-            let DocumentQueryResult::Document(view)=document_query(controller,DocumentQuery::Get{document_id:id,version}).await? else{return Err(error(502,"Unexpected document"))};
-            return Ok(Some(document(&view)))
+            let part=match f.get("part").map(String::as_str).unwrap_or("record") {"record"=>crate::read_page::DocumentPart::Record,"body"=>crate::read_page::DocumentPart::Body,_=>return Err(error(400,"Invalid document part"))};
+            let (cursor,max_bytes)=super::read_pages::options(&f)?;
+            let read=boxed_route(||super::read_pages::query(controller,crate::read_page::Request {selection:crate::read_page::Selection::Document{document_id:id.clone(),version,part},cursor,max_bytes})).await?;
+            if read.complete && read.offset==0 && part==crate::read_page::DocumentPart::Record && version.is_none() && !f.contains_key("cursor") && !f.contains_key("max_bytes") {
+                let view:DocumentView=serde_json::from_str(&read.content).map_err(|_|error(502,"Unexpected document projection"))?;
+                let full=document(&view);
+                if full.body.len()<=limits.product.response_bytes {return Ok(Some(full));}
+            }
+            return Ok(Some(super::read_pages::render(&read)))
         }
         if kind=="review"&&action.is_empty() {
             query_fields(raw_query,&[],limits)?;

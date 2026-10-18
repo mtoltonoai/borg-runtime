@@ -28,6 +28,10 @@ pub enum DefinitionLimitField {
     CodingSummaryBytes,
     #[serde(rename = "collaboration.complete_result_bytes")]
     CollaborationCompleteResultBytes,
+    #[serde(rename = "coding.frame_bytes")]
+    CodingFrameBytes,
+    #[serde(rename = "collaboration.journal_bytes")]
+    CollaborationJournalBytes,
 }
 impl DefinitionLimitField {
     pub fn value(self, values: &ExecutionLimits) -> Option<usize> {
@@ -44,6 +48,8 @@ impl DefinitionLimitField {
             Self::CodingSummaryChars => values.coding.summary_chars,
             Self::CodingSummaryBytes => values.coding.summary_bytes,
             Self::CollaborationCompleteResultBytes => values.collaboration.complete_result_bytes,
+            Self::CodingFrameBytes => values.coding.frame_bytes,
+            Self::CollaborationJournalBytes => values.collaboration.journal_bytes,
         })
     }
     pub fn set(self, values: &mut ExecutionLimits, value: usize) {
@@ -60,6 +66,8 @@ impl DefinitionLimitField {
             Self::CodingSummaryChars => values.coding.summary_chars = value,
             Self::CodingSummaryBytes => values.coding.summary_bytes = value,
             Self::CollaborationCompleteResultBytes => values.collaboration.complete_result_bytes = value,
+            Self::CodingFrameBytes => values.coding.frame_bytes = value,
+            Self::CollaborationJournalBytes => values.collaboration.journal_bytes = value,
         }
     }
     /// Preserve untouched groups; touched groups freeze their complete current
@@ -67,8 +75,8 @@ impl DefinitionLimitField {
     pub fn materialize(self, overrides: &mut ExecutionLimitOverrides, values: &ExecutionLimits) {
         match self {
             Self::NativeRequestBytes | Self::NativeHelperValueBytes | Self::NativeResponseWireBytes | Self::NativeContextBytes | Self::NativeOutputBytes | Self::NativeResultBytes | Self::NativeMaxOutputTokens => overrides.native = Some(values.native.clone()),
-            Self::CodingModelContextWindow | Self::CodingCommandOutputBytes | Self::CodingSummaryChars | Self::CodingSummaryBytes => overrides.coding = Some(values.coding.clone()),
-            Self::CollaborationCompleteResultBytes => overrides.collaboration = Some(values.collaboration.clone()),
+            Self::CodingModelContextWindow | Self::CodingCommandOutputBytes | Self::CodingSummaryChars | Self::CodingSummaryBytes | Self::CodingFrameBytes => overrides.coding = Some(values.coding.clone()),
+            Self::CollaborationCompleteResultBytes | Self::CollaborationJournalBytes => overrides.collaboration = Some(values.collaboration.clone()),
         }
     }
 }

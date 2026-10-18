@@ -810,6 +810,14 @@ pub(super) fn delivery_blocks_admission(tx:&Connection,task:&Task)->Result<bool>
     let session=super::sessions::get(&view,&task.session_id)?;
     Ok(state(&view,&session)?.0.pending.is_some_and(|b|b.delivery.is_some()))
 }
+pub(super) fn terminal_read_closed(tx:&Connection,task:&Task)->Result<bool> {
+    let present:bool=tx.query_row("SELECT workflow_delivery IS NOT NULL FROM sessions WHERE id=?1",[&task.session_id],|r|r.get(0))?;
+    if !present {return Ok(true)}
+    let accepted=task.input.resolved_limits.as_ref().ok_or_else(||Fault::Store("terminal delivery lacks accepted limits".into()))?;
+    let view=tx.with_limits(&accepted.global_metadata);
+    let session=super::sessions::get(&view,&task.session_id)?;
+    Ok(state(&view,&session)?.0.pending.is_none())
+}
 pub(super) fn apply(tx:&Connection,op:&Operation,cfg:&ControllerConfig,now:u64)->Result<(Data,bool)> {
     let caller=match op {Operation::ObserveCollaborationDelivery{caller,..}|Operation::PrepareCollaborationDelivery{caller,..}|Operation::BeginCollaborationDelivery{caller,..}|Operation::AcknowledgeCollaborationDelivery{caller,..}=>caller,_=>return Err(Fault::Store("wrong workflow delivery route".into()))};
     let task=super::collaboration_calls::caller(tx,caller,now)?;

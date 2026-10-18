@@ -25,6 +25,7 @@ pub mod execution_profile;
 
 pub mod repository_read;
 pub mod repository_view;
+pub mod read_page;
 
 pub mod repository_config;
 
@@ -39,3 +40,4 @@ pub mod pull_request;
 pub(crate) mod pull_request_view;
 
 pub mod supplied_outer;
+pub mod read_retention;

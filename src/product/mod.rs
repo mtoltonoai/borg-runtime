@@ -24,6 +24,7 @@ mod live;
 mod machine_resources;
 mod protected_view;
 mod repository;
+pub(crate) mod read_pages;
 mod repository_catalogue;
 mod sessions;
 mod task_defaults;
@@ -1775,6 +1776,7 @@ async fn get_other(controller: &Controller, path: &str, query: &str) -> UiRespon
             _ => not_task(reply),
         };
     }
+    if let Some(response)=boxed_route(|| read_pages::task(controller,path,query)).await { return response; }
     let Some(rest) = path.strip_prefix("/tasks/") else {
         return error(404, "Unknown browser route");
     };

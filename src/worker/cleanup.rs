@@ -69,6 +69,12 @@ pub(super) fn read_record<T: serde::de::DeserializeOwned>(
     path: &Path,
     bound: usize,
 ) -> Result<Option<T>, String> {
+    read_record_bytes(path, bound)?.map(|bytes| {
+        serde_json::from_slice(&bytes).map_err(|_| "cleanup record invalid".into())
+    }).transpose()
+}
+
+pub(super) fn read_record_bytes(path: &Path, bound: usize) -> Result<Option<Vec<u8>>, String> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -100,9 +106,7 @@ pub(super) fn read_record<T: serde::de::DeserializeOwned>(
     if bytes.len() > bound {
         return Err("retention.worker.record_bytes".into());
     }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| "cleanup record invalid".into())
+    Ok(Some(bytes))
 }
 
 fn save(path: &Path, record: &Record) -> Result<(), String> {
@@ -638,6 +642,8 @@ async fn attempt(
 }
 #[path = "cleanup_plugins.rs"]
 mod plugins;
+#[path = "cleanup_reads.rs"]
+mod reads;
 
 async fn attempt_at(
     config: &WorkerConfig, state: &Path, client: &ApiClient,
@@ -652,10 +658,8 @@ async fn attempt_at(
     // eligibility before any removal; old format-1 records remain unchanged.
     let plugin_due = plugins::attempt_at(config, state, client, active, validation_runtime,
         policy, policy_revision, path, now).await?;
-    Ok(match (workspace_due, plugin_due) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    })
+    let read_due=reads::attempt_at(config,state,client,active,validation_runtime,policy,policy_revision,path,now).await?;
+    Ok([workspace_due,plugin_due,read_due].into_iter().flatten().min())
 }
 
 async fn workspace_attempt_at(

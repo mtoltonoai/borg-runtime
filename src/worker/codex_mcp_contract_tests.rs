@@ -212,7 +212,7 @@ async fn actual_client_transport_loss_recovers_original_mutation_receipt_without
     let seen = peer.seen.lock().unwrap().clone();
     assert_eq!(seen.calls.len(), 1);
     assert_eq!(seen.lookups, 1);
-    let recovered = bridge.journal.entries[index].outcome.as_ref().unwrap();
+    let recovered = bridge.journal.entries[index].outcome.as_ref().unwrap().inline().unwrap();
     let original = seen.receipt.unwrap();
     assert_eq!(recovered.reply.outcome, original.reply.outcome);
     assert_eq!(recovered.reply.commit, original.reply.commit);

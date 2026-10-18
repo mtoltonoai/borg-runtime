@@ -3,6 +3,7 @@
 //! are reconciled by original identity. Only closed read adapters can redispatch
 //! after validated absence. No unresolved result reaches the supplied executor.
 use super::process;
+use crate::read_retention::{CallBody,ReadReference};
 use crate::limits::{CollaborationLimits, RuntimeLimits, WorkerLimits};
 use crate::{
     mcp::{self, CallResult, Caller, Client, Invocation},
@@ -22,6 +23,7 @@ use std::{
 
 pub const SERVER_NAME: &str = "borg_collaboration";
 const REVISION: u32 = 2;
+const READ_REVISION:u32=3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -170,7 +172,7 @@ fn read_memory_boundary(config: &Config) -> Result<Option<MemoryBoundary>, Strin
     )?
     .ok_or("memory boundary journal absent")?;
     let journal: Journal = decode(&bytes, config.limits.journal_bytes)?;
-    if journal.revision != REVISION
+    if !matches!(journal.revision,REVISION|READ_REVISION)
         || journal.caller != config.caller
         || journal.deadline_unix_ms != config.deadline_unix_ms
         || journal.controller_url != config.controller_url
@@ -244,7 +246,7 @@ struct Entry {
     thread_id: String,
     session_id: String,
     invocation: Invocation,
-    outcome: Option<CallResult>,
+    outcome: Option<CallBody>,
     delivered: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -260,6 +262,22 @@ struct Journal {
     deadline_unix_ms: u64,
     controller_url: String,
     entries: Vec<Entry>,
+}
+fn reference_owner(config:&Config)->Result<bool,String> {
+    let Some(root)=config.state.parent().and_then(Path::parent) else {return Ok(false)};
+    if config.state!=super::codex::state_path(&root.join("codex"),&config.caller.attempt_id) {return Ok(false)}
+    super::handoff::admits_read_references(root,&config.worker_limits)
+}
+fn check_body(config:&Config,revision:u32,entry:&Entry,body:&CallBody)->Result<(),String> {
+    match body {
+        CallBody::Inline(value)=>Bridge::<Client>::check_result(&entry.invocation,value,config.limits.complete_result_bytes),
+        CallBody::Reference {committed_read_reference:value}=> {
+            if revision!=READ_REVISION || !entry.delivered || !reference_owner(config)? {return Err("committed read reference requires delivered journal3/worker20".into())}
+            value.validate(&entry.invocation)?;
+            bounded_json_size(value,config.limits.complete_result_bytes)?;
+            Ok(())
+        }
+    }
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -569,7 +587,7 @@ impl<T: Transport> Bridge<T> {
             || journal.limits != config.limits
             || journal.worker_limits != config.worker_limits
         || journal.instruction_source != config.instruction_source
-            || journal.revision != REVISION
+            || !matches!(journal.revision,REVISION|READ_REVISION)
             || journal.caller != config.caller
             || journal.deadline_unix_ms != config.deadline_unix_ms
             || journal.controller_url != config.controller_url
@@ -596,7 +614,7 @@ impl<T: Transport> Bridge<T> {
                 return Err("collaboration journal binding differs".into());
             }
             if let Some(outcome) = &e.outcome {
-                Self::check_result(&e.invocation, outcome, config.limits.complete_result_bytes)?;
+                check_body(&config,journal.revision,e,outcome)?;
             }
         }
         for entry in &journal.entries {
@@ -652,12 +670,38 @@ impl<T: Transport> Bridge<T> {
         )
     }
     fn save(&self) -> Result<(), String> {
+        if self.journal.revision==READ_REVISION && !reference_owner(&self.config)? {return Err("read reference save requires worker20".into())}
         bounded_save(
             &self.path,
             &self.journal,
             self.config.limits.journal_bytes,
             "execution.collaboration.journal_bytes",
         )
+    }
+    fn compact_delivered(&mut self)->Result<(),String> {
+        if !reference_owner(&self.config)? {return Ok(())}
+        if let Some(boundary)=read_memory_boundary(&self.config)? {
+            if !boundary_released(&self.config,&boundary)? {return Ok(())}
+        }
+        if super::collaboration_notice::unresolved(&self.config.state,&self.config.runtime_limits)? { return Ok(()) }
+        let previous=self.journal.clone();
+        let mut changed=false;
+        for entry in &mut self.journal.entries {
+            if !entry.delivered {continue}
+            let Some(original)=entry.outcome.as_ref().and_then(CallBody::inline) else {continue};
+            Self::check_result(&entry.invocation,original,self.config.limits.complete_result_bytes)?;
+            let Ok(reference)=ReadReference::new(&entry.invocation,original) else {continue};
+            let compact=CallBody::Reference {committed_read_reference:reference};
+            if serde_json::to_vec(&compact).map_err(|_|"read reference encoding")?.len()
+                >=serde_json::to_vec(original).map_err(|_|"read result encoding")?.len() {continue}
+            entry.outcome=Some(compact);
+            changed=true;
+        }
+        if changed {
+            self.journal.revision=READ_REVISION;
+            if let Err(error)=self.save() { self.journal=previous; return Err(error); }
+        }
+        Ok(())
     }
     fn remember_failure(&self, call: &Invocation, stage: FailureStage) {
         let path = self.config.directory().join("diagnostic.json");
@@ -770,6 +814,7 @@ impl<T: Transport> Bridge<T> {
         meta: &Value,
     ) -> Result<(Value, usize), InvokeError> {
         self.live()?;
+        self.compact_delivered()?;
         let logical = meta
             .get("callId")
             .and_then(Value::as_str)
@@ -862,6 +907,17 @@ impl<T: Transport> Bridge<T> {
             self.journal.entries.len() - 1
         };
         let call = self.journal.entries[index].invocation.clone();
+        if let Some(reference)=self.journal.entries[index].outcome.as_ref().and_then(CallBody::reference).cloned() {
+            // An absent reference is never the legacy not-found retry path.
+            self.save()?;
+            let original=self.until_observed(self.transport.lookup_observed(&call)).await
+                .map_err(|e|InvokeError::from(e.into_message()))?.ok_or(crate::read_retention::UNAVAILABLE)?;
+            let recovered=reference.restore(&call,original)?;
+            Self::check_result(&call,&recovered,self.config.limits.complete_result_bytes)?;
+            safe_value(&recovered,&self.credentials,&self.config.worker_limits)?;
+            self.journal.entries[index].outcome=Some(recovered.into());
+            self.save()?;
+        }
         if self.journal.entries[index].outcome.is_none() {
             // Mutations stay lookup-only after their first send. Closed read
             // adapters may repeat only this exact occurrence after absence.
@@ -888,7 +944,7 @@ impl<T: Transport> Bridge<T> {
                         .is_ok()
                     {
                         safe_value(&result, &self.credentials, &self.config.worker_limits)?;
-                        self.journal.entries[index].outcome = Some(result);
+                        self.journal.entries[index].outcome = Some(result.into());
                         self.save()?;
                         break;
                     }
@@ -956,6 +1012,7 @@ impl<T: Transport> Bridge<T> {
         let result = self.journal.entries[index]
             .outcome
             .as_ref()
+            .and_then(CallBody::inline)
             .ok_or("missing recorded collaboration result")?;
         Self::check_result(&call, result, self.config.limits.complete_result_bytes)?;
         safe_value(result, &self.credentials, &self.config.worker_limits)?;
@@ -1084,7 +1141,7 @@ pub(super) fn continuation_boundary(config:&Config)->Result<std::fs::File,String
             return Err("supplied continuation awaits original MCP outcome and delivery".into());
         }
     }
-    if matches!(inspect_retained_outcomes(config,None,false)?,OutcomeDisposition::Unresolved) {
+    if matches!(inspect_retained_outcomes(config,None,false,None,false)?,OutcomeDisposition::Unresolved) {
         return Err("supplied continuation has unresolved MCP outcome".into());
     }
     Ok(lock)
@@ -1096,7 +1153,7 @@ pub(super) fn continuation_boundary(config:&Config)->Result<std::fs::File,String
 pub(super) fn reopen_after_known_stop(config:&Config)->Result<(),String> {
     let lock=outer_boundary_file(config)?;
     lock.try_lock().map_err(|_|"old collaboration call remains active")?;
-    inspect_retained_outcomes(config,None,false)?;
+    inspect_retained_outcomes(config,None,false,None,false)?;
     if super::collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {
         return Err("supplied resume has an unresolved workflow append".into());
     }
@@ -1125,19 +1182,42 @@ fn outer_boundary_file(config:&Config)->Result<std::fs::File,String> {
     Ok(file)
 }
 
+pub(super) fn terminal_reads(config:&Config, after:Option<&str>, bound:usize)->Result<Vec<crate::read_retention::ReleaseItem>,String> {
+    if !reference_owner(config)? {return Err("terminal read release requires worker20".into())}
+    if inspect_retained_outcomes(config,None,false,None,false)?==OutcomeDisposition::Unresolved {return Err("Coding outcomes unresolved".into())}
+    if super::collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {return Err("Coding delivery remains unresolved".into())}
+    let lock=outer_boundary_file(config)?;
+    lock.try_lock().map_err(|_|"terminal read has an active bridge owner")?;
+    if let Some(boundary)=read_memory_boundary(config)? {if !boundary_released(config,&boundary)? {return Err("memory boundary still needs original body".into())}}
+    let Some(bytes)=read_private(&config.directory().join("calls.json"),config.limits.journal_bytes,"execution.collaboration.journal_bytes")? else{return Ok(vec![])};
+    let journal:Journal=decode(&bytes,config.limits.journal_bytes)?;
+    let mut selected=Vec::new();
+    for entry in &journal.entries {
+        if !entry.delivered || entry.outcome.is_none() {return Err("Coding read still has a delivery consumer".into())}
+        if after.is_some_and(|id|entry.invocation.operation_id.as_str()<=id) {continue}
+        let reference=match entry.outcome.as_ref().unwrap() {
+            CallBody::Inline(value)=>match ReadReference::new(&entry.invocation,value) {Ok(v)=>v,Err(_)=>continue},
+            CallBody::Reference{committed_read_reference:value}=>value.clone(),
+        };
+        reference.validate(&entry.invocation)?;
+        selected.push(crate::read_retention::ReleaseItem{operation_id:entry.invocation.operation_id.clone(),commit:reference.commit,evidence:reference.evidence});
+    }
+    selected.sort_by(|a,b|a.operation_id.cmp(&b.operation_id));selected.truncate(bound);Ok(selected)
+}
+
 pub fn outcome_disposition(config: &Config) -> Result<OutcomeDisposition, String> {
-    inspect_retained_outcomes(config, None, false)
+    inspect_retained_outcomes(config, None, false, None, false)
 }
 
 /// Historical outer markers must not silently adopt newly typed Task fields.
 /// Uses the same private bounded reader, identity joins and result validation as
 /// recovery; this function neither rewrites a record nor resolves an outcome.
 pub(super) fn admit_worker18_outcomes(config: &Config) -> Result<(), String> {
-    inspect_retained_outcomes(config, Some(super::outcome_requires_worker18), false).map(|_| ())
+    inspect_retained_outcomes(config, Some(super::outcome_requires_worker18), false, None, false).map(|_| ())
 }
 
 pub(super) fn admit_retry_outcomes(config:&Config)->Result<(),String> {
-    inspect_retained_outcomes(config,Some(crate::supplied_outer::outcome_uses),false).map(|_|())
+    inspect_retained_outcomes(config,Some(crate::supplied_outer::outcome_uses),false,None,false).map(|_|())
 }
 pub(super) fn admit_retry_outcomes_from_retained_config(mut config:Config)->Result<(),String> {
     let Some(bytes)=read_private(&config.state.join("borg-collaboration-config.json"),config.limits.config_bytes,"execution.collaboration.config_bytes")? else {
@@ -1150,9 +1230,55 @@ pub(super) fn admit_retry_outcomes_from_retained_config(mut config:Config)->Resu
 }
 pub(super) fn admit_worker19_outcomes(config:&Config)->Result<(),String> {
     if crate::protocol::policy_requires_wire24(&config.runtime_limits)||config.limits.capabilities.is_some() {return Err("Coding accepted identity/task metadata requires worker19".into())}
-    inspect_retained_outcomes(config,None,true).map(|_|())
+    inspect_retained_outcomes(config,None,true,None,false).map(|_|())
 }
-fn inspect_retained_outcomes(config: &Config, historical_rejects: Option<fn(&Outcome)->bool>, historical_worker19:bool) -> Result<OutcomeDisposition, String> {
+pub(super) fn admit_identity_limit_fields_outcomes(config: &Config) -> Result<(), String> {
+    use crate::protocol::identity_limit_fields as vocabulary;
+    if vocabulary::metadata_uses(&config.runtime_limits) {
+        return Err("Coding accepted identity limit field policy requires worker20".into());
+    }
+    if let Some(bytes) = read_private(&config.state.join("borg-collaboration-config.json"), config.limits.config_bytes, "execution.collaboration.config_bytes")? {
+        let retained: Config = decode(&bytes, config.limits.config_bytes)?;
+        if vocabulary::metadata_uses(&retained.runtime_limits) {
+            return Err("Coding retained identity limit field policy requires worker20".into());
+        }
+    }
+    inspect_retained_outcomes(config, Some(vocabulary::outcome_uses), false, Some(vocabulary::invocation_uses), false).map(|_| ())
+}
+pub(super) fn admit_identity_limit_fields_from_retained_config(mut config: Config) -> Result<(), String> {
+    if let Some(bytes) = read_private(&config.state.join("borg-collaboration-config.json"), config.limits.config_bytes, "execution.collaboration.config_bytes")? {
+        let retained: Config = decode(&bytes, config.limits.config_bytes)?;
+        config.controller_url = retained.controller_url;
+    } else {
+        // The accepted command already fences new policy tags. A historical
+        // Coding attempt need not have started its MCP bridge at all. No saved
+        // endpoint exists in that case, so do not validate the placeholder URL.
+        if crate::protocol::identity_limit_fields::metadata_uses(&config.runtime_limits) {
+            return Err("Coding accepted identity limit field policy requires worker20".into());
+        }
+        match std::fs::symlink_metadata(config.directory().join("calls.json")) {
+            Ok(_) => return Err("Coding journal lacks its original config".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("Coding journal inventory unavailable".into()),
+        }
+    }
+    admit_identity_limit_fields_outcomes(&config)
+}
+pub(super) fn admit_read_pagination_from_retained_config(mut config:Config)->Result<(),String> {
+    let Some(bytes)=read_private(&config.state.join("borg-collaboration-config.json"),config.limits.config_bytes,"execution.collaboration.config_bytes")? else {
+        return match std::fs::symlink_metadata(config.directory().join("calls.json")) {
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err("Coding journal lacks its original config".into()),
+        };
+    };
+    let retained:Config=decode(&bytes,config.limits.config_bytes)?;
+    config.controller_url=retained.controller_url;
+    admit_read_pagination(&config)
+}
+pub(super) fn admit_read_pagination(config:&Config)->Result<(),String> {
+    inspect_retained_outcomes(config,None,false,None,true).map(|_|())
+}
+fn inspect_retained_outcomes(config: &Config, historical_rejects: Option<fn(&Outcome)->bool>, historical_worker19:bool, historical_requests: Option<fn(&mcp::Invocation)->bool>, historical_pagination: bool) -> Result<OutcomeDisposition, String> {
     config.validate()?;
     // The host reconstructs this scope from the original RunAttempt. A retained
     // bridge configuration cannot silently substitute or drop that source.
@@ -1176,7 +1302,7 @@ fn inspect_retained_outcomes(config: &Config, historical_rejects: Option<fn(&Out
         || journal.limits != config.limits
         || journal.worker_limits != config.worker_limits
         || journal.instruction_source != config.instruction_source
-        || journal.revision != REVISION
+        || !matches!(journal.revision,REVISION|READ_REVISION)
         || journal.caller != config.caller
         || journal.deadline_unix_ms != config.deadline_unix_ms
         || journal.controller_url != config.controller_url
@@ -1187,11 +1313,19 @@ fn inspect_retained_outcomes(config: &Config, historical_rejects: Option<fn(&Out
     let mut operations = std::collections::BTreeSet::new();
     let mut unresolved = false;
     for entry in &journal.entries {
-        if historical_worker19 && (mcp::identity_administration::handles(&entry.invocation.tool) || entry.outcome.as_ref().is_some_and(|o|crate::protocol::outcome_requires_wire24(&o.reply.outcome))) { return Err("original Coding identity/task call requires worker19, including refusals".into()); }
+        if (historical_worker19 || historical_rejects.is_some() || historical_requests.is_some() || historical_pagination)
+            && entry.outcome.as_ref().and_then(CallBody::reference).is_some() {
+            return Err("retained read reference requires worker20; historical predicates cannot admit a removed body".into());
+        }
+        if historical_requests.is_some_and(|rejects| rejects(&entry.invocation)) {
+            return Err("original Coding identity limit field request requires worker20, including refusals".into());
+        }
+        if historical_pagination && (crate::protocol::call_requires_read_pagination(&entry.invocation) || entry.outcome.as_ref().and_then(CallBody::inline).is_some_and(|o|crate::protocol::outcome_requires_read_pagination(&o.reply.outcome))) {return Err("retained Coding pagination requires worker20; original bytes retained".into());}
+        if historical_worker19 && (mcp::identity_administration::handles(&entry.invocation.tool) || entry.outcome.as_ref().and_then(CallBody::inline).is_some_and(|o|crate::protocol::outcome_requires_wire24(&o.reply.outcome))) { return Err("original Coding identity/task call requires worker19, including refusals".into()); }
         entry.invocation.validate(&config.runtime_limits)?;
         if historical_worker19 && super::machine_resources::requires(
             &Operation::CallCollaboration { call: entry.invocation.clone() },
-            entry.outcome.as_ref().map(|o| &o.reply.outcome)) {
+            entry.outcome.as_ref().and_then(CallBody::inline).map(|o| &o.reply.outcome)) {
             return Err("machine resource vocabulary in retained Coding journal requires worker19".into());
         }
         if entry.invocation.caller != config.caller
@@ -1211,8 +1345,8 @@ fn inspect_retained_outcomes(config: &Config, historical_rejects: Option<fn(&Out
         }
         match &entry.outcome {
             Some(outcome) => {
-                Bridge::<Client>::check_result(&entry.invocation, outcome, config.limits.complete_result_bytes)?;
-                if historical_rejects.is_some_and(|rejects| rejects(&outcome.reply.outcome)) {
+                check_body(config,journal.revision,entry,outcome)?;
+                if historical_rejects.is_some_and(|rejects| outcome.inline().is_none_or(|o|rejects(&o.reply.outcome))) {
                     return Err("retained Coding outcome requires its original worker marker".into());
                 }
             }

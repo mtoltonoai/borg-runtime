@@ -283,7 +283,7 @@ pub(super) fn validate_existing(tx:&Connection<'_>,cfg:&ControllerConfig,version
     let ids=q.query_map([sql_bound(receipt_bound.saturating_add(1))?],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
     if ids.len()>receipt_bound{return Err(Fault::Store("original admission inventory exceeds bound".into()))}
     for id in ids {
-        let receipt=super::metadata::read(tx,&id)?.ok_or_else(||Fault::Store("receipt disappeared".into()))?;
+        let Some(receipt)=super::metadata::scan_inline(tx,&id)? else {continue};
         let initial=matches!(&receipt.request,Operation::SubmitTask{..}|Operation::SubmitTaskDraft{..}|Operation::DelegateTask{..})
             ||matches!(&receipt.request,Operation::CallCollaboration{call} if matches!(call.tool.as_str(),"collab_task_delegate"|"collab_task_create"));
         if !initial {continue}
@@ -306,6 +306,22 @@ pub(super) fn admit_prior_supplied_retry(tx:&Connection<'_>,bound:usize)->Result
         count+=1;if count>bound{return Err(Fault::Store("supplied assignment inventory exceeds bound".into()))}
         let id:String=row.get(0)?;let intent=read(tx,&id)?.ok_or_else(||Fault::Store("supplied assignment disappeared".into()))?;
         if crate::supplied_outer::input_uses(&intent.input)||crate::supplied_outer::definition_uses(&intent.session.definition) {return Err(Fault::Store("supplied retry assignment requires schema25".into()))}
+    }
+    Ok(())
+}
+
+pub(super) fn admit_prior_identity_limit_fields(tx: &Connection<'_>, bound: usize) -> Result<()> {
+    let mut query = tx.prepare("SELECT operation_id FROM task_assignments ORDER BY operation_id")?;
+    let mut rows = query.query([])?;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > bound { return Err(Fault::Store("assignment inventory exceeds bound".into())); }
+        let id: String = row.get(0)?;
+        let intent = read(tx, &id)?.ok_or_else(|| Fault::Store("assignment disappeared".into()))?;
+        if crate::protocol::identity_limit_fields::input_uses(&intent.input) {
+            return Err(Fault::Store("identity limit field vocabulary requires schema26".into()));
+        }
     }
     Ok(())
 }

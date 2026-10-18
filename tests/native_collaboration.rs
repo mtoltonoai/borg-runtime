@@ -821,7 +821,8 @@ async fn native_collaboration_actual_read_write_read_final_and_lost_ack_restart(
         no_memory_notices(request);
         assert_eq!(request["store"], false);
         assert_eq!(request["parallel_tool_calls"], false);
-        assert_eq!(request["tools"].as_array().unwrap().len(), 33);
+        assert_eq!(request["tools"].as_array().unwrap().len(), 34);
+        assert!(request["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "collab_read_continue"));
         assert!(
             request["tools"]
                 .as_array()
@@ -2369,3 +2370,6 @@ mod http_route_stack;
 
 #[path = "native/task_reassignment.rs"]
 mod task_reassignment;
+
+#[path = "native/read_pagination.rs"]
+mod read_pagination;

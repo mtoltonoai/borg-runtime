@@ -7,6 +7,9 @@ use std::{path::Path, time::Duration};
 /// A borrowed SQL view carrying the exact selected metadata. No second store,
 /// global defaults, reload, or mutable policy copy is introduced.
 pub(crate) struct StoreContext<'a> {
+    /// Only the closed public read dispatcher sets this while it fits a page.
+    /// Source admission and mutation limits are never bypassed by this flag.
+    pub(super) fitting_read: bool,
     pub(super) machine_resources: Option<&'a super::machine_resources::State>,
     sql: &'a SqlConnection,
     pub(super) bound_actor: Option<crate::collaboration::workflow::RecordedActor>,
@@ -23,7 +26,7 @@ pub(crate) struct StoreContext<'a> {
 }
 impl<'a> StoreContext<'a> {
     pub fn new(sql: &'a SqlConnection, limits: &'a crate::limits::RuntimeLimits) -> Self {
-        Self { sql, limits, bound_actor: None, machine_resources: None, invocation_path: crate::collaboration::workflow::TrustedHostPath::OperatorApi,
+        Self { sql, limits, fitting_read: false, bound_actor: None, machine_resources: None, invocation_path: crate::collaboration::workflow::TrustedHostPath::OperatorApi,
             workflow_policy: limits.workflow.as_ref(),
             workflow_terminals: super::collaboration_finalizer::TerminalBuffer::new(),
             governance_limits: limits, governance_decisions: super::governance::DecisionBuffer::new() }
@@ -31,7 +34,7 @@ impl<'a> StoreContext<'a> {
     /// Borrow another accepted policy without losing request provenance or the
     /// root transaction's terminal buffer. This never creates a SQL transaction.
     pub fn with_limits<'b>(&'b self, limits: &'b crate::limits::RuntimeLimits) -> StoreContext<'b> {
-        StoreContext { sql: self.sql, limits, bound_actor: self.bound_actor.clone(), machine_resources: self.machine_resources, invocation_path: self.invocation_path,
+        StoreContext { sql: self.sql, limits, fitting_read: self.fitting_read, bound_actor: self.bound_actor.clone(), machine_resources: self.machine_resources, invocation_path: self.invocation_path,
             workflow_policy: self.workflow_policy, workflow_terminals: self.workflow_terminals.clone(),
             governance_limits: self.governance_limits, governance_decisions: self.governance_decisions.clone() }
     }
@@ -341,7 +344,7 @@ impl Database {
         }
         //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
         //# An unsupported stored schema version MUST be refused without rewriting its data.
-        if !fresh && (app != APPLICATION || ![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, SCHEMA].contains(&version)) {
+        if !fresh && (app != APPLICATION || ![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, SCHEMA].contains(&version)) {
             return Err("unsupported controller database schema; clean development reset required; original data retained".into());
         }
         // The OS owner lock also excludes validators whose original DB thread
@@ -414,9 +417,12 @@ impl Database {
                 }
             }
         }
+        super::read_retention::admit(conn,stored_version).map_err(|e|format!("read retention admission: {e:?}"))?;
         super::metadata::validate_existing(conn, config).map_err(|_| {
             "invalid controller commit revision or receipt; original bytes retained".to_string()
         })?;
+        super::read_pagination::validate_existing(conn, config, stored_version)
+            .map_err(|_| "read pagination vocabulary requires schema26; original bytes retained".to_string())?;
         super::machine_resources::validate_existing(conn, config, stored_version)
             .map_err(|_| "machine resource vocabulary requires schema25; original bytes retained".to_string())?;
         super::credits::validate_existing(conn, config).map_err(|_| {
@@ -432,6 +438,8 @@ impl Database {
         })?;
         super::compatibility::validate_shape(conn, stored_version)?;
         super::compatibility::validate_records(conn)?;
+        super::identity_limit_fields::validate_existing(conn, config, stored_version)
+            .map_err(|e| format!("identity limit field admission: {e:?}"))?;
         super::identity_administration::validate_existing(conn, config, stored_version)
             .map_err(|_| "invalid identity/task creation records; original bytes retained".to_string())?;
         super::operations::supplied_outer::validate_existing(conn,config,stored_version).map_err(|e|format!("supplied retry admission: {e:?}"))?;
@@ -672,7 +680,7 @@ impl Database {
             if !valid_id(limits, op) {
                 return refuse("invalid_input", "invalid operation identity");
             }
-            if let Some(receipt) = super::metadata::read(&tx, op)? {
+            if let Some(receipt) = super::metadata::read_retained(&tx, op)? {
                 //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
                 //# Reusing a mutating request's identity with different input MUST fail without changing its recorded outcome.
                 if encode(&receipt.request)? != request {
@@ -683,12 +691,14 @@ impl Database {
                 }
                 //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
                 //# An exact retry of a committed mutating request MUST return its recorded outcome.
+                let commit=receipt.commit.clone();
+                let replay=receipt.replay()?;
                 let reply = super::metadata::reply(
                     &self.config.limits,
                     request_id,
                     operation,
-                    receipt.outcome,
-                    Some(receipt.commit),
+                    replay,
+                    Some(commit),
                     observed,
                 )?;
                 return Ok(super::checked_transaction::Completion::Rollback((reply, false)));
@@ -937,11 +947,10 @@ impl Database {
         ) = (operation, &outcome)
         {
             // This stamp binds the original nested receipt, never mutable effect state.
-            if record.kind == "application_mutation" {
-                let receipt = super::metadata::read(&tx, operation_id)?
+            if matches!(record.kind.as_str(), "application_mutation" | "committed_read_reference") {
+                let receipt = super::metadata::read_retained(&tx, operation_id)?
                     .ok_or_else(|| Fault::Store("mutation lookup lost original receipt".into()))?;
-                if record.intended != serde_json::to_value(&receipt.request)?
-                    || record.outcome.as_ref() != Some(&serde_json::to_value(&receipt.outcome)?)
+                if *record != receipt.lookup()?
                 {
                     return Err(Fault::Store(
                         "mutation lookup changed original outcome".into(),

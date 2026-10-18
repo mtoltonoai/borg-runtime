@@ -4,6 +4,22 @@ use super::{ControllerConfig, database::*};
 use crate::{limits::ExecutionLimitOverrides, protocol::*};
 use rusqlite::{OptionalExtension, params};
 
+/// Check the existing supplied-output representation without allocating its
+/// maximum extent. The same helper is used by retained output readers.
+pub(super) fn validate_supplied_output(
+    limits: &crate::limits::RuntimeLimits,
+    definition: &Definition,
+    effective: &crate::limits::ExecutionLimits,
+) -> Result<()> {
+    if definition.executor == ExecutorKind::Coding {
+        if let Some(charter) = &limits.charter {
+            crate::charter::supplied_output_bytes(effective.coding.frame_bytes, charter.reply_items)
+                .map_err(|reason| Fault::Refused("invalid_limits", reason))?;
+        }
+    }
+    Ok(())
+}
+
 //= spec/impl/v2/implementation.md#operational-feedback-applies-supported-configuration
 //# A definition-limit change MUST compare the expected selected definition revision before applying a new immutable revision.
 //= spec/impl/v2/implementation.md#operational-feedback-applies-supported-configuration
@@ -96,6 +112,7 @@ pub(super) fn apply(tx: &StoreContext<'_>, input: &DefinitionUpdate, cfg: &Contr
     definition.limit_overrides = Some(Box::new(overrides));
     let actual = current.resolve_definition(&definition).map_err(|reason| Fault::Refused("invalid_limits", reason))?;
     if actual != after { return Err(Fault::Store("definition patch changed an unrequested effective value".into())); }
+    validate_supplied_output(current, &definition, &actual)?;
     // Caller-authored task revisions may already use the generated spelling.
     // Skip those finite existing entries rather than reusing their identity.
     definition.revision = loop {

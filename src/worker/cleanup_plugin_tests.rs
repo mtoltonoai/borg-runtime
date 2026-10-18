@@ -818,3 +818,58 @@ async fn codex_home_recorded_thread_requires_session_copy_history_alone_is_not_e
     );
     lab.close().await;
 }
+
+
+#[tokio::test]
+async fn bounded_cleanup_progress_does_not_block_control_or_require_new_work() {
+    Box::pin(read_cleanup_without_new_work()).await;
+}
+async fn read_cleanup_without_new_work() {
+    let lab=Lab::open("read-release").await;
+    let _plugins=checkout_plugins(&lab);
+    let home=codex::state_path(&lab.state.join("codex"),&lab.attempt.id);
+    let actor=collaboration_caller(&lab.attempt);
+    let set=crate::mcp::Invocation {operation_id:"retained-transcript-seed".into(),logical_call_id:"seed".into(),caller:actor.clone(),tool:"collab_memory_set".into(),arguments:json!({"key":"read-release","expected_revision":null,"value":"retained output ".repeat(4096)})};
+    assert!(matches!(lab.call(set.operation()).await.outcome,Outcome::Ok{..}));
+    let call=crate::mcp::Invocation {operation_id:"retained-transcript-read".into(),logical_call_id:"original-read".into(),caller:actor.clone(),tool:"collab_memory_get".into(),arguments:json!({"key":"read-release"})};
+    let reply=lab.call(call.operation()).await;
+    let result=crate::mcp::result(&call,reply.clone()).unwrap();
+    let metadata=lab.input.resolved_limits.as_ref().unwrap();
+    let calls=home.join("collaboration-codex/calls.json");process::private_directory(calls.parent().unwrap()).unwrap();
+    let journal=json!({"runtime_limits":metadata.global_metadata,"limits":lab.input.execution_limits().unwrap().collaboration,
+        "worker_limits":lab.config.limits.worker,"revision":2,"caller":actor,"deadline_unix_ms":lab.attempt.deadline_unix_ms,
+        "controller_url":lab.config.controller_url,"entries":[{"thread_id":"controlled-thread","session_id":"controlled-session","invocation":call,"outcome":result,"delivered":true}]});
+    atomic_json(&calls,&journal).unwrap();let original_journal=std::fs::read(&calls).unwrap();
+    process::private_directory(&home.join("sessions")).unwrap();
+    let transcript=serde_json::to_vec(&json!({"thread_id":"controlled-thread","type":"function_call_output","call_id":call.logical_call_id,"output":result})).unwrap();
+    std::fs::write(home.join("sessions/controlled-thread.jsonl"),&transcript).unwrap();
+    atomic_json(&home.join("borg-thread.json"),&json!({"thread_id":"controlled-thread","turn_id":"controlled-turn"})).unwrap();
+    let _cp=cache_success(&lab).await;
+    let task=lab.task().await;let command=std::fs::read(&lab.command_path).unwrap();
+    let policy=&lab.config.limits.retention.as_ref().unwrap().worker;
+    only_plugins(&lab,process::now_ms()).await.unwrap();assert_eq!(progress(&lab)["done"],true);
+    let archive=lab.state.join("codex-transcripts").join(component(&lab.attempt.id));
+    assert_eq!(std::fs::read(archive.join("sessions/controlled-thread.jsonl")).unwrap(),transcript);
+    let due=Box::pin(super::super::reads::attempt_at(&lab.config,&lab.state,&lab.client,&BTreeMap::new(),&lab.control.validation_runtime,
+        policy,&lab.config.limits.revision,&lab.command_path,process::now_ms())).await.unwrap();
+    // A first-safe receipt may be later than the scheduler's captured clock.
+    // One subsequent scheduled observation closes that same original batch.
+    if let Some(due)=due {
+        tokio::time::sleep(Duration::from_millis(due.saturating_sub(process::now_ms()))).await;
+        Box::pin(super::super::reads::attempt_at(&lab.config,&lab.state,&lab.client,&BTreeMap::new(),&lab.control.validation_runtime,
+            policy,&lab.config.limits.revision,&lab.command_path,process::now_ms())).await.unwrap();
+    }
+    let compact=lab.call(Operation::GetOperation {operation_id:call.operation_id.clone()}).await;
+    assert!(matches!(compact.outcome,Outcome::Ok{data:Data::Operation(ref record)} if record.kind=="committed_read_reference"),"{compact:?}");
+    assert_eq!(lab.task().await,task);assert_eq!(std::fs::read(&lab.command_path).unwrap(),command);
+    assert_eq!(std::fs::read(&calls).unwrap(),original_journal);
+    assert_eq!(std::fs::read(archive.join("sessions/controlled-thread.jsonl")).unwrap(),transcript);
+    let progress_file=lab.state.join("cleanup-reads").join(format!("{}.json",component(&lab.attempt.id)));
+    let progress_before=std::fs::read(&progress_file).unwrap();
+    Box::pin(super::super::reads::attempt_at(&lab.config,&lab.state,&lab.client,&BTreeMap::new(),&lab.control.validation_runtime,
+        policy,&lab.config.limits.revision,&lab.command_path,process::now_ms())).await.unwrap();
+    assert_eq!(std::fs::read(progress_file).unwrap(),progress_before,"bounded cursor makes no duplicate batch");
+    let mut disabled=(*lab.config.limits).clone();disabled.retention=None;
+    assert!(Scheduler::open_selected(&lab.config,&lab.state,&disabled).unwrap().deadline().is_none(),"absent configured policy schedules no cleanup");
+    lab.close().await;
+}

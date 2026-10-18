@@ -92,8 +92,7 @@ pub(super) fn validate_existing(
             ));
         }
         let id: String = row.get(0)?;
-        let record = super::metadata::read(tx, &id)?
-            .ok_or_else(|| Fault::Store("default-assignment receipt disappeared".into()))?;
+        let Some(record) = super::metadata::scan_inline(tx, &id)? else { continue };
         let selected_request = match &record.request {
             Operation::SubmitTaskDraft { .. } => true,
             Operation::SubmitTask { input, .. } | Operation::DelegateTask { child: input, .. } => {

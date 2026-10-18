@@ -188,15 +188,11 @@ pub(super) fn apply(
             if let Some(body) = body {
                 return Ok((Data::Operation(decode(&body)?), false));
             }
-            let Some(receipt) = super::super::metadata::read(tx, operation_id)? else {
+            let Some(receipt) = super::super::metadata::read_retained(tx, operation_id)? else {
                 return refuse("not_found", "operation has no committed outcome");
             };
             Ok((
-                Data::Operation(super::super::metadata::lookup_record(
-                    operation_id,
-                    &receipt.request,
-                    &receipt.outcome,
-                )?),
+                Data::Operation(receipt.lookup()?),
                 false,
             ))
         }

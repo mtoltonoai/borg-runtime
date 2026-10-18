@@ -12,6 +12,7 @@ struct CallsFixture {
     own: Task,
     other: Task,
     caller: Caller,
+    command_id: String,
 }
 
 async fn calls_fixture(mut cfg: ControllerConfig) -> CallsFixture {
@@ -49,8 +50,8 @@ async fn calls_fixture(mut cfg: ControllerConfig) -> CallsFixture {
         operation_id: "call-view-assignment".into(), worker_id: worker.id,
         incarnation: worker.incarnation, acknowledged: vec![],
     }).await else { panic!("actual controller assignment") };
-    let attempt = commands.iter().find_map(|command| match command {
-        WorkerCommand::RunAttempt { attempt, .. } if attempt.task_id == own.id => Some(attempt.clone()),
+    let (command_id, attempt) = commands.iter().find_map(|command| match command {
+        WorkerCommand::RunAttempt { command_id, attempt, .. } if attempt.task_id == own.id => Some((command_id.clone(), attempt.clone())),
         _ => None,
     }).expect("the submitted task has a controller-issued attempt");
     report(&controller, &attempt, Observation::Started { thread_id: None, turn_id: None }).await;
@@ -61,7 +62,7 @@ async fn calls_fixture(mut cfg: ControllerConfig) -> CallsFixture {
     let own = task(&controller, &own.id).await;
     let other = task(&controller, &other.id).await;
     assert_eq!(own.attempt.as_ref().unwrap().id, caller.attempt_id);
-    CallsFixture { fixture: Fixture { controller, path }, own, other, caller }
+    CallsFixture { fixture: Fixture { controller, path }, own, other, caller, command_id }
 }
 
 fn invocation(caller: &Caller, id: &str, tool: &str, arguments: serde_json::Value) -> Invocation {
@@ -309,4 +310,59 @@ async fn bounded_call_projection_refuses_display_without_changing_its_real_store
     let outcome: Outcome = serde_json::from_value(record.outcome.unwrap()).unwrap();
     assert_eq!(outcome, original.outcome);
     assert_eq!(read_snapshot(c, &f.own.id, &f.other.id).await, before);
+}
+
+
+#[tokio::test]
+async fn call_receipt_ui_labels_retained_reference_and_fresh_observation() {
+    Box::pin(retained_call_ui()).await;
+}
+async fn retained_call_ui() {
+    use borg_runtime::read_retention::*;
+    let mut cfg=config();let mut selected=(*cfg.limits).clone();
+    selected.retention=Some(borg_runtime::limits::RetentionLimits {worker:borg_runtime::limits::WorkerRetentionLimits {
+        success_grace_ms:0,failed_grace_ms:0,cancelled_grace_ms:0,idle_cache_grace_ms:1000,
+        batch_entries:8,filesystem_entries_per_yield:8,operation_timeout_ms:1000,retry_delay_ms:1,record_bytes:1_048_576,
+    }});
+    cfg.limits=std::sync::Arc::new(selected);let policy=cfg.limits.retention.as_ref().unwrap().worker.clone();
+    let policy_revision=cfg.limits.revision.clone();
+    let f=calls_fixture(cfg).await;let c=&f.fixture.controller;
+    let seed=invocation(&f.caller,"retained-ui-seed","collab_memory_set",serde_json::json!({
+        "key":"retained-ui","expected_revision":null,"value":"<script>original output</script>".repeat(2048)}));
+    assert!(matches!(exchange(c,seed.operation()).await.outcome,Outcome::Ok{..}));
+    let read=invocation(&f.caller,"retained-ui-read","collab_memory_get",serde_json::json!({"key":"retained-ui"}));
+    let original=exchange(c,read.operation()).await;
+    let evidence=ReadEvidence::from_outcome(&read,&original.outcome).unwrap();
+    let current=task(c,&f.own.id).await;
+    call(c,Operation::CancelTask {operation_id:"retained-ui-cancel".into(),task_id:current.id,expected_revision:current.revision}).await;
+    report(c,f.own.attempt.as_ref().unwrap(),Observation::ProcessTreeStopped).await;
+    let closed=task(c,&f.own.id).await;let a=closed.attempt.as_ref().unwrap();
+    // Controlled worker report, not an assertion about filesystem copyout.
+    let mut plan=TerminalReadRelease {operation_id:"retained-ui-custody".into(),caller:f.caller.clone(),command_id:f.command_id.clone(),
+        session_id:closed.session_id.clone(),terminal_revision:closed.revision,first_safe_operation_id:None,policy_revision,policy,
+        custody:TranscriptCustody::NativeJournal {manifest_sha256:evidence.outcome_sha256.clone(),bytes:evidence.outcome_bytes as u64,files:1},
+        custody_operation_id:"retained-ui-custody".into(),reads:vec![ReleaseItem{operation_id:read.operation_id.clone(),commit:original.commit.clone().unwrap(),evidence:evidence.clone()}]};
+    call(c,Operation::ObserveWorker {report:Report {report_id:plan.custody_operation_id.clone(),worker_id:a.worker_id.clone(),incarnation:a.worker_incarnation.clone(),
+        task_id:closed.id.clone(),attempt_id:a.id.clone(),generation:a.generation,observation:Observation::ReadTranscriptCustody {proof:Box::new(plan.clone())}}}).await;
+    plan.operation_id="retained-ui-safe".into();
+    let first=exchange(c,Operation::ReleaseTerminalReads(plan.clone())).await;
+    assert!(matches!(first.outcome,Outcome::Ok{data:Data::TerminalReadRelease(ref r)} if r.released.is_empty()));
+    plan.first_safe_operation_id=Some(plan.operation_id.clone());plan.operation_id="retained-ui-release".into();
+    let released=exchange(c,Operation::ReleaseTerminalReads(plan)).await;
+    assert!(matches!(released.outcome,Outcome::Ok{data:Data::TerminalReadRelease(ref r)} if r.released==vec![read.operation_id.clone()]));
+    let before=read_snapshot(c,&f.own.id,&f.other.id).await;
+    let receipt_before=exchange(c,Operation::GetOperation {operation_id:read.operation_id.clone()}).await.outcome;
+    let page=ui(c,"GET",&route(&f.own.id,Some(&read.operation_id)),vec![]).await;
+    assert_eq!(page.status,200,"{}",page.body);
+    for label in ["Original read body unavailable","digest is not a replacement body","Fresh task observation","Fresh accepted-source observation","new occurrence and current admission"] {
+        assert!(page.body.contains(label),"{label}: {}",page.body);
+    }
+    assert!(page.body.contains(&evidence.outcome_sha256));
+    assert!(!page.body.contains("<script>original output"));
+    let observed=exchange(c,Operation::QueryCollaboration {query:Query::Call {task_id:f.own.id.clone(),operation_id:read.operation_id.clone()}}).await;
+    assert!(matches!(observed.outcome,Outcome::Ok{data:Data::Collaboration(QueryResult::RetainedCall(ref retained))} if retained.invocation==read && retained.original_commit==original.commit.clone().unwrap()));
+    // Fresh browser observation is a separate read, never an original-call retry.
+    assert_eq!(ui(c,"GET",&format!("/tasks/{}",encode(&f.own.id)),vec![]).await.status,200);
+    assert_eq!(read_snapshot(c,&f.own.id,&f.other.id).await,before);
+    assert_eq!(exchange(c,Operation::GetOperation {operation_id:read.operation_id}).await.outcome,receipt_before);
 }

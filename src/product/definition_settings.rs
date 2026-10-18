@@ -38,7 +38,8 @@ fn field_unit(field: DefinitionLimitField) -> &'static str {
         | DefinitionLimitField::NativeHelperValueBytes | DefinitionLimitField::NativeResponseWireBytes
         | DefinitionLimitField::NativeOutputBytes | DefinitionLimitField::NativeResultBytes
         | DefinitionLimitField::CodingCommandOutputBytes | DefinitionLimitField::CodingSummaryBytes
-        | DefinitionLimitField::CollaborationCompleteResultBytes => "bytes",
+        | DefinitionLimitField::CollaborationCompleteResultBytes
+        | DefinitionLimitField::CodingFrameBytes | DefinitionLimitField::CollaborationJournalBytes => "bytes",
     }
 }
 

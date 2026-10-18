@@ -26,7 +26,7 @@ fn original(tx:&Connection<'_>,task:&Task,r:&Report,index:u32,calls:u32)->Result
     }
     // Only actual bounded call occurrences are checked. No configured-budget scan.
     for ordinal in 1..=calls {
-        if super::super::metadata::read(tx,&contract::call_operation_id(&c.attempt_id,index,ordinal))?.is_some() {
+        if super::super::metadata::read_retained(tx,&contract::call_operation_id(&c.attempt_id,index,ordinal))?.is_some() {
             return refuse("source_mismatch","output cap call was already dispatched");
         }
     }
