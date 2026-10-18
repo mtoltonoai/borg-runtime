@@ -82,6 +82,7 @@ mod tests {
             process::private_directory(&state).unwrap();
             atomic_json(&state.join("format.json"),&json!({"format_revision":18})).unwrap();
             let cmd=command(&metadata,coding);let WorkerCommand::RunAttempt{attempt,task,..}=&cmd else{unreachable!()};
+            process::private_directory(&state.join("commands")).unwrap();
             record_launch(&state.join("commands/original.json"),&cmd,&metadata).unwrap();
             let cfg=WorkerConfig{limits:metadata.clone(),resource_profile:None,controller_url:"http://127.0.0.1:9".into(),id:attempt.worker_id.clone(),incarnation:attempt.worker_incarnation.clone(),workspace_root:state.clone(),codex_path:"/must-not-launch".into(),coding_capacity:metadata.worker.coding_capacity,native_capacity:metadata.worker.native_capacity,native_endpoint:"http://127.0.0.1:9/no-provider".into(),validation_executable:"/must-not-launch".into()};
             let call=crate::mcp::Invocation{operation_id:"machine-original".into(),logical_call_id:"machine-logical".into(),caller:collaboration_caller(attempt),tool:"collab_machines_list".into(),arguments:json!({"cursor":null,"limit":1})};

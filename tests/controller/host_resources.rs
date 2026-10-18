@@ -33,9 +33,19 @@ async fn view(c:&Controller,index:usize)->View {
         Outcome::Ok{data:Data::Collaboration(QueryResult::Machine(v))}=>v,other=>panic!("{other:?}"),
     }
 }
-fn snapshot(p:&std::path::Path)->(i64,i64,i64,i64) {
-    let c=Connection::open(p).unwrap();
-    (c.query_row("SELECT count(*) FROM receipts",[],|r|r.get(0)).unwrap(),c.query_row("SELECT value FROM counters WHERE kind='controller_revision'",[],|r|r.get(0)).unwrap(),c.query_row("SELECT count(*) FROM tasks",[],|r|r.get(0)).unwrap(),c.query_row("SELECT count(*) FROM history",[],|r|r.get(0)).unwrap())
+// Read through the database owner while it is live. Direct SQLite checks
+// below happen only after controller_owner_released confirms closure.
+async fn snapshot(c:&Controller)->(u64,Vec<Task>,Vec<borg_runtime::collaboration::HistoryEntry>) {
+    let reply=exchange(c,Operation::ListTasks{after:None,limit:100}).await;
+    let revision=reply.observed_controller_revision.unwrap();
+    let Outcome::Ok{data:Data::Tasks(tasks)}=reply.outcome else{panic!("{reply:?}")};
+    let mut history=Vec::new();
+    for task in &tasks {
+        let Outcome::Ok{data:Data::Collaboration(QueryResult::TaskHistory(page))}=exchange(c,Operation::QueryCollaboration{query:Query::TaskHistory{task_id:task.id.clone(),after:None,limit:100}}).await.outcome else{panic!("history read refused")};
+        assert!(page.next_cursor.is_none(),"controlled fixture history is fully observed");
+        history.extend(page.items);
+    }
+    (revision,tasks,history)
 }
 #[tokio::test]
 async fn host_resources_latest_identity_ordering_and_receipt_budget() {
@@ -64,12 +74,16 @@ async fn host_resources_latest_identity_ordering_and_receipt_budget() {
     assert!(matches!(send(&c,successor.clone()).await.outcome,Outcome::Ok{..}));
     assert_eq!(code(send(&c,sample(1,9999)).await.outcome),"stale_worker");
     assert_eq!(code(call(&c,Operation::RegisterAgent{operation_id:"receipt-full".into(),definition:native("fill").definition}).await),"capacity");
-    let before=snapshot(&p);assert_eq!(before.0,4);
+    let before=snapshot(&c).await;assert_eq!(before.0,4);
     for sequence in 2..=128 {successor.sequence=sequence;assert!(matches!(send(&c,successor.clone()).await.outcome,Outcome::Ok{..}));}
     assert_eq!(view(&c,1).await.sample.unwrap().sequence,128);
-    assert_eq!(snapshot(&p),before,"telemetry must not churn task receipts/revisions/history even when saturated");
+    assert_eq!(snapshot(&c).await,before,"telemetry must not churn task receipts/revisions/history even when saturated");
     let old=c.handle(Request{protocol_revision:23,request_id:"old-wire".into(),command:Operation::ReportMachineResources{sample:sample(0,1)}}).await;
     assert_eq!(code(old.outcome),"unsupported_version");assert_eq!(view(&c,0).await.freshness,Freshness::Unobserved);
+    drop(c);controller_owner_released(&p).await;
+    let sql=Connection::open(&p).unwrap();
+    assert_eq!(sql.query_row("SELECT count(*) FROM receipts",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+    assert_eq!(sql.query_row("SELECT value FROM counters WHERE kind='controller_revision'",[],|r|r.get::<_,u64>(0)).unwrap(),before.0);
 }
 #[tokio::test]
 async fn host_resources_controller_workers_fresh_stale_and_restart() {
@@ -83,10 +97,10 @@ async fn host_resources_controller_workers_fresh_stale_and_restart() {
     send(&c,failed.clone()).await;
     let v=view(&c,2).await;assert_eq!(v.freshness,Freshness::Fresh);assert_eq!(v.sample.unwrap().memory,failed.memory);
     mono.store(30100,Ordering::SeqCst);send(&c,failed).await;assert_eq!(view(&c,2).await.freshness,Freshness::Stale,"duplicate does not renew receiver time");
-    let stored=snapshot(&p);drop(c);tokio::time::sleep(Duration::from_millis(25)).await;
+    let stored=snapshot(&c).await;drop(c);controller_owner_released(&p).await;
     let restarted=Controller::open_with_config(&p,cfg).unwrap();
     for index in 0..4 {let v=view(&restarted,index).await;assert_eq!(v.freshness,Freshness::Unobserved);assert!(v.sample.is_none());assert!(v.received_at_unix_ms.is_none());}
-    assert_eq!(snapshot(&p),stored,"restart does not restore fabricated host samples");
+    assert_eq!(snapshot(&restarted).await,stored,"restart does not restore fabricated host samples");
 }
 async fn actor(c:&Controller,id:&str,coding_task:bool)->borg_runtime::mcp::Caller {
     let t=submit(c,id,if coding_task{coding(id)}else{native(id)}).await;
@@ -109,7 +123,7 @@ async fn host_resources_shared_mcp_projection_redaction_and_no_mutations() {
     let (cfg,mono,_)=settings();let p=path();let c=Controller::open_with_config(&p,cfg).unwrap();registered(&c).await;
     let native=actor(&c,"machine-native",false).await;let coding=actor(&c,"machine-coding",true).await;
     for index in 0..4 {send(&c,sample(index,1)).await;}
-    let before=snapshot(&p);
+    let before=snapshot(&c).await;
     let n=mcp(&c,&native,"native-machine-read","collab_machines_list",json!({"cursor":null,"limit":4})).await;
     let cod=mcp(&c,&coding,"coding-machine-read","collab_machines_list",json!({"cursor":null,"limit":4})).await;
     assert_eq!(n.reply.outcome,cod.reply.outcome);assert!(!n.requires_quiescence&&!cod.requires_quiescence);
@@ -130,7 +144,7 @@ async fn host_resources_shared_mcp_projection_redaction_and_no_mutations() {
     mono.store(20000,Ordering::SeqCst);send(&c,sample(0,2)).await;
     let replay=mcp(&c,&native,"native-machine-read","collab_machines_list",json!({"cursor":null,"limit":4})).await;
     assert_eq!(replay.reply.commit,n.reply.commit);assert_eq!(replay.reply.outcome,n.reply.outcome,"original MCP read receipt must not be freshly sampled or re-aged");
-    assert_eq!(snapshot(&p).2,before.2);assert_eq!(snapshot(&p).3,before.3,"model reads do not mutate task history");
+    assert_eq!(snapshot(&c).await.1,before.1);assert_eq!(snapshot(&c).await.2,before.2,"model reads do not mutate task history");
 }
 fn shape(c:&Connection)->Vec<(String,String,Option<String>)> {
     c.prepare("SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().map(Result::unwrap).collect()
@@ -146,14 +160,17 @@ fn prior24()->Connection {
 #[tokio::test]
 async fn host_resources_prior_schema_new_vocabulary_refused() {
     let (cfg,_,_)=settings();let p=path();let c=Controller::open_with_config(&p,cfg.clone()).unwrap();registered(&c).await;
+    drop(c);controller_owner_released(&p).await;
     let sql=Connection::open(&p).unwrap();assert_eq!(shape(&sql),shape(&prior24()),"independently constructed historical24 SQL remains exact");
-    let originals=receipts(&sql);drop(sql);drop(c);tokio::time::sleep(Duration::from_millis(25)).await;
+    let originals=receipts(&sql);drop(sql);
     let sql=Connection::open(&p).unwrap();sql.pragma_update(None,"user_version",24).unwrap();drop(sql);
     let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
+    drop(c);controller_owner_released(&p).await;
     let sql=Connection::open(&p).unwrap();assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),25);assert_eq!(receipts(&sql),originals);assert_eq!(shape(&sql),shape(&prior24()));drop(sql);
+    let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
     let caller=actor(&c,"historical-telemetry-read",false).await;
     let result=mcp(&c,&caller,"new-machine-outcome","collab_machines_list",json!({"cursor":null,"limit":4})).await;assert!(matches!(result.reply.outcome,Outcome::Ok{..}));
-    drop(c);tokio::time::sleep(Duration::from_millis(25)).await;
+    drop(c);controller_owner_released(&p).await;
     let sql=Connection::open(&p).unwrap();sql.pragma_update(None,"user_version",24).unwrap();let originals=receipts(&sql);drop(sql);
     let before=std::fs::read(&p).unwrap();
     let refused=Controller::open_with_config(&p,cfg);assert!(matches!(refused,Err(ref error) if error.contains("schema25")),"new typed outcome must refuse before upgrade");
