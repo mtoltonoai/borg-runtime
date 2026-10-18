@@ -259,7 +259,7 @@ fn acknowledged_transient_retains_the_genuine_native_proof_for_manual_reentry() 
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(Box::pin((*ticket).execute(&db.validation_host)))
+        runtime.block_on(Box::pin((*ticket).execute(&db.validation_host, &db.config.repository_read)))
     };
     contendible(&db);
     let reader = area.contender();

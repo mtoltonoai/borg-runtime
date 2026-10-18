@@ -655,7 +655,7 @@ mod tests {
                     // Genuine bounded schema validation, followed by exact
                     // original-request finalization. No synthetic proof/token.
                     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                    let proof = runtime.block_on(Box::pin((*ticket).execute(&db.validation_host)));
+                    let proof = runtime.block_on(Box::pin((*ticket).execute(&db.validation_host, &db.config.repository_read)));
                     db.handle(OriginalRequest { request, invocation_path: TrustedHostPath::OperatorApi,
                         validation: Some(ExternalProof::Native(proof)) }).0
                 }

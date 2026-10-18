@@ -3069,6 +3069,10 @@ fn retained_worker_limits(
                 && !handoff::admits_default_assignment(state, &selected.worker)? {
                 return Err("task_defaults.agent_id requires worker18 before retaining new limits".into());
             }
+            if crate::protocol::policy_requires_wire24(selected)
+                && !handoff::admits_identity_administration(state, &selected.worker)? {
+                return Err("identity/task policy requires worker19 before retaining new limits".into());
+            }
             atomic_json(&path, &**selected)?;
             return Ok(selected.clone());
         }

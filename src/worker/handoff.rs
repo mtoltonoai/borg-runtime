@@ -1455,7 +1455,7 @@ mod tests {
         Arc::new(limits)
     }
     fn historical_state(label: &str, revision: u32) -> (PathBuf, Vec<u8>) {
-        assert!(matches!(revision, 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17));
+        assert!(matches!(revision, 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18));
         let state = area(label);
         process::private_directory(&state.join("commands")).unwrap();
         process::private_directory(&state.join("mutations")).unwrap();
@@ -2102,6 +2102,71 @@ mod tests {
             finish_state_upgrade(&state, &metadata, &lease).unwrap();
             if coding { assert!(crate::worker::coding_collaboration_closed(&config, input, attempt, &state).unwrap()); }
             for (path, bytes) in originals { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+        }
+    }
+
+    #[test]
+    fn identity_worker18_upgrade_preserves_original_carriers() {
+        let (state,marker)=historical_state("identity-old18",18);
+        let metadata=historical_limits();
+        let policy=state.join("limits.json");atomic_json(&policy,&*metadata).unwrap();
+        let command=default_assignment_command(&metadata);
+        let path=state.join("commands/original.json");record_launch(&path,&command).unwrap();
+        let await_path=default_assignment_await(&state,&metadata,command);
+        let originals:Vec<_>=[policy,path,await_path].into_iter().map(|p|{let b=std::fs::read(&p).unwrap();(p,b)}).collect();
+        assert!(!admits_identity_administration(&state,&metadata.worker).unwrap());
+        initialize_state(&state).unwrap();assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);
+        let lease=process::WorkerLease::claim(&state.join("worker-owner.json"),&metadata.worker).unwrap();
+        finish_state_upgrade(&state,&metadata,&lease).unwrap();
+        assert_eq!(read_state_format(&state,&metadata.worker).unwrap().format_revision,19);
+        for (p,b) in originals {assert_eq!(std::fs::read(p).unwrap(),b)}
+    }
+    #[test]
+    fn identity_worker18_rejects_new_policy_inputs_and_refused_calls_without_rewrite() {
+        for carrier in ["limits","command","await","pending-call","refused-call"] {
+            let (state,marker)=historical_state(&format!("identity-{carrier}"),18);
+            let old=historical_limits();let mut new=(*old).clone();
+            new.task_creation=Some(crate::limits::TaskCreationPolicy{version:1,revision:"creation1".into(),enabled:true});
+            let retained=if carrier=="limits" {&new} else {old.as_ref()};
+            let policy=state.join("limits.json");atomic_json(&policy,retained).unwrap();
+            let command=default_assignment_command(if carrier=="command"{&new}else{&old});
+            let command_path=state.join("commands/original.json");record_launch(&command_path,&command).unwrap();
+            let mut paths=vec![policy,command_path];
+            if carrier=="await"{paths.push(default_assignment_await(&state,&old,default_assignment_command(&new)));}
+            if carrier.ends_with("call") {
+                let WorkerCommand::RunAttempt{attempt,..}=&command else{unreachable!()};
+                let call=crate::mcp::Invocation{operation_id:"identity-original".into(),logical_call_id:"call1".into(),caller:crate::mcp::Caller{task_id:attempt.task_id.clone(),attempt_id:attempt.id.clone(),generation:attempt.generation,worker_id:attempt.worker_id.clone(),incarnation:attempt.worker_incarnation.clone()},tool:"collab_task_create".into(),arguments:json!({"agent_id":null})};
+                let mut journal=mutations::prepare(call.operation(),0,&old).unwrap();
+                if carrier=="refused-call" {
+                    journal.outcome=Some(Outcome::Refused{code:"invalid_input".into(),message:"explicit null identity refused".into()});
+                    journal.outcome_context=Some(CommitContext{commit:MutationCommit{operation_id:call.operation_id,controller_revision:1},observed_controller_revision:1});
+                }
+                let directory=state.join("collaboration").join(component(&attempt.id));process::private_directory(&directory).unwrap();
+                let path=directory.join("0000000001.json");mutations::persist(&path,&journal).unwrap();paths.push(path);
+            }
+            let originals:Vec<_>=paths.into_iter().map(|p|{let b=std::fs::read(&p).unwrap();(p,b)}).collect();
+            let lease=process::WorkerLease::claim(&state.join("worker-owner.json"),&old.worker).unwrap();
+            let reason=finish_state_upgrade(&state,retained,&lease).unwrap_err();assert!(reason.contains("worker19"),"{carrier}: {reason}");
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);assert!(!state.join("format.pending").exists());
+            for (p,b) in &originals {assert_eq!(std::fs::read(p).unwrap(),*b)}
+            // Same typed records are legal under the new marker; this deliberate
+            // fixture marker change is not a successful historical migration.
+            atomic_json(&state.join("format.json"),&json!({"format_revision":19})).unwrap();
+            finish_state_upgrade(&state,retained,&lease).unwrap();
+            for (p,b) in originals {assert_eq!(std::fs::read(p).unwrap(),b)}
+        }
+    }
+    #[test]
+    fn identity_empty_historical_root_refuses_policy_before_any_metadata_write() {
+        for manager in [false,true] {
+            let (state,marker)=historical_state(&format!("identity-empty18-{manager}"),18);
+            for name in ["outbox","processes","codex","mutations/settlements","native-tracking","publications","pull-requests"] {process::private_directory(&state.join(name)).unwrap();}
+            let mut metadata=(*historical_limits()).clone();
+            if manager {metadata.identity_administration=Some(crate::limits::IdentityAdministrationPolicy{version:1,revision:"manager1".into(),enabled:true,manager_agent_id:"charter".into(),complete_definitions:true});}
+            else {metadata.task_creation=Some(crate::limits::TaskCreationPolicy{version:1,revision:"creation1".into(),enabled:true});}
+            let metadata=Arc::new(metadata);let _lease=process::WorkerLease::claim(&state.join("worker-owner.json"),&metadata.worker).unwrap();
+            let reason=crate::worker::retained_worker_limits(&state,&metadata).unwrap_err();assert!(reason.contains("worker19"),"{reason}");
+            assert!(!state.join("limits.json").exists());assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);
         }
     }
 
