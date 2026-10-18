@@ -1234,14 +1234,11 @@ class CodexHomePreservationTests(NoExternalEffects):
             for p in paths:self.assertIn(str(p.relative_to(f.root)),preserved)
             self.assertTrue(f.host._codex_home_proof['other_original_rows_exact'])
 
-    def test_default_assignment_cleanup_family_matches_source_and_requires_every_member(self):
-        selected=Path(hostmod.__file__).resolve().parent.parent
-        for name,digest in hostmod._DEFAULT_ASSIGNMENT_CODEX_HOME_SOURCES.items():
-            with self.subTest(source=name):
-                self.assertEqual(common.digest((selected/name).read_bytes()),digest)
-        self.assertIn(b'pub const WIRE_REVISION: u32 = 23;',(selected/'src/protocol.rs').read_bytes())
-        self.assertIn(b'const DEFAULT_ASSIGNMENT_VERSION: i64 = 24;',(selected/'src/controller/application_schema.rs').read_bytes())
-        self.assertIn(b'const CURRENT_STATE_FORMAT: u32 = 18;',(selected/'src/worker/handoff.rs').read_bytes())
+    def test_default_assignment_cleanup_family_retains_historical_pins_and_requires_every_member(self):
+        # This family identifies the historical wire23/schema24/worker18 source,
+        # not the current checkout. Updating source must not repin old receipts.
+        self.assertEqual(common.digest(common.canonical(hostmod._DEFAULT_ASSIGNMENT_CODEX_HOME_SOURCES)),
+                         '22d0a871b7f93a4d431ae48e71376b53f16d55f65cef8c679579c755bd6779ae')
         with self.fixture() as f:
             self.assertTrue(f.host.codex_home_scope())
             old=copy.deepcopy(f.host._verified_manifest)
@@ -1257,6 +1254,94 @@ class CodexHomePreservationTests(NoExternalEffects):
                 with self.subTest(missing=name):self.assertFalse(f.host.codex_home_scope())
             f.host._verified_manifest=old
             self.assertTrue(f.host.codex_home_scope())
+
+    def select_composed(self,f):
+        f.host._verified_manifest={'source':{'files':{
+            n:{'sha256':sha} for n,sha in hostmod._COMPOSED_CODEX_HOME_SOURCES.items()}}}
+        f.host.p['formats']['before']=dict(hostmod._COMPOSED_CODEX_HOME_FORMATS)
+        f.host.p['formats']['after']=dict(hostmod._COMPOSED_CODEX_HOME_FORMATS)
+
+    def test_composed_cleanup_family_matches_actual_producers_and_formats(self):
+        selected=Path(hostmod.__file__).resolve().parent.parent
+        for name,digest in hostmod._COMPOSED_CODEX_HOME_SOURCES.items():
+            with self.subTest(source=name):
+                self.assertEqual(common.digest((selected/name).read_bytes()),digest)
+        self.assertEqual(hostmod._COMPOSED_CODEX_HOME_FORMATS,
+                         {'wire':24,'controller_schema':25,'worker_format':19})
+        self.assertIn(b'pub const WIRE_REVISION: u32 = 24;',(selected/'src/protocol.rs').read_bytes())
+        self.assertIn(b'const VERSION: i64 = 25;',(selected/'src/controller/application_schema.rs').read_bytes())
+        self.assertIn(b'const CURRENT_STATE_FORMAT: u32 = 19;',(selected/'src/worker/handoff.rs').read_bytes())
+        self.assertIn(b'const JOURNAL: &str = "borg-supplied-outer.json";',
+                      (selected/'src/worker/codex_retry.rs').read_bytes())
+        with self.fixture() as f:
+            self.select_composed(f);common.format_contract(f.host.p)
+            self.assertTrue(f.host.codex_home_scope())
+            f.host.h['role']='controller'
+            self.assertFalse(f.host.codex_home_scope())
+
+    def test_composed_cleanup_family_requires_every_member_and_exact_format(self):
+        with self.fixture() as f:
+            self.select_composed(f);fresh=copy.deepcopy(f.host._verified_manifest)
+            for name in hostmod._COMPOSED_CODEX_HOME_SOURCES:
+                for change in ('missing','changed'):
+                    f.host._verified_manifest=copy.deepcopy(fresh)
+                    if change=='missing':del f.host._verified_manifest['source']['files'][name]
+                    else:f.host._verified_manifest['source']['files'][name]['sha256']='0'*64
+                    with self.subTest(source=name,change=change):self.assertFalse(f.host.codex_home_scope())
+            f.host._verified_manifest=copy.deepcopy(fresh)
+            for name,value in hostmod._COMPOSED_CODEX_HOME_FORMATS.items():
+                for wrong in (value-1,value+1,float(value),str(value),None):
+                    f.host.p['formats']['after']=dict(hostmod._COMPOSED_CODEX_HOME_FORMATS,**{name:wrong})
+                    with self.subTest(format=name,value=wrong):self.assertFalse(f.host.codex_home_scope())
+            del f.host.p['formats']['after']
+            self.assertFalse(f.host.codex_home_scope())
+            self.select_composed(f)
+            f.host.p['formats']['before']={'wire':23,'controller_schema':24,'worker_format':18}
+            # Selecting current cleanup readers never authorizes a new upgrade.
+            with self.assertRaisesRegex(ValueError,'qualified forward transition required'):
+                common.format_contract(f.host.p)
+
+    def test_composed_cleanup_rejects_mixed_historical_producer_families(self):
+        with self.fixture() as f:
+            for historical in (hostmod._CODEX_HOME_SOURCES,hostmod._SUPPLIED_CODEX_HOME_SOURCES,
+                               hostmod._DIRECTORY_CODEX_HOME_SOURCES,hostmod._DEFAULT_ASSIGNMENT_CODEX_HOME_SOURCES):
+                differing=[n for n in historical if historical[n]!=hostmod._COMPOSED_CODEX_HOME_SOURCES[n]]
+                self.assertGreater(len(differing),1)
+                for name in differing:
+                    self.select_composed(f)
+                    f.host._verified_manifest['source']['files'][name]['sha256']=historical[name]
+                    with self.subTest(historical=common.digest(common.canonical(historical)),source=name):
+                        self.assertFalse(f.host.codex_home_scope())
+
+    def test_composed_cleanup_preserves_outer_retry_journal_and_all_original_records(self):
+        with self.fixture() as f:
+            self.select_composed(f)
+            journal=f.base+'/borg-supplied-outer.json'
+            f.f.write(journal,{'binding':{'session_id':f.attempt['session_id']},
+                              'index':2,'thread_id':'thread','committed':True,'dispatched':True})
+            f.f.refresh();f.stop=copy.deepcopy(f.f.stop)
+            f.stop['codex_homes']=hostmod.codex_home_snapshot(f.host,f.stop['state'])
+            original=copy.deepcopy(f.stop);raw=(f.root/journal).read_bytes()
+            f.compact();preserved,changes=f.check()
+            self.assertTrue(changes)
+            self.assertEqual((f.root/journal).read_bytes(),raw)
+            self.assertEqual(preserved[journal],original['state'][journal])
+            self.assertEqual(f.stop,original)
+            self.assertTrue(f.host._codex_home_proof['other_original_rows_exact'])
+
+    def test_composed_cleanup_refuses_retry_journal_removal_content_or_session_changes(self):
+        for case in ('removed','content','journal_session','current_session'):
+            with self.subTest(case=case),self.fixture() as f:
+                self.select_composed(f);journal=f.base+'/borg-supplied-outer.json'
+                body={'binding':{'session_id':f.attempt['session_id']},'thread_id':'thread','index':2}
+                f.f.write(journal,body);f.f.refresh();f.stop=copy.deepcopy(f.f.stop)
+                f.stop['codex_homes']=hostmod.codex_home_snapshot(f.host,f.stop['state'])
+                f.compact()
+                if case=='removed':(f.root/journal).unlink()
+                elif case=='content':f.f.write(journal,{**body,'index':3})
+                elif case=='journal_session':f.f.write(journal,{**body,'binding':{'session_id':'replacement-session'}})
+                else:f.task['session_id']='replacement-session'
+                with self.assertRaises(ValueError):f.check()
 
     def test_default_assignment_cleanup_preserves_journals_and_refuses_changed_session(self):
         with self.fixture() as f:
