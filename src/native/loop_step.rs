@@ -3180,8 +3180,20 @@ mod provider_schema_tests {
         let definition: crate::protocol::Definition =
             serde_json::from_value(source["definition"].clone()).unwrap();
         let selected = limits.resolve_definition(&definition).unwrap();
+        // This fixture exercises the retained v4 diagnostic definition and its
+        // exact 19,746-byte acceptance binding. c986716 later expanded only the
+        // agent-get description by 50 bytes; reconstruct that historical input
+        // explicitly, without changing current catalogue or accepted limits.
+        let mut historical_tools = crate::mcp::catalogue(&limits);
+        let agent_get = historical_tools
+            .iter_mut()
+            .find(|tool| tool.name == "collab_agent_get")
+            .unwrap();
+        assert_eq!(agent_get.description,
+            "AgentSummary; identity, stored Definition and retired status; historical identities remain readable");
+        agent_get.description = "AgentSummary; identity and stored Definition only".into();
         let profile = NativeLoopProfile {
-            functions: crate::mcp::catalogue(&limits)
+            functions: historical_tools
                 .into_iter()
                 .map(|tool| NativeFunction {
                     name: tool.name,

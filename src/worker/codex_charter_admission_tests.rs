@@ -541,22 +541,28 @@ async fn real_launch_admission_precedes_supplied_begin_and_exact_executor_associ
     let accepted = f.task().await.input;
     f.admit(&control).await;
     let (events, mut received) = mpsc::channel(16);
-    let result = Box::pin(execute_with_credentials_collaboration_and_charter(
-        &f.binary,
-        &f.root,
-        &f.state,
-        &f.state.join("processes"),
-        &InferenceSettings::selected(),
-        &f.runtime.execution,
-        "Original task only.",
-        &control,
-        events,
-        &[],
-        None,
-        None,
-        None,
-        Some(&f.scope),
-    ))
+    // Construct the large nested fixture future in the existing isolated
+    // constructor frame; retain the ordinary test thread stack and execution.
+    let processes = f.state.join("processes");
+    let inference = InferenceSettings::selected();
+    let result = crate::worker::boxed_execution(|| {
+        execute_with_credentials_collaboration_and_charter(
+            &f.binary,
+            &f.root,
+            &f.state,
+            &processes,
+            &inference,
+            &f.runtime.execution,
+            "Original task only.",
+            &control,
+            events,
+            &[],
+            None,
+            None,
+            None,
+            Some(&f.scope),
+        )
+    })
     .await
     .unwrap();
     assert!(result.success);

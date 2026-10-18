@@ -1336,21 +1336,8 @@ async fn agent_directory_pagination_preserves_canonical_identity() {
     assert_eq!(next[0].id, "agent-2");
     assert_eq!(first[0].id, first[0].definition.id);
     assert_eq!(next[0].id, next[0].definition.id);
-    let r = f
-        .controller
-        .handle(crate::protocol::Request {
-            protocol_revision: WIRE_REVISION,
-            request_id: "reassign".into(),
-            command: Operation::AssignTask {
-                operation_id: "reassign".into(),
-                task_id: a.id.clone(),
-                expected_revision: a.revision,
-                agent_id: "agent-2".into(),
-            },
-        })
-        .await;
-    assert!(matches!(r.outcome,Outcome::Refused{ref code,..} if code=="definition_conflict"));
-    for t in [a, b] {
+
+    for t in [&a, &b] {
         let Data::Tasks(rows) = call(
             &f.controller,
             Operation::ListAgentTasks {
@@ -1366,6 +1353,34 @@ async fn agent_directory_pagination_preserves_canonical_identity() {
         assert_eq!(rows[0].id, t.id);
         assert_eq!(rows[0].input.definition.id, t.assigned_agent_id);
     }
+    // Pagination above observes both original owners. The current accepted
+    // handoff creates a new session for the same idle task, not a refusal.
+    let r = f
+        .controller
+        .handle(crate::protocol::Request {
+            protocol_revision: WIRE_REVISION,
+            request_id: "reassign".into(),
+            command: Operation::AssignTask {
+                operation_id: "reassign".into(),
+                task_id: a.id.clone(),
+                expected_revision: a.revision,
+                agent_id: "agent-2".into(),
+            },
+        })
+        .await;
+    let Outcome::Ok { data: Data::Task(reassigned) } = r.outcome else {
+        panic!("idle same-executor reassignment must be accepted: {:?}", r.outcome);
+    };
+    assert_eq!(reassigned.id, a.id);
+    assert_ne!(reassigned.session_id, a.session_id);
+    assert_eq!(reassigned.assigned_agent_id, b.assigned_agent_id);
+    assert_eq!(reassigned.input.definition, b.input.definition);
+    assert_eq!(reassigned.input.instruction, a.input.instruction);
+    assert_eq!(reassigned.input.output_schema, a.input.output_schema);
+    assert_eq!(reassigned.input.dependencies, a.input.dependencies);
+    assert_eq!(reassigned.input.limits, a.input.limits);
+    assert_eq!(reassigned.status, TaskStatus::Queued);
+    assert!(reassigned.pending_assignment.is_none());
 }
 
 #[tokio::test]

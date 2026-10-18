@@ -443,7 +443,7 @@ fn schema23_to24_lineage_migration_is_atomic_and_preserves_session_columns_and_i
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        24
+        application_schema::VERSION
     );
     assert_eq!(session_rows(&sql), original_sessions);
     assert_eq!(original(&sql), original_receipt);
