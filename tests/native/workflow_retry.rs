@@ -207,7 +207,6 @@ async fn exercise_retry(label: &str, refusal: Value, expect_retry: bool) {
         assert_eq!(held.calls.load(Ordering::SeqCst), 1);
         assert_eq!(std::fs::read(&journal_path).unwrap(), tool_bytes);
         assert_eq!(mirror(&lab, &task), durable);
-        assert_eq!(serde_json::to_value(observe_delivery(&api, &terminal).await).unwrap(), before_json);
         assert!(!notice_directory(&lab, &task).join("acknowledge.json").exists());
         let (_, diagnostic) = original(&api, &contract::diagnostic_id(&attempt.id, 2)).await;
         let Observation::NativeRequestDiagnostic { request_binding, observed_outcome, failure, .. } = report(&diagnostic) else { panic!("original unknown diagnostic"); };
@@ -232,6 +231,18 @@ async fn exercise_retry(label: &str, refusal: Value, expect_retry: bool) {
         assert_eq!(lab.usage(&attempt.id), (2, Some(5), Some(2)));
         {
             let db = rusqlite::Connection::open_with_flags(lab.root.join("tasks.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            // Delivery observation requires an active caller. After terminal
+            // failure, inspect its retained canonical state only with both
+            // owners stopped; an Unknown response must not acknowledge it.
+            let raw: String = db.query_row("SELECT workflow_delivery FROM sessions WHERE id=?1",
+                [&task.session_id], |row| row.get(0)).unwrap();
+            let retained: Value = serde_json::from_str(&raw).unwrap();
+            for field in ["pending", "acknowledged_cursor", "routing_cursor", "superseded"] {
+                assert_eq!(retained[field], before_json[field]);
+            }
+            assert_eq!(retained["routing_turn"].as_bool().unwrap_or(false),
+                before_json["routing_turn"].as_bool().unwrap_or(false));
+            assert!(retained["last_ack_context"].is_null());
             let mut query = db.prepare("SELECT body FROM history WHERE task_id=?1 AND kind='worker_observation' ORDER BY seq").unwrap();
             let rows: Vec<String> = query.query_map([&task.id], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
             let uncertainty = rows.iter().map(|body| serde_json::from_str::<Value>(body).unwrap())
