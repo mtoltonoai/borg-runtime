@@ -1,6 +1,7 @@
 //! Real controller transactions with controlled, explicitly identified worker
 //! reports. Filesystem custody is exercised separately by the cleanup producer.
 use super::*;
+use std::sync::atomic::AtomicBool;
 use borg_runtime::read_retention::{ReadEvidence, ReleaseItem, TerminalReadRelease, TranscriptCustody};
 
 struct RetainedFixture {
