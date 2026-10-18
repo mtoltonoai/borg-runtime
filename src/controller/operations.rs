@@ -213,8 +213,6 @@ pub(crate) fn apply(
                 return Ok((Data::Task(Box::new(t.task)), false));
             }
             revision(&t, *expected_revision)?;
-            super::task_handoffs::cancel_pending(tx, task_id)?;
-            t.task.pending_assignment = None;
             cancel(tx, &mut t, cfg)?;
             Ok((Data::Task(Box::new(t.task)), true))
         }
@@ -1123,6 +1121,11 @@ fn cancel(tx: &Connection, t: &mut StoredTask, cfg: &ControllerConfig) -> Result
             pending.push(child);
         }
         if !terminal(current.task.status) {
+            // Cancel the durable handoff and this freshly loaded projection
+            // together for every visited task, including delegated descendants.
+            // Both remain inside the original action savepoint with stop/save.
+            super::task_handoffs::cancel_pending(tx, &id)?;
+            current.task.pending_assignment = None;
             current.task.status = TaskStatus::Cancelled;
             //= spec/impl/v2/implementation.md#cancellation-commits-intent-before-interruption
             //# A cancellation acknowledgment MUST distinguish requested cancellation from verified execution termination.

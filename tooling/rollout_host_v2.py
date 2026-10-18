@@ -141,7 +141,7 @@ _PUBLICATION_UNION_CODEX_HOME_SOURCES = {
     'src/controller/identity_limit_fields.rs': 'feae44991d67c43b3da5d4a7a03b16daab68e0505fc6be39630e611de2c1d4bd',
     'src/controller/machine_resources.rs': 'cd2617a4b80d732d4ccbd876dc39761db69046e17c15952d4f9d01cf9cd3d1cd',
     'src/controller/mod.rs': '399dfaaf3936e0fa4d8bcb4b1d9668ae4648f0bcf740b86dd05e328be4a2d141',
-    'src/controller/operations.rs': '029107bde1780738a3816bda6bd716dbdc30468391c3b3203fe7adecf92222e4',
+    'src/controller/operations.rs': '14aa6d7d7a6bf95b11180323a641456614d77ad56286bde516ea55f61f94fb95',
     'src/controller/operations/effects.rs': '9d7647d45f99ebb346a37f2bec0150ec87532f2454d3bd686df3f875d610846d',
     'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7',
     'src/controller/operations/supplied_outer.rs': 'c51a074820b443b263bc93721c2f6a9fdbe329fb4bcae14e9a767e53d79a87b5',

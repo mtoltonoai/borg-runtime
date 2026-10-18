@@ -766,8 +766,8 @@ async fn same_origin_and_non_get_guards_prevent_browser_mutations() {
 //# The browser interface MUST support task assignment.
 async fn stale_action_refuses_and_does_not_retarget_a_form() {
     let fixture = Fixture::new().await;
-    // Exact same-agent assignment is idempotently recorded; another agent
-    // cannot retarget the accepted definition in the clean session schema.
+    // Exact same-agent assignment records a receipt but does not advance the
+    // task revision. A real handoff makes the retained cancellation form stale.
     let created = ui(
         &fixture.controller,
         "POST",
@@ -798,6 +798,25 @@ async fn stale_action_refuses_and_does_not_retarget_a_form() {
     )
     .await;
     assert_eq!(again.status, 303);
+    assert_eq!(task(&fixture.controller, id).await, before);
+    let mut target = before.input.definition.clone();
+    target.id = "stale-form-target".into();
+    target.revision = "stale-form-target-r1".into();
+    call(&fixture.controller, Operation::RegisterAgent {
+        operation_id: "register-stale-form-target".into(), definition: target.clone(),
+    }).await;
+    let moved = ui(&fixture.controller, "POST", &format!("/tasks/{id}/assign"), form(&[
+        ("operation_id", "assign-different-target".into()),
+        ("expected_revision", before.revision.to_string()),
+        ("agent_id", target.id.clone()),
+    ])).await;
+    assert_eq!(moved.status, 303, "{}", moved.body);
+    let reassigned = task(&fixture.controller, id).await;
+    assert!(reassigned.revision > before.revision);
+    assert_ne!(reassigned.session_id, before.session_id);
+    assert_eq!(reassigned.input.definition, target);
+    assert_eq!(reassigned.input.instruction, before.input.instruction);
+    assert_eq!(reassigned.input.limits, before.input.limits);
     let stale = ui(
         &fixture.controller,
         "POST",
@@ -810,9 +829,11 @@ async fn stale_action_refuses_and_does_not_retarget_a_form() {
     .await;
     assert_eq!(stale.status, 409);
     assert!(stale.body.contains("stale-cancel"));
+    assert!(stale.body.contains("stale_revision"));
     assert!(stale.body.contains("Refresh"));
     let after = task(&fixture.controller, id).await;
-    assert_eq!(after.assigned_agent_id, "coding-default");
+    assert_eq!(after, reassigned);
+    assert_eq!(after.assigned_agent_id, "stale-form-target");
     assert_eq!(after.status, TaskStatus::Queued);
 }
 
