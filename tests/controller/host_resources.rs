@@ -83,7 +83,7 @@ async fn host_resources_latest_identity_ordering_and_receipt_budget() {
     drop(c);controller_owner_released(&p).await;
     let sql=Connection::open(&p).unwrap();
     assert_eq!(sql.query_row("SELECT count(*) FROM receipts",[],|r|r.get::<_,i64>(0)).unwrap(),4);
-    assert_eq!(sql.query_row("SELECT value FROM counters WHERE kind='controller_revision'",[],|r|r.get::<_,u64>(0)).unwrap(),before.0);
+    assert_eq!(sql.query_row("SELECT value FROM counters WHERE kind='controller_revision'",[],|r|r.get::<_,i64>(0)).unwrap(),i64::try_from(before.0).unwrap());
 }
 #[tokio::test]
 async fn host_resources_controller_workers_fresh_stale_and_restart() {
