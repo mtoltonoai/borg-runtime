@@ -289,6 +289,154 @@ def _cache_config(raw,source):
             or values.get(('core','bare'))!='true' or values.get(('origin','url'))!=source):
         raise ValueError('cleanup_transition_git_config_binding')
 
+# The active preflight runs the installed predecessor, not the candidate.
+# This closed family describes its fixed idle journal/cleanup atomic writers.
+_ACTIVE_PREFLIGHT_WRITERS = {
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+    'src/worker/mutations.rs': 'e510c3020ca1476ac3d2bda9762b2cee11d2f29d1ac552472d9218b9237e0553',
+    'src/worker/cleanup.rs': '5cbe54319ba54f53064519c72240e5ea75070cc9a5879be548fd20c4971a87b9',
+    'src/worker/mod.rs': 'cdc4900fd348d3a7c19a9fdc7abb5cb3e1d9e8537843bee95e627bd4da868b21',
+}
+
+
+class ActiveWorkerSample:
+    """Bounded pre-stop observations; never a stopped preservation baseline."""
+    slots = frozenset(('mutations/registration.json', 'mutations/await.json'))
+
+    def __init__(self, host):
+        self.host = host
+        files = getattr(host, '_verified_before_manifest', {}).get('source', {}).get('files', {})
+        if not all(isinstance(files.get(name), dict) and files[name].get('sha256') == sha
+                   for name, sha in _ACTIVE_PREFLIGHT_WRITERS.items()):
+            raise ValueError('active sample installed writer differs')
+        policy = host.cleanup_policy()
+        if policy is None:
+            raise ValueError('active sample cleanup policy unselected')
+        self.cleanup_bound = min(host.l['state_bytes'], host.l['receipt_bytes'],
+                                 policy['retention']['worker']['record_bytes'])
+        self.mutation_bound = min(host.l['state_bytes'], host.l['receipt_bytes'],
+                                  host.retained_policy()['worker']['mutation_record_bytes'])
+        self.root = _full(Path(host.h['state']['root']).lstat())
+        self.captured = {}; self.captured_bytes = 0; self.transients = set()
+        self.vanished = set(); self.vanished_reserved_bytes = 0
+        self.directory_changes = 0; self.replacements = 0
+
+    def mutable_bound(self, key):
+        if key in self.slots:
+            return self.mutation_bound
+        if re.fullmatch(r'cleanup/(?:[0-9a-f]{2})+\.json', key):
+            return self.cleanup_bound
+        return None
+
+    def transient_target(self, key):
+        if key.endswith('.pending'):
+            target = key[:-8] + '.json'
+            if self.mutable_bound(target) is not None:
+                return target
+        return None
+
+    def metadata(self, key, meta):
+        bound = self.mutable_bound(key)
+        if (bound is None or not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1
+                or meta.st_dev != self.root[0] or meta.st_uid != self.host.h['service_uid']
+                or meta.st_gid != self.root[3] or stat.S_IMODE(meta.st_mode) != 0o600
+                or not 0 <= meta.st_size <= bound):
+            raise ValueError('active sample mutable file metadata')
+
+    def vanished_temporary(self, key):
+        target = self.transient_target(key)
+        if target is None:
+            return None
+        if key in self.vanished:
+            raise ValueError('active sample repeated vanished temporary')
+        self.vanished.add(key); self.transients.add(target)
+        bound = self.mutable_bound(target)
+        self.vanished_reserved_bytes += bound
+        # The name was enumerated but its type/bytes were not observed. Reserve
+        # the entire selected record bound; do not infer zero bytes or emptiness.
+        return bound
+
+    def transient(self, key, meta):
+        target = self.transient_target(key)
+        if target is None:
+            return False
+        self.metadata(target, meta)
+        self.transients.add(target)
+        return True
+
+    def entry(self, key, meta):
+        if key in ('cleanup', 'mutations'):
+            if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != self.host.h['service_uid']
+                    or meta.st_gid != self.root[3] or stat.S_IMODE(meta.st_mode) != 0o700):
+                raise ValueError('active sample directory ownership')
+        if self.mutable_bound(key) is None:
+            return False
+        self.metadata(key, meta)
+        return True
+
+    def directory(self, relative, expected, observed):
+        if relative not in ('cleanup', 'mutations'):
+            return expected == observed
+        if (tuple(expected[:7]) != tuple(observed[:7])
+                or expected[2] != self.host.h['service_uid'] or expected[3] != self.root[3]
+                or not stat.S_ISDIR(expected[4]) or stat.S_IMODE(expected[4]) != 0o700):
+            return False
+        self.directory_changes += expected[7:] != observed[7:]
+        return True
+
+    def opened(self, key, before, opened):
+        if _full(before) == _full(opened):
+            return opened
+        if self.mutable_bound(key) is None or before.st_ino == opened.st_ino:
+            raise ValueError('state file changed before read')
+        self.metadata(key, before); self.metadata(key, opened)
+        self.replacements += 1
+        return opened
+
+    def path(self, key, expected, observed):
+        if expected == observed:
+            return True
+        bound = self.mutable_bound(key)
+        if (bound is None or expected[1] == observed[1] or expected[0] != observed[0]
+                or expected[2:5] != observed[2:5] or observed[5] != 1
+                or not stat.S_ISREG(observed[4]) or not 0 <= observed[6] <= bound):
+            return False
+        self.replacements += 1
+        return True
+
+    def capture_bytes(self, key, raw, identity, digest):
+        if (key in self.captured or self.mutable_bound(key) is None
+                or len(raw) > self.mutable_bound(key) or c.digest(raw) != digest):
+            raise ValueError('active sample body binding')
+        self.captured_bytes += len(raw)
+        if self.captured_bytes > self.host.l['receipt_bytes']:
+            raise ValueError('active sample aggregate bound')
+        self.captured[key] = (raw, {'sha256': digest, 'identity': identity})
+
+    def cleanup_bytes(self, name, entry, bound):
+        pair = self.captured.get(name)
+        if (pair is None or not name.startswith('cleanup/')
+                or c.canonical(pair[1]) != c.canonical(entry) or len(pair[0]) > bound):
+            raise ValueError('active cleanup exact sample required')
+        return pair[0]
+
+    def finish(self, state):
+        if not self.transients <= set(self.captured):
+            raise ValueError('active sample temporary without sampled target')
+        if any(c.canonical(pair[1]) != c.canonical(state.get(key))
+               for key, pair in self.captured.items()):
+            raise ValueError('active sample inventory binding')
+        return {'simultaneous_snapshot': False, 'owned_snapshot': False,
+                'complete_historical_membership': False, 'temporary_bodies_validated': False,
+                'temporary_targets_observed': len(self.transients),
+                'vanished_temporary_names': len(self.vanished),
+                'vanished_temporary_metadata_validated': False,
+                'vanished_temporary_reserved_bytes': self.vanished_reserved_bytes,
+                'directory_time_changes': self.directory_changes,
+                'atomic_path_replacements': self.replacements,
+                'installed_writer_sources': _ACTIVE_PREFLIGHT_WRITERS}
+
+
 class WorkerStateCapture:
     def __init__(self, host, common, stop):
         self.host, self.c, self.stop = host, common, stop
@@ -1388,6 +1536,7 @@ class Host:
             flag=('--protected-release-config '+self.p['controller_config']['path']).encode()
             if flag not in c.read(self.h['unit']['path'],self.l['module_bytes'],True): raise ValueError('service protected configuration binding differs')
         if int(row['MainPID']) not in self.pids(row): raise ValueError('main process outside service group')
+        if not new:self._verified_before_manifest=c.strict(manifest)
         return row
     def check_stopped_predecessor(self):
         # Caller holds the existing worker owner lock. The profile is a precise
@@ -1476,7 +1625,10 @@ class Host:
         finally:os.close(fd)
     def state_files(self):
         return self._state_files()
-    def _state_files(self,capture=None):
+    def _state_files(self,capture=None,*,preflight=None):
+        if preflight is not None:
+            if capture is not None:raise ValueError('conflicting inventory scopes')
+            capture=preflight
         root=Path(self.h['state']['root']);out={};total=0;count=0;commands={};links=[]
         full=lambda m:(m.st_dev,m.st_ino,m.st_uid,m.st_gid,m.st_mode,m.st_nlink,m.st_size,m.st_mtime_ns,m.st_ctime_ns)
         public=lambda m:[m.st_dev,m.st_ino,m.st_uid,m.st_gid,stat.S_IMODE(m.st_mode)]
@@ -1516,7 +1668,17 @@ class Host:
                             count+=1
                             if count>self.l['state_entries']:raise ValueError('state inventory entry bound')
                             name=entry.name;key=str(Path(relative)/name)
-                            m=os.stat(name,dir_fd=current,follow_symlinks=False)
+                            try:m=os.stat(name,dir_fd=current,follow_symlinks=False)
+                            except FileNotFoundError:
+                                reserved=preflight.vanished_temporary(key) if preflight is not None else None
+                                if reserved is None:raise
+                                if reserved>self.l['state_bytes']-total:raise ValueError('state inventory byte bound')
+                                total+=reserved
+                                continue
+                            if preflight is not None and preflight.transient(key,m):
+                                if m.st_size>self.l['state_bytes']-total:raise ValueError('state inventory byte bound')
+                                total+=m.st_size
+                                continue
                             sampled=capture.entry(key,m) if capture else False
                             if stat.S_ISDIR(m.st_mode):
                                 nodes[key]=full(m);pending.append(key);continue
@@ -1544,7 +1706,9 @@ class Host:
                                 command_file=len(Path(key).parts)==2 and key.startswith('commands/') and key.endswith('.json')
                                 opened=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=current)
                                 try:
-                                    if full(os.fstat(opened))!=full(m):raise ValueError('state file changed before read')
+                                    if preflight is not None:m=preflight.opened(key,m,os.fstat(opened))
+                                    elif full(os.fstat(opened))!=full(m):raise ValueError('state file changed before read')
+                                    if m.st_size>self.l['state_bytes']-total:raise ValueError('state inventory byte bound')
                                     with os.fdopen(opened,'rb',closefd=False) as stream:
                                         if command_file or sampled:
                                             # Keep original command bytes for the conditional
@@ -1934,15 +2098,39 @@ class Host:
         self.after=phase=='inspect'
         self.compatibility();_,self._verified_manifest=c.verify_package(self.p,self.h,self.s)
         if phase=='preflight':
+            size=None;inventory=None
+            def worker_inventory(active=False):
+                self.clean()
+                sample=ActiveWorkerSample(self) if active else None
+                if sample is None:
+                    state=self.state_files();cleanup=self.cleanup_snapshot(state);proof={}
+                else:
+                    state=self._state_files(preflight=sample)
+                    # Cleanup semantics consume the same descriptor bytes, never
+                    # a later atomic replacement of the sampled record.
+                    self._worker_capture=sample
+                    try:cleanup=self.cleanup_snapshot(state)
+                    finally:del self._worker_capture
+                    proof=sample.finish(state)
+                self.clean()
+                return {'sha256':c.digest(c.canonical(state)),'rows':len(state),'stats':self.inventory_stats,
+                        'cleanup_records':len(cleanup),'clean':True,'owned_snapshot':False,**proof}
             if 'stopped_predecessor' in self.h:
-                with self.owner():row=self.check_stopped_predecessor()
-            else:row=self.check_running(False)
-            size=self.state_size() if self.h['role']=='worker' else None
-            inventory=None
-            if self.h['role']=='worker':
-                self.clean();state=self.state_files();cleanup=self.cleanup_snapshot(state)
-                inventory={'sha256':c.digest(c.canonical(state)),'rows':len(state),'stats':self.inventory_stats,
-                           'cleanup_records':len(cleanup),'clean':True,'owned_snapshot':False}
+                with self.owner():
+                    row=self.check_stopped_predecessor()
+                    size=self.state_size();inventory=worker_inventory()
+                    if self.stopped()!=row:raise ValueError('stopped predecessor service raced')
+            else:
+                row=self.check_running(False)
+                if self.h['role']=='worker':
+                    files=getattr(self,'_verified_before_manifest',{}).get('source',{}).get('files',{})
+                    active=all(isinstance(files.get(n),dict) and files[n].get('sha256')==sha
+                               for n,sha in _ACTIVE_PREFLIGHT_WRITERS.items())
+                    if not active:size=self.state_size()
+                    inventory=worker_inventory(active)
+                    if active:size={**self.inventory_stats,'content_hashed':inventory['temporary_targets_observed']==0,'owned_snapshot':False,
+                                    'simultaneous_snapshot':False}
+                    if self.check_running(False)!=row:raise ValueError('preflight service changed during sample')
             tasks=self.tasks() if self.h['role']=='controller' else None
             return {'service':row,'tasks':tasks,'metadata':self.metadata(),'formats':self.p['formats']['before'],'state_size':size,'worker_inventory':inventory}
         if phase=='stop':
