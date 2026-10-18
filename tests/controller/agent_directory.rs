@@ -570,6 +570,8 @@ async fn bound_agent_directory_filters_before_paging_and_exposes_no_lifecycle_mu
     let directory_before = agents(&c, None, 10).await;
     let task_before = get(&c, &t.id).await;
     let new_definition = native("directory-mcp-forbidden-new").definition;
+    assert!(matches!(t.input.definition.execution_profile.as_ref(),
+        Some(ExecutionProfile::CollaborationV1 { .. })));
     let catalogue = mcp::catalogue_for_profile(c.limits(), t.input.definition.execution_profile.as_ref());
     for (tool, arguments) in [
         ("collab_agent_register", json!({"definition":new_definition})),
@@ -579,7 +581,7 @@ async fn bound_agent_directory_filters_before_paging_and_exposes_no_lifecycle_mu
         let refused = directory_reply(&c, invoke(&format!("directory-forbidden-{tool}"), tool, arguments)).await;
         assert_eq!(code(refused.outcome.clone()), "invalid_input");
         assert!(matches!(&refused.outcome, Outcome::Refused { message, .. }
-            if message == "tool is outside the collaboration catalogue"));
+            if message == "identity/task tools require V2"));
         assert_eq!(agents(&c, None, 10).await, directory_before);
         assert_eq!(get(&c, &t.id).await, task_before);
     }

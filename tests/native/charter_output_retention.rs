@@ -53,6 +53,7 @@ async fn scenario(restart:bool){
     // Match the explicit accepted original response bound; the global scanner
     // remains mandatory through original output upload and restart.
     l.worker.credential_scan_units=l.execution.native.response_wire_bytes.checked_add(25*l.execution.native.json_nodes).unwrap();
+    configure_native_schema(l);
     let accepted_native=l.execution.native.clone();
     if restart {
         // The exact accepted definition override is larger than the global
