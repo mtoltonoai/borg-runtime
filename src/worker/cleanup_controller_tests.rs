@@ -49,9 +49,6 @@ impl Lab {
             std::process::id(), process::now_ms(), NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir(&root).unwrap();
         let state = root.join("state");
-        for name in ["commands", "outbox", "processes", "publications", "codex"] {
-            process::private_directory(&state.join(name)).unwrap();
-        }
         let seed = root.join("seed");std::fs::create_dir(&seed).unwrap();
         git_fixture(&seed, &["init", "--quiet"]);
         std::fs::write(seed.join("source.txt"), "durable source\n").unwrap();
@@ -78,6 +75,10 @@ impl Lab {
             operation_timeout_ms: 30_000, retry_delay_ms: 1, record_bytes: 1_048_576,
         }});
         metadata.validate().unwrap();let metadata = Arc::new(metadata);
+        handoff::initialize_state(&state, &metadata.worker).unwrap();
+        for name in ["commands", "outbox", "processes", "publications", "codex"] {
+            process::private_directory(&state.join(name)).unwrap();
+        }
         let controller = Controller::open_with_config(root.join("controller.sqlite"), ControllerConfig {
             limits: metadata.clone(), ..ControllerConfig::default()
         }).unwrap();
