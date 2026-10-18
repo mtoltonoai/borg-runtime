@@ -311,15 +311,38 @@ _ACTIVE_PREFLIGHT_WRITERS = {
 }
 
 
+# Installed 0516 has the same atomic process/mutation writers. Its cleanup and
+# caller source changed; admit that exact predecessor family independently of
+# the newer candidate. This remains a live sample, never stopped preservation.
+_ACTIVE_PREFLIGHT_CURRENT_FORMATS = {'wire': 24, 'controller_schema': 25, 'worker_format': 19}
+_ACTIVE_PREFLIGHT_CURRENT_WRITERS = {
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+    'src/worker/mutations.rs': 'e510c3020ca1476ac3d2bda9762b2cee11d2f29d1ac552472d9218b9237e0553',
+    'src/worker/cleanup.rs': '4b0e33c95ae3f0d1c37a4a8f6af8dab9838ec7661c162824d7983b857242d3ea',
+    'src/worker/mod.rs': 'bced916dd3dbb0572f4955d0f65641f491b90ab80cf2ac84f76d89fe68da621a',
+}
+
+
+def active_preflight_writers(host):
+    files = getattr(host, '_verified_before_manifest', {}).get('source', {}).get('files', {})
+    families = [_ACTIVE_PREFLIGHT_WRITERS]
+    if _same(c, host.p.get('formats', {}).get('before'), _ACTIVE_PREFLIGHT_CURRENT_FORMATS):
+        families.append(_ACTIVE_PREFLIGHT_CURRENT_WRITERS)
+    for family in families:
+        if all(isinstance(files.get(name), dict) and files[name].get('sha256') == sha
+               for name, sha in family.items()):
+            return family
+    return None
+
+
 class ActiveWorkerSample:
     """Bounded pre-stop observations; never a stopped preservation baseline."""
     slots = frozenset(('mutations/registration.json', 'mutations/await.json'))
 
     def __init__(self, host):
         self.host = host
-        files = getattr(host, '_verified_before_manifest', {}).get('source', {}).get('files', {})
-        if not all(isinstance(files.get(name), dict) and files[name].get('sha256') == sha
-                   for name, sha in _ACTIVE_PREFLIGHT_WRITERS.items()):
+        self.writer_sources = active_preflight_writers(host)
+        if self.writer_sources is None:
             raise ValueError('active sample installed writer differs')
         policy = host.cleanup_policy()
         if policy is None:
@@ -446,7 +469,7 @@ class ActiveWorkerSample:
                 'vanished_temporary_reserved_bytes': self.vanished_reserved_bytes,
                 'directory_time_changes': self.directory_changes,
                 'atomic_path_replacements': self.replacements,
-                'installed_writer_sources': _ACTIVE_PREFLIGHT_WRITERS}
+                'installed_writer_sources': self.writer_sources}
 
 
 class WorkerStateCapture:
@@ -2504,9 +2527,7 @@ class Host:
             else:
                 row=self.check_running(False)
                 if self.h['role']=='worker':
-                    files=getattr(self,'_verified_before_manifest',{}).get('source',{}).get('files',{})
-                    active=all(isinstance(files.get(n),dict) and files[n].get('sha256')==sha
-                               for n,sha in _ACTIVE_PREFLIGHT_WRITERS.items())
+                    active=active_preflight_writers(self) is not None
                     if not active:size=self.state_size()
                     inventory=worker_inventory(active)
                     if active:size={**self.inventory_stats,'content_hashed':inventory['temporary_targets_observed']==0,'owned_snapshot':False,
