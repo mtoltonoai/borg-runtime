@@ -2121,7 +2121,13 @@ mod tests {
             let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &metadata.worker).unwrap();
             let reason = if coding { crate::worker::coding_collaboration_closed(&config, input, attempt, &state).unwrap_err() }
                 else { finish_state_upgrade(&state, &metadata, &lease).unwrap_err() };
-            assert!(reason.contains("pending_assignment") && reason.contains("worker18"), "{reason}");
+            // Both composed readers use the shared typed-outcome guard. The
+            // original worker17 marker still refuses this worker18 carrier.
+            assert_eq!(reason, if coding {
+                "retained Coding outcome requires its original worker marker"
+            } else {
+                "retained native outcome requires its original worker marker"
+            });
             assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
             assert!(!state.join("format.pending").exists());
             for (path, bytes) in &originals { assert_eq!(&std::fs::read(path).unwrap(), bytes); }
