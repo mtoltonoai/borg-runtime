@@ -826,6 +826,7 @@ async fn bounded_cleanup_progress_does_not_block_control_or_require_new_work() {
 }
 async fn read_cleanup_without_new_work() {
     let lab=Lab::open("read-release").await;
+    let _scheduler=Scheduler::open(&lab.config,&lab.state).unwrap();
     let _plugins=checkout_plugins(&lab);
     let home=codex::state_path(&lab.state.join("codex"),&lab.attempt.id);
     let actor=collaboration_caller(&lab.attempt);
