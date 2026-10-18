@@ -567,6 +567,8 @@ async fn lazy_legacy_queue_still_refuses_full_and_releases_capacity_on_dequeue()
 //# An accepted task MUST retain its resolved execution-limit values.
 #[tokio::test]
 async fn maximum_session_profile_small_progress_result_and_restart_remain_durable() {
+    use crate::charter::*;
+
     Box::pin(async {
         let selected = RuntimeLimits::parse(include_bytes!(
             "../../tests/fixtures/maximum-session-controller-metadata-04.json"
@@ -578,6 +580,21 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
         let mut input = coding(&selected, "maximum-profile-native");
         input.definition.executor = ExecutorKind::Native;
+        // The selected maximum profile enables charter policy. Supply its
+        // original source rather than changing the policy to admit this fixture.
+        input.definition.charter = Some(DefinitionCharter::Inline {
+            source: CharterSource {
+                files: vec![CharterFile {
+                    file: "charter.md".into(),
+                    text: "# Purpose\n\nThe agent MUST preserve accepted metadata.\n".into(),
+                }],
+                clauses: vec![CharterClauseRef {
+                    file: "charter.md".into(),
+                    section: "Purpose".into(),
+                    sentence: "The agent MUST preserve accepted metadata.".into(),
+                }],
+            },
+        });
         input.repository = None;
         input.output_schema = Some(serde_json::json!({"type":"object","required":["answer"],
             "properties":{"answer":{"type":"integer"}},"additionalProperties":false}));
@@ -613,6 +630,29 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         task(&command(&c, report(crate::native_loop_contract::reservation_id(&a.id,1), Observation::Usage {
             model_requests:1, input_tokens:Some(4), output_tokens:Some(2), native_diagnostic_reserved:true
         })).await);
+        let binding = match command(&c, Operation::QueryCharter {
+            query: CharterQuery::Session { session_id: a.session_id.clone() },
+        }).await.outcome {
+            Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Session(Some(value))) } => value,
+            other => panic!("expected accepted charter binding: {other:?}"),
+        };
+        let caller = crate::mcp::Caller {
+            task_id: a.task_id.clone(), attempt_id: a.id.clone(), generation: a.generation,
+            worker_id: a.worker_id.clone(), incarnation: a.worker_incarnation.clone(),
+        };
+        let charter = |id: &str, observation| Operation::ObserveCharter {
+            operation_id: id.into(), caller: caller.clone(), observation,
+        };
+        let begin = charter("maximum-profile-charter-begin", CharterObservation::BeginTurn {
+            session_id: a.session_id.clone(), expected_revision: binding.session.revision,
+            request_index: 1,
+        });
+        let begun = command(&c, begin.clone()).await;
+        let boundary = match &begun.outcome {
+            Outcome::Ok { data: Data::Charter(CharterOutcome::Boundary(value)) } => value.clone(),
+            other => panic!("expected original charter boundary: {other:?}"),
+        };
+        assert_eq!(boundary.effective, binding.charter);
         let diagnostic = command(&c, report(crate::native_loop_contract::diagnostic_id(&a.id,1), Observation::NativeRequestDiagnostic {
             request_index:1, endpoint:"https://api.openai.com/v1/responses".into(),
             model:initial.input.definition.required_inference().unwrap().model.clone(),
@@ -621,6 +661,36 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
             observed_outcome:crate::native_loop_contract::NativeRequestObservedOutcome::Completed, failure:None
         })).await;
         assert!(matches!(diagnostic.outcome, Outcome::Ok { data:Data::Acknowledged }), "{diagnostic:?}");
+        // These controlled native observations retain the same original request
+        // and no-tool reply required by ordinary completion under charter policy.
+        let reply = charter("maximum-profile-charter-reply", CharterObservation::Reply {
+            turn_id: boundary.turn_id.clone(),
+            reply: CharterReplyObservation {
+                output: Some(serde_json::json!([{"id":"maximum-profile-output","type":"message",
+                    "content":[{"type":"output_text","text":"{\"answer\":42}"}]}])),
+                output_reference: None,
+                response_id: Some("maximum-profile-controlled-response".into()),
+                output_item_ids: vec!["maximum-profile-output".into()],
+                tool_call_ids: vec![],
+                declaration: Some(serde_json::to_value(DeclaredCharterReferences {
+                    revision: boundary.effective.reference.clone(),
+                    clauses: boundary.effective.source.clauses.clone(),
+                }).unwrap()),
+            },
+        });
+        let replied = command(&c, reply.clone()).await;
+        match &replied.outcome {
+            Outcome::Ok { data: Data::Charter(CharterOutcome::Reply(value)) } =>
+                assert!(value.audit.findings.is_empty()),
+            other => panic!("expected retained charter reply: {other:?}"),
+        }
+        let close = charter("maximum-profile-charter-close", CharterObservation::CompleteTurn {
+            turn_id: boundary.turn_id.clone(), results: vec![],
+        });
+        let closed = command(&c, close.clone()).await;
+        assert!(matches!(&closed.outcome, Outcome::Ok {
+            data: Data::Charter(CharterOutcome::Turn(value))
+        } if value.completed_by.as_deref() == Some("maximum-profile-charter-close")), "{closed:?}");
         task(&command(&c, report(crate::native_loop_contract::completion_id(&a.id), Observation::NativeLoopCompleted {
             model_requests:1, calls:vec![], requests:vec![], final_response_index:None
         })).await);
@@ -643,7 +713,8 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         controller_owner_released(&p).await;
         let c = Controller::open_with_config(&p, cfg).unwrap();
         assert_eq!(task(&command(&c, Operation::GetTask { task_id:accepted.id.clone() }).await), accepted);
-        for (operation, original) in [(submit, submitted), (result_operation, result_reply)] {
+        for (operation, original) in [(submit, submitted), (begin, begun), (reply, replied),
+            (close, closed), (result_operation, result_reply)] {
             let replay = command(&c, operation).await;
             assert_eq!(replay.outcome, original.outcome);
             assert_eq!(replay.commit, original.commit);

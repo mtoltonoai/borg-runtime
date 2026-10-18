@@ -1541,6 +1541,8 @@ async fn maximum_queue_metadata_boots_and_delivers_a_single_original_call() {
 //# A component MUST validate its configured limits before admitting work governed by those limits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maximum_session_profile_coding_bridge_retains_exact_original_tool_result() {
+    use borg_runtime::charter::{CharterClauseRef, CharterFile, CharterSource, DefinitionCharter};
+
     Box::pin(async {
         let selected = RuntimeLimits::parse(include_bytes!(
             "fixtures/maximum-session-controller-metadata-04.json"
@@ -1552,6 +1554,21 @@ async fn maximum_session_profile_coding_bridge_retains_exact_original_tool_resul
         assert_eq!(*lab.limits, selected);
         let mut input = lab.input(selected.execution.collaboration.complete_result_bytes);
         input.definition.limit_overrides = None;
+        // Exercise the enabled charter policy in the selected profile without
+        // changing the historical charter-free helpers used by other cases.
+        input.definition.charter = Some(DefinitionCharter::Inline {
+            source: CharterSource {
+                files: vec![CharterFile {
+                    file: "charter.md".into(),
+                    text: "# Purpose\n\nThe agent MUST preserve accepted metadata.\n".into(),
+                }],
+                clauses: vec![CharterClauseRef {
+                    file: "charter.md".into(),
+                    section: "Purpose".into(),
+                    sentence: "The agent MUST preserve accepted metadata.".into(),
+                }],
+            },
+        });
         let accepted = lab.start(input, "maximum-profile").await;
         let snapshot = accepted.input.resolved_limits.as_ref().unwrap();
         assert_eq!(*snapshot.global_metadata, selected);
