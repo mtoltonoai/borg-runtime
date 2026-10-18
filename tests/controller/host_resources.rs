@@ -23,11 +23,18 @@ fn sample(index:usize,sequence:u64)->Sample {
         memory:Metric::Available{value:MemoryUsage{used_bytes:3072,total_bytes:4096,available_bytes:1024}},
         filesystems:vec![Filesystem{scope_labels:m.storage_labels.clone(),space:Metric::Available{value:DiskUsage{used_bytes:286720,total_bytes:409600,free_bytes:122880,available_bytes:81920}}}]}
 }
-async fn exchange(c:&Controller,operation:Operation)->Reply {
-    let reply=c.handle(Request {protocol_revision:WIRE_REVISION,request_id:"host-resources-test".into(),command:operation.clone()}).await;
-    reply.validate_for(&operation).unwrap();reply
+// Match the executor's existing boxed_execution seam: construct large nested
+// futures outside the caller's polling frame without increasing its stack.
+#[inline(never)]
+fn boxed_execution<F,Fut>(make:F)->std::pin::Pin<Box<Fut>>
+where F:FnOnce()->Fut,Fut:std::future::Future {Box::pin(make())}
+fn exchange(c:&Controller,operation:Operation)->impl std::future::Future<Output=Reply>+'_ {
+    boxed_execution(move||async move {
+        let reply=boxed_execution(||c.handle(Request {protocol_revision:WIRE_REVISION,request_id:"host-resources-test".into(),command:operation.clone()})).await;
+        reply.validate_for(&operation).unwrap();reply
+    })
 }
-async fn send(c:&Controller,sample:Sample)->Reply {exchange(c,Operation::ReportMachineResources{sample}).await}
+fn send(c:&Controller,sample:Sample)->impl std::future::Future<Output=Reply>+'_ {exchange(c,Operation::ReportMachineResources{sample})}
 async fn view(c:&Controller,index:usize)->View {
     match exchange(c,Operation::QueryCollaboration{query:Query::Machine{machine_id:profile().machines[index].machine_id.clone()}}).await.outcome {
         Outcome::Ok{data:Data::Collaboration(QueryResult::Machine(v))}=>v,other=>panic!("{other:?}"),
@@ -78,7 +85,7 @@ async fn host_resources_latest_identity_ordering_and_receipt_budget() {
     for sequence in 2..=128 {successor.sequence=sequence;assert!(matches!(send(&c,successor.clone()).await.outcome,Outcome::Ok{..}));}
     assert_eq!(view(&c,1).await.sample.unwrap().sequence,128);
     assert_eq!(snapshot(&c).await,before,"telemetry must not churn task receipts/revisions/history even when saturated");
-    let old=c.handle(Request{protocol_revision:23,request_id:"old-wire".into(),command:Operation::ReportMachineResources{sample:sample(0,1)}}).await;
+    let old=boxed_execution(||c.handle(Request{protocol_revision:23,request_id:"old-wire".into(),command:Operation::ReportMachineResources{sample:sample(0,1)}})).await;
     assert_eq!(code(old.outcome),"unsupported_version");assert_eq!(view(&c,0).await.freshness,Freshness::Unobserved);
     drop(c);controller_owner_released(&p).await;
     let sql=Connection::open(&p).unwrap();
