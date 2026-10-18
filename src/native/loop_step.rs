@@ -3169,6 +3169,10 @@ mod shape_diagnostic_tests {
 }
 
 #[cfg(test)]
+#[path = "activation_admission_tests.rs"]
+mod activation_admission_tests;
+
+#[cfg(test)]
 mod provider_schema_tests {
     use super::*;
 
