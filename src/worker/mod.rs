@@ -103,8 +103,11 @@ struct Reporter {
     outbox_lock: Arc<tokio::sync::Mutex<()>>,
 }
 impl Reporter {
+    // Keep nested report futures off each caller polling frame. The separate
+    // constructor also avoids an unboxed temporary on that stack in debug builds.
+    // Each method remains async so retention and sequencing still begin on poll.
     async fn send(&self, observation: Observation) -> Result<(), String> {
-        self.send_acknowledged(observation).await.map(|_| ())
+        boxed_execution(|| self.send_acknowledged(observation)).await.map(|_| ())
     }
     async fn send_acknowledged(&self, observation: Observation) -> Result<bool, String> {
         let report_id = format!(
@@ -112,7 +115,7 @@ impl Reporter {
             self.attempt.id,
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
-        self.send_identified(report_id, observation).await
+        boxed_execution(|| self.send_identified(report_id, observation)).await
     }
     async fn send_identified(
         &self,
@@ -120,7 +123,7 @@ impl Reporter {
         observation: Observation,
     ) -> Result<bool, String> {
         let credentials = configured_credentials(&self.config.limits)?;
-        self.send_identified_with_credentials(report_id, observation, &credentials)
+        boxed_execution(|| self.send_identified_with_credentials(report_id, observation, &credentials))
             .await
     }
     async fn supplied_outer(&self,id:String,observation:crate::supplied_outer::Observation,control:&Control)
@@ -132,17 +135,17 @@ impl Reporter {
         let original=self.retain_identified_with_credentials(id,Observation::SuppliedOuter{observation:observation.clone()},&credentials)?;
         let intended=Operation::ObserveWorker{report:original.clone()};
         let mut stopped=control.clone();
-        let operation=async {
+        let operation=boxed_execution(|| async {
             loop {
                 control.check()?;
-                match acceptance::lookup_required(&self.client,&original.report_id,&intended).await? {
+                match boxed_execution(|| acceptance::lookup_required(&self.client,&original.report_id,&intended)).await? {
                     acceptance::Lookup::Recorded(Outcome::Ok{data:Data::SuppliedOuterWait(wait)},_) if observation.phase()=="wait" && wait.index==observation.index()=>return Ok(Some(wait)),
                     acceptance::Lookup::Recorded(Outcome::Ok{data:Data::Task(task)},_) if observation.phase()!="wait"
                         && task.id==self.attempt.task_id && task.attempt.as_ref().is_some_and(|a|a.id==self.attempt.id&&a.generation==self.attempt.generation)=>{
                         if observation.phase()=="dispatch" {
                             // A replayed admission is original history. It is
                             // insufficient alone to launch under changed state.
-                            let current=controller_call(&self.client,Operation::GetTask{task_id:self.attempt.task_id.clone()},control).await?;
+                            let current=boxed_execution(|| controller_call(&self.client,Operation::GetTask{task_id:self.attempt.task_id.clone()},control)).await?;
                             let Data::Task(current)=current else{return Err("supplied currentness unavailable".into())};
                             if current.status!=TaskStatus::Active || current.pending_assignment.is_some()
                                 || current.waiting_child_id.is_some() || current.session_id!=self.attempt.session_id
@@ -157,14 +160,14 @@ impl Reporter {
                     },
                     acceptance::Lookup::Recorded(_,_)=>return Err("supplied outer original phase refused or mismatched; no dispatch".into()),
                     acceptance::Lookup::Absent=>{
-                        let (_,saved)=self.send_identified_retained(original.report_id.clone(),original.observation.clone(),&credentials).await?;
+                        let (_,saved)=boxed_execution(|| self.send_identified_retained(original.report_id.clone(),original.observation.clone(),&credentials)).await?;
                         if saved!=original{return Err("supplied original normalization changed".into());}
                     },
                     acceptance::Lookup::Unavailable=>{},
                 }
                 tokio::time::sleep(Duration::from_millis(control.runtime_limits.execution.collaboration.lookup_backoff_ms)).await;
             }
-        };
+        });
         tokio::select!{biased;_=stopped.stopped()=>Err("supplied outer original receipt unresolved after cancellation or deadline".into()),result=operation=>result,}
     }
     // Private seam lets tests use synthetic credentials without mutating process
@@ -175,7 +178,7 @@ impl Reporter {
         observation: Observation,
         credentials: &[String],
     ) -> Result<bool, String> {
-        self.send_identified_retained(report_id, observation, credentials).await.map(|(acknowledged, _)| acknowledged)
+        boxed_execution(|| self.send_identified_retained(report_id, observation, credentials)).await.map(|(acknowledged, _)| acknowledged)
     }
     // Keep the exact normalized original for required-report reconciliation,
     // including when the concurrent ordinary outbox removes an acknowledged file.
@@ -188,7 +191,7 @@ impl Reporter {
             return Ok((false, report));
         }
         let _lock = self.outbox_lock.lock().await;
-        flush_outbox_with_credentials(&self.client, &self.outbox, credentials).await?;
+        boxed_execution(|| flush_outbox_with_credentials(&self.client, &self.outbox, credentials)).await?;
         let acknowledged = !path.exists() && !path.with_extension("refused").exists();
         // Transport loss leaves the same local outbox record for replay.
         Ok((acknowledged, report))
@@ -1712,7 +1715,7 @@ async fn coding(
             event=received.recv()=>match event {
                 Some(codex::Event::SuppliedOuter{observation,acknowledged})=>{
                     let id=crate::supplied_outer::id(&attempt.id,observation.index(),observation.phase());
-                    let committed=reporter.supplied_outer(id,observation,&control).await;
+                    let committed=boxed_execution(|| reporter.supplied_outer(id,observation,&control)).await;
                     let _=acknowledged.send(committed);
                 },
                 Some(codex::Event::Started{thread_id,turn_id})=>reporter.send(Observation::Started{thread_id:Some(thread_id),turn_id:Some(turn_id)}).await?,
