@@ -192,6 +192,44 @@ def recovered_fixture(*args,**kwargs):
 class RecoveredCharterJournalTests(CharterJournalTests):
     fixture=staticmethod(recovered_fixture)
 
+    def test_selected20_journal_subset_matches_current_sources_and_refuses_drift(self):
+        # Authenticate the secondary journal subset independently of the fixture
+        # helper and of the larger family, so a stale subset cannot be masked.
+        required = hostmod._RECOVERED_CHARTER_JOURNAL_SOURCES
+        self.assertEqual(set(required), {'src/worker/charter.rs',
+            'src/worker/charter_output.rs', 'src/worker/mutations.rs', 'src/worker/process.rs'})
+        self.assertEqual(hostmod._RECOVERED_CODEX_HOME_FORMATS,
+                         {'wire': 25, 'controller_schema': 26, 'worker_format': 20})
+        root = Path(hostmod.__file__).resolve().parents[1]
+        for name, expected in required.items():
+            with self.subTest(source=name):
+                self.assertEqual(expected, hostmod._RECOVERED_CODEX_HOME_SOURCES[name])
+                self.assertEqual(C.digest((root / name).read_bytes()), expected)
+            for changed in (None, '0' * 64):
+                with self.subTest(source=name, pin=changed), self.fixture('supplied_reply') as f:
+                    journal, value = original_journal(f, 'supplied_reply')
+                    baseline(f, journal, value); replace_journal(f, journal)
+                    self.assertTrue(f.host.selected_writer_sources(required))
+                    selected = f.host._verified_manifest['source']['files']
+                    if changed is None:
+                        del selected[name]
+                    else:
+                        selected[name]['sha256'] = changed
+                    self.assertFalse(f.host.selected_writer_sources(required))
+                    with self.assertRaisesRegex(ValueError, 'original_worker_history_changed'):
+                        f.history()
+        # A complete current family cannot be substituted with its historical
+        # charter-output producer, even when every other selected pin is exact.
+        with self.fixture('supplied_reply') as f:
+            journal, value = original_journal(f, 'supplied_reply')
+            baseline(f, journal, value); replace_journal(f, journal)
+            selected = f.host._verified_manifest['source']['files']
+            selected['src/worker/charter_output.rs']['sha256'] = (
+                hostmod._CHARTER_JOURNAL_SOURCES['src/worker/charter_output.rs'])
+            self.assertFalse(f.host.selected_writer_sources(required))
+            with self.assertRaisesRegex(ValueError, 'original_worker_history_changed'):
+                f.history()
+
     def test_selected20_journal_proof_retains_original_caller_and_selected_sources(self):
         with self.fixture('supplied_reply') as f:
             name,value=original_journal(f,'supplied_reply')

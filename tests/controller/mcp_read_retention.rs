@@ -169,7 +169,7 @@ async fn immutable_reference_keeps_actual_resolved_source() {
     let recovered=mcp::recovered(&call,lookup(&f.c,&call).await).unwrap();
     assert_eq!(recovered.reply.outcome,original.outcome);assert_eq!(recovered.reply.commit,original.commit);
     evidence.verify(&call,&recovered.reply.outcome).unwrap();
-    let reference=ReadReference::new(&call,&mcp::result(&call,original.clone()).unwrap()).unwrap();
+    let reference=borg_runtime::read_retention::ReadReference::new(&call,&mcp::result(&call,original.clone()).unwrap()).unwrap();
     let mut changed_commit=recovered.clone();
     changed_commit.reply.commit.as_mut().unwrap().controller_revision+=1;
     assert!(reference.restore(&call,changed_commit).is_err(),"original commit revision cannot change during reconstruction");

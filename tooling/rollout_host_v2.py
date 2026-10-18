@@ -1519,7 +1519,7 @@ _CHARTER_JOURNAL_SOURCES = {**_CHARTER_MANIFEST_SOURCES,
 
 _RECOVERED_CHARTER_JOURNAL_SOURCES = {
     'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
-    'src/worker/charter_output.rs': '77ee76cbb97a69fdd08b510ff3b9404afc64caa02a9fd6db350eba7a4403635b',
+    'src/worker/charter_output.rs': 'b4231b3e24e7933a1e142a187bf6f07ff6d316889aaf2b14354bec2d6fef1900',
     'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
     'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
 }

@@ -138,8 +138,10 @@ class RetainedHoldTests(NoExternalEffects):
                     current,preserved,observed=x.observe()
                 self.assertEqual(preserved[x.f.command],x.before[x.f.command])
                 row=observed[x.f.name]
-                self.assertEqual(set(row),{'last_observed_ms_before','last_observed_ms_after',
+                self.assertEqual(set(row),{'original','observed','last_observed_ms_before','last_observed_ms_after',
                     'next_due_ms_before','next_due_ms_after','unchanged_record_sha256'})
+                self.assertEqual(row['original'],x.before[x.f.name])
+                self.assertEqual(row['observed'],current[x.f.name])
                 self.assertEqual(row['last_observed_ms_before'],original['last_observed_ms'])
                 self.assertEqual(row['next_due_ms_after'],x.observed['last_observed_ms']+original['policy']['retry_delay_ms'])
                 self.assertEqual(x.hook.proof()['records'],0)
