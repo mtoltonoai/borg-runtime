@@ -1580,7 +1580,7 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                         return Err("unsupported MCP version".into());
                     }
                     (
-                        json!({"protocolVersion":mcp::VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"borg-collaboration-bridge","version":"1"}}),
+                        Some(json!({"protocolVersion":mcp::VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"borg-collaboration-bridge","version":"1"}})),
                         None,
                     )
                 }
@@ -1591,7 +1591,7 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                         .filter(|t| t.name != "collab_task_delegate"
                             && bridge.config.catalogue().iter().any(|selected|selected.name==t.name))
                         .collect::<Vec<_>>();
-                    (json!({"tools":tools}), None)
+                    (Some(json!({"tools":tools})), None)
                 }
                 "tools/call" => {
                     #[derive(Deserialize)]
@@ -1604,12 +1604,23 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                     }
                     let call: Call = serde_json::from_value(params)
                         .map_err(|_| "invalid MCP tool parameters")?;
-                    runtime.block_on(bridge.invoke_for_stdio(&call.name, call.arguments, &call.meta))?
+                    let (body, delivered) = runtime.block_on(
+                        bridge.invoke_for_stdio(&call.name, call.arguments, &call.meta),
+                    )?;
+                    (Some(body), delivered)
                 }
-                "ping" => (json!({}), None),
-                _ => return Err("unsupported MCP method".into()),
+                "ping" => (Some(json!({})), None),
+                // A valid request for an unadvertised method is a correlated
+                // protocol error, not an unresolved tool occurrence. Keep the
+                // same bounded flush/ACK path without creating a journal entry.
+                _ => (None, None),
             };
-            let mut response = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":body}))
+            let reply = match body {
+                Some(body) => json!({"jsonrpc":"2.0","id":id,"result":body}),
+                None => json!({"jsonrpc":"2.0","id":id,
+                    "error":{"code":-32601,"message":"Unknown MCP method"}}),
+            };
+            let mut response = serde_json::to_vec(&reply)
                 .map_err(|_| "MCP reply encoding failed")?;
             if response.len() >= frame_bytes {
                 return Err(

@@ -566,6 +566,11 @@ impl Peer {
         id
     }
     async fn receive_rpc(&mut self, id: u64) -> Value {
+        let value = self.receive_frame(id).await;
+        assert!(value.get("error").is_none(), "{value:?}");
+        value["result"].clone()
+    }
+    async fn receive_frame(&mut self, id: u64) -> Value {
         let mut line = Vec::new();
         let n = tokio::time::timeout(WAIT, self.stdout.read_until(b'\n', &mut line))
             .await
@@ -576,9 +581,9 @@ impl Peer {
             "bridge did not return a bounded complete frame"
         );
         let value: Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["id"], id);
-        assert!(value.get("error").is_none(), "{value:?}");
-        value["result"].clone()
+        value
     }
     async fn call(&mut self, logical: &str, tool: &str, args: Value) -> CallResult {
         let body=self.rpc("tools/call",json!({"name":tool,"arguments":args,"_meta":{"callId":logical,"threadId":thread(&self.config.caller.attempt_id),"sessionId":"controlled-session"}})).await;
@@ -1327,4 +1332,97 @@ async fn codex_pending_original_receipt_survives_stop_and_second_worker_selectio
     reopened.close(false).await;
     proxy.owner.stop().await;
     lab.finish(&[later], (2, 1)).await;
+}
+
+// Actual stdio request/response and controller commits; no supplied Codex or
+// provider is launched. Resource discovery must not terminate a tools-only peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_optional_discovery_errors_preserve_bridge_and_original_tool_receipt() {
+    let mut lab = Lab::new("optional-discovery", true).await;
+    let input = lab.input(65_536);
+    let task = lab.start(input, "discovery").await;
+    let pinned = serde_json::to_vec(&task.input).unwrap();
+    let mut proxy = Proxy::start(lab.url.clone(), false).await;
+    let config = lab.config(&task, &proxy.url, "bridge");
+    let mut peer = Peer::start(config.clone()).await;
+    let journal = config.directory().join("calls.json");
+    assert!(!journal.exists(), "initialization must not create an occurrence journal");
+    let first = peer.send_rpc("resources/list", json!({})).await;
+    let second = peer.send_rpc("resources/templates/list", json!({})).await;
+    for id in [first, second] {
+        assert_eq!(peer.receive_frame(id).await,
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Unknown MCP method"}}));
+    }
+    assert!(peer.child.try_wait().unwrap().is_none());
+    assert!(!config.stop_path().exists());
+    assert!(!journal.exists(), "unsupported discovery must not create an occurrence journal");
+    assert!(proxy.calls.lock().unwrap().is_empty());
+    assert_eq!(proxy.lookups.load(Ordering::SeqCst), 0);
+    let args = json!({"key":"optional-discovery","expected_revision":null,"value":"original"});
+    let result = peer.call("original", "collab_memory_set", args.clone()).await;
+    assert!(matches!(result.reply.outcome, Outcome::Ok {..}), "{result:?}");
+    let original = peer.invocation("original");
+    exact_lookup(&lab, &original, &result).await;
+    let committed = std::fs::read(&journal).unwrap();
+    for method in ["resources/list", "resources/templates/list", "unadvertised/fixture"] {
+        let id = peer.send_rpc(method, json!({})).await;
+        assert_eq!(peer.receive_frame(id).await,
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Unknown MCP method"}}));
+        assert_eq!(std::fs::read(&journal).unwrap(), committed);
+        assert!(!config.stop_path().exists());
+    }
+    assert_eq!(peer.call("original", "collab_memory_set", args).await, result);
+    assert_eq!(proxy.calls.lock().unwrap().as_slice(), &[original]);
+    assert_eq!(proxy.lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(serde_json::to_vec(&lab.get(&task.id).await.input).unwrap(), pinned);
+    peer.close(false).await;
+    proxy.owner.stop().await;
+    lab.finish(&[task], (1, 0)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_discovery_response_does_not_mask_invalid_frames_or_cancellation() {
+    let mut lab = Lab::new("discovery-fail-closed", true).await;
+    let input = lab.input(65_536);
+    let task = lab.start(input, "fail-closed").await;
+    let mut proxy = Proxy::start(lab.url.clone(), false).await;
+    for case in ["malformed", "cancelled", "changed-occurrence"] {
+        let config = lab.config(&task, &proxy.url, case);
+        let mut peer = Peer::start(config.clone()).await;
+        let logical = format!("original-{case}");
+        let args = json!({"key":case,"expected_revision":null,"value":"original"});
+        let result = peer.call(&logical, "collab_memory_set", args).await;
+        assert!(matches!(result.reply.outcome, Outcome::Ok {..}), "{result:?}");
+        let id = peer.send_rpc("resources/list", json!({})).await;
+        assert_eq!(peer.receive_frame(id).await["error"]["code"], -32601);
+        let journal = config.directory().join("calls.json");
+        let committed = std::fs::read(&journal).unwrap();
+        let sends = proxy.calls.lock().unwrap().len();
+        let frame = match case {
+            "malformed" => json!({"jsonrpc":"2.0","id":99,"method":"ping","unexpected":true}),
+            "cancelled" => json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}),
+            "changed-occurrence" => json!({"jsonrpc":"2.0","id":99,"method":"tools/call","params":{
+                "name":"collab_memory_set","arguments":{"key":"changed","expected_revision":null,"value":"different"},
+                "_meta":{"callId":logical,"threadId":thread(&config.caller.attempt_id),"sessionId":"controlled-session"}}}),
+            _ => unreachable!(),
+        };
+        let mut bytes = serde_json::to_vec(&frame).unwrap(); bytes.push(b'\n');
+        peer.stdin.as_mut().unwrap().write_all(&bytes).await.unwrap();
+        peer.stdin.as_mut().unwrap().flush().await.unwrap();
+        let pid = peer.child.id().unwrap();
+        // Keep stdin open: termination must follow the rejected frame, not EOF.
+        let status = tokio::time::timeout(WAIT, peer.child.wait()).await.unwrap().unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(std::fs::read(&journal).unwrap(), committed);
+        assert_eq!(proxy.calls.lock().unwrap().len(), sends);
+        let stop: Value = serde_json::from_slice(&std::fs::read(config.stop_path()).unwrap()).unwrap();
+        assert_eq!(stop["caller"], serde_json::to_value(&config.caller).unwrap());
+        peer.closed = true;
+        process::atomic_json(&config.state.join("closed-invalid-request.json"),
+            &json!({"pid":pid,"reaped":true,"code":status.code(),"stdin_held_open":true,
+                "journal_unchanged":true,"no_additional_tool_dispatch":true,"case":case})).unwrap();
+    }
+    assert_eq!(proxy.calls.lock().unwrap().len(), 3);
+    proxy.owner.stop().await;
+    lab.finish(&[task], (1, 0)).await;
 }

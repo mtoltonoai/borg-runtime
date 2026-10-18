@@ -761,6 +761,25 @@ pub(super) fn apply_inner(
     if final_now >= original.task.input.limits.deadline_unix_ms {
         return refuse("deadline", "collaboration caller expired before commit");
     }
+    // Progress acknowledges the canonical mutation without echoing its entire
+    // accepted input/output. Keep its exact task revision and changed bit; the
+    // outer response bound and original receipt transaction still apply.
+    //= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+    //# The collaboration tool interface MUST use the controller's canonical operation layer.
+    let result = match (call.tool.as_str(), result) {
+        ("collab_task_progress", (Data::Task(task), changed)) => (
+            Data::CollaborationPage(ListPage {
+                items: vec![json!({
+                    "task_id": task.id,
+                    "session_id": task.session_id,
+                    "revision": task.revision,
+                })],
+                next_cursor: None,
+            }),
+            changed,
+        ),
+        (_, result) => result,
+    };
     safe(limits, result)
 }
 fn bounded(limits: &crate::limits::RuntimeLimits, value: (Data, bool)) -> Result<(Data, bool)> {

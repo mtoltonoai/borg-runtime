@@ -261,7 +261,7 @@
   },
   {
     "name": "collab_task_progress",
-    "description": "Committed task revision; reported progress only, never completion/acceptance",
+    "description": "Committed progress acknowledgment: one collaboration_page item with task_id, session_id and revision; next_cursor is null. Reported progress only, never completion/acceptance",
     "inputSchema": {
       "type": "object",
       "properties": {

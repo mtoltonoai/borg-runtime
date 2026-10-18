@@ -729,7 +729,18 @@ async fn accepted_new_calls_keep_memory_progress_and_page_policy_after_global_ch
             json!({"text":"x".repeat(2048)}));
         let observed = invoke(&c, &progress).await;
         if accepted_large {
-            assert!(matches!(observed.outcome, Outcome::Ok { data: Data::Task(_) }));
+            let current = get(&c, &t.id).await;
+            assert_eq!(current.progress, "x".repeat(2048));
+            assert_eq!(observed.outcome, Outcome::Ok {
+                data: Data::CollaborationPage(mcp::ListPage {
+                    items: vec![json!({
+                        "task_id": current.id,
+                        "session_id": current.session_id,
+                        "revision": current.revision,
+                    })],
+                    next_cursor: None,
+                }),
+            });
         } else {
             assert_eq!(code(observed.outcome.clone()), "capacity");
             assert!(matches!(&observed.outcome, Outcome::Refused { message, .. } if message.contains("controller.max_progress_bytes")));
@@ -1109,3 +1120,6 @@ include!("definition_updates.rs");
 
 #[path = "mcp_read_retention.rs"]
 mod read_retention;
+
+#[path = "mcp_task_progress.rs"]
+mod task_progress;
