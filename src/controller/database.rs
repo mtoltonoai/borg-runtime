@@ -7,6 +7,7 @@ use std::{path::Path, time::Duration};
 /// A borrowed SQL view carrying the exact selected metadata. No second store,
 /// global defaults, reload, or mutable policy copy is introduced.
 pub(crate) struct StoreContext<'a> {
+    pub(super) machine_resources: Option<&'a super::machine_resources::State>,
     sql: &'a SqlConnection,
     pub(super) bound_actor: Option<crate::collaboration::workflow::RecordedActor>,
     pub limits: &'a crate::limits::RuntimeLimits,
@@ -22,7 +23,7 @@ pub(crate) struct StoreContext<'a> {
 }
 impl<'a> StoreContext<'a> {
     pub fn new(sql: &'a SqlConnection, limits: &'a crate::limits::RuntimeLimits) -> Self {
-        Self { sql, limits, bound_actor: None, invocation_path: crate::collaboration::workflow::TrustedHostPath::OperatorApi,
+        Self { sql, limits, bound_actor: None, machine_resources: None, invocation_path: crate::collaboration::workflow::TrustedHostPath::OperatorApi,
             workflow_policy: limits.workflow.as_ref(),
             workflow_terminals: super::collaboration_finalizer::TerminalBuffer::new(),
             governance_limits: limits, governance_decisions: super::governance::DecisionBuffer::new() }
@@ -30,7 +31,7 @@ impl<'a> StoreContext<'a> {
     /// Borrow another accepted policy without losing request provenance or the
     /// root transaction's terminal buffer. This never creates a SQL transaction.
     pub fn with_limits<'b>(&'b self, limits: &'b crate::limits::RuntimeLimits) -> StoreContext<'b> {
-        StoreContext { sql: self.sql, limits, bound_actor: self.bound_actor.clone(), invocation_path: self.invocation_path,
+        StoreContext { sql: self.sql, limits, bound_actor: self.bound_actor.clone(), machine_resources: self.machine_resources, invocation_path: self.invocation_path,
             workflow_policy: self.workflow_policy, workflow_terminals: self.workflow_terminals.clone(),
             governance_limits: self.governance_limits, governance_decisions: self.governance_decisions.clone() }
     }
@@ -202,6 +203,7 @@ impl StoreFailure {
 }
 
 pub(crate) struct Database {
+    machine_resources: super::machine_resources::State,
     validation_issuer: std::sync::Arc<()>,
     pub(super) conn: SqlConnection,
     pub config: ControllerConfig,
@@ -265,6 +267,7 @@ impl Database {
         });
         match startup {
             Ok(validation_host) => Ok(Self {
+                machine_resources: super::machine_resources::State::default(),
                 conn,
                 validation_host,
                 config,
@@ -414,6 +417,8 @@ impl Database {
         super::metadata::validate_existing(conn, config).map_err(|_| {
             "invalid controller commit revision or receipt; original bytes retained".to_string()
         })?;
+        super::machine_resources::validate_existing(conn, config, stored_version)
+            .map_err(|_| "machine resource vocabulary requires schema25; original bytes retained".to_string())?;
         super::credits::validate_existing(conn, config).map_err(|_| {
             "invalid control/effect credit association; original bytes retained".to_string()
         })?;
@@ -635,8 +640,20 @@ impl Database {
     ) -> Result<(Reply, bool)> {
         let limits = &self.config.limits;
         let now = (self.config.clock)();
+        // This observational boundary precedes durable receipt processing. A
+        // report only reads current registration and replaces one memory slot.
+        // No accepted task policy, task state or mutation revision is changed.
+        if let Operation::ReportMachineResources { sample } = operation {
+            let tx = StoreContext::new(&self.conn, limits);
+            let observed = super::metadata::current(&tx)?;
+            let data = self.machine_resources.report(&tx, &self.config, sample)?;
+            let mut reply = Reply::ok(request_id, data);
+            reply.observed_controller_revision = Some(observed);
+            return Ok((reply, false));
+        }
         super::checked_transaction::immediate(&mut self.conn, |sql| {
         let mut tx = StoreContext::new(sql, &self.config.limits);
+        tx.machine_resources = Some(&self.machine_resources);
         tx.invocation_path = invocation_path;
         let observed = super::metadata::current(&tx)?;
         let request = encode(operation)?;

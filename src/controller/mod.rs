@@ -31,6 +31,7 @@ mod store_retry;
 mod store_phase;
 pub use store_phase::StartupCancellation;
 mod database;
+pub mod machine_resources;
 mod pull_request;
 #[cfg(test)]
 mod pull_request_tests;
@@ -87,6 +88,7 @@ struct Inner {
 /// owned dependency so deadline races can be tested without sleeping or polling.
 #[derive(Clone)]
 pub struct ControllerConfig {
+    pub machine_resources: Option<machine_resources::Config>,
     pub limits: Arc<crate::limits::RuntimeLimits>,
     pub protected_release: Option<crate::protected_release::Config>,
     /// Trusted existing bare repositories. Empty disables source material reads.
@@ -103,6 +105,7 @@ pub struct ControllerConfig {
 impl Default for ControllerConfig {
     fn default() -> Self {
         Self {
+            machine_resources: None,
             limits: Arc::new(
                 crate::limits::RuntimeLimits::seed().expect("invalid installed limits metadata"),
             ),
@@ -218,6 +221,12 @@ impl Controller {
             c.validate(&config.limits.interface)?;
         }
         config.limits.validate()?;
+        if let Some(observations) = &config.machine_resources {
+            observations.profile.validate()?;
+            if observations.profile.local().role != crate::machine_resources::Role::Controller {
+                return Err("controller host profile must select its controller row".into());
+            }
+        }
         if !config.validation_executable.is_absolute() || !config.validation_executable.is_file() {
             return Err("controller requires an absolute trusted validation executable".into());
         }

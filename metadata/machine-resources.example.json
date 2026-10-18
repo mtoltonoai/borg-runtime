@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "local_machine_id": "agent-lab",
+  "machines": [
+    {"machine_id":"agent-lab","label":"Controller","role":"controller","worker_id":null,"storage_labels":["root","borg-state","workspaces"]},
+    {"machine_id":"agent-lab-2","label":"Worker 2","role":"worker","worker_id":"agent-lab-2","storage_labels":["root","borg-state","workspaces"]},
+    {"machine_id":"agent-lab-3","label":"Worker 3","role":"worker","worker_id":"agent-lab-3","storage_labels":["root","borg-state","workspaces"]},
+    {"machine_id":"agent-lab-4","label":"Worker 4","role":"worker","worker_id":"agent-lab-4","storage_labels":["root","borg-state","workspaces"]}
+  ],
+  "storage_scopes": [
+    {"label":"root","path":"/"},
+    {"label":"borg-state","path":"/var/lib/borg/state"},
+    {"label":"workspaces","path":"/var/lib/borg/workspaces"}
+  ],
+  "stat_helper": {
+    "path": "/usr/bin/stat",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "bounds": {
+    "sample_interval_ms": 5000,
+    "collection_timeout_ms": 2000,
+    "cleanup_timeout_ms": 1000,
+    "report_timeout_ms": 2000,
+    "stale_after_ms": 15000,
+    "max_window_ms": 60000,
+    "kernel_read_bytes": 1048576,
+    "helper_output_bytes": 4096,
+    "helper_binary_bytes": 1048576,
+    "max_filesystems": 16,
+    "max_machines": 64,
+    "max_cpu_cores": 65536,
+    "identity_bytes": 128,
+    "label_bytes": 128
+  }
+}

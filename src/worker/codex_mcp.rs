@@ -1087,7 +1087,7 @@ pub(super) fn admit_worker19_outcomes(config:&Config)->Result<(),String> {
     if crate::protocol::policy_requires_wire24(&config.runtime_limits)||config.limits.capabilities.is_some() {return Err("Coding accepted identity/task metadata requires worker19".into())}
     inspect_retained_outcomes(config,false,true).map(|_|())
 }
-fn inspect_retained_outcomes(config: &Config, historical_marker: bool, historical_identity:bool) -> Result<OutcomeDisposition, String> {
+fn inspect_retained_outcomes(config: &Config, historical_marker: bool, historical_worker19:bool) -> Result<OutcomeDisposition, String> {
     config.validate()?;
     // The host reconstructs this scope from the original RunAttempt. A retained
     // bridge configuration cannot silently substitute or drop that source.
@@ -1122,8 +1122,13 @@ fn inspect_retained_outcomes(config: &Config, historical_marker: bool, historica
     let mut operations = std::collections::BTreeSet::new();
     let mut unresolved = false;
     for entry in &journal.entries {
-        if historical_identity && (mcp::identity_administration::handles(&entry.invocation.tool) || entry.outcome.as_ref().is_some_and(|o|crate::protocol::outcome_requires_wire24(&o.reply.outcome))) { return Err("original Coding identity/task call requires worker19, including refusals".into()); }
+        if historical_worker19 && (mcp::identity_administration::handles(&entry.invocation.tool) || entry.outcome.as_ref().is_some_and(|o|crate::protocol::outcome_requires_wire24(&o.reply.outcome))) { return Err("original Coding identity/task call requires worker19, including refusals".into()); }
         entry.invocation.validate(&config.runtime_limits)?;
+        if historical_worker19 && super::machine_resources::requires(
+            &Operation::CallCollaboration { call: entry.invocation.clone() },
+            entry.outcome.as_ref().map(|o| &o.reply.outcome)) {
+            return Err("machine resource vocabulary in retained Coding journal requires worker19".into());
+        }
         if entry.invocation.caller != config.caller
             || !logical.insert(&entry.invocation.logical_call_id)
             || !operations.insert(&entry.invocation.operation_id)

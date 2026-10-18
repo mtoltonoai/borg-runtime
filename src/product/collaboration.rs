@@ -195,7 +195,7 @@ async fn route(
             return Err(error(502, "Unexpected worker projection"));
         };
         let mut body = String::from(
-            "<p>Capacity is the controller's current registered view. Free capacity is not a reservation or proof of host availability.</p><table><thead><tr><th>Worker</th><th>Incarnation</th><th>Coding occupied / capacity</th><th>Native occupied / capacity</th></tr></thead><tbody>",
+            "<p><a href=\"/machines\">Machines: measured CPU, memory and filesystem usage</a></p><p>Capacity is the controller's current registered view. Free capacity is not a reservation or proof of host availability.</p><table><thead><tr><th>Worker</th><th>Incarnation</th><th>Coding occupied / capacity</th><th>Native occupied / capacity</th></tr></thead><tbody>",
         );
         for w in &workers.items {
             let _ = write!(

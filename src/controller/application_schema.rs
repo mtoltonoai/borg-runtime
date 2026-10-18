@@ -19,8 +19,11 @@ pub(super) const AGENT_DIRECTORY_VERSION: i64 = 23;
 // Schema24 adds immutable per-session inputs and pending same-task handoffs,
 // and fences root submission drafts/default-routing metadata. Existing row bodies stay exact.
 pub(super) const DEFAULT_ASSIGNMENT_VERSION: i64 = 24;
+// Schema25 jointly fences identity administration and machine read vocabulary.
+// Existing schema24 rows and SQL shape remain byte-exact.
 pub(super) const IDENTITY_ADMINISTRATION_VERSION: i64 = 25;
-pub(super) const VERSION: i64 = IDENTITY_ADMINISTRATION_VERSION;
+pub(super) const MACHINE_RESOURCES_VERSION: i64 = 25;
+pub(super) const VERSION: i64 = 25;
 const SESSION_HANDOFF_DELTA: &str = include_str!("schema24-from23.sql");
 const AGENT_DIRECTORY_DELTA: &str = include_str!("schema23-from22.sql");
 const DELTA: &str = include_str!("schema14-from13.sql");
@@ -157,7 +160,7 @@ pub(super) fn expected_schema(conn: &Connection, version: i64) -> Result<(), Str
             conn.pragma_update(None,"user_version",AGENT_DIRECTORY_VERSION).map_err(|e|e.to_string())
         }
         DEFAULT_ASSIGNMENT_VERSION => {
-            expected_schema(conn,AGENT_DIRECTORY_VERSION)?;
+            expected_schema(conn, AGENT_DIRECTORY_VERSION)?;
             conn.execute_batch(SESSION_HANDOFF_DELTA).map_err(|e|e.to_string())?;
             conn.pragma_update(None,"user_version",DEFAULT_ASSIGNMENT_VERSION).map_err(|e|e.to_string())
         }

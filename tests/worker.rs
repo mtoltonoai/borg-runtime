@@ -2352,3 +2352,6 @@ mod automatic_cleanup;
 
 #[path = "worker/native_retry.rs"]
 mod native_retry;
+
+#[path = "worker/host_resources.rs"]
+mod host_resources;

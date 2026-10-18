@@ -71,6 +71,8 @@ pub enum Query {
     Worker {
         worker_id: String,
     },
+    Machines { after: Option<String>, limit: usize },
+    Machine { machine_id: String },
     TaskHistory {
         task_id: String,
         after: Option<String>,
@@ -182,6 +184,8 @@ pub enum QueryResult {
     MemoryKeys(Page<MemoryKey>),
     Workers(Page<WorkerCapacity>),
     Worker(WorkerCapacity),
+    Machines(Page<crate::machine_resources::View>),
+    Machine(crate::machine_resources::View),
     TaskHistory(Page<HistoryEntry>),
     TaskAttempts(Page<AttemptView>),
     TaskCheckpoints(Page<CheckpointPublication>),

@@ -130,6 +130,10 @@ enum ToolArgs {
     },
     #[serde(rename = "collab_worker_get")]
     Worker { worker_id: String },
+    #[serde(rename = "collab_machines_list")]
+    Machines { cursor: Option<String>, limit: usize },
+    #[serde(rename = "collab_machine_get")]
+    Machine { machine_id: String },
     #[serde(rename = "collab_task_attempts_list")]
     Attempts {
         task_id: String,
@@ -563,6 +567,8 @@ fn apply_inner(
             })?);
         }
         ToolArgs::Worker { worker_id } => return bounded(limits, query(Query::Worker { worker_id })?),
+        ToolArgs::Machines { cursor, limit } => return bounded(limits, query(Query::Machines { after: cursor, limit })?),
+        ToolArgs::Machine { machine_id } => return bounded(limits, query(Query::Machine { machine_id })?),
         ToolArgs::History {
             task_id,
             cursor,

@@ -15,6 +15,7 @@ pub mod worker;
 pub mod protected_release;
 
 pub mod collaboration;
+pub mod machine_resources;
 
 pub mod mcp;
 

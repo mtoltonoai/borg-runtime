@@ -115,6 +115,9 @@ async fn run(
 ) -> Result<(), String> {
     match mode.as_str() {
         "controller" => {
+            let host_profile = args.remove("--host-observation-profile")
+                .map(|path| borg_runtime::machine_resources::Profile::load(std::path::Path::new(&path), limits.transport.body_bytes))
+                .transpose()?;
             let db = required(&mut args, "--db")?;
             let address = required(&mut args, "--listen")?
                 .parse()
@@ -143,6 +146,7 @@ async fn run(
             done(args)?;
             let mut config = borg_runtime::controller::ControllerConfig::default();
             config.limits = limits.clone();
+            config.machine_resources = host_profile.map(borg_runtime::controller::machine_resources::Config::new).transpose()?;
             config.protected_release = protected.clone();
             if let Some(repositories) = repositories {
                 config.repository_read = repositories;
@@ -179,6 +183,7 @@ async fn run(
                 None => None,
             };
             let listener = server::listen(address).await?;
+            let observations = controller.start_machine_resources()?;
             println!(
                 "Controller listening on {}",
                 listener.local_addr().map_err(|e| e.to_string())?
@@ -193,9 +198,14 @@ async fn run(
                     None => std::future::pending().await,
                 }
             };
-            tokio::select! {r=server::serve(controller,listener,origin)=>r,r=protected_server=>r,_=shutdown.recv()=>Ok(())}
+            let result = tokio::select! {biased; _=shutdown.recv()=>Ok(()),r=server::serve(controller,listener,origin)=>r,r=protected_server=>r};
+            if let Some(observations) = observations { observations.shutdown().await?; }
+            result
         }
         "worker" => {
+            let host_profile = args.remove("--host-observation-profile")
+                .map(|path| borg_runtime::machine_resources::Profile::load(std::path::Path::new(&path), limits.transport.body_bytes).map(Arc::new))
+                .transpose()?;
             let config = WorkerConfig {
                 limits: limits.clone(),
                 resource_profile: args.remove("--resource-profile").map(PathBuf::from),
@@ -220,7 +230,7 @@ async fn run(
                     .unwrap_or_else(|| "https://api.openai.com/v1/responses".into()),
             };
             done(args)?;
-            worker::run(config).await
+            worker::run_with_machine_resources(config, host_profile).await
         }
         "list" => {
             let endpoint = required(&mut args, "--controller")?;

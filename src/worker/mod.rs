@@ -11,6 +11,7 @@ mod handoff;
 mod memory_notice;
 mod collaboration_notice;
 mod mutations;
+pub mod machine_resources;
 mod completion;
 mod native_loop;
 mod native_retry;
@@ -2610,9 +2611,11 @@ fn coding_collaboration_closed(
         limits: input.execution_limits()?.collaboration.clone(),
         worker_limits: config.limits.worker.clone(),
     };
-    if !handoff::admits_identity_administration(state, &config.worker_limits)? { codex_mcp::admit_worker19_outcomes(&config)?; }
     if !handoff::admits_default_assignment(state, &config.worker_limits)? {
         codex_mcp::admit_worker18_outcomes(&config)?;
+    }
+    if !handoff::admits_machine_resources(state, &config.worker_limits)? {
+        codex_mcp::admit_worker19_outcomes(&config)?;
     }
     if collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {
         return Ok(false);
@@ -3120,9 +3123,19 @@ fn same_execution_policy(retained: &RuntimeLimits, selected: &RuntimeLimits) -> 
     &execution == retained
 }
 
-pub async fn run(mut config: WorkerConfig) -> Result<(), String> {
+pub async fn run(config: WorkerConfig) -> Result<(), String> {
+    run_with_machine_resources(config, None).await
+}
+
+pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: Option<Arc<crate::machine_resources::Profile>>) -> Result<(), String> {
     // Refuse uninspectable named inputs before registration, state, or helpers.
     config.limits.validate()?;
+    if let Some(profile) = &host_profile {
+        profile.validate()?;
+        if profile.local().role != crate::machine_resources::Role::Worker || profile.local().worker_id.as_deref() != Some(&config.id) {
+            return Err("worker host observation profile differs from configured worker".into());
+        }
+    }
     configured_credentials(&config.limits)?;
     // Register before any controller/recovery await. A signal received while
     // registering or reconnecting is retained for the whole lifecycle select.
@@ -3222,6 +3235,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<(), String> {
             .saturating_add(config.native_capacity),
     );
     let mut registered = false;
+    let mut machine_producer = None;
     let mut recovered = false;
     let mut recovery_diagnosed = false;
     let mut state_format_ready = false;
@@ -3368,6 +3382,11 @@ pub async fn run(mut config: WorkerConfig) -> Result<(), String> {
                     {
                         true => {
                             registered = true;
+                            if machine_producer.is_none() {
+                                if let Some(profile) = &host_profile {
+                                    machine_producer = Some(machine_resources::start(&config, profile.clone())?);
+                                }
+                            }
                             backoff =
                                 Duration::from_millis(config.limits.worker.reconnect_initial_ms);
                         }
@@ -3831,7 +3850,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<(), String> {
         // shutdown replay, including resource refusal or interrupted recovery.
         return result;
     }
-    shutdown(
+    let shutdown = shutdown(
         &config,
         &mut active,
         &state,
@@ -3839,7 +3858,13 @@ pub async fn run(mut config: WorkerConfig) -> Result<(), String> {
         &outbox_lock,
         &validation_runtime,
     )
-    .await?;
+    ;
+    let observations = async {
+        if let Some(producer) = machine_producer { producer.shutdown().await } else { Ok(()) }
+    };
+    let (tasks, observations) = tokio::join!(shutdown, observations);
+    tasks?;
+    observations?;
     result
 }
 

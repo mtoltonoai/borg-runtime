@@ -25,6 +25,8 @@ pub(crate) fn apply(
     let limits = tx.limits;
     match op {
         Operation::AdministerIdentity { operation_id, input } => super::identity_administration::apply(tx, operation_id, input, cfg, now),
+        Operation::ReportMachineResources { .. } => refuse(
+            "observation_boundary", "machine reports must enter the controller observation boundary"),
         Operation::AcquireNativeRequest { .. } | Operation::SettleNativeRequest { .. }
         | Operation::ObserveNativeRequest { .. } => super::native_request_coordination::apply(tx, op, cfg, now),
         Operation::MutateGovernance { operation_id, mutation } => {

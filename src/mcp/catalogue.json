@@ -1039,5 +1039,56 @@
       "idempotentHint": true,
       "openWorldHint": false
     }
+  },
+  {
+    "name": "collab_machines_list",
+    "description": "Page<MachineResourceView>: configured controller and registered workers, host CPU core-equivalents/percent, memory/filesystem bytes, producer time and receiver age/status. Original read receipts replay their original as_of time; reads never sample or control hosts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "cursor",
+        "limit"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "collab_machine_get",
+    "description": "MachineResourceView for one configured machine. Freshness is controller monotonic receipt age as of this read; stale retained values are not current. No raw filesystem paths or host controls.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "machine_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "machine_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   }
 ]

@@ -14,6 +14,8 @@ pub(crate) fn retryable_read_tool(name: &str) -> bool {
         | "collab_memory_get"
         | "collab_workers_list"
         | "collab_worker_get"
+        | "collab_machines_list"
+        | "collab_machine_get"
         | "collab_task_attempts_list"
         | "collab_task_checkpoints_list"
         | "collab_task_releases_list"

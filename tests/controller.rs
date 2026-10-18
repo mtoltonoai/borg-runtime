@@ -3,6 +3,8 @@ use borg_runtime::{
     protocol::*,
 };
 use serde_json::json;
+#[path = "controller/host_resources.rs"]
+mod host_resources;
 use std::{
     path::PathBuf,
     sync::{

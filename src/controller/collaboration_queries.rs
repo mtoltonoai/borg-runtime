@@ -32,7 +32,7 @@ fn cursor(kind: &str, scope: &str, position: &str) -> Result<String> {
         position: position.into(),
     })
 }
-fn start(
+pub(super) fn start(
     limits: &crate::limits::RuntimeLimits,
     after: &Option<String>,
     kind: &str,
@@ -69,7 +69,7 @@ fn sequence(value: &str) -> Result<i64> {
     }
     Ok(n)
 }
-fn bound(limit: usize, limits: &crate::limits::RuntimeLimits) -> Result<i64> {
+pub(super) fn bound(limit: usize, limits: &crate::limits::RuntimeLimits) -> Result<i64> {
     if limit == 0 {
         return refuse("invalid_input", "invalid collaboration page limit");
     }
@@ -87,7 +87,7 @@ fn bound(limit: usize, limits: &crate::limits::RuntimeLimits) -> Result<i64> {
     }
     Ok((limit + 1) as i64)
 }
-fn identity(limits: &crate::limits::RuntimeLimits, value: &str) -> Result<()> {
+pub(super) fn identity(limits: &crate::limits::RuntimeLimits, value: &str) -> Result<()> {
     if !valid_id(limits, value) {
         return refuse("invalid_input", "invalid collaboration identity");
     }
@@ -95,7 +95,7 @@ fn identity(limits: &crate::limits::RuntimeLimits, value: &str) -> Result<()> {
 }
 /// At most limit+1 rows are materialized. Filtered pages still advance by the
 /// scanned row, so an empty partial page cannot masquerade as complete.
-fn page<T: Serialize>(
+pub(super) fn page<T: Serialize>(
     limits: &crate::limits::RuntimeLimits,
     rows: Vec<(String, Option<T>)>,
     limit: usize,
@@ -432,6 +432,7 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
             Ok(QueryResult::Definition(value))
         }
         Query::Worker { worker_id } => Ok(QueryResult::Worker(worker(tx, worker_id)?)),
+        Query::Machines { .. } | Query::Machine { .. } => super::machine_resources::query(tx, cfg, query),
         Query::Workers { after, limit } => {
             let n = bound(*limit, limits)?;
             let at = start(limits, after, "workers", "")?;

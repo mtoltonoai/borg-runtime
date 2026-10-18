@@ -627,6 +627,9 @@ pub struct MemoryValue {
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum Operation {
     AdministerIdentity { operation_id: String, input: IdentityAdministrationRequest },
+    /// Ephemeral trusted-host observation without a task mutation identity.
+    /// Never exposed in the model tool catalogue.
+    ReportMachineResources { sample: crate::machine_resources::Sample },
     /// Private host coordination, never advertised as MCP tools.
     AcquireNativeRequest {
         operation_id: String, caller: crate::mcp::Caller, request_index: u32,
@@ -863,6 +866,7 @@ pub struct Request {
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Data {
     IdentityAdministration(Box<IdentityAdministrationOutcome>),
+    MachineResourceReport(crate::machine_resources::ReportDisposition),
     NativeRequestAdmission(crate::native_retry::NativeRequestAdmission),
     NativeRequestSettlement(crate::native_retry::NativeRequestSettlement),
     NativeRequestReadiness { acquire_operation_id: String, changed: bool },
@@ -1013,6 +1017,8 @@ impl Reply {
                 return Err("native request response differs from original operation".into());
             }
             let valid = match (operation, data) {
+                (Operation::ReportMachineResources { .. }, Data::MachineResourceReport(_)) => true,
+                (Operation::ReportMachineResources { .. }, _) | (_, Data::MachineResourceReport(_)) => false,
                 (Operation::RegisterAgent { definition, .. }, Data::Agent(agent)) =>
                     agent.id == definition.id && agent.definition == *definition && !agent.retired,
                 (Operation::RetireAgent { agent_id, expected_revision, .. }, Data::Agent(agent)) =>

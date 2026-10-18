@@ -30,6 +30,51 @@
   let revision = "0", cursor = null, dirty = false, pending = false, running = false, stopped = false, failures = 0, timer = null, forceRefresh = false, wake = false, editVersion = 0, pendingRevision = null;
   let reconnectPending = false;
   let workflowCursor = null, workflowPosition = null, workflowHead = null;
+  let machineTimer = null, machineDue = false, waitingForChanges = false;
+  const machineInterval = () => {
+    const raw = document.querySelector("main")?.dataset.machineRefreshMs;
+    if(raw === undefined) return null;
+    const interval = Number(raw);
+    return positive(interval) ? interval : null;
+  };
+  let machineSeen = machineInterval() === null ? 0 : performance.now();
+  function ageMachines(unavailable=false) {
+    if(machineInterval() === null) return;
+    const section = document.querySelector("main")?.querySelector("#machine-resources");
+    if(!section) return;
+    const elapsed = Math.max(0, Math.floor(performance.now()-machineSeen));
+    for(const row of section.querySelectorAll("[data-machine-row]")) {
+      if(row.dataset.machineFreshness === "unobserved") continue;
+      const original = Number(row.dataset.machineAgeMs), staleAfter = Number(row.dataset.machineStaleAfterMs);
+      const age = original+elapsed;
+      const known = row.dataset.machineAgeMs !== "" && Number.isSafeInteger(original) && original>=0 && Number.isSafeInteger(age) && positive(staleAfter);
+      const field = row.querySelector("[data-machine-age]");
+      if(field) field.textContent = known ? String(age) : "unavailable";
+      if(!known || age>=staleAfter || row.dataset.machineFreshness === "stale") {
+        row.dataset.machineFreshness = "stale";
+        const status = row.querySelector("[data-machine-age-status]");
+        if(status) status.textContent = "Stale · retained sample";
+      }
+    }
+    if(unavailable) {
+      const notice = section.querySelector("[data-machine-connection]");
+      if(notice) notice.textContent = "Machine updates unavailable · last observations retained; freshness continues to age";
+    }
+  }
+  function scheduleMachines() {
+    clearTimeout(machineTimer); machineTimer=null;
+    const interval=machineInterval();
+    if(interval===null || stopped || document.hidden) return;
+    machineTimer=setTimeout(()=>{
+      machineTimer=null;ageMachines();scheduleMachines();
+      if(live.retry_limit!==null && failures>live.retry_limit) return;
+      machineDue=true;
+      // Interrupt only the read-only browser change wait. A sample timer never
+      // overlaps another fetch or cancels a page read already in flight.
+      if(waitingForChanges){wake=true;abortActive();}
+      else if(!running && timer===null){run();}
+    },interval);
+  }
   const decimal = value => typeof value === "string" && value.length <= metadata.cursor_max.length && /^(0|[1-9][0-9]*)$/.test(value) && BigInt(value) <= BigInt(metadata.cursor_max);
   function state(text) { status.textContent = text; }
   async function bounded(url, html = false, byteLimit = policy.response_bytes) {
@@ -144,6 +189,7 @@
     if(!old || old.dataset.liveRefresh!=="true") return;
     if(!force && editing()){pending=true;refresh.hidden=false;return;}
     const capturedEdits=editVersion, capturedFocus=document.activeElement;
+    const observationFetchStarted=machineInterval()===null?null:performance.now();
     const html=await bounded(location.pathname+location.search,true);
     const parsed=new DOMParser().parseFromString(html,"text/html"), next=parsed.querySelector("main");
     if(!next || next.dataset.liveRefresh!=="true") throw new Error("Unexpected live view");
@@ -153,13 +199,30 @@
     const newlyFocused=document.activeElement!==capturedFocus && document.activeElement?.closest("main input,main textarea,main select");
     if(document.querySelector("main")!==old || editVersion!==capturedEdits || newlyFocused || (!force && editing())){pending=true;refresh.hidden=false;return;}
     old.replaceWith(document.importNode(next,true)); document.title=parsed.title;
+    if(machineInterval()!==null){machineSeen=observationFetchStarted===null?performance.now():observationFetchStarted;ageMachines();}
     dirty=false;pending=false;refresh.hidden=true;
+  }
+  async function updateMachines() {
+    if(machineInterval()===null) return;
+    const old=document.querySelector("main")?.querySelector("#machine-resources");
+    if(!old) throw new Error("Machine view unavailable");
+    const observationFetchStarted=performance.now();
+    const html=await bounded(location.pathname+location.search,true);
+    const parsed=new DOMParser().parseFromString(html,"text/html");
+    const next=parsed.querySelector("main")?.querySelector("#machine-resources");
+    if(!next || next.querySelector("script,iframe,object,embed,form,input,textarea,select")) throw new Error("Invalid machine view");
+    if(document.querySelector("main")?.querySelector("#machine-resources")!==old) return;
+    // Replace only the observation section. Dirty input and captured form
+    // revisions elsewhere in main survive this read, including on reconnect.
+    old.replaceWith(document.importNode(next,true));machineSeen=observationFetchStarted;ageMachines();
+    failures=0;retryDelay=live.retry_initial_ms;
   }
   async function run() {
     if(running || stopped || document.hidden) return; running=true;
     try {
       if(forceRefresh){forceRefresh=false;await updatePage(true);}
       while(!stopped && !document.hidden) {
+        if(machineDue){machineDue=false;await updateMachines();}
         if(pendingRevision !== null) {
           const taskMore=await activity();
           const workflowMore=await workflowActivity();
@@ -169,7 +232,10 @@
           failures=0;retryDelay=live.retry_initial_ms;state(pending?"Live activity · page update ready":"Live");
           continue;
         }
-        const value=await bounded("/ui/changes?after="+encodeURIComponent(revision));
+        let value;
+        waitingForChanges=true;
+        try {value=await bounded("/ui/changes?after="+encodeURIComponent(revision));}
+        finally {waitingForChanges=false;}
         if(!decimal(value.revision) || typeof value.reset!=="boolean" || typeof value.changed!=="boolean") throw new Error("Invalid change revision");
         if(value.reset){
           cursor=null;feed.replaceChildren();
@@ -183,6 +249,7 @@
       }
     } catch(error) {
       if(!stopped && !document.hidden && !forceRefresh && !wake){
+        ageMachines(true);
         // A reconnect can observe new startup metadata at the same durable
         // revision. Reconcile once, preserving the activity cursor and edits.
         reconnectPending=true;
@@ -194,8 +261,9 @@
   }
   document.addEventListener("input",event=>{if(event.target.closest("main form")){dirty=true;editVersion++;}});
   refresh.addEventListener("click",()=>{failures=0;retryDelay=live.retry_initial_ms;forceRefresh=true;abortActive();if(!running)run();});
-  document.addEventListener("visibilitychange",()=>{if(document.hidden){abortActive();clearTimeout(timer);timer=null;state("Updates paused while hidden");}else{state("Reconnecting");wake=true;if(!running){wake=false;run();}}});
-  window.addEventListener("pagehide",()=>{stopped=true;abortActive();clearTimeout(timer);});
-  window.addEventListener("pageshow",event=>{if(event.persisted){stopped=false;wake=true;state("Reconnecting");if(!running){wake=false;run();}}});
+  document.addEventListener("visibilitychange",()=>{if(document.hidden){abortActive();clearTimeout(timer);timer=null;clearTimeout(machineTimer);machineTimer=null;ageMachines(true);state("Updates paused while hidden");}else{state("Reconnecting");ageMachines();machineDue=machineInterval()!==null;scheduleMachines();wake=true;if(!running){wake=false;run();}}});
+  window.addEventListener("pagehide",()=>{stopped=true;abortActive();clearTimeout(timer);clearTimeout(machineTimer);machineTimer=null;});
+  window.addEventListener("pageshow",event=>{if(event.persisted){stopped=false;wake=true;ageMachines();machineDue=machineInterval()!==null;scheduleMachines();state("Reconnecting");if(!running){wake=false;run();}}});
+  scheduleMachines();
   run();
 })();

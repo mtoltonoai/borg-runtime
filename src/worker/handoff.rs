@@ -90,6 +90,21 @@ pub(super) fn admit_retained_identity(state:&Path,limits:&RuntimeLimits)->Result
     }
     Ok(())
 }
+
+pub(super) fn admit_machine_outcomes(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
+    for (_, receipt) in command_receipts(state, limits)? {
+        let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { continue; };
+        let path = path(state, attempt);
+        if path.exists() {
+            let saved = load(&path, attempt, task)?;
+            if super::machine_resources::requires(&saved.request, saved.outcome.as_ref()) {
+                return Err("machine resource vocabulary in retained Saved outcome requires worker19".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn record(
     state: &Path,
     attempt: &Attempt,
@@ -408,6 +423,7 @@ struct Format {
 // Original absent fields retain exact serialization; no new state namespace.
 // Outer17 fences supplied public outer-turn journals and output manifests.
 // Outer18 carries optional default-assignment metadata in accepted snapshots.
+// Outer19 fences identity/task and machine read vocabulary in retained journals.
 const CURRENT_STATE_FORMAT: u32 = 19;
 const DEFAULT_ASSIGNMENT_STATE_FORMAT: u32 = 18;
 const SUPPLIED_STATE_FORMAT: u32 = 17;
@@ -462,6 +478,10 @@ pub(super) fn admits_default_assignment(state: &Path, limits: &WorkerLimits) -> 
     Ok(matches!(read_state_format(state, limits)?.format_revision, DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
+pub(super) fn admits_machine_resources(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(read_state_format(state, limits)?.format_revision == CURRENT_STATE_FORMAT)
+}
+
 pub(super) fn admits_identity_administration(state:&Path,limits:&WorkerLimits)->Result<bool,String> { Ok(read_state_format(state,limits)?.format_revision==CURRENT_STATE_FORMAT) }
 
 pub(super) fn admits_pull_request_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
@@ -505,7 +525,7 @@ fn write_current_state_format(state: &Path, limits: &WorkerLimits) -> Result<(),
 /// Call only after the existing local retained-policy, command, resource and
 /// stopped-journal admission checks, with this state's owner lease held, before
 /// any report replay or recovery request. Inner records keep their own readers
-/// and recovery gates; this is only the explicit outer 9-17 -> 18 migration.
+/// and recovery gates; this is only the explicit outer 9-18 -> 19 migration.
 /// A failure must exit before the ordinary shutdown report-flushing path.
 pub(super) fn finish_state_upgrade(
     state: &Path,
@@ -515,7 +535,8 @@ pub(super) fn finish_state_upgrade(
     read_state_format(state, &limits.worker)?;
     crate::worker::admit_default_assignment(state, limits)?;
     crate::worker::admit_identity_administration(state, limits)?;
-    // Also re-persist an observed 18: a prior rename may have succeeded before
+    crate::worker::machine_resources::admit(state, limits)?;
+    // Also re-persist an observed 19: a prior rename may have succeeded before
     // its directory sync failed. Visibility alone is not a durable barrier.
     write_current_state_format(state, &limits.worker)
         .map_err(|error| format!("worker state format upgrade failed: {error}"))
@@ -1571,7 +1592,7 @@ mod tests {
             b"{\"format_revision\":10,\"extra\":true}".to_vec(),
             b"{\"format_revision\":10,\"format_revision\":10}".to_vec(),
             b"{\"format_revision\":8}".to_vec(),
-            b"{\"format_revision\":19}".to_vec(),
+            b"{\"format_revision\":20}".to_vec(),
             vec![b' '; limits.state_format_bytes + 1],
         ].into_iter().enumerate() {
             let state = area(&format!("invalid-format-{i}"));
@@ -1773,7 +1794,7 @@ mod tests {
             std::fs::read(format_five.join("format.json")).unwrap(),
             original
         );
-        for revision in [6, 7, 8, 19] {
+        for revision in [6, 7, 8, 20] {
             let previous = root.join(format!("format-{revision}"));
             std::fs::create_dir(&previous).unwrap();
             let bytes = serde_json::to_vec(&json!({"format_revision":revision})).unwrap();

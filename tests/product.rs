@@ -2965,3 +2965,6 @@ mod collaboration_joined;
 
 #[path = "product/default_task_submission.rs"]
 mod default_task_submission;
+
+#[path = "product/host_resources.rs"]
+mod host_resources;
