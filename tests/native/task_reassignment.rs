@@ -24,6 +24,44 @@ async fn lineage(api: &ApiClient, session_id: &str) -> (Session, TaskInput, bool
     (session, *input, current)
 }
 
+// Read-only projections over the completed original task. The worker is already
+// closed before these are captured; no handoff or effect is dispatched again.
+async fn restart_view(api: &ApiClient, original: &Task, finished: &Task, page_limit: usize)
+    -> Vec<(Operation, Reply)>
+{
+    let operations = vec![
+        Operation::GetTask { task_id: original.id.clone() },
+        Operation::QueryCollaboration { query: Query::SessionInput { session_id: original.session_id.clone() } },
+        Operation::QueryCollaboration { query: Query::SessionInput { session_id: finished.session_id.clone() } },
+        Operation::QueryCollaboration { query: Query::TaskAttempts { task_id: original.id.clone(), after: None, limit: 3 } },
+        Operation::QueryCollaboration { query: Query::TaskCheckpoints { task_id: original.id.clone(), after: None, limit: page_limit } },
+        Operation::QueryCharter { query: CharterQuery::Session { session_id: original.session_id.clone() } },
+        Operation::QueryCharter { query: CharterQuery::Session { session_id: finished.session_id.clone() } },
+        Operation::ListTasks { after: None, limit: 2 },
+    ];
+    let mut observed = Vec::new();
+    for operation in operations {
+        let reply = api.call(operation.clone()).await.unwrap();
+        reply.validate_for(&operation).unwrap();
+        assert!(matches!(reply.outcome, Outcome::Ok { .. }), "restart observation: {reply:?}");
+        observed.push((operation, reply));
+    }
+    observed
+}
+
+fn closed_file_identity(path: &Path) -> Value {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => {
+            assert!(m.file_type().is_file(), "closed fixture file must be regular: {}", path.display());
+            json!({"path":path,"present":true,"device":m.dev(),"inode":m.ino(),
+                "bytes":m.len(),"mode":m.mode(),"links":m.nlink()})
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({"path":path,"present":false}),
+        Err(error) => panic!("closed fixture file {}: {error}", path.display()),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 // Traceability scope: Real worker quiescence, controller receipts, Coding checkpoint and checks; native and Coding providers are explicitly controlled local peers.
 //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
@@ -200,7 +238,38 @@ async fn journey() {
     assert!(matches!(api.call(Operation::ListTasks { after: None, limit: 2 }).await.unwrap().outcome,
         Outcome::Ok { data: Data::Tasks(tasks) } if tasks.len() == 1 && tasks[0].id == original.id));
     assert_eq!(peer.count(), 1);
-    worker.stop().await; controller.stop().await; drop(worker); drop(controller);
+    worker.stop().await; drop(worker);
+    let before_restart = Box::pin(restart_view(&api, &original, &finished,
+        lab.limits.controller.collaboration_page_items)).await;
+    let Outcome::Ok { data: Data::Task(durable) } = &before_restart[0].1.outcome else { unreachable!() };
+    assert_eq!(durable.id, finished.id); assert_eq!(durable.session_id, finished.session_id);
+    assert_eq!(durable.status, TaskStatus::Succeeded); assert_eq!(durable.input, finished.input);
+    assert_eq!(durable.assigned_agent_id, finished.assigned_agent_id);
+    assert_eq!(durable.attempt, finished.attempt); assert_eq!(durable.result, finished.result);
+    assert_eq!(durable.selected_checkpoint, finished.selected_checkpoint);
+    for (index, session_id, accepted, expected_current) in [
+        (1, &original.session_id, &original.input, false),
+        (2, &current.session_id, &current.input, true),
+    ] {
+        let Outcome::Ok { data: Data::Collaboration(QueryResult::SessionInput { session, input, current }) }
+            = &before_restart[index].1.outcome else { unreachable!() };
+        assert_eq!(&session.id, session_id); assert_eq!(session.task_id, original.id);
+        assert_eq!(session.definition, accepted.definition); assert_eq!(input.as_ref(), accepted);
+        assert_eq!(*current, expected_current);
+    }
+    let Outcome::Ok { data: Data::Collaboration(QueryResult::TaskAttempts(final_attempts)) }
+        = &before_restart[3].1.outcome else { unreachable!() };
+    assert!(final_attempts.next_cursor.is_none()); assert_eq!(final_attempts.items.len(), 2);
+    assert!(final_attempts.items.iter().all(|view| view.attempt.stopped && !view.attempt.uncertain));
+    let Outcome::Ok { data: Data::Collaboration(QueryResult::TaskCheckpoints(checkpoints)) }
+        = &before_restart[4].1.outcome else { unreachable!() };
+    assert!(checkpoints.next_cursor.is_none(), "this bounded fixture must expose all checkpoint records");
+    assert_eq!(checkpoints.items.iter().filter(|view| view.selected && view.state == "settled"
+        && view.checkpoint == *checkpoint && view.attempt_id == second.id
+        && view.generation == second.generation
+        && view.outcome.as_ref().is_some_and(|outcome| outcome.acknowledged == Some(true)
+            && outcome.not_applied != Some(true))).count(), 1);
+    controller.stop().await; drop(controller);
     for label in ["handoff-worker", "controller"] {
         let closed: Value = serde_json::from_slice(&std::fs::read(lab.root.join(format!("{label}-closed.json"))).unwrap()).unwrap();
         assert_eq!(closed["reaped"], true); assert_eq!(closed["code"], 0);
@@ -267,6 +336,82 @@ async fn journey() {
     assert!(*assign_revision < stops[0].2 && deliveries.iter().all(|delivery| stops[0].2 < delivery.2),
         "the successor Run is delivered only after the prior real stopped report commits");
     assert_eq!(lab.usage(&first.id), (1, None, None));
+    let submissions: Vec<_> = receipts.iter().filter(|(operation, outcome, _)| matches!(operation,
+        Operation::SubmitTask { operation_id, .. } if operation_id == "submit-loop")
+        && matches!(outcome, Outcome::Ok { data: Data::Task(task) } if task.id == original.id)).collect();
+    assert_eq!(submissions.len(), 1);
+    let results: Vec<_> = receipts.iter().filter(|(operation, outcome, _)| matches!(operation,
+        Operation::ObserveWorker { report } if report.attempt_id == second.id
+            && matches!(report.observation, Observation::ResultCandidate { .. }))
+        && matches!(outcome, Outcome::Ok { data: Data::Task(task) }
+            if task.status == TaskStatus::Succeeded && task.result == finished.result)).collect();
+    assert_eq!(results.len(), 1, "one original accepted result receipt");
+    let receipt_count: i64 = db.query_row("SELECT count(*) FROM receipts", [], |r| r.get(0)).unwrap();
+    db.close().map_err(|(_, error)| error).unwrap();
+    // Both original process owners and the read-only SQLite owner are closed.
+    // A new controller process reopens the same DB; the worker stays stopped.
+    let mut restarted = lab.controller("handoff-controller-restart").await;
+    let fresh_api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
+    let after_restart = Box::pin(restart_view(&fresh_api, &original, &finished,
+        lab.limits.controller.collaboration_page_items)).await;
+    assert_eq!(after_restart.len(), before_restart.len());
+    for ((before_operation, before_reply), (after_operation, after_reply))
+        in before_restart.iter().zip(&after_restart)
+    {
+        assert_eq!(serde_json::to_value(before_operation).unwrap(), serde_json::to_value(after_operation).unwrap());
+        assert_eq!(after_reply.outcome, before_reply.outcome, "fresh controller changed the retained projection");
+        assert_eq!(after_reply.commit, before_reply.commit);
+        assert!(after_reply.observed_controller_revision.unwrap() >= before_reply.observed_controller_revision.unwrap());
+    }
+    let mut original_lookups = Vec::new();
+    for (operation, outcome, revision) in [submissions[0], assigns[0], stops[0], completions[0], results[0]] {
+        let operation_id = operation.mutation_id().unwrap();
+        let lookup = Operation::GetOperation { operation_id: operation_id.into() };
+        let reply = fresh_api.call(lookup.clone()).await.unwrap(); reply.validate_for(&lookup).unwrap();
+        let Outcome::Ok { data: Data::Operation(record) } = &reply.outcome else { panic!("original receipt: {reply:?}") };
+        assert_eq!(record.id, operation_id); assert_eq!(record.kind, "application_mutation");
+        assert_eq!(record.state, "settled");
+        assert_eq!(record.intended, serde_json::to_value(operation).unwrap());
+        assert_eq!(record.outcome, Some(serde_json::to_value(outcome).unwrap()));
+        assert_eq!(reply.commit, Some(MutationCommit { operation_id: operation_id.into(), controller_revision: *revision }));
+        original_lookups.push(json!({"original_operation":operation,"original_outcome":outcome,
+            "original_controller_revision":revision,"lookup":lookup,"reply":reply}));
+    }
+    assert_eq!(get(&fresh_api, &original.id).await, **durable);
+    assert_eq!(peer.count(), 1, "read-only restart must not send another Native request");
+    assert_eq!(git_at(&remote, &["rev-parse", &checkpoint.remote_ref]), checkpoint.commit);
+    restarted.stop().await; drop(restarted);
+    let restart_closed: Value = serde_json::from_slice(&std::fs::read(
+        lab.root.join("handoff-controller-restart-closed.json")).unwrap()).unwrap();
+    assert_eq!(restart_closed["reaped"], true); assert_eq!(restart_closed["code"], 0);
+    let db = rusqlite::Connection::open_with_flags(lab.root.join("tasks.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    for (table, expected) in [("tasks", 1_i64), ("sessions", 2), ("attempts", 2), ("receipts", receipt_count)] {
+        assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), expected,
+            "read-only restart must not allocate or replay {table}");
+    }
+    db.close().map_err(|(_, error)| error).unwrap();
+    let limits_bytes = std::fs::read(&lab.worker_limits_file).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&limits_bytes).unwrap(), serde_json::to_value(&*lab.limits).unwrap());
+    let limits_sha256 = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &limits_bytes)
+        .as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    std::fs::write(lab.root.join("same-task-restart-browser-input.json"), serde_json::to_vec_pretty(&json!({
+        "scope":"closed original local handoff fixture; browser observation not yet executed",
+        "fixture_root":lab.root,"database":closed_file_identity(&lab.root.join("tasks.sqlite")),
+        "wal":closed_file_identity(&lab.root.join("tasks.sqlite-wal")),
+        "shm":closed_file_identity(&lab.root.join("tasks.sqlite-shm")),
+        "limits":closed_file_identity(&lab.worker_limits_file),"limits_sha256":limits_sha256,
+        "runtime_path":env!("CARGO_BIN_EXE_borg-runtime"),"repository_root":remote,
+        "original_controller_closed":lab.root.join("controller-closed.json"),
+        "worker_closed":lab.root.join("handoff-worker-closed.json"),"restarted_controller_closed":restart_closed,
+        "task":durable,"original_session":original.session_id,"successor_session":current.session_id,
+        "original_attempt":first.id,"successor_attempt":second.id,
+        "checkpoint":checkpoint,"accepted_result":finished.result,
+        "before_restart":before_restart,"after_restart":after_restart,"original_lookups":original_lookups,
+        "routes":[format!("/tasks/{}",original.id),format!("/sessions/{}",original.session_id),
+            format!("/sessions/{}",current.session_id),format!("/tasks/{}/attempts",original.id),
+            format!("/tasks/{}/checkpoint",original.id),format!("/tasks/{}/result",original.id)],
+        "worker_or_provider_replay_permitted":false,"browser_acceptance":null,
+    })).unwrap()).unwrap();
     std::fs::write(lab.root.join("same-task-reassignment.json"), serde_json::to_vec_pretty(&json!({
         "scope":"actual local worker/controller and Git, controlled native and Coding providers",
         "original":original,"charged_native":charged,"coding_started":current,"finished":finished,
