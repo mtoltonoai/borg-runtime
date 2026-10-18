@@ -103,6 +103,14 @@ async fn supplied_failed_public_turn_retains_error_and_missing_final_without_com
     let marker=std::fs::read(f.state.join("format.json")).unwrap();
     process::atomic_json(&f.state.join("format.json"),&json!({"format_revision":16})).unwrap();
     assert!(crate::worker::charter::admit(&f.state,&f.runtime,&f.scope.caller.worker_id).unwrap_err().contains("worker17"));
+    // Supplied output retains its worker17 floor through both predecessor21
+    // and current union22; admission never upgrades or rewrites the marker.
+    for revision in [17,20,21,22] {
+        process::atomic_json(&f.state.join("format.json"),&json!({"format_revision":revision})).unwrap();
+        let selected=std::fs::read(f.state.join("format.json")).unwrap();
+        crate::worker::charter::admit(&f.state,&f.runtime,&f.scope.caller.worker_id).unwrap();
+        assert_eq!(std::fs::read(f.state.join("format.json")).unwrap(),selected);
+    }
     std::fs::write(f.state.join("format.json"),marker).unwrap();
     crate::worker::charter::admit(&f.state,&f.runtime,&f.scope.caller.worker_id).unwrap();
     let original=f.original(&format!("{id}-reply"));

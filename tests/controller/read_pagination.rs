@@ -275,7 +275,7 @@ async fn shared_read_pagination_operator_tasks_agents_keep_keysets_and_retiremen
 async fn operator_directory_journey() {
     let mut cfg=config();Arc::make_mut(&mut cfg.limits).controller.list_page_bytes=64;cfg.limits.validate().unwrap();
     let c=Controller::open_with_config(path(),cfg).unwrap();
-    let mut input=native("adapter-a");input.instruction=text();let first=submit(&c,"operator-task-a",input).await;
+    let mut input=native("adapter-a");input.instruction=text();let first=submit(&c,"operator-task-a",input.clone()).await;
     let second=submit(&c,"operator-task-b",native("adapter-b")).await;
     assert!(serde_json::to_vec(&first).unwrap().len()>c.limits().controller.list_page_bytes);
     assert!(matches!(call(&c,Operation::ListTasks{after:None,limit:1}).await,Outcome::Ok{data:Data::Tasks(v)} if v.is_empty()));
@@ -305,6 +305,6 @@ async fn operator_directory_journey() {
         let value:AgentSummary=serde_json::from_value(page.items[0].clone()).unwrap();assert_eq!(value.id,"adapter-b");assert!(!value.retired);
     }
     assert!(matches!(call(&c,Operation::GetAgent{agent_id:selected.id.clone()}).await,Outcome::Ok{data:Data::Agent(a)} if a.retired));
-    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"operator-retired-new-task".into(),input:first.input.clone()}).await,Outcome::Refused{code,..} if code=="agent_retired"));
+    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"operator-retired-new-task".into(),input}).await,Outcome::Refused{code,..} if code=="agent_retired"));
     assert_eq!(get(&c,&first.id).await.input,first.input,"read and retirement do not alter accepted work");
 }

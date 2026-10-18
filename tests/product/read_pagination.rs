@@ -166,7 +166,7 @@ async fn browser_directory_journey() {
     limits.controller.list_page_bytes=64;limits.product.page_items=1;limits.validate().unwrap();
     let c=Controller::open_with_config(f.path.parent().unwrap().join("directory-lists.sqlite"),cfg).unwrap();
     let input=directory_input(&c,"browser-adapter-a",&"long accepted instruction ".repeat(800));
-    let Data::Task(first)=call(&c,Operation::SubmitTask{operation_id:"browser-directory-a".into(),input}).await else{panic!("first task")};
+    let Data::Task(first)=call(&c,Operation::SubmitTask{operation_id:"browser-directory-a".into(),input:input.clone()}).await else{panic!("first task")};
     let Data::Task(second)=call(&c,Operation::SubmitTask{operation_id:"browser-directory-b".into(),input:directory_input(&c,"browser-adapter-b","second")}).await else{panic!("second task")};
     assert!(serde_json::to_vec(&first).unwrap().len()>c.limits().controller.list_page_bytes);
     assert!(matches!(call(&c,Operation::ListTasks{after:None,limit:1}).await,Data::Tasks(v) if v.is_empty()));
@@ -199,7 +199,7 @@ async fn browser_directory_journey() {
         assert!(href(&active.body,"Next agent page").is_none());
     }
     assert_eq!(ui(&c,"GET",&format!("{agent_next}&after=browser-adapter-a"),vec![]).await.status,400);
-    let refused=browser_outcome(&c,Operation::SubmitTask{operation_id:"browser-retired-new-task".into(),input:first.input.clone()}).await;
+    let refused=browser_outcome(&c,Operation::SubmitTask{operation_id:"browser-retired-new-task".into(),input}).await;
     assert!(matches!(refused,Outcome::Refused{code,..} if code=="agent_retired"));
     assert_eq!(super::task(&c,&first.id).await.input,first.input);
     // Normal fitting pages keep their existing progress/definition presentation.

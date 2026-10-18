@@ -143,9 +143,27 @@ fn canonical_expansion_retains_and_reopens_under_original_resolved_policy() {
     atomic_json(&s.join("format.json"),&serde_json::json!({"format_revision":13})).unwrap();
     // The actual startup inventory used by recover selects both original B and N.
     let mut startup=RuntimeLimits::seed().unwrap();startup.execution.native.json_nodes=1;
-    for revision in [13,14] {
+    let manifest_path=directory(&s,&m.operation_id).join("manifest.json");
+    let manifest_before=std::fs::read(&manifest_path).unwrap();
+    // The output carrier predates both standalone publication21 and union22.
+    // Unknown future23 and pre-carrier12 remain strict, read-only refusals.
+    for revision in [12,23] {
         atomic_json(&s.join("format.json"),&serde_json::json!({"format_revision":revision})).unwrap();
+        let marker=std::fs::read(s.join("format.json")).unwrap();
+        assert!(admit(&s,&startup,"worker").unwrap_err().contains("new output records under historical worker marker"));
+        assert_eq!(std::fs::read(s.join("format.json")).unwrap(),marker);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(),manifest_before);
+        assert_eq!(std::fs::read(&command_path).unwrap(),command_before);
+        assert_eq!(bytes(&s,&m),expected);
+    }
+    for revision in [13,14,20,21,22] {
+        atomic_json(&s.join("format.json"),&serde_json::json!({"format_revision":revision})).unwrap();
+        let marker=std::fs::read(s.join("format.json")).unwrap();
         admit(&s,&startup,"worker").unwrap();
+        assert_eq!(std::fs::read(s.join("format.json")).unwrap(),marker);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(),manifest_before);
+        assert_eq!(std::fs::read(&command_path).unwrap(),command_before);
+        assert_eq!(bytes(&s,&m),expected);
     }
     let restored=inventory(&s,&startup,"worker").unwrap();assert_eq!(restored.len(),1);
     assert_eq!(restored[0].1,l);assert_eq!(restored[0].2,maximum);

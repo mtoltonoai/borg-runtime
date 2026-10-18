@@ -9,6 +9,16 @@ fn selection(reg: &borg_runtime::repository_catalogue::Registration, actions: Ve
         target_revision: reg.pull_request_target.as_ref().unwrap().revision.clone(), actions, branch_namespace: "borg/publication-fixture".into() }
 }
 fn profile(selected: Option<p::Selection>) -> ExecutionProfile { ExecutionProfile::CollaborationV2 { web_search: None, publication: selected } }
+fn bind_native_publication_fixture(c: &Controller, input: &mut TaskInput) {
+    let mut native=c.limits().execution.native.clone();native.function_count=mcp::catalogue_for_profile(c.limits(),input.definition.execution_profile.as_ref()).len();
+    let profile=borg_runtime::native::NativeLoopProfile{functions:mcp::catalogue_for_profile(c.limits(),input.definition.execution_profile.as_ref()).into_iter().map(|t|borg_runtime::native::NativeFunction{name:t.name,description:t.description,parameters:t.input_schema}).collect(),web_search:None};
+    let carrier=json!({"schema":input.output_schema,"profile":profile,"output_bytes":input.limits.output_bytes});
+    native.schema_bytes=native.schema_bytes.max(serde_json::to_vec(&carrier).unwrap().len());
+    // Existing complete Native test-definition profile from identity_support;
+    // the larger provider request includes its catalogue and context framing.
+    native.json_nodes=65_536;
+    input.definition.limit_overrides=Some(Box::new(borg_runtime::limits::ExecutionLimitOverrides{native:Some(native),..Default::default()}));
+}
 async fn fixture(c: &Controller, root: &std::path::Path, executor: ExecutorKind, enabled: bool) -> (Task, Task, Caller, Worker, borg_runtime::repository_catalogue::Registration) {
     let reg = borg_runtime::repository_catalogue::Registration { repository_id: "publication-fixture".into(), registration_revision: "one".into(), display_name: "Local publication fixture".into(),
         source_endpoint: root.join("source.git").to_string_lossy().into(), checkpoint_endpoint: root.join("checkpoints.git").to_string_lossy().into(),
@@ -37,16 +47,7 @@ async fn fixture(c: &Controller, root: &std::path::Path, executor: ExecutorKind,
     if let Some(repo) = &mut input.repository { repo.registration = Some(reg.binding()); }
     input.dependencies = vec![source.id.clone()];
     input.definition.execution_profile = Some(profile(enabled.then(||selection(&reg, vec![p::Action::PublishBranch, p::Action::OpenPullRequest]))));
-    if executor == ExecutorKind::Native && enabled {
-        let mut native=c.limits().execution.native.clone();native.function_count=mcp::catalogue_for_profile(c.limits(),input.definition.execution_profile.as_ref()).len();
-        let profile=borg_runtime::native::NativeLoopProfile{functions:mcp::catalogue_for_profile(c.limits(),input.definition.execution_profile.as_ref()).into_iter().map(|t|borg_runtime::native::NativeFunction{name:t.name,description:t.description,parameters:t.input_schema}).collect(),web_search:None};
-        let carrier=json!({"schema":input.output_schema,"profile":profile,"output_bytes":input.limits.output_bytes});
-        native.schema_bytes=native.schema_bytes.max(serde_json::to_vec(&carrier).unwrap().len());
-        // Existing complete Native test-definition profile from identity_support;
-        // the larger provider request includes its catalogue and context framing.
-        native.json_nodes=65_536;
-        input.definition.limit_overrides=Some(Box::new(borg_runtime::limits::ExecutionLimitOverrides{native:Some(native),..Default::default()}));
-    }
+    if executor == ExecutorKind::Native && enabled { bind_native_publication_fixture(c, &mut input); }
     let requester = submit(c, "publication-requester-submit", input).await;
     let w = worker("publication-requester-worker", "one", usize::from(executor==ExecutorKind::Native), usize::from(executor==ExecutorKind::Coding)); register(c, &w).await;
     let attempt = run(&commands(c, &w, vec![]).await);
@@ -215,7 +216,9 @@ async fn publication_mcp_missing_target_disallowed_action_and_small_worker_envel
     assert_eq!(code(invoke(&c,&publish(&caller,&source,&reg,"tiny-publication-envelope")).await.outcome),"capacity");
     assert!(commands(&c,&w,vec![]).await.iter().all(|c|!matches!(c,WorkerCommand::PublishRepository{..})));
     let mut input=native("missing-publication-target");input.definition.execution_profile=Some(profile(Some(p::Selection::V1{repository_id:reg.repository_id.clone(),registration_revision:reg.registration_revision.clone(),target_revision:"unregistered-target".into(),actions:vec![p::Action::PublishBranch],branch_namespace:"borg/fixture".into()})));
-    assert_eq!(code(call(&c,Operation::SubmitTask{operation_id:"missing-target-task".into(),input}).await),"publication_configuration");
+    bind_native_publication_fixture(&c, &mut input);
+    let refusal = call(&c,Operation::SubmitTask{operation_id:"missing-target-task".into(),input}).await;
+    assert_eq!(code(refusal.clone()),"publication_configuration","{refusal:?}");
     let selected=selection(&reg,vec![p::Action::PublishBranch]);
     assert!(p::validate("collab_pull_request_open",&json!({"publication_id":"x","title":"title","body":"body"}),c.limits(),Some(&selected)).is_err());
     assert_eq!(get(&c,&source.id).await,source);

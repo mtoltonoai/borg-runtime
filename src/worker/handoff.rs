@@ -1532,7 +1532,7 @@ mod tests {
         Arc::new(limits)
     }
     fn historical_state(label: &str, revision: u32) -> (PathBuf, Vec<u8>) {
-        assert!(matches!(revision, 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19));
+        assert!(matches!(revision, 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22));
         let state = area(label);
         process::private_directory(&state.join("commands")).unwrap();
         process::private_directory(&state.join("mutations")).unwrap();
