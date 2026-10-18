@@ -460,13 +460,13 @@ async fn native_http_diagnostics_keep_status_and_known_labels_only() {
         (
             400,
             json!({"error":{"message":std::env::var("HOME").unwrap(), "type":"private_project_123", "code":"DO_NOT_COPY_PROVIDER_SECRET", "param":"text.format.schema.properties.DO_NOT_COPY_PROVIDER_SECRET"}}),
-            format!("native_provider_request_refused status=400 error_body=complete provider_message_state=redacted provider_message_bytes={}", std::env::var("HOME").unwrap().len()),
+            format!("native_provider_request_refused status=400 classification_refused=unsupported_type error_body=complete provider_message_state=redacted provider_message_bytes={}", std::env::var("HOME").unwrap().len()),
             ProviderOutcome::Unknown,
         ),
         (
             400,
             json!({"error":{"type":17,"code":["invalid_json_schema"],"param":false}}),
-            "native_provider_request_refused status=400 error_body=complete".to_string(),
+            "native_provider_request_refused status=400 classification_refused=invalid_field_type error_body=complete".to_string(),
             ProviderOutcome::Unknown,
         ),
         (

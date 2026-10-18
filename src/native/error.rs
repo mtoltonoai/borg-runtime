@@ -146,6 +146,15 @@ pub(super) async fn inspect(
     };
     fields.push(("error_body", "complete".into()));
     initial.body = DiagnosticBodyState::Complete;
+    let classification = classify(status, &value);
+    if let Err(reason) = classification {
+        // A fixed source label explains refusal without retaining any provider
+        // field names, strings or prose. This is diagnostic only, never proof.
+        // The existing all-or-bounded summary policy still applies.
+        if !reason.contains(key) {
+            fields.insert(0, ("classification_refused", reason.into()));
+        }
+    }
     let Some(error) = value.get("error").and_then(Value::as_object) else {
         return unknown(result, &fields, initial, ProviderFailureClass::HttpRefused);
     };
@@ -166,7 +175,7 @@ pub(super) async fn inspect(
     }
     fields.extend(message_diagnostics(error.get("message"), key));
     initial.quota = quota_diagnostic(error.get("message"), key);
-    let category = category(status, &value);
+    let category = classification.ok();
     initial.category = category
         .map(CategoryDiagnostic::Value)
         .unwrap_or(CategoryDiagnostic::Absent);
@@ -219,35 +228,63 @@ fn category_label(category: ProviderErrorCategory) -> &'static str {
 // This runs only after bounded, duplicate-free admission of the complete body.
 // Closed keys and compatible status/code/type prevent a recognized substring or
 // an error object hidden in a different envelope from becoming retry proof.
+#[cfg(test)]
 fn category(status: u16, value: &Value) -> Option<ProviderErrorCategory> {
+    classify(status, value).ok()
+}
+
+fn classify(status: u16, value: &Value) -> Result<ProviderErrorCategory, &'static str> {
     use ProviderErrorCategory::*;
-    let root = value.as_object()?;
-    if root.len() != 1 {
-        return None;
+    let root = value.as_object().ok_or("invalid_root")?;
+    if root.keys().any(|key| key != "error") {
+        return Err("unexpected_root_keys");
     }
-    let error = root.get("error")?.as_object()?;
+    let error = root.get("error").ok_or("missing_error")?
+        .as_object().ok_or("invalid_error")?;
     if error
         .keys()
         .any(|key| !["message", "type", "param", "code"].contains(&key.as_str()))
-        || error.get("message").is_some_and(|value| !value.is_string())
+    {
+        return Err("unexpected_error_keys");
+    }
+    if error.get("message").is_some_and(|value| !value.is_string())
         || error
             .get("param")
             .is_some_and(|value| !value.is_null() && !value.is_string())
+        || error.get("type").is_some_and(|value| !value.is_null() && !value.is_string())
     {
-        return None;
+        return Err("invalid_field_type");
     }
     let code = match error.get("code") {
         None | Some(Value::Null) => None,
         Some(Value::String(code)) => Some(code.as_str()),
-        _ => return None,
+        _ => return Err("invalid_field_type"),
     };
     let compatible_type = |expected: &[&str]| {
         error.get("type").is_none_or(|value| {
             value.is_null() || value.as_str().is_some_and(|kind| expected.contains(&kind))
         })
     };
-    match code {
-        Some("rate_limit_exceeded") if status == 429 && compatible_type(&["rate_limit_error"]) => {
+    let category = match code {
+        // The provider documents this exact HTTP refusal before a response
+        // stream begins. Unlike the historical rate_limit_exceeded envelope,
+        // the newly admitted slow_down code requires its documented type.
+        // https://developers.openai.com/api/docs/guides/rate-limits
+        Some("slow_down")
+            if status == 429 && error.get("type").and_then(Value::as_str) == Some("rate_limit_error") =>
+        {
+            Some(RateLimited)
+        }
+        // Firsthand Responses.create HTTP example in the upstream SDK issue:
+        // https://github.com/openai/openai-node/issues/1477
+        // This is a selected observed compatibility shape, not a claim about
+        // any previously retained Unknown response whose body was discarded.
+        Some("rate_limit_exceeded")
+            if status == 429 && (compatible_type(&["rate_limit_error"])
+                || (error.get("type").and_then(Value::as_str) == Some("tokens")
+                    && error.get("message").is_some_and(Value::is_string)
+                    && error.get("param") == Some(&Value::Null))) =>
+        {
             Some(RateLimited)
         }
         Some("server_is_overloaded")
@@ -319,7 +356,18 @@ fn category(status: u16, value: &Value) -> Option<ProviderErrorCategory> {
             _ => None,
         },
         _ => None,
-    }
+    };
+    category.ok_or_else(|| {
+        if error.get("type").and_then(Value::as_str).is_some_and(|kind| !TYPES.contains(&kind)) {
+            "unsupported_type"
+        } else if code.is_some_and(|code| !CODES.contains(&code)) {
+            "unsupported_code"
+        } else if code.is_none() && error.get("type").is_none_or(Value::is_null) {
+            "missing_discriminator"
+        } else {
+            "status_or_type_mismatch"
+        }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -378,6 +426,7 @@ const TYPES: &[&str] = &[
     "permission_error",
     "not_found_error",
     "rate_limit_error",
+    "tokens",
     "insufficient_quota",
     "server_error",
     "service_unavailable_error",
@@ -1149,6 +1198,41 @@ mod header_tests {
             ),
             Some(QuotaExhausted)
         );
+    }
+
+    #[test]
+    fn selected_throttling_envelopes_and_refusal_reasons_are_closed() {
+        use serde_json::json;
+        use ProviderErrorCategory::RateLimited;
+        for value in [
+            json!({"error":{"type":"rate_limit_error","code":"slow_down"}}),
+            json!({"error":{"message":"synthetic quota detail","type":"tokens","param":null,"code":"rate_limit_exceeded"}}),
+        ] {
+            assert_eq!(classify(429, &value), Ok(RateLimited));
+            for status in [200, 400, 401, 403, 500, 503] {
+                assert_eq!(classify(status, &value), Err("status_or_type_mismatch"));
+            }
+        }
+        for (value, reason) in [
+            (json!([]), "invalid_root"),
+            (json!({}), "missing_error"),
+            (json!({"error":null}), "invalid_error"),
+            (json!({"error":{"code":"slow_down","type":"rate_limit_error"},"output":[]}), "unexpected_root_keys"),
+            (json!({"error":{"code":"slow_down","type":"rate_limit_error","PRIVATE_KEY":true}}), "unexpected_error_keys"),
+            (json!({"error":{"code":"slow_down","type":17}}), "invalid_field_type"),
+            (json!({"error":{"code":17,"type":"rate_limit_error"}}), "invalid_field_type"),
+            (json!({"error":{"code":"rate_limit_exceeded","type":"requests"}}), "unsupported_type"),
+            (json!({"error":{"code":"PRIVATE_CODE","type":"rate_limit_error"}}), "unsupported_code"),
+            (json!({"error":{}}), "missing_discriminator"),
+            (json!({"error":{"code":"slow_down"}}), "status_or_type_mismatch"),
+            (json!({"error":{"code":"slow_down","type":"tokens"}}), "status_or_type_mismatch"),
+            (json!({"error":{"code":"slow_down","type":"insufficient_quota"}}), "status_or_type_mismatch"),
+            (json!({"error":{"code":"rate_limit_exceeded","type":"tokens"}}), "status_or_type_mismatch"),
+            (json!({"error":{"code":"rate_limit_exceeded","type":"tokens","message":"safe","param":"input"}}), "status_or_type_mismatch"),
+        ] {
+            assert_eq!(classify(429, &value), Err(reason));
+            assert_eq!(category(429, &value), None);
+        }
     }
 
     #[test]

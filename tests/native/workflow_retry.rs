@@ -39,7 +39,7 @@ struct RetryPeer {
 impl RetryPeer {
     async fn start(api: ApiClient, task: Task, policy: Arc<RuntimeLimits>,
         second_entered: Arc<tokio::sync::Notify>, second_release: Arc<tokio::sync::Notify>,
-        third_entered: Arc<tokio::sync::Notify>, third_release: Arc<tokio::sync::Notify>) -> Self {
+        third_entered: Arc<tokio::sync::Notify>, third_release: Arc<tokio::sync::Notify>, refusal: Value) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
         let bodies = Arc::new(Mutex::new(Vec::new())); let captured = bodies.clone();
@@ -88,7 +88,7 @@ impl RetryPeer {
                     1 => {
                         second_entered.notify_one(); second_release.notified().await;
                         rejected_at = Some(tokio::time::Instant::now());
-                        (429, "retry-after-ms: 5\r\n", json!({"error":{"code":"rate_limit_exceeded","type":"rate_limit_error"}}))
+                        (429, "retry-after-ms: 5\r\n", refusal.clone())
                     }
                     2 => {
                         *delay.lock().unwrap() = Some(rejected_at.unwrap().elapsed());
@@ -116,8 +116,34 @@ impl Drop for RetryPeer { fn drop(&mut self) { if let Some(owner) = &self.owner 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn known_429_tool_continuation_retains_original_call_and_defers_notice_ack() {
-    let mut lab = workflow_lab("workflow-native-retry");
+    exercise_retry("workflow-native-retry", json!({"error":{"code":"rate_limit_exceeded","type":"rate_limit_error"}}), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_down_tool_continuation_retains_original_call_and_defers_notice_ack() {
+    exercise_retry("workflow-native-slow-down", json!({"error":{"code":"slow_down","type":"rate_limit_error"}}), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tokens_tool_continuation_retains_original_call_and_defers_notice_ack() {
+    exercise_retry("workflow-native-tokens", json!({"error":{"code":"rate_limit_exceeded","type":"tokens","message":"synthetic quota refusal","param":null}}), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_throttle_shape_preserves_partial_tool_state_without_retry() {
+    exercise_retry("workflow-native-unknown-throttle", json!({"error":{"code":"rate_limit_exceeded","type":"requests","message":"PRIVATE_PROMPT","param":null}}), false).await;
+}
+
+async fn exercise_retry(label: &str, refusal: Value, expect_retry: bool) {
+    let mut lab = workflow_lab(label);
     let mut policy = (*lab.limits).clone();
+    // The shared workflow fixture predates the two machine-resource tools.
+    // Select the current complete V2 catalogue within explicit local bounds;
+    // production metadata and the original retry/effect oracles stay unchanged.
+    policy.execution.native.function_count = 66;
+    policy.execution.native.schema_bytes = 65_536;
+    assert_eq!(borg_runtime::mcp::catalogue_for_profile(&policy,
+        Some(&ExecutionProfile::CollaborationV2 { web_search: None })).len(), 66);
     // Same explicit bounded local retry selection as charter_retry's peer; no
     // production/default metadata selection or actual provider call is changed.
     policy.native_retry = Some(NativeRetryLimits { initial_backoff_ms: 5, backoff_multiplier: 2,
@@ -136,7 +162,7 @@ async fn known_429_tool_continuation_retains_original_call_and_defers_notice_ack
     let second_entered = Arc::new(tokio::sync::Notify::new()); let second_release = Arc::new(tokio::sync::Notify::new());
     let third_entered = Arc::new(tokio::sync::Notify::new()); let third_release = Arc::new(tokio::sync::Notify::new());
     let mut peer = RetryPeer::start(api.clone(), task.clone(), lab.limits.clone(), second_entered.clone(),
-        second_release.clone(), third_entered.clone(), third_release.clone()).await;
+        second_release.clone(), third_entered.clone(), third_release.clone(), refusal).await;
     let proxy = Proxy::start(lab.url.clone(), None, false, lab.limits.clone()).await;
     let held = Arc::new(HeldToolReply::new("collab_memory_get"));
     *proxy.held_reply.lock().unwrap() = Some(held.clone());
@@ -171,6 +197,69 @@ async fn known_429_tool_continuation_retains_original_call_and_defers_notice_ack
     assert_eq!(reported_requests(&api, &task.id, &attempt.id).await, 2);
     assert!(!notice_directory(&lab, &task).join("acknowledge.json").exists());
     second_release.notify_one();
+    if !expect_retry {
+        let terminal = until(&api, &task.id, |t| t.status == TaskStatus::Failed && t.attempt.as_ref().is_some_and(|a| a.stopped && a.uncertain)).await;
+        assert!(terminal.result.is_none());
+        assert_eq!(terminal.input, task.input);
+        assert_eq!(terminal.session_id, task.session_id);
+        assert_eq!(terminal.attempt.as_ref().unwrap().id, attempt.id);
+        assert_eq!(peer.count(), 2, "unknown response cannot authorize another POST");
+        assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), tool_bytes);
+        assert_eq!(mirror(&lab, &task), durable);
+        assert!(!notice_directory(&lab, &task).join("acknowledge.json").exists());
+        let (_, diagnostic) = original(&api, &contract::diagnostic_id(&attempt.id, 2)).await;
+        let Observation::NativeRequestDiagnostic { request_binding, observed_outcome, failure, .. } = report(&diagnostic) else { panic!("original unknown diagnostic"); };
+        assert_eq!(observed_outcome, contract::NativeRequestObservedOutcome::Unknown);
+        assert_eq!(failure.unwrap().http.unwrap().category, borg_runtime::native::CategoryDiagnostic::Absent);
+        let bytes = peer.bodies.lock().unwrap()[1].clone();
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bytes);
+        assert_eq!(request_binding, Some(ProviderRequestBinding { bytes: u64::try_from(bytes.len()).unwrap(), sha256: digest.as_ref().iter().map(|b| format!("{b:02x}")).collect() }));
+        let rejection = api.call(Operation::GetOperation { operation_id: contract::rejection_id(&attempt.id, 2) }).await.unwrap();
+        assert!(matches!(rejection.outcome, Outcome::Refused { ref code, .. } if code == "not_found"));
+        worker.stop().await;
+        // The final acceptance-refusal Progress may follow stopped; capture the
+        // settled public task after stopping the worker before asserting reopen.
+        let stable = get(&api, &task.id).await;
+        assert_eq!(stable.input, task.input);
+        assert_eq!(stable.session_id, task.session_id);
+        assert_eq!(stable.attempt, terminal.attempt);
+        assert_eq!(stable.status, TaskStatus::Failed);
+        assert!(stable.result.is_none());
+        controller.stop().await;
+        assert_eq!(ack_count(&lab, &task.id), 0);
+        assert_eq!(lab.usage(&attempt.id), (2, Some(5), Some(2)));
+        {
+            let db = rusqlite::Connection::open_with_flags(lab.root.join("tasks.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            // Delivery observation requires an active caller. After terminal
+            // failure, inspect its retained canonical state only with both
+            // owners stopped; an Unknown response must not acknowledge it.
+            let raw: String = db.query_row("SELECT workflow_delivery FROM sessions WHERE id=?1",
+                [&task.session_id], |row| row.get(0)).unwrap();
+            let retained: Value = serde_json::from_str(&raw).unwrap();
+            for field in ["pending", "acknowledged_cursor", "routing_cursor", "superseded"] {
+                assert_eq!(retained[field], before_json[field]);
+            }
+            assert_eq!(retained["routing_turn"].as_bool().unwrap_or(false),
+                before_json["routing_turn"].as_bool().unwrap_or(false));
+            assert!(retained["last_ack_context"].is_null());
+            let mut query = db.prepare("SELECT body FROM history WHERE task_id=?1 AND kind='worker_observation' ORDER BY seq").unwrap();
+            let rows: Vec<String> = query.query_map([&task.id], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            let uncertainty = rows.iter().map(|body| serde_json::from_str::<Value>(body).unwrap())
+                .find(|value| value["kind"] == "execution_uncertain").expect("retained uncertainty event");
+            let message = uncertainty["message"].as_str().unwrap();
+            assert!(message.contains("classification_refused=unsupported_type"));
+            assert!(!message.contains("PRIVATE_PROMPT"));
+        }
+        let mut controller = lab.controller("workflow-unknown-restart").await;
+        assert_eq!(get(&api, &task.id).await, stable);
+        assert_eq!(original(&api, &contract::diagnostic_id(&attempt.id, 2)).await.1, diagnostic);
+        assert_eq!(peer.count(), 2);
+        controller.stop().await;
+        assert_eq!(std::fs::read(&journal_path).unwrap(), tool_bytes);
+        peer.close().await;
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(30), third_entered.notified()).await.expect("authorized retry absent");
     assert_eq!(peer.count(), 3); assert!(peer.retry_delay.lock().unwrap().unwrap() >= Duration::from_millis(5));
     assert_eq!(held.calls.load(Ordering::SeqCst), 1, "retained call must not be dispatched again");
