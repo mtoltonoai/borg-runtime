@@ -572,14 +572,49 @@ async fn cancel_deadline_stale_owner_and_budget_stop_without_another_start() {
     assert_eq!(t.status, TaskStatus::Failed);
     assert_eq!(lab.starts(), 1);
     lab.close().await;
-    let mut lab = Lab::start("repeat-rate", 1, 20, true, false).await;
+    let mut lab = Lab::start("repeat-rate", 1, 20, true, true).await;
     let t = lab.finished().await;
     assert_eq!(t.status, TaskStatus::Failed);
     assert_eq!(lab.starts(), 2);
+    let work = lab
+        .worker_root
+        .join("workspaces")
+        .join(process::component(&t.attempt.as_ref().unwrap().id));
+    let until = tokio::time::Instant::now() + Duration::from_secs(20);
+    while work.exists() {
+        lab.worker.live();
+        assert!(
+            tokio::time::Instant::now() < until,
+            "settled refusal must not retain a definitely-unsent retry indefinitely"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     lab.close().await;
 }
 #[tokio::test]
 async fn bounded_diagnostics_preserve_actual_cause_without_provider_text_authority() {
+    let mut visible = Lab::start("success", 4, 20, true, false).await;
+    let done = visible.finished().await;
+    assert_eq!(done.status, TaskStatus::Succeeded);
+    let history = call(
+        &visible.api,
+        Operation::QueryCollaboration {
+            query: Query::TaskHistory {
+                task_id: done.id,
+                after: None,
+                limit: 100,
+            },
+        },
+    )
+    .await;
+    let text = serde_json::to_string(&history).unwrap();
+    assert!(
+        text.contains("due_ms=")
+            && text.contains("policy_initial_ms=20")
+            && text.contains("retained-rate-thread"),
+        "bounded existing UI/MCP history must expose canonical timing and source"
+    );
+    visible.close().await;
     let mut lab = Lab::start("generic", 4, 20, true, false).await;
     let t = lab.finished().await;
     assert_eq!(lab.starts(), 1);

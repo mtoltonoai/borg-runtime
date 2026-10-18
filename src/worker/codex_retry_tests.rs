@@ -129,14 +129,18 @@ async fn bounded<T>(f: &Fixture, future: impl Future<Output = T>) -> T {
 }
 type Response = oneshot::Sender<std::result::Result<Option<Wait>, String>>;
 async fn event(receiver: &mut mpsc::Receiver<Event>) -> (Outer, Response) {
-    match receiver.recv().await.expect("original report event") {
-        Event::SuppliedOuter {
-            observation,
-            acknowledged,
-        } => (observation, acknowledged),
-        _ => panic!("unexpected event at original supplied phase"),
+    loop {
+        match receiver.recv().await.expect("original report event") {
+            Event::SuppliedOuter {
+                observation,
+                acknowledged,
+            } => return (observation, acknowledged),
+            Event::Progress(text) => assert!(text.starts_with("Supplied outer ")),
+            _ => panic!("unexpected event at original supplied phase"),
+        }
     }
 }
+
 fn rate_terminal() -> Value {
     json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{
         "id":TURN,"status":"failed","error":{"codexErrorInfo":"rateLimitExceeded","message":"controlled rate terminal"}
@@ -161,7 +165,7 @@ fn dispatch_observation() -> Outer {
 async fn terminal_owner(f: &Fixture) -> Owner {
     let mut owner = f.owner();
     owner.before_send(&f.control).unwrap();
-    let (events, mut receiver) = mpsc::channel(1);
+    let (events, mut receiver) = mpsc::channel(2);
     let observed = async {
         let (value, response) = event(&mut receiver).await;
         assert_eq!(
@@ -204,7 +208,7 @@ async fn terminal_owner(f: &Fixture) -> Owner {
 }
 async fn admitted_owner(f: &Fixture) -> Owner {
     let mut owner = terminal_owner(f).await;
-    let (events, mut receiver) = mpsc::channel(1);
+    let (events, mut receiver) = mpsc::channel(2);
     let observed = async {
         let (value, response) = event(&mut receiver).await;
         assert_eq!(value, wait_observation());
@@ -237,7 +241,7 @@ async fn waiting_report_response_loss_retains_exact_original_before_any_next_sen
     let f = Fixture::new();
     bounded(&f, async {
         let mut owner = terminal_owner(&f).await;
-        let (events, mut receiver) = mpsc::channel(1);
+        let (events, mut receiver) = mpsc::channel(2);
         let observed = async {
             let (value, response) = event(&mut receiver).await;
             assert_eq!(value, wait_observation());
@@ -339,7 +343,7 @@ async fn committed_dispatch_before_send_reopens_as_known_unsent_cleanup_candidat
     let f = Fixture::new();
     bounded(&f, async {
         let mut owner = terminal_owner(&f).await;
-        let (events, mut receiver) = mpsc::channel(1);
+        let (events, mut receiver) = mpsc::channel(2);
         let canonical_wait = f.wait();
         let observed = async {
             let (value, response) = event(&mut receiver).await;
@@ -394,7 +398,7 @@ async fn committed_dispatch_before_send_reopens_as_known_unsent_cleanup_candidat
     let f = Fixture::new();
     bounded(&f, async {
         let mut owner = terminal_owner(&f).await;
-        let (events, mut receiver) = mpsc::channel(1);
+        let (events, mut receiver) = mpsc::channel(2);
         let observed = async {
             let (value, response) = event(&mut receiver).await;
             assert_eq!(value, wait_observation());

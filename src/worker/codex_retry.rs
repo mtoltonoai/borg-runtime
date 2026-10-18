@@ -193,7 +193,20 @@ impl Owner {
             self.record.terminal = false;
         }
         self.record.committed = true;
-        self.save(control)
+        self.save(control)?;
+        if matches!(self.record.phase, Some(Outer::Waiting { .. })) {
+            let wait = self
+                .record
+                .wait
+                .as_ref()
+                .ok_or("original supplied wait absent")?;
+            let policy = &self.record.policy;
+            events.send(Event::Progress(format!("Supplied outer {} waiting: thread={} prior_turn={} rate_failures={} admitted_ms={} due_ms={} delay_ms={} policy_initial_ms={} multiplier={} maximum_ms={} jitter_ms={}",
+                wait.index,self.record.thread_id,self.record.turn_id.as_deref().unwrap_or("unavailable"),wait.rate_failures,
+                wait.admitted_at_ms,wait.not_before_ms,wait.not_before_ms.saturating_sub(wait.admitted_at_ms),policy.initial_backoff_ms,
+                policy.backoff_multiplier,policy.max_backoff_ms,policy.jitter_ms))).await.map_err(|_|"supplied progress observer closed")?;
+        }
+        Ok(())
     }
     pub(super) async fn acknowledged(
         &mut self,
@@ -459,7 +472,7 @@ pub(in crate::worker) async fn cleanup_verified(
                     },
                 },
             };
-            if !cleanup_original(client, &id, &intended, attempt, timeout_ms).await? {
+            if !cleanup_original(client, &id, &intended, attempt, timeout_ms, preadvance).await? {
                 return Ok(false);
             }
             (
@@ -490,7 +503,7 @@ pub(in crate::worker) async fn cleanup_verified(
             },
         },
     };
-    cleanup_original(client, &id, &expected, attempt, timeout_ms).await
+    cleanup_original(client, &id, &expected, attempt, timeout_ms, false).await
 }
 async fn cleanup_original(
     client: &crate::client::ApiClient,
@@ -498,6 +511,7 @@ async fn cleanup_original(
     expected: &crate::protocol::Operation,
     attempt: &crate::protocol::Attempt,
     timeout_ms: u64,
+    allow_refusal: bool,
 ) -> std::result::Result<bool, String> {
     use crate::protocol::{Data, Operation, Outcome};
     let reply = tokio::time::timeout(
@@ -529,7 +543,8 @@ async fn cleanup_original(
     )
     .map_err(|_| "supplied terminal original outcome invalid")?;
     Ok(
-        matches!(original,Outcome::Ok{data:Data::Task(task)} if task.id==attempt.task_id&&task.attempt.as_ref().is_some_and(|a|a.id==attempt.id&&a.generation==attempt.generation)),
+        matches!(&original,Outcome::Ok{data:Data::Task(task)} if task.id==attempt.task_id&&task.attempt.as_ref().is_some_and(|a|a.id==attempt.id&&a.generation==attempt.generation))
+            || (allow_refusal && matches!(original, Outcome::Refused { .. })),
     )
 }
 

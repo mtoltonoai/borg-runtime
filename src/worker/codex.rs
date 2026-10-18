@@ -742,6 +742,7 @@ async fn execute_observed(
     let mut initial_completion_held = false;
     let mut initial_dispatch_unknown = false;
     let mut completion_started = false;
+    let mut pending_completion_held = false;
     let result=async {
         session.initialize(control).await?;
         session.preflight_command(cwd,control).await?;
@@ -892,6 +893,7 @@ async fn execute_observed(
                 let status=message["params"]["turn"]["status"].as_str().ok_or("executor terminal event missing status")?;
                 if !matches!(status,"completed"|"failed"|"interrupted") {return Err("unrecognized executor terminal status".into());}
                 lifecycle.terminal();
+                pending_completion_held=pending_completion.is_some();
                 if let (Some(scope),Some(capture))=(initial_charter,charter_capture.take()) {
                     // A commentary item is not a supplied final result. Missing final
                     // metadata stays an audit finding, with the public terminal retained.
@@ -1021,7 +1023,7 @@ async fn execute_observed(
             collaboration_uncertain,
             execution_uncertain: lifecycle.uncertain(),
             completion_held:false,
-            completion_uncertain:initial_dispatch_unknown || completion_started,
+            completion_uncertain:initial_dispatch_unknown || completion_started || (pending_completion_held && lifecycle.uncertain()),
         });
     }
     if collaboration_uncertain {
@@ -1036,16 +1038,16 @@ async fn execute_observed(
                 }),
             collaboration_uncertain: true,
             execution_uncertain: lifecycle.uncertain(),
-            completion_held:initial_completion_held || completion_started,
-            completion_uncertain:initial_dispatch_unknown || completion_started,
+            completion_held:initial_completion_held || completion_started || pending_completion_held,
+            completion_uncertain:initial_dispatch_unknown || completion_started || (pending_completion_held && lifecycle.uncertain()),
         });
     }
     result.map_err(|message| ExecutionFailure {
         message,
         collaboration_uncertain: false,
         execution_uncertain: lifecycle.uncertain(),
-        completion_held:initial_completion_held || completion_started,
-        completion_uncertain:initial_dispatch_unknown || completion_started,
+        completion_held:initial_completion_held || completion_started || pending_completion_held,
+        completion_uncertain:initial_dispatch_unknown || completion_started || (pending_completion_held && lifecycle.uncertain()),
     })
 }
 
@@ -1216,7 +1218,7 @@ mod credential_tests {
     }
     #[tokio::test]
     async fn retry_and_completion_share_monotone_outer_occurrences_and_reservations() {
-        completion_journeys(&["rate-completion"]).await;
+        completion_journeys(&["rate-completion","rate-completion-exhausted"]).await;
     }
     async fn completion_journeys(modes:&[&'static str]) {
         use crate::worker::completion::tests as fixture;
@@ -1246,7 +1248,7 @@ for line in sys.stdin:
         turn='turn-'+str(starts)
         emit({'id':request['id'],'result':{'turn':{'id':turn}}})
         emit({'method':'thread/tokenUsage/updated','params':{'threadId':'completion-thread','turnId':turn,'tokenUsage':{'total':{'inputTokens':starts*10,'outputTokens':starts*2}}}})
-        if mode=='rate-completion' and starts==2:
+        if mode.startswith('rate-completion') and starts==2:
             emit({'method':'turn/completed','params':{'threadId':'completion-thread','turn':{'id':turn,'status':'failed','error':{'codexErrorInfo':'rateLimitExceeded','message':'controlled rejection'}}}})
         else:
             emit({'method':'turn/completed','params':{'threadId':'completion-thread','turn':{'id':turn,'status':'completed'}}})
@@ -1256,7 +1258,7 @@ for line in sys.stdin:
 "#).unwrap();
             std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
             let mut limits=fixture::policy();
-            if mode=="rate-completion" {limits.execution.coding.rate_limit_retry=Some(crate::supplied_outer::RetryPolicy {initial_backoff_ms:1,backoff_multiplier:2,max_backoff_ms:2,jitter_ms:1});}
+            if mode.starts_with("rate-completion") {limits.execution.coding.rate_limit_retry=Some(crate::supplied_outer::RetryPolicy {initial_backoff_ms:1,backoff_multiplier:2,max_backoff_ms:2,jitter_ms:1});}
             if mode=="exhausted" || mode=="initial-refused" {limits.governance.as_mut().unwrap().completion_continuations=0;}
             let first=CompletionBoundary::CodexTurn {thread_id:"completion-thread".into(),turn_id:"turn-1".into()};
             let second=CompletionBoundary::CodexTurn {thread_id:"completion-thread".into(),turn_id:if mode=="rate-completion" {"turn-3"}else{"turn-2"}.into()};
@@ -1303,7 +1305,13 @@ for line in sys.stdin:
                             assert_eq!(model_requests,1);acknowledged.send(Ok(())).unwrap();
                         },
                         Event::SuppliedOuter{observation,acknowledged}=>{
-                            assert_eq!(mode,"rate-completion");
+                            assert!(mode.starts_with("rate-completion"));
+                            if mode=="rate-completion-exhausted" && observation.index()==3 {
+                                assert_eq!(observation.phase(),"wait");
+                                outer.push((3,"wait"));
+                                acknowledged.send(Err("original outer allowance exhausted".into())).unwrap();
+                                continue;
+                            }
                             let answer=match &observation {
                                 crate::supplied_outer::Observation::Waiting{index,cause,..}=>{
                                     assert!(matches!((*index,cause),(2,crate::supplied_outer::Cause::Completion{..})|(3,crate::supplied_outer::Cause::RateLimit{retry_index:1})));
@@ -1317,6 +1325,7 @@ for line in sys.stdin:
                     }
                 }
                 if mode=="rate-completion" {assert_eq!(outer,vec![(1,"ack"),(1,"terminal"),(2,"wait"),(2,"dispatch"),(2,"ack"),(2,"terminal"),(3,"wait"),(3,"dispatch"),(3,"ack"),(3,"terminal")]);}
+                if mode=="rate-completion-exhausted" {assert_eq!(outer,vec![(1,"ack"),(1,"terminal"),(2,"wait"),(2,"dispatch"),(2,"ack"),(2,"terminal"),(3,"wait")]);}
                 (started,barriers)
             });
             let decision_peer=if mode.starts_with("initial") {None}else {
@@ -1337,6 +1346,23 @@ for line in sys.stdin:
                 assert_eq!(observations,(0,0));
                 if mode=="initial-refused" {assert!(!root.join("starts.jsonl").exists());}
                 else {assert_eq!(std::fs::read_to_string(root.join("starts.jsonl")).unwrap().lines().count(),1);}
+                continue;
+            }
+            if mode=="rate-completion-exhausted" {
+                let error=result.unwrap_err();
+                assert!(error.completion_held,"original input stays held after a known rate terminal");
+                assert!(!error.completion_uncertain && !error.execution_uncertain);
+                assert_eq!(observations,(1,1));
+                assert_eq!(std::fs::read_to_string(root.join("starts.jsonl")).unwrap().lines().count(),2);
+                let root=state.join("completion");let mut inputs=Vec::new();
+                for caller in std::fs::read_dir(root).unwrap() {for boundary in std::fs::read_dir(caller.unwrap().path()).unwrap() {
+                    let p=boundary.unwrap().path().join("input.json");if p.exists(){inputs.push(serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap());}
+                }}
+                assert_eq!(inputs.len(),1);
+                assert_eq!(inputs[0]["feedback"]["continuation"]["begin_operation_id"],feedback.continuation.begin_operation_id);
+                assert_eq!(inputs[0]["accepted_at"]["turn_id"],"turn-2");
+                assert_eq!(inputs[0]["consumed_at"],Value::Null);
+                assert_eq!(inputs[0]["started"],true);
                 continue;
             }
             let result=result.unwrap();
