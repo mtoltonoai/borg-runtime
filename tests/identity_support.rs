@@ -41,7 +41,7 @@ pub fn policy() -> RuntimeLimits {
     p.execution.native.context_bytes = 524288;
     p.execution.native.schema_bytes = 262144;
     p.execution.native.json_nodes = 65536;
-    p.execution.native.function_count = 71;
+    p.execution.native.function_count = 73;
     p.charter = Some(CharterLimits {
         record_bytes: 262144,
         source_bytes: 32768,

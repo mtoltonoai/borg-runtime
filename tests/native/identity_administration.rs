@@ -457,7 +457,7 @@ async fn native_and_coding_task_creation_share_real_mcp_contract() {
     let ns = Server::new(&native).await;
     let nc = client(&native, &ns);
     let nt = nc.tools().await.unwrap();
-    assert_eq!(nt.len(), 65);
+    assert_eq!(nt.len(), 67);
     let mut previous = None;
     let before = native.current().await;
     let created = task(
@@ -609,7 +609,7 @@ async fn charter_creates_designer_and_requests_review_through_mcp() {
     let server = Server::new(&h).await;
     let client = client(&h, &server);
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 71);
+    assert_eq!(tools.len(), 73);
     let mut previous = None;
     let designer = definition(&h.cfg.limits, "ui-designer", ExecutorKind::Native, false);
     let args = admin_args(&h.cfg.limits, json!({"definition":designer}));

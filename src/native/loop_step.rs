@@ -3180,37 +3180,25 @@ mod provider_schema_tests {
         let definition: crate::protocol::Definition =
             serde_json::from_value(source["definition"].clone()).unwrap();
         let selected = limits.resolve_definition(&definition).unwrap();
-        // This fixture exercises the retained v4 diagnostic definition and its
-        // exact 19,746-byte acceptance binding. c986716 later expanded only the
-        // agent-get description by 50 bytes; reconstruct that historical input
-        // explicitly, without changing current catalogue or accepted limits.
-        let mut historical_tools = crate::mcp::catalogue(&limits);
-        let agent_get = historical_tools
-            .iter_mut()
-            .find(|tool| tool.name == "collab_agent_get")
-            .unwrap();
-        assert_eq!(agent_get.description,
-            "AgentSummary; identity, stored Definition and retired status; historical identities remain readable");
-        agent_get.description = "AgentSummary; identity and stored Definition only".into();
-        let profile = NativeLoopProfile {
-            functions: historical_tools
-                .into_iter()
-                .map(|tool| NativeFunction {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool.input_schema,
-                })
-                .collect(),
-            web_search: None,
-        };
-        let validation = ValidationInput {
-            output_prefix: None,
-            joined_charter: false,
-            schema: source["output_schema"].clone(),
-            profile,
-            output_bytes: limits.task_defaults.output_bytes,
-            repair_enabled: false,
-        };
+        // Retain the complete v4 input rendered from the exact catalogue,
+        // renderer and limits named by its acceptance binding. Later catalogue
+        // additions must not change this historical 19,746-byte fixture or be
+        // mistaken for qualification of the current catalogue under v4 limits.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "testdata/operational-diagnostic-v4-validation.json"
+        ))
+        .unwrap();
+        for key in [
+            "catalogue_source_sha256",
+            "catalogue_renderer_sha256",
+            "global_metadata_sha256",
+        ] {
+            assert_eq!(fixture["source_bindings"][key], source["schema_binding"][key]);
+        }
+        let validation: ValidationInput =
+            serde_json::from_value(fixture["validation_input"].clone()).unwrap();
+        assert_eq!(validation.schema, source["output_schema"]);
+        assert_eq!(validation.output_bytes, 65_536);
         (source, validation, selected.native)
     }
     fn report() -> Value {

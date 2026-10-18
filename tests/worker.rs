@@ -687,7 +687,9 @@ for line in sys.stdin:
     .await
     .unwrap();
     assert!(outcome.success);
-    assert_eq!(outcome.summary, "fixture completed");
+    // The unassociated item above cannot supply this turn's final result;
+    // completion comes from the matching original terminal notification.
+    assert_eq!(outcome.summary, "Executor turn completed");
     let expected = serde_json::json!({"input_tokens":100,"output_tokens":12,"model_requests":null});
     assert_eq!(
         serde_json::to_value(&outcome.observed_usage).unwrap(),

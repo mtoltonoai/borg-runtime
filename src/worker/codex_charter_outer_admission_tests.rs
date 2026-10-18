@@ -40,8 +40,9 @@ for line in sys.stdin:
 async fn run_outer(f:&AdmissionFixture,control:&Control)->std::result::Result<super::super::Result,ExecutionFailure>{
     let (events,_received)=mpsc::channel(16);
     let executor_state=f.root.join("executor-state");process::private_directory(&executor_state).unwrap();
-    Box::pin(execute_with_credentials_collaboration_and_charter(&f.binary,&f.root,&executor_state,&f.state.join("processes"),
-        &InferenceSettings::selected(),&f.runtime.execution,"Original product task.",control,events,&[],None,None,None,Some(&f.scope))).await
+    let processes=f.state.join("processes");let inference=InferenceSettings::selected();
+    crate::worker::boxed_execution(|| execute_with_credentials_collaboration_and_charter(&f.binary,&f.root,&executor_state,&processes,
+        &inference,&f.runtime.execution,"Original product task.",control,events,&[],None,None,None,Some(&f.scope))).await
 }
 #[tokio::test]
 async fn supplied_final_result_original_ack_loss_reconciles_without_second_start_and_keeps_full_metadata(){
