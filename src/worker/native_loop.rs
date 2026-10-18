@@ -538,8 +538,11 @@ fn output(journal: &mutations::Journal, input: &TaskInput) -> Result<String, Str
     // revision is not substituted for the historical result's source revision.
     let value = serde_json::json!({"operation_id":call.operation_id,"logical_call_id":call.logical_call_id,
         "outcome":outcome,"commit":context.commit});
-    bounded_json_size(&value, input.limits.output_bytes)
-        .map_err(|_| "native collaboration result bound: task_output_bytes")?;
+    // The complete tool envelope is input to the next model request. The loop
+    // separately bounds its JSON framing and the accumulated context; final
+    // task output retains its own allowance.
+    bounded_json_size(&value, input.execution_limits()?.native.context_bytes)
+        .map_err(|_| "native collaboration result bound: native_context_bytes")?;
     let encoded = serde_json::to_string(&value).map_err(|e| e.to_string())?;
     if contains_credential(&encoded, &configured_credentials(&journal.limits)?) {
         return Err("collaboration result contains configured credential".into());
@@ -1954,6 +1957,164 @@ pub(super) async fn recover_delegate(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tool_result_input_tests {
+    use super::*;
+
+    // Synthetic component data, not a receipt from the failed live task.
+    fn fixture(
+        context_bytes: usize,
+        global_context_bytes: usize,
+    ) -> (TaskInput, mutations::Journal, String) {
+        let mut limits = RuntimeLimits::seed().unwrap();
+        limits.execution.native.context_bytes = global_context_bytes;
+        let mut native = limits.execution.native.clone();
+        native.context_bytes = context_bytes;
+        let mut input: TaskInput = serde_json::from_value(json!({
+            "instruction": "Read the synthetic retained tool result.",
+            "definition": {
+                "id": "tool-input-agent", "revision": "tool-input-r1", "executor": "native",
+                "inference": InferenceSettings::selected(),
+                "execution_profile": {"kind": "collaboration_v1"},
+                "limit_overrides": {"native": native}
+            },
+            "repository": null, "acceptance_commands": [],
+            "output_schema": {"type": "object"},
+            "limits": limits.task_defaults.at(process::now_ms()).unwrap(),
+            "dependencies": []
+        }))
+        .unwrap();
+        input.limits.output_bytes = 65_536;
+        input.resolved_limits = Some(limits.resolve_task(&input).unwrap());
+        let call = mcp::Invocation {
+            operation_id: "synthetic-tool-operation".into(),
+            logical_call_id: "logical-first".into(),
+            caller: mcp::Caller {
+                task_id: "synthetic-task".into(),
+                attempt_id: "synthetic-attempt".into(),
+                generation: 1,
+                worker_id: "synthetic-worker".into(),
+                incarnation: "one".into(),
+            },
+            tool: "collab_memory_get".into(),
+            arguments: json!({"key": "fixture"}),
+        };
+        let mut value = json!({
+            "operation_id": "synthetic-tool-operation", "logical_call_id": "logical-first",
+            "outcome": {"status": "ok", "data": {"kind": "memory", "value": {
+                "agent_id": "tool-input-agent", "key": "fixture", "revision": 1,
+                "value": "synthetic \"quoted\" \\ input\n\u{03bb}".repeat(256)
+            }}},
+            "commit": {"operation_id": "synthetic-tool-operation", "controller_revision": 7}
+        });
+        let padding = 95_028 - serde_json::to_vec(&value).unwrap().len();
+        let payload = value["outcome"]["data"]["value"]["value"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        value["outcome"]["data"]["value"]["value"] = json!(payload + &"x".repeat(padding));
+        let expected = serde_json::to_string(&value).unwrap();
+        assert_eq!(expected.len(), 95_028);
+        let mut journal = mutations::prepare(call.operation(), 0, &limits).unwrap();
+        let reply = Reply {
+            request_id: "synthetic-lookup".into(),
+            commit: Some(serde_json::from_value(value["commit"].clone()).unwrap()),
+            // A later lookup must not replace the original commit revision.
+            observed_controller_revision: Some(13),
+            outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+        };
+        journal.outcome_context = CommitContext::from_reply(&reply, &journal.request).unwrap();
+        journal.outcome = Some(reply.outcome);
+        (input, journal, expected)
+    }
+
+    #[test]
+    // Traceability scope: Synthetic retained component envelope preserves every byte and the original commit under an accepted definition override; no historical receipt is fabricated.
+    //= spec/impl/v2/implementation.md#native-tool-profiles-and-continuations
+    //= type=test
+    //# A native model continuation MUST use the recorded outcome of its corresponding tool call.
+    fn complete_tool_envelope_uses_accepted_context_override() {
+        for context_bytes in [95_028, 131_072] {
+            let (input, journal, expected) = fixture(context_bytes, 65_536);
+            assert_eq!(input.limits.output_bytes, 65_536);
+            assert_eq!(
+                input.execution_limits().unwrap().native.context_bytes,
+                context_bytes
+            );
+            assert_eq!(journal.limits.execution.native.context_bytes, 65_536);
+            let retained = serde_json::to_vec(&journal).unwrap();
+            assert_eq!(output(&journal, &input).unwrap(), expected);
+            assert_eq!(serde_json::to_vec(&journal).unwrap(), retained);
+            assert_eq!(input.limits.output_bytes, 65_536);
+        }
+    }
+
+    #[test]
+    fn tighter_accepted_context_rejects_despite_larger_global_context() {
+        let (input, journal, expected) = fixture(95_027, 131_072);
+        assert!(expected.len() < journal.limits.execution.native.context_bytes);
+        assert_eq!(
+            output(&journal, &input).unwrap_err(),
+            "native collaboration result bound: native_context_bytes"
+        );
+    }
+
+    #[test]
+    fn tool_envelope_requires_valid_original_commit_context() {
+        let (input, journal, _) = fixture(131_072, 65_536);
+        let mut missing = journal.clone();
+        missing.outcome_context = None;
+        assert_eq!(
+            output(&missing, &input).unwrap_err(),
+            "collaboration commit absent"
+        );
+        let mut missing = journal.clone();
+        missing.outcome = None;
+        assert_eq!(
+            output(&missing, &input).unwrap_err(),
+            "collaboration outcome absent"
+        );
+        for invalid in 0..4 {
+            let mut changed = journal.clone();
+            let context = changed.outcome_context.as_mut().unwrap();
+            match invalid {
+                0 => context.commit.operation_id = "different-operation".into(),
+                1 => context.commit.controller_revision = 0,
+                2 => context.observed_controller_revision = 6,
+                3 => context.commit.controller_revision = u64::MAX,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                output(&changed, &input).unwrap_err(),
+                "invalid committed mutation context"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_envelope_refuses_unbound_or_inconsistent_execution_snapshot() {
+        let (input, journal, _) = fixture(131_072, 65_536);
+        let mut unbound = input.clone();
+        unbound.resolved_limits = None;
+        assert_eq!(
+            output(&journal, &unbound).unwrap_err(),
+            "execution limits are not bound at admission"
+        );
+        let mut inconsistent = input;
+        inconsistent
+            .resolved_limits
+            .as_mut()
+            .unwrap()
+            .values
+            .native
+            .context_bytes += 1;
+        assert_eq!(
+            output(&journal, &inconsistent).unwrap_err(),
+            "execution limits values differ from their recorded sources"
+        );
+    }
 }
 
 #[cfg(test)]

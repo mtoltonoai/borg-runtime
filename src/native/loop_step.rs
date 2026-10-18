@@ -226,6 +226,42 @@ impl NativeLoopCall {
     pub fn request_index(&self) -> u32 {
         self.request_index
     }
+    // Kept separate from sending so the exact continuation append can be
+    // exercised without a provider. The caller checks task/profile/call identity.
+    fn tool_output_context(&self, output: &str, policy: &NativeLimits) -> Result<Value, String> {
+        if output.len() > policy.context_bytes {
+            return Err("native_tool_result_bound_native_context_bytes".into());
+        }
+        // Charge serialized framing before cloning/appending accumulated
+        // context. JSON escaping is included, and nothing is truncated.
+        // Traceability scope: After the caller verifies task/profile/call identity, this append preserves the corresponding tool output under the accepted context bound.
+        //= spec/impl/v2/implementation.md#native-tool-profiles-and-continuations
+        //# A native model continuation MUST use the recorded outcome of its corresponding tool call.
+        let appended = json!({"type":"function_call_output","call_id":self.call_id,"output":output});
+        let old = schema::measure(
+            &self.context,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?
+        .0;
+        let next = schema::measure(
+            &appended,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?
+        .0;
+        if old.saturating_add(next).saturating_add(1) > policy.context_bytes {
+            return Err("native_tool_context_bound_native_context_bytes".into());
+        }
+        let mut context = self.context.clone();
+        context
+            .as_array_mut()
+            .ok_or("native_tool_context_invalid")?
+            .push(appended);
+        Ok(context)
+    }
     /// Render the exact completed tool result for a separately reserved
     /// compaction. Receipt/current-owner verification remains with the worker.
     pub fn compaction_input(&self, output: &str) -> Result<Value, String> {
@@ -1165,38 +1201,7 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
                 )?;
                 (call.context.clone(), index)
             } else {
-                if reply.output.len() > policy.context_bytes {
-                    return Err("native_tool_result_bound_native_context_bytes".into());
-                }
-                // Charge serialized framing before cloning/appending accumulated
-                // context. JSON escaping is included, and nothing is truncated.
-                // Traceability scope: The helper verifies the prior task/profile/call identity and appends that corresponding recorded tool output unchanged.
-                //= spec/impl/v2/implementation.md#native-tool-profiles-and-continuations
-                //# A native model continuation MUST use the recorded outcome of its corresponding tool call.
-                let appended = json!({"type":"function_call_output","call_id":reply.call_id,"output":reply.output});
-                let old = schema::measure(
-                    &call.context,
-                    policy.context_bytes,
-                    policy,
-                    "native_context_bytes",
-                )?
-                .0;
-                let next = schema::measure(
-                    &appended,
-                    policy.context_bytes,
-                    policy,
-                    "native_context_bytes",
-                )?
-                .0;
-                if old.saturating_add(next).saturating_add(1) > policy.context_bytes {
-                    return Err("native_tool_context_bound_native_context_bytes".into());
-                }
-                let mut context = call.context.clone();
-                context
-                    .as_array_mut()
-                    .ok_or("native_tool_context_invalid")?
-                    .push(appended);
-                (context, index)
+                (call.tool_output_context(reply.output, policy)?, index)
             }
         }
     };
@@ -2350,6 +2355,204 @@ mod policy_tests {
         );
         envelope["output"].as_array_mut().unwrap().truncate(1);
         validate_response(&envelope, &input, policy.context_bytes, deadline(), &policy).unwrap();
+    }
+
+    fn tool_input_fixture(context_bytes: usize) -> (NativeLoopCall, String) {
+        let limits = crate::limits::RuntimeLimits::seed().unwrap();
+        let mut native = limits.execution.native.clone();
+        native.context_bytes = context_bytes;
+        native.function_calls_per_response = 2;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut task: TaskInput = serde_json::from_value(json!({
+            "instruction": "Read the synthetic retained tool result.",
+            "definition": {
+                "id": "tool-input-agent", "revision": "tool-input-r1", "executor": "native",
+                "inference": crate::protocol::InferenceSettings::selected(),
+                "execution_profile": {"kind": "collaboration_v1"},
+                "limit_overrides": {"native": native}
+            },
+            "repository": null, "acceptance_commands": [],
+            "output_schema": {"type": "object", "properties": {"result": {"type": "string"}},
+                "required": ["result"], "additionalProperties": false},
+            "limits": limits.task_defaults.at(now).unwrap(), "dependencies": []
+        }))
+        .unwrap();
+        task.limits.output_bytes = 65_536;
+        task.resolved_limits = Some(limits.resolve_task(&task).unwrap());
+        let call = NativeLoopCall {
+            pending: vec![(
+                "logical-second".into(),
+                "read_version".into(),
+                json!({"version": 1}),
+            )],
+            call_index: 1,
+            task,
+            profile: profile(),
+            context: envelope(json!({"version": 1}))["output"].clone(),
+            request_index: 1,
+            charged_through: 1,
+            compacted: false,
+            call_id: "logical-first".into(),
+            name: "inspect_record".into(),
+            arguments: json!({"key": "alpha"}),
+        };
+        // Complete synthetic envelope, including strings that require escaping
+        // again inside function_call_output. This is not historical evidence.
+        let mut value = json!({
+            "operation_id": "synthetic-tool-operation", "logical_call_id": "logical-first",
+            "outcome": {"status": "ok", "data": {"kind": "memory", "value": {
+                "agent_id": "tool-input-agent", "key": "fixture", "revision": 1,
+                "value": "synthetic \"quoted\" \\ input\n\u{03bb}".repeat(256)
+            }}},
+            "commit": {"operation_id": "synthetic-tool-operation", "controller_revision": 7}
+        });
+        let padding = 95_028 - serde_json::to_vec(&value).unwrap().len();
+        let payload = value["outcome"]["data"]["value"]["value"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        value["outcome"]["data"]["value"]["value"] = json!(payload + &"x".repeat(padding));
+        let result = serde_json::to_string(&value).unwrap();
+        assert_eq!(result.len(), 95_028);
+        (call, result)
+    }
+
+    #[test]
+    // Traceability scope: Component-only serial and continuation context construction retains a complete synthetic envelope; no provider or historical receipt is used.
+    //= spec/impl/v2/implementation.md#native-tool-profiles-and-continuations
+    //= type=test
+    //# A native model continuation MUST use the recorded outcome of its corresponding tool call.
+    fn large_tool_input_survives_serial_and_continuation_appends_unchanged() {
+        let (first, result) = tool_input_fixture(262_144);
+        assert_eq!(first.task.limits.output_bytes, 65_536);
+        let original = first.retained_items().clone();
+        let second = first.next_call(&result).unwrap().unwrap();
+        let policy = &second.task.execution_limits().unwrap().native;
+        let context = second.tool_output_context(&result, policy).unwrap();
+        let mut expected = original.clone();
+        for call_id in ["logical-first", "logical-second"] {
+            expected.as_array_mut().unwrap().push(json!({
+                "type": "function_call_output", "call_id": call_id, "output": result
+            }));
+        }
+        assert_eq!(context, expected);
+        // Check after the full JSON context has been encoded and decoded too.
+        let round_trip: Value =
+            serde_json::from_slice(&serde_json::to_vec(&context).unwrap()).unwrap();
+        for index in [2, 3] {
+            assert_eq!(
+                round_trip[index]["output"].as_str().unwrap().as_bytes(),
+                result.as_bytes()
+            );
+        }
+        assert_eq!(first.retained_items(), &original);
+        assert_eq!(second.retained_items().as_array().unwrap().len(), 3);
+        assert_eq!(second.task.limits.output_bytes, 65_536);
+        assert_eq!(second.request_index(), first.request_index());
+        assert_eq!(second.charged_through, first.charged_through);
+        assert!(second.pending.is_empty());
+    }
+
+    #[test]
+    fn tool_input_context_counts_json_framing_and_accumulated_history() {
+        let (first, result) = tool_input_fixture(262_144);
+        let appended =
+            json!({"type": "function_call_output", "call_id": first.call_id(), "output": result});
+        let framed_bytes = serde_json::to_vec(&appended).unwrap().len();
+        let accumulated_bytes = serde_json::to_vec(first.retained_items()).unwrap().len();
+        let exact_bound = accumulated_bytes + framed_bytes + 1;
+        assert!(framed_bytes > result.len());
+        for (bound, reason) in [
+            (result.len(), "native_json_byte_bound_native_context_bytes"),
+            (
+                framed_bytes,
+                "native_tool_context_bound_native_context_bytes",
+            ),
+            (
+                exact_bound - 1,
+                "native_tool_context_bound_native_context_bytes",
+            ),
+        ] {
+            let (call, same_result) = tool_input_fixture(bound);
+            assert_eq!(same_result, result);
+            let policy = &call.task.execution_limits().unwrap().native;
+            assert_eq!(call.next_call(&result).err().unwrap(), reason);
+            assert_eq!(
+                call.tool_output_context(&result, policy).unwrap_err(),
+                reason
+            );
+            assert_eq!(call.task.limits.output_bytes, 65_536);
+        }
+        let (call, _) = tool_input_fixture(exact_bound);
+        let policy = &call.task.execution_limits().unwrap().native;
+        let second = call.next_call(&result).unwrap().unwrap();
+        let context = call.tool_output_context(&result, policy).unwrap();
+        assert_eq!(second.retained_items(), &context);
+        assert_eq!(serde_json::to_vec(&context).unwrap().len(), exact_bound);
+        assert_eq!(
+            second.tool_output_context(&result, policy).unwrap_err(),
+            "native_tool_context_bound_native_context_bytes"
+        );
+        let (call, _) = tool_input_fixture(result.len() - 1);
+        assert_eq!(
+            call.tool_output_context(&result, &call.task.execution_limits().unwrap().native)
+                .unwrap_err(),
+            "native_tool_result_bound_native_context_bytes"
+        );
+    }
+
+    #[test]
+    fn large_tool_input_does_not_raise_final_output_or_change_its_schema() {
+        let (call, _) = tool_input_fixture(262_144);
+        let policy = &call.task.execution_limits().unwrap().native;
+        let input = ValidationInput {
+            output_prefix: None,
+            joined_charter: false,
+            repair_enabled: false,
+            schema: call.task.output_schema.clone().unwrap(),
+            profile: call.profile.clone(),
+            output_bytes: call.task.limits.output_bytes,
+        };
+        assert_eq!(input.output_bytes, 65_536);
+        let final_envelope = |value: Value| {
+            json!({
+                "status": "completed", "error": null,
+                "output": [{"type": "message", "id": "synthetic-final", "role": "assistant",
+                    "status": "completed", "content": [{"type": "output_text",
+                        "text": serde_json::to_string(&value).unwrap(), "annotations": []}]}]
+            })
+        };
+        let overhead = serde_json::to_vec(&json!({"result": ""})).unwrap().len();
+        let at_bound = final_envelope(json!({"result": "x".repeat(65_536 - overhead)}));
+        assert_eq!(
+            at_bound["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .len(),
+            65_536
+        );
+        validate_response(&at_bound, &input, policy.context_bytes, deadline(), policy).unwrap();
+        let oversized = final_envelope(json!({"result": "x".repeat(65_537 - overhead)}));
+        assert_eq!(
+            validate_response(&oversized, &input, policy.context_bytes, deadline(), policy)
+                .unwrap_err(),
+            "native_output_cap_prefix_bound_task_output_bytes"
+        );
+        assert_eq!(
+            validate_response(
+                &final_envelope(json!({"result": 1})),
+                &input,
+                policy.context_bytes,
+                deadline(),
+                policy
+            )
+            .unwrap_err(),
+            "native_output_schema_mismatch"
+        );
+        assert_eq!(call.task.limits.output_bytes, 65_536);
     }
 
     #[tokio::test]
