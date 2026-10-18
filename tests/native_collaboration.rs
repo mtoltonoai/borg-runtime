@@ -1185,7 +1185,12 @@ async fn native_collaboration_cancel_before_dispatch_refuses_write_and_continuat
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_collaboration_configured_child_quiesces_and_restarts_without_another_model_request()
 {
-    let lab = Lab::new("delegate");
+    let mut lab = Lab::new("delegate");
+    let mut metadata = (*lab.limits).clone();
+    charter_worker::configure_native_schema(&mut metadata);
+    metadata.validate().unwrap();
+    lab.limits = Arc::new(metadata);
+    std::fs::write(lab.root.join("limits.json"), serde_json::to_vec_pretty(&*lab.limits).unwrap()).unwrap();
     let mut c = lab.controller("controller").await;
     let peer = Peer::start(|i, _| {
         Some(function(

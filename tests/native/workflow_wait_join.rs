@@ -61,6 +61,18 @@ fn wait_charter() -> CharterSource {
 
 async fn self_wait_scenario(with_charter: bool) {
     let mut lab = workflow_lab(if with_charter { "workflow-charter-self-wait-join" } else { "workflow-native-self-wait-join" });
+    // Same explicit current V2 sizing as workflow_retry's positive fixture;
+    // this scenario has no identity/publication capability catalogue.
+    let mut selected = (*lab.limits).clone();
+    selected.execution.native.function_count = 67;
+    selected.execution.native.schema_bytes = 65_536;
+    let tools = borg_runtime::mcp::catalogue_for_profile(&selected,
+        Some(&ExecutionProfile::CollaborationV2 { publication: None, web_search: None }));
+    assert_eq!(tools.len(), 67);
+    assert_eq!(tools.iter().filter(|tool| tool.name == "collab_read_continue").count(), 1);
+    selected.validate().unwrap();
+    lab.limits = Arc::new(selected);
+    std::fs::write(lab.root.join("limits.json"), serde_json::to_vec_pretty(&*lab.limits).unwrap()).unwrap();
     if with_charter {
         let mut limits = (*lab.limits).clone();
         limits.charter = Some(borg_runtime::limits::CharterLimits {
