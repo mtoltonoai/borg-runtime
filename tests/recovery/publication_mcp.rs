@@ -145,7 +145,12 @@ sys.exit(1)
     let head_remote=format!("ssh://fixture@127.0.0.1{}",remote.to_str().unwrap());let source=source(&mut lab,remote.clone(),&provider.url,Some(head_remote)).await;
     let root=native_task(&lab,&source).await;let model=Model::start(lab.client.clone(),root.id.clone(),args(&source),p::State::Completed).await;let origin=lab.origin.clone();let ssh=ssh.to_str().unwrap();
     native_worker(&mut lab,&model.endpoint,&origin,&[("OPENAI_API_KEY","fixture-native-key"),("GITHUB_TOKEN",TOKEN),("BORG_WORKER_GIT_SSH_COMMAND",ssh)]);
-    let done=lab.successful(&root.id).await;assert_eq!(done.input.repository,None);assert_eq!(done.result.as_ref().unwrap().checkpoint,None);assert_eq!(lab.get(&source.id).await,source);
+    // The Native requester has a structured result; only its Coding dependency owns a Git checkpoint.
+    let done=lab.until(&root.id,"accepted Native publication result",|t|t.status==TaskStatus::Succeeded && t.attempt.as_ref().is_some_and(|a|a.stopped && !a.uncertain)).await;
+    assert_eq!(done.input.definition.executor,ExecutorKind::Native);assert_eq!(done.selected_checkpoint,None);
+    assert_eq!(done.result.as_ref().unwrap().output,Some(json!({"handled":true})));assert_eq!(done.blocked_reason,None);
+    save(lab.root.join(format!("{}.json",done.id)),&done);
+    assert_eq!(done.input.repository,None);assert_eq!(done.result.as_ref().unwrap().checkpoint,None);assert_eq!(lab.get(&source.id).await,source);
     assert_eq!(model.posts.lock().unwrap().len(),3);assert!(lab.root.join("git-ack-lost").exists());assert_eq!(provider.state.lock().unwrap().creates,0);
     inspect_no_secret(&lab.root.join("publication-native"));lab.restart_controller().await;assert_eq!(lab.get(&source.id).await,source);lab.close();
 }
