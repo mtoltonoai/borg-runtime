@@ -17,6 +17,11 @@ use std::{process::Stdio, sync::Arc, time::Duration};
 use support::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+// Supplied only by the controlled fixture environment, never a provider key.
+// HOME is unsuitable here: committed task results contain repository paths.
+const FIXTURE_KEY_ENV: &str = "BORG_IDENTITY_TEST_CREDENTIAL";
+const FIXTURE_KEY: &str = "synthetic-charter-identity-loop-key";
+
 struct Server {
     url: String,
     join: tokio::task::JoinHandle<Result<(), String>>,
@@ -67,6 +72,11 @@ async fn native_call(
     args: Value,
     index: u32,
 ) -> CallResult {
+    assert_eq!(
+        std::env::var(FIXTURE_KEY_ENV).as_deref(),
+        Ok(FIXTURE_KEY),
+        "the qualification environment must select the explicit synthetic credential"
+    );
     let profile = NativeLoopProfile {
         functions: tools
             .iter()
@@ -173,7 +183,7 @@ async fn native_call(
         &input,
         &native::NativeConfig {
             endpoint: peer.endpoint.clone(),
-            api_key_env: "HOME".into(),
+            api_key_env: FIXTURE_KEY_ENV.into(),
             model: SELECTED_MODEL.into(),
         },
         &profile,
@@ -183,8 +193,22 @@ async fn native_call(
         std::future::pending(),
     )
     .await;
+    let step = match observation.result {
+        Ok(step) => step,
+        Err(error) => {
+            // A pre-dispatch refusal must remain visible; waiting for a request
+            // that was never sent otherwise hides it behind the peer timeout.
+            peer.handle.abort();
+            let _ = peer.handle.await;
+            panic!("actual native request {index} failed: {error:?}");
+        }
+    };
     let request = peer.received.await.unwrap();
     peer.handle.await.unwrap();
+    assert!(
+        !request.to_string().contains(FIXTURE_KEY),
+        "the fixture credential must never enter the actual model request body"
+    );
     assert_eq!(
         request["tools"]
             .as_array()
@@ -218,7 +242,7 @@ async fn native_call(
             "the next actual model request receives its preceding committed result once"
         );
     }
-    let NativeLoopStep::Call(call) = observation.result.unwrap() else {
+    let NativeLoopStep::Call(call) = step else {
         panic!("actual native tool call required")
     };
     assert_eq!(call.name(), tool);
@@ -503,7 +527,26 @@ async fn native_and_coding_task_creation_share_real_mcp_contract() {
     let mut peer = CodingPeer::start(&coding, &cs).await;
     let catalogue: Vec<Tool> =
         serde_json::from_value(peer.rpc("tools/list", json!({})).await["tools"].clone()).unwrap();
-    assert_eq!(nt, catalogue);
+    // Coding's existing bridge excludes delegation. All other tool contracts,
+    // including the complete independent-task creation schema, stay identical.
+    assert!(nt.iter().any(|tool| tool.name == "collab_task_delegate"));
+    assert!(
+        !catalogue
+            .iter()
+            .any(|tool| tool.name == "collab_task_delegate")
+    );
+    assert_eq!(
+        nt.iter().find(|tool| tool.name == "collab_task_create"),
+        catalogue
+            .iter()
+            .find(|tool| tool.name == "collab_task_create")
+    );
+    assert_eq!(
+        nt.iter()
+            .filter(|tool| tool.name != "collab_task_delegate")
+            .collect::<Vec<_>>(),
+        catalogue.iter().collect::<Vec<_>>()
+    );
     let mut args = create_args(Some("engineer"));
     args["repository"] = json!(coding.source);
     args["instruction_source"] = json!(coding.source);
