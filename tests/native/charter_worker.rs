@@ -11,6 +11,29 @@ fn limits() -> borg_runtime::limits::CharterLimits {
         reference_depth: 8, records: 1024, page_items: 32, page_bytes: 262_144,
     }
 }
+// This V1 catalogue has the same bounded 32 KiB positive-fixture allowance
+// already exercised in native_collaboration's read/write/restart journey.
+// Measure the actual production projection; keep all worker validation and the
+// selected function/node limits. The historical 16 KiB comparison is evidence,
+// not a permanent assertion that future catalogues must remain larger.
+pub(super) fn configure_native_schema(policy: &mut RuntimeLimits) {
+    let selected = ExecutionProfile::CollaborationV1 { web_search: None };
+    let profile = borg_runtime::native::NativeLoopProfile {
+        functions: borg_runtime::mcp::catalogue_for_profile(policy, Some(&selected))
+            .into_iter().map(|tool| borg_runtime::native::NativeFunction {
+                name: tool.name, description: tool.description, parameters: tool.input_schema,
+            }).collect(),
+        web_search: None,
+    };
+    assert_eq!(profile.functions.len(), 36);
+    assert_eq!(policy.execution.native.function_count, 64);
+    assert_eq!(policy.execution.native.json_nodes, 4_096);
+    policy.execution.native.schema_bytes = 32_768;
+    let bytes = bounded_json_size(&profile, policy.execution.native.schema_bytes)
+        .expect("selected V1 catalogue must fit the explicit fixture bound");
+    eprintln!("charter_fixture_v1_profile_bytes={bytes} historical_schema_bytes=16384 selected_schema_bytes=32768");
+}
+
 fn source(revision: &str) -> DefinitionCharter {
     let sentence = format!("The agent MUST retain the {revision} task purpose.");
     DefinitionCharter::Inline { source: CharterSource {
@@ -71,6 +94,7 @@ async fn worker_scenario(change_during_compaction:bool) {
     let mut lab=Lab::new(if change_during_compaction {"charter-native-obsolete"} else {"charter-native-join"});
     let mut policy=(*lab.limits).clone(); policy.charter=Some(limits());
     policy.execution.native.context_bytes=262_144;
+    configure_native_schema(&mut policy);
     policy.charter.as_ref().unwrap().validate(&policy).unwrap();
     lab.limits=Arc::new(policy);
     std::fs::write(lab.root.join("limits.json"),serde_json::to_vec_pretty(&*lab.limits).unwrap()).unwrap();

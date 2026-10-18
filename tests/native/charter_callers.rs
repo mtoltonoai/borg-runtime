@@ -10,6 +10,7 @@ fn configure(lab: &mut Lab) {
     let policy = Arc::make_mut(&mut lab.limits);
     policy.charter = Some(limits());
     policy.execution.native.context_bytes = 262_144;
+    configure_native_schema(policy);
     policy.native_retry = Some(NativeRetryLimits {
         initial_backoff_ms: 5,
         backoff_multiplier: 2,

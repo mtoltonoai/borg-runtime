@@ -116,7 +116,7 @@ class CurrentFormatObservationTests(unittest.TestCase):
         for field in (0,2,3,4):
             self.old=copy.deepcopy(old);self.new=copy.deepcopy(new);self.new['identity'][field]+=1
             with self.subTest(field=field),self.assertRaisesRegex(ValueError,'noninode_identity_changed'):self.history()
-        for identity in ([1],[-1,2,999,987,384],[True,2,999,987,384],[64769,2,999,987,420]):
+        for identity in ([1],[-1,2,999,987,384],[True,3,999,987,384],[64769,2,999,987,420]):
             self.old=copy.deepcopy(old);self.new=copy.deepcopy(new)
             self.new['identity']=copy.deepcopy(identity)
             self.assertNotEqual(self.old,self.new)

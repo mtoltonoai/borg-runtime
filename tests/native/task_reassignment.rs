@@ -56,6 +56,7 @@ async fn journey() {
         reference_depth: 8, records: 1024, page_items: 32, page_bytes: 262_144,
     });
     metadata.execution.native.context_bytes = 262_144;
+    super::charter_worker::configure_native_schema(&mut metadata);
     metadata.validate().unwrap(); lab.limits = Arc::new(metadata);
     std::fs::write(&lab.worker_limits_file, serde_json::to_vec_pretty(&*lab.limits).unwrap()).unwrap();
     let seed = lab.root.join("seed"); std::fs::create_dir(&seed).unwrap();
