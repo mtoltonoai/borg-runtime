@@ -221,8 +221,10 @@ async fn replay(c: &Controller, op: &Operation, original: &Reply) {
 
 #[tokio::test]
 //= spec/impl/v2/implementation.md#platform-owned-model-retries
+//= type=test
 //# Platform recovery of a supplied executor MUST NOT create another session or repeat an uncertain start merely to implement a provider retry.
 //= spec/impl/v2/implementation.md#cancellation-commits-intent-before-interruption
+//= type=test
 //# Reconnecting or resuming an attempt MUST NOT reset its recorded model-request accounting.
 async fn only_exact_acknowledged_rate_limit_terminal_admits_next_occurrence() {
     let p = path();
@@ -433,7 +435,10 @@ async fn refuses_old_bytes(p: &std::path::Path, cfg: ControllerConfig) {
 
 #[tokio::test]
 //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
+//= type=test
 //# An exact retry of a committed mutating request MUST return its recorded outcome.
+//= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
+//= type=test
 //# A change to stored task state representation MUST have an explicit migration disposition.
 async fn retry_receipts_reopen_exactly_and_old_vocabulary_refuses_before_replay() {
     let p = path();

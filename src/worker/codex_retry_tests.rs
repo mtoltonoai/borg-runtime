@@ -236,6 +236,7 @@ async fn admitted_owner(f: &Fixture) -> Owner {
 
 #[tokio::test]
 //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
+//= type=test
 //# An exact retry of a committed mutating request MUST return its recorded outcome.
 async fn waiting_report_response_loss_retains_exact_original_before_any_next_send() {
     let f = Fixture::new();
@@ -288,6 +289,7 @@ async fn waiting_report_response_loss_retains_exact_original_before_any_next_sen
 
 #[tokio::test]
 //= spec/impl/v2/implementation.md#automatic-cleanup-preserves-durable-work
+//= type=test
 //# Automatic cleanup MUST use per-kind retention settings from worker metadata.
 async fn committed_dispatch_before_send_reopens_as_known_unsent_cleanup_candidate() {
     let f = Fixture::new();
@@ -453,6 +455,7 @@ async fn committed_dispatch_before_send_reopens_as_known_unsent_cleanup_candidat
 
 #[tokio::test]
 //= spec/impl/v2/implementation.md#the-supplied-executor-is-qualified-at-its-actual-boundary
+//= type=test
 //# A lost start response MUST be reconciled before another executor turn is started for that command.
 async fn before_send_without_supplier_ack_remains_unknown_and_cannot_be_replayed_or_cleaned() {
     let f = Fixture::new();
