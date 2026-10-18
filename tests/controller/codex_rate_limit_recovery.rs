@@ -386,18 +386,37 @@ async fn only_exact_acknowledged_rate_limit_terminal_admits_next_occurrence() {
     }
 }
 
-fn files(p: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+fn files(p: &std::path::Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = p.parent().unwrap();
     let mut result = BTreeMap::new();
-    for entry in std::fs::read_dir(p.parent().unwrap()).unwrap() {
-        let entry = entry.unwrap();
-        let meta = std::fs::symlink_metadata(entry.path()).unwrap();
-        assert!(meta.is_file());
-        assert!(meta.len() <= 64 * 1024 * 1024, "bounded private fixture");
-        result.insert(
-            entry.file_name().into(),
-            std::fs::read(entry.path()).unwrap(),
-        );
-        assert!(result.len() <= 16, "bounded private fixture");
+    let mut pending = vec![root.to_path_buf()];
+    let mut total = 0u64;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                !meta.file_type().is_symlink(),
+                "private fixture cannot alias another root"
+            );
+            assert!(
+                relative.components().count() <= 2,
+                "bounded private fixture depth"
+            );
+            let bytes = if meta.is_dir() {
+                pending.push(path);
+                None
+            } else {
+                assert!(meta.is_file());
+                total = total.checked_add(meta.len()).unwrap();
+                assert!(total <= 64 * 1024 * 1024, "bounded private fixture");
+                Some(std::fs::read(path).unwrap())
+            };
+            assert!(result.insert(relative, bytes).is_none());
+            assert!(result.len() <= 16, "bounded private fixture");
+        }
     }
     result
 }
@@ -507,15 +526,34 @@ async fn retry_receipts_reopen_exactly_and_old_vocabulary_refuses_before_replay(
     charge_is(&c, &a, 1).await;
     drop(c);
     controller_owner_released(&p).await;
-    // Corrupt only the causal association in a separate closed copy. The
-    // original receipts above and the old-vocabulary negative below stay exact.
+    // Produce a separate real controller root before corrupting one association.
+    // Copying an existing root would change its bound path and inode identities
+    // and refuse before the causal validator. The original receipts above and
+    // the old-vocabulary negative below stay exact.
     let corrupt = path();
-    for (name, bytes) in files(&p) {
-        std::fs::write(corrupt.parent().unwrap().join(name), bytes).unwrap();
+    let (corrupt_cfg, corrupt_clock, _) = retry_config();
+    let c = Controller::open_with_config(&corrupt, corrupt_cfg.clone()).unwrap();
+    let corrupt_attempt = setup(&c).await;
+    for value in [
+        ack(1, TURN),
+        terminal(1, TURN, "failed", "rateLimitExceeded"),
+    ] {
+        accepted(&send(&c, operation(&corrupt_attempt, value)).await);
     }
+    let due = wait(&send(&c, operation(&corrupt_attempt, waiting(2, TURN, 1))).await);
+    corrupt_clock.store(due.not_before_ms, Ordering::SeqCst);
+    accepted(&send(&c, operation(&corrupt_attempt, dispatch(2, TURN, 1))).await);
+    let uncorrupted = get(&c, &corrupt_attempt.task_id).await;
+    drop(c);
+    controller_owner_released(&corrupt).await;
+    let c = Controller::open_with_config(&corrupt, corrupt_cfg.clone()).unwrap();
+    assert_eq!(get(&c, &corrupt_attempt.task_id).await, uncorrupted);
+    charge_is(&c, &corrupt_attempt, 1).await;
+    drop(c);
+    controller_owner_released(&corrupt).await;
     {
         let sql = rusqlite::Connection::open(&corrupt).unwrap();
-        let id = supplied_outer::id(&a.id, 2, "dispatch");
+        let id = supplied_outer::id(&corrupt_attempt.id, 2, "dispatch");
         let raw: String = sql
             .query_row("SELECT request FROM receipts WHERE id=?1", [&id], |r| {
                 r.get(0)
@@ -542,7 +580,7 @@ async fn retry_receipts_reopen_exactly_and_old_vocabulary_refuses_before_replay(
     }
     let corrupted_bytes = files(&corrupt);
     for _ in 0..2 {
-        let error = match Controller::open_with_config(&corrupt, cfg.clone()) {
+        let error = match Controller::open_with_config(&corrupt, corrupt_cfg.clone()) {
             Ok(_) => panic!("corrupt dispatch admitted"),
             Err(e) => e.to_string(),
         };
