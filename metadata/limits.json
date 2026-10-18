@@ -1,6 +1,39 @@
 {
   "schema_version": 1,
-  "revision": "v2-limits-2026-10-15-repository-catalogue-1",
+  "revision": "v2-limits-2026-10-17-default-task-assignment-1",
+  "workflow": {
+    "record_bytes": 195584,
+    "text_bytes": 65536,
+    "options": 64,
+    "records": 100000,
+    "revisions": 1000000,
+    "page_items": 100,
+    "page_bytes": 196608,
+    "waits_per_task": 128,
+    "graph_scan_nodes": 100000,
+    "events_per_mutation": 512,
+    "event_bytes": 16384,
+    "notice_bytes": 16384,
+    "pending_delivery_bytes": 196608,
+    "delivery_scan_rows": 800
+  },
+  "definition_updates": {
+    "revision": "v2-definition-updates-maximum-context-2",
+    "allowed_fields": [
+      "native.context_bytes",
+      "native.output_bytes",
+      "native.result_bytes",
+      "native.max_output_tokens",
+      "coding.command_output_bytes",
+      "coding.summary_chars",
+      "coding.summary_bytes",
+      "collaboration.complete_result_bytes",
+      "native.request_bytes",
+      "native.helper_value_bytes",
+      "native.response_wire_bytes",
+      "coding.model_context_window"
+    ]
+  },
   "worker": {
     "coding_capacity": 1,
     "native_capacity": 0,
@@ -70,7 +103,8 @@
       "command_output_bytes": 65536,
       "preflight_timeout_ms": 5000,
       "preflight_output_bytes": 1024,
-      "interrupt_timeout_ms": 500
+      "interrupt_timeout_ms": 500,
+      "model_context_window": 1050000
     },
     "collaboration": {
       "config_bytes": 16384,
@@ -91,7 +125,7 @@
       "empty_prefix_pages": 4
     },
     "native": {
-      "context_bytes": 65536,
+      "context_bytes": 4294967295,
       "input_bytes": 1048576,
       "output_bytes": 1048576,
       "result_bytes": 262144,
@@ -102,9 +136,9 @@
       "validation_work": 8388608,
       "regex_bytes": 65536,
       "regex_dfa_bytes": 65536,
-      "request_bytes": 1048576,
-      "response_wire_bytes": 6358528,
-      "helper_value_bytes": 1048832,
+      "request_bytes": 4294967295,
+      "response_wire_bytes": 4294967295,
+      "helper_value_bytes": 4294967295,
       "max_output_tokens": 16384,
       "function_count": 64,
       "function_name_bytes": 64,
@@ -261,6 +295,7 @@
     "http_header_count": 100
   },
   "task_defaults": {
+    "agent_id": "triage",
     "deadline_ms": 1800000,
     "model_requests": 4294967295,
     "output_bytes": 65536,
@@ -279,8 +314,21 @@
     "native_helper_length_bits": 32,
     "task_model_request_bits": 32,
     "durable_unsigned_value_bits": 63,
-    "provider_model_context_tokens": null,
+    "provider_model_context_tokens": 1050000,
     "provider_requests_per_minute": null,
     "codex_inner_tool_calls": null
+  },
+  "retention": {
+    "worker": {
+      "success_grace_ms": 0,
+      "failed_grace_ms": 86400000,
+      "cancelled_grace_ms": 86400000,
+      "idle_cache_grace_ms": 604800000,
+      "batch_entries": 4,
+      "operation_timeout_ms": 30000,
+      "retry_delay_ms": 60000,
+      "record_bytes": 8192,
+      "filesystem_entries_per_yield": 128
+    }
   }
 }

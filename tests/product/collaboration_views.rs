@@ -363,6 +363,7 @@ async fn all_repository_views_use_exact_selected_source_after_stop_without_worke
         Operation::RegisterRepository {
             operation_id: "register-selected".into(),
             registration: borg_runtime::repository_catalogue::Registration {
+                pull_request_target: None,
                 repository_id: "selected".into(),
                 registration_revision: "r1".into(),
                 display_name: "Selected UI repository".into(),
@@ -421,6 +422,56 @@ async fn all_repository_views_use_exact_selected_source_after_stop_without_worke
                 r.body
                     .contains("&lt;script&gt;not executable&lt;/script&gt;")
             );
+        }
+    }
+    // A one-line page must retain the file's total size and exact blob, not
+    // substitute the rendered page length or merely echo request operands.
+    for start in [1, 2] {
+        let Data::Collaboration(borg_runtime::collaboration::QueryResult::Repository(read)) = call(
+            &c,
+            Operation::QueryCollaboration {
+                query: borg_runtime::collaboration::Query::Repository {
+                    task_id: id.into(),
+                    request: borg_runtime::repository_view::Request::ReadFile {
+                        source: borg_runtime::repository_view::SourceSelector::Start,
+                        path: "answer.txt".into(),
+                        start_line: start,
+                        max_lines: 1,
+                    },
+                },
+            },
+        )
+        .await else { panic!("canonical file projection") };
+        let borg_runtime::repository_view::Data::File {
+            path, object, start_line, total_lines, next_line, ..
+        } = read.data else { panic!("canonical file data") };
+        assert_eq!(path, "answer.txt");
+        assert_eq!(object, git(&["rev-parse", "HEAD:answer.txt"]));
+        assert_eq!(start_line, start);
+        assert_eq!(total_lines, 2);
+        let r = ui(
+            &c,
+            "GET",
+            &format!("/tasks/{id}/repository?view=read&path=answer.txt&start_line={start}&max_lines=1"),
+            vec![],
+        ).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        for metadata in [
+            format!("<dt>Path</dt><dd>{path}</dd>"),
+            format!("<dt>Blob object</dt><dd>{object}</dd>"),
+            format!("<dt>Start line</dt><dd>{start_line}</dd>"),
+            format!("<dt>Total lines</dt><dd>{total_lines}</dd>"),
+        ] {
+            assert!(r.body.contains(&metadata), "{}", r.body);
+        }
+        assert_eq!(r.body.contains("Next file lines"), next_line.is_some());
+        assert!(!r.body.contains("<script>not executable"));
+        if start == 1 {
+            assert!(r.body.contains("&lt;script&gt;not executable&lt;/script&gt;"));
+            assert!(!r.body.contains("second line"));
+        } else {
+            assert!(r.body.contains("second line"));
+            assert!(!r.body.contains("not executable"));
         }
     }
     for (query, status) in [

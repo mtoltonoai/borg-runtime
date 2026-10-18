@@ -22,7 +22,7 @@ def save(path,value):
 def fake_package(root):
     # Same deterministic archive/verifier; deliberately non-runnable ELF fixture.
     binary=root/'fake-binary';raw=bytearray(128);raw[:7]=b'\x7fELF\x02\x01\x01';raw[16:18]=(3).to_bytes(2,'little');raw[18:20]=(62).to_bytes(2,'little');binary.write_bytes(raw);binary.chmod(0o500)
-    files={name:{'mode':'100644','git_blob':'a'*40,'size':1,'sha256':'2'*64} for name in ('Cargo.toml','Cargo.lock','src/main.rs','src/lib.rs','src/protocol.rs','src/controller/database.rs','src/worker/handoff.rs')}
+    files={name:{'mode':'100644','git_blob':'a'*40,'size':1,'sha256':'2'*64} for name in ({'Cargo.toml','Cargo.lock','src/main.rs','src/lib.rs'}|common.AGENT_DIRECTORY_SOURCES)}
     files['Cargo.toml']['sha256']=package.MANIFEST_SHA;files['Cargo.lock']['sha256']=package.LOCK_SHA
     build={'tools':{'sha256':package.TOOL_SHA,'versions':{'gcc':'13.3.0','gcc_target':'x86_64-linux-gnu','ar':'GNU ar 2.42','pkg-config':'1.8.1','cargo':'cargo 1.99.0 (fixture)','rustc':'rustc 1.99.0 (fixture)\nhost: '+package.TARGET}},'sqlite':{'identity':{'version':'3.54.0','source_id':package.SQLITE_SOURCE,'threadsafe':1,'api_armor':1,'foreign_keys':1},'source_sha256':package.SQLITE_FILES,'archive_sha256':package.SQLITE_ARCHIVE_SHA,'cflags':package.CFLAGS,'static_library_sha256':'1'*64}}
     m={'format':'borg-v2-release/1','source':{'commit':'a'*40,'tree':'b'*40,'object_format':'sha1','files':files},'profile':package.PROFILE,'recipe':{'packager_sha256':'3'*64,'build_helper_sha256':package.BUILDER_SHA,**package.READER_SHA,'environment':package.ENV_PROFILE},'build':build,'files':{'bin/borg-runtime':package.elf_binary(binary)}}
@@ -61,6 +61,7 @@ class Fixture:
         self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True);self.root.chmod(0o700)
         self.runtime_limits=common.strict((Path(adapter.__file__).parents[1]/'metadata/limits.json').read_bytes());self.runtime_limits['worker']['coding_capacity']=1;self.runtime_limits['worker']['native_capacity']=0
         self.effects=[];self.active={};self.invocations={};self.instances={};self.lost_phase=None
+        self.on_start=None;self.original_receipts={};self.external_records={};self.operation_queries=[];self.lookup_transform=None;self.task_phases=[]
         package_path=Path(package_path) if package_path else fake_package(self.root)
         self.artifact,self.manifest=artifact(package_path)
         self.subject=subject or {'release_id':'release-test','artifact':self.artifact,'repository':'fixture-repo','target_ref':'refs/heads/main','expected_base':'0'*40,'policy':'policy','deployment_target':'fixture','target_revision':'one','installed_package_sha256':'1'*64}
@@ -82,7 +83,7 @@ class Fixture:
             policy=save(root/'policy.json',self.runtime_limits);save(state/'limits.json',self.runtime_limits);(state/'owner').write_bytes(b'fixed owner bytes')
             (state/'helpers').mkdir(mode=0o700);(state/'helpers'/'owner.binding').write_text('fixed-binding')
             if role=='controller':
-                db=state/'tasks.sqlite';con=sqlite3.connect(db);con.execute('PRAGMA user_version=12');con.execute('CREATE TABLE evidence(id TEXT PRIMARY KEY,value TEXT)');con.execute("INSERT INTO evidence VALUES('original','unknown-outcome-retained')");con.commit();con.close();fmt=None
+                db=state/'tasks.sqlite';con=sqlite3.connect(db);con.execute('PRAGMA user_version=12');con.execute('CREATE TABLE evidence(id TEXT PRIMARY KEY,value TEXT)');con.execute("INSERT INTO evidence VALUES('original','unknown-outcome-retained')");con.execute('CREATE TABLE receipts(id TEXT PRIMARY KEY, request TEXT NOT NULL, outcome TEXT NOT NULL, committed_ms INTEGER NOT NULL, controller_revision INTEGER NOT NULL)');con.execute('CREATE TABLE external_operations(id TEXT PRIMARY KEY, body TEXT NOT NULL, prepare TEXT NOT NULL, settlement TEXT, finalization_reserved INTEGER NOT NULL DEFAULT 0)');con.commit();con.close();fmt=None
             else:
                 db=None;fmt=state/'format.json';save(fmt,{'format_revision':9});(state/'commands').mkdir(mode=0o700);(state/'outbox').mkdir(mode=0o700);(state/'mutations').mkdir(mode=0o700)
             old={**self.artifact,'package_sha256':self.subject['installed_package_sha256'],'binary_sha256':'4'*64}
@@ -91,6 +92,118 @@ class Fixture:
             h={'id':name,'role':role,'transport':{'kind':'local','ssh_config':None,'alias':None},'profile_path':str(self.root/'profile.json'),'state_root':str(control),'service':name+'.service','unit':pin(unit),'new_unit':pin(new),'release_root':str(release),'package':str(package_path),'old_artifact':old,'service_uid':os.geteuid(),'helper_uid':os.geteuid(),'incarnation':'systemd_invocation' if role=='worker' else None,'state':{'root':str(state),'format_file':str(fmt) if fmt else None,'database':str(db) if db else None,'policy':policy},'owner_lock':str(state/'owner'),'helpers':[str(state/'helpers')],'preserve_metadata':[str(state/'helpers'/'owner.binding')],'preserve_files':[],'api':{'host':'127.0.0.1','port':1,'worker_id':'worker' if role=='worker' else None},'systemctl':pin('/usr/bin/true')}
             self.profile['hosts'].append(h);self.active[name]=True;self.invocations[name]='old-invocation'
         self.profile_path=self.root/'profile.json';save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
+    def forward_transition(self,lossless=False,diagnostic=False,charter_adoption=False,memory_notice_removal=False,pr_publication=False,instruction_source=False):
+        """Real additive SQL on scratch state; service/runtime effects stay controlled.
+
+        The synthetic evidence pins are not real migration qualification. Actual
+        runtime/retained-state receipts must be supplied by the operator profile.
+        """
+        after=common.INSTRUCTION_SOURCE_AFTER if instruction_source else common.PR_PUBLICATION_AFTER if pr_publication else common.MEMORY_NOTICE_REMOVAL_AFTER if memory_notice_removal else common.CHARTER_ADOPTION_AFTER if charter_adoption else common.DIAGNOSTIC_AFTER if diagnostic else common.LOSSLESS_AFTER if lossless else common.FORWARD_AFTER
+        self.profile['formats']={'before':dict(common.FORWARD_BEFORE),'after':dict(after),
+            'source_files':{k:self.manifest['source']['files'][k]['sha256'] for k in (common.INSTRUCTION_SOURCE_SOURCES if instruction_source else common.PR_PUBLICATION_SOURCES if pr_publication else common.MEMORY_NOTICE_REMOVAL_SOURCES if memory_notice_removal else common.CHARTER_ADOPTION_SOURCES if charter_adoption else common.DIAGNOSTIC_SOURCES if diagnostic else common.LOSSLESS_SOURCES if lossless else common.FORWARD_SOURCES)},
+            'forward':{'kind':common.INSTRUCTION_SOURCE_KIND if instruction_source else common.PR_PUBLICATION_KIND if pr_publication else common.MEMORY_NOTICE_REMOVAL_KIND if memory_notice_removal else common.CHARTER_ADOPTION_KIND if charter_adoption else common.DIAGNOSTIC_KIND if diagnostic else common.LOSSLESS_KIND if lossless else common.FORWARD_KIND,'before_package_sha256':self.subject['installed_package_sha256'],
+                'after_package_sha256':self.artifact['package_sha256'],
+                'evidence':{name:save(self.root/(name+'-qualification.json'),{'synthetic_adapter_fixture':name}) for name in ('controller','worker','retained_state')}}}
+        source=Path(adapter.__file__).parents[1]/'src/controller'
+        controller=self.profile['hosts'][0];db=Path(controller['state']['database'])
+        con=sqlite3.connect(db)
+        con.execute('DROP TABLE evidence');con.execute('DROP TABLE receipts');con.execute('DROP TABLE external_operations')
+        con.executescript((source/'schema12.sql').read_text())
+        con.execute("INSERT INTO sessions VALUES('session',1,'agent','task',?,7,9,?)",['retained session bytes','retained pending memory'])
+        request={'operation':'historical-fixture'};outcome={'status':'ok','data':{'original':'unchanged'}}
+        con.execute("INSERT INTO receipts VALUES('original',?,?,0,7)",[common.canonical(request).decode(),common.canonical(outcome).decode()])
+        con.commit();con.close()
+        self.original_receipts['original']={'request':request,'outcome':outcome,'revision':7}
+        def startup(host):
+            if host['role']=='controller':
+                con=sqlite3.connect(host['state']['database'])
+                if con.execute('PRAGMA user_version').fetchone()[0]==12:
+                    extra=(source/'schema17-from16.sql').read_text() if lossless or diagnostic or charter_adoption or memory_notice_removal or pr_publication or instruction_source else ''
+                    if diagnostic or charter_adoption or memory_notice_removal or pr_publication or instruction_source:extra+=(source/'schema18-from17.sql').read_text()
+                    con.executescript('BEGIN;'+(source/'schema13-from12.sql').read_text()+(source/'schema14-from13.sql').read_text()+extra+'PRAGMA user_version='+str(after['controller_schema'])+';COMMIT;')
+                con.close()
+            else:
+                path=Path(host['state']['format_file']);temporary=path.with_name('upgraded-marker')
+                save(temporary,{'format_revision':after['worker_format']});os.replace(temporary,path);common.sync(path.parent)
+        self.on_start=startup
+        save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
+    def supplied_turn_transition(self):
+        """Controlled runtime startup over real retained schema21 SQLite.
+
+        These local adapter fixtures do not qualify a deployment or Rust
+        migration. A real profile must pin the corresponding actual evidence.
+        """
+        self.forward_transition(instruction_source=True)
+        for h in self.profile['hosts']:self.on_start(h)
+        f=self.profile['formats']
+        f['before']=dict(common.SUPPLIED_TURN_BEFORE);f['after']=dict(common.SUPPLIED_TURN_AFTER)
+        f['source_files']={n:self.manifest['source']['files'][n]['sha256'] for n in common.SUPPLIED_TURN_SOURCES}
+        f['forward']['kind']=common.SUPPLIED_TURN_KIND
+        self.bind_supplied_predecessors()
+        def startup(host):
+            if host['role']=='controller':
+                con=sqlite3.connect(host['state']['database'])
+                if con.execute('PRAGMA user_version').fetchone()[0]==21:
+                    con.executescript('BEGIN;PRAGMA user_version=22;COMMIT;')
+                con.close()
+            else:
+                path=Path(host['state']['format_file']);temporary=path.with_name('upgraded-marker')
+                save(temporary,{'format_revision':17});os.replace(temporary,path);common.sync(path.parent)
+        self.on_start=startup
+        save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
+
+    def agent_directory_transition(self):
+        """Controlled schema21-to23 startup; no Rust/host qualification."""
+        self.supplied_turn_transition()
+        f=self.profile['formats']
+        f['before']=dict(common.AGENT_DIRECTORY_BEFORE);f['after']=dict(common.AGENT_DIRECTORY_AFTER)
+        f['source_files']={n:self.manifest['source']['files'][n]['sha256'] for n in common.AGENT_DIRECTORY_SOURCES}
+        f['forward']['kind']=common.AGENT_DIRECTORY_KIND
+        self.bind_supplied_predecessors()
+        source=Path(adapter.__file__).parents[1]/'src/controller/schema23-from22.sql'
+        delta=source.read_text()
+        def startup(host):
+            if host['role']=='controller':
+                con=sqlite3.connect(host['state']['database'])
+                if con.execute('PRAGMA user_version').fetchone()[0]==21:
+                    con.executescript('BEGIN;'+delta+'PRAGMA user_version=23;COMMIT;')
+                con.close()
+            else:
+                path=Path(host['state']['format_file']);temporary=path.with_name('upgraded-marker')
+                save(temporary,{'format_revision':17});os.replace(temporary,path);common.sync(path.parent)
+        self.on_start=startup
+        save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
+
+    def bind_supplied_predecessors(self):
+        proofs={}
+        for h in self.profile['hosts']:
+            old=h['old_artifact'];manifest=copy.deepcopy(self.manifest)
+            manifest['source'].update(commit=old['source_commit'],tree=old['source_tree'],object_format=old['object_format'])
+            manifest['files']['bin/borg-runtime'].update(sha256=old['binary_sha256'],size=old['binary_bytes'],target=old['target'])
+            raw=common.canonical(manifest);old['manifest_sha256']=common.digest(raw)
+            release=Path(h['release_root'])/old['package_sha256'];release.mkdir(mode=0o700,exist_ok=True)
+            path=release/'manifest.json';path.write_bytes(raw);path.chmod(0o600)
+            proofs[h['id']]={'formats':dict(common.SUPPLIED_TURN_BEFORE),'artifact':copy.deepcopy(old),
+                'unit':copy.deepcopy(h['unit']),
+                'source_files':{n:manifest['source']['files'][n]['sha256'] for n in common.SUPPLIED_TURN_BEFORE_SOURCES}}
+        self.profile['formats']['forward']['before_hosts']=proofs
+        save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
+
+    def stopped_worker(self):
+        self.forward_transition(diagnostic=True)
+        h=self.profile['hosts'][1];self.active[h['id']]=False
+        old=h['old_artifact'];raw=b'controlled original predecessor executable'
+        old['binary_sha256']=common.digest(raw);old['binary_bytes']=len(raw)
+        release=Path(h['release_root'])/old['package_sha256'];release.mkdir(mode=0o700)
+        common.write_new(release/'borg-runtime',raw,0o500)
+        common.write_new(release/'manifest.json',package.canonical(self.manifest),0o400)
+        host=hostmod.Host(self.profile,h,self.subject,{'action_id':'proof','deadline_ms':common.now_ms()+60000})
+        m=Path(h['owner_lock']).lstat()
+        h['stopped_predecessor']={'service':host.service(),
+            'owner_identity':[m.st_dev,m.st_ino,m.st_uid,m.st_gid,__import__('stat').S_IMODE(m.st_mode)],
+            'state_sha256':common.digest(common.canonical(host.state_files()))}
+        save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
+        return h
     def leaf_trust(self,path,directory=False):
         # Explicit test-only host ownership boundary. Private test tree may have
         # shared CI ancestors; all leaf type/link/mode and actual bytes retained.
@@ -106,7 +219,7 @@ class Fixture:
         owner=self
         class ControlledHost(hostmod.Host):
             def service(self):
-                return {'ActiveState':'active' if owner.active[self.h['id']] else 'inactive','SubState':'running' if owner.active[self.h['id']] else 'dead','MainPID':'42' if owner.active[self.h['id']] else '0','ControlGroup':'/fixture','FragmentPath':self.h['unit']['path'],'DropInPaths':'','NeedDaemonReload':'no','InvocationID':owner.invocations[self.h['id']],'User':'fixture'}
+                return {'ActiveState':'active' if owner.active[self.h['id']] else 'inactive','SubState':'running' if owner.active[self.h['id']] else 'dead','MainPID':'42' if owner.active[self.h['id']] else '0','ControlGroup':'/fixture','FragmentPath':self.h['unit']['path'],'DropInPaths':'','NeedDaemonReload':'no','InvocationID':owner.invocations[self.h['id']],'User':__import__('pwd').getpwuid(os.geteuid()).pw_name}
             def check_running(self,new):
                 row=self.service();expected=self.h['new_unit'] if new else self.h['unit']
                 if not owner.active[self.h['id']] or common.digest(Path(self.h['unit']['path']).read_bytes())!=expected['sha256']:raise ValueError('fixture running unit differs')
@@ -119,6 +232,7 @@ class Fixture:
                 owner.effects.append([self.h['id'],*args])
                 if args[0]=='stop':owner.active[self.h['id']]=False
                 elif args[0]=='start':
+                    if owner.on_start:owner.on_start(self.h)
                     owner.active[self.h['id']]=True;owner.invocations[self.h['id']]='new-invocation'
                     if self.h['role']=='worker':
                         q={'operation':'register_worker','input':{'operation_id':'new-register','worker':{'id':'worker','incarnation':'new-invocation','coding_capacity':1,'native_capacity':0}}}
@@ -126,13 +240,35 @@ class Fixture:
                         save(Path(self.h['state']['root'])/'mutations/registration.json',{'limits':owner.runtime_limits,'revision':3,'request':q,'outcome':outcome,'outcome_context':{'commit':{'controller_revision':8,'operation_id':'new-register'},'observed_controller_revision':8},'consumed':False,'recovery_epoch':0})
                 elif args!=['daemon-reload']:raise AssertionError('unselected controlled service command')
                 return b''
-            def tasks(self):return {'task-original':{'id':'task-original','status':'failed','attempt':{'stopped':True,'uncertain':True},'checkpoint':{'registration':'unchanged'}}}
+            def tasks(self):
+                owner.task_phases.append(self.after)
+                return {'task-original':{'id':'task-original','status':'failed','attempt':{'stopped':True,'uncertain':True},'checkpoint':{'registration':'unchanged'}}}
             def api(self,operation,inp):
-                assert operation=='get_operation';j=common.strict((Path(self.h['state']['root'])/'mutations/registration.json').read_bytes())
+                assert operation=='get_operation'
+                owner.operation_queries.append(inp['operation_id'])
+                if inp['operation_id'] in owner.external_records:
+                    reply={'request_id':'rollout-read','commit':None,'observed_controller_revision':9,
+                        'status':'ok','data':{'kind':'operation','value':copy.deepcopy(owner.external_records[inp['operation_id']])}}
+                    return owner.lookup_transform(reply) if owner.lookup_transform else reply
+                if inp['operation_id'] in owner.original_receipts:
+                    old=owner.original_receipts[inp['operation_id']]
+                    record={'id':inp['operation_id'],'task_id':'','attempt_id':'','generation':0,
+                        'kind':'application_mutation','intended':old['request'],'outcome':old['outcome'],'state':'settled'}
+                    reply={'request_id':'rollout-read','commit':{'operation_id':inp['operation_id'],'controller_revision':old['revision']},
+                        'observed_controller_revision':9,'status':'ok','data':{'kind':'operation','value':record}}
+                    return owner.lookup_transform(reply) if owner.lookup_transform else reply
+                j=common.strict((Path(self.h['state']['root'])/'mutations/registration.json').read_bytes())
                 return {'request_id':'rollout-read','commit':j['outcome_context']['commit'],'observed_controller_revision':9,'status':'ok','data':{'kind':'operation','value':{'id':inp['operation_id'],'task_id':'','attempt_id':'','generation':0,'kind':'application_mutation','intended':j['request'],'state':'settled','outcome':j['outcome']}}}
         def transport(argv,limits,deadline_ms,data=b''):
             req=common.strict(data);hid=argv[argv.index('--host')+1];h=next(h for h in self.profile['hosts'] if h['id']==hid)
-            result=hostmod.phase(self.profile,h,req)
+            try:result=hostmod.phase(self.profile,h,req)
+            except Exception as error:
+                # Match actual host main + nonzero c.run boundary. Each module
+                # loads its own pinned common, so Python class identity is not
+                # the wire contract between the controller and helper.
+                envelope=hostmod.c.canonical({'host_error':hostmod.c.error_record(error,req['phase'])})
+                status=type('Status',(),{'si_code':os.CLD_EXITED,'si_status':1})()
+                raise adapter.c.CommandFailure(status,envelope,b'') from None
             if self.lost_phase==[hid,req['phase']]:self.lost_phase=None;raise ValueError('controlled lost host ACK after original effect')
             return common.canonical(result)
         with contextlib.ExitStack() as stack:
@@ -193,3 +329,84 @@ def integration_main():
         save(Path(value['output'])/'integration-result.json',{'status':'PASS_CONTROLLED_HOST_ACTUAL_PROTECTED_PROTOCOL','loss':loss,'first':first,'second':second,'effects':effects,'requests':seen,'no_effect_retry':True})
 
 if __name__=='__main__':integration_main()
+
+class CleanupFixture:
+    """Real private files with explicit selected-policy data; no installed host."""
+    def __init__(self,root):
+        self.root=Path(root)
+        self.selected=common.strict((Path(adapter.__file__).parents[1]/'metadata/limits.json').read_bytes())
+        policy=copy.deepcopy(self.selected['retention']['worker'])
+        self.record={'format_revision':1,'command_id':'cleanup-run','attempt_id':'cleanup-attempt',
+            'policy':policy,'policy_revision':self.selected['revision'],'status':'cancelled',
+            'checkpoint':{'registration':{'repository_id':'repo','registration_revision':'one'},
+                'repository':'file:///checkpoint','commit':'a'*40,'remote_ref':'refs/heads/checkpoint','operation_id':'checkpoint'},
+            'first_safe_ms':1000,'last_observed_ms':1100,'next_due_ms':1000+policy['cancelled_grace_ms'],
+            'disposition':'retained','reason':'grace','worktrees':[{'proof':None,'started':False,'done':False} for _ in range(2)],
+            'cache':None,'cache_started':False,'cache_safe_ms':None,'cache_done':False}
+        self.name='cleanup/'+self.record['attempt_id'].encode().hex()+'.json'
+        self.command='commands/'+self.record['command_id'].encode().hex()+'.json'
+        for directory in ('cleanup','commands','mutations','mutations/nested','processes'):
+            (self.root/directory).mkdir(mode=0o700)
+        self.write(self.name,self.record)
+        self.write(self.command,{'command':{'kind':'run_attempt','command_id':self.record['command_id'],
+            'attempt':{'id':self.record['attempt_id'],'worker_id':'agent-lab-2'}}})
+        self.write('format.json',{'format_revision':9})
+        for name in ('mutations/registration.json','mutations/await.json',
+                     'mutations/settled-original.json','mutations/nested/retained-original.json'):
+            self.write(name,{'fixture_slot':name,'observation':1})
+        self.registry='processes/cleanup-'+self.record['attempt_id'].encode().hex()
+        self.unknown='processes/cleanup-'+'unrelated-attempt'.encode().hex()
+        for directory in (self.registry,self.registry+'/home',self.registry+'/home/code',
+                          self.registry+'/unrecognized-descendant',self.unknown):
+            (self.root/directory).mkdir(mode=0o700)
+            for name in ('original-one.json','original-two.json'):
+                self.write(directory+'/'+name,{'fixture':name,'retained':True})
+        self.host=hostmod.Host.__new__(hostmod.Host)
+        self.host.h={'role':'worker','service_uid':os.geteuid(),'api':{'worker_id':'agent-lab-2'},'state':{'root':str(self.root)}}
+        self.host.p={'formats':{'forward':{'kind':common.INSTRUCTION_SOURCE_KIND},'source_files':{'src/worker/cleanup.rs':hostmod._CLEANUP_SOURCE_SHA}}}
+        self.host._verified_manifest={'source':{'files':{'src/worker/process.rs':{'sha256':hostmod._PROCESS_SOURCE_SHA}}}}
+        self.host.l={'state_bytes':1048576,'receipt_bytes':1048576,'state_entries':256,'io_chunk_bytes':65536}
+        self.host.r={'deadline_ms':common.now_ms()+30000}
+        # Only fixture policy selection is injected. Record/path/descriptor,
+        # transition and preservation predicates are the maintained functions.
+        self.host.cleanup_policy=lambda:self.selected
+        self.host.retained_policy=lambda:self.selected
+        self.refresh()
+    def write(self,name,value):
+        path=self.root/name;temporary=path.with_name(path.name+'.new')
+        temporary.write_bytes(common.canonical(value));temporary.chmod(0o600);temporary.replace(path)
+    def refresh(self):
+        self.before=self.host.state_files()
+        self.stop={'state':self.before,'cleanup_records':self.host.cleanup_snapshot(self.before)}
+    def capture(self):
+        self.hook=hostmod.WorkerStateCapture(self.host,hostmod.c,self.stop)
+        self.host._worker_capture=self.hook
+        return self.hook
+
+@contextlib.contextmanager
+def cleanup_fixture():
+    with tempfile.TemporaryDirectory(prefix='rollout-capture-') as root:
+        yield CleanupFixture(Path(root))
+
+@contextlib.contextmanager
+def after_directory_scan(path,action):
+    """One deterministic race after real enumeration, before descriptor check."""
+    target=path.stat();scan=os.scandir;fstat=os.fstat;fired=[]
+    @contextlib.contextmanager
+    def wrapped(fd):
+        actual=fstat(fd);selected=(actual.st_dev,actual.st_ino)==(target.st_dev,target.st_ino)
+        with scan(fd) as entries:
+            if selected and not fired:
+                def iterator():
+                    yield from entries
+                    action();fired.append(True)
+                yield iterator()
+            else:yield entries
+    with patch.object(os,'scandir',side_effect=wrapped):yield fired
+
+def advance_directory_clock(path):
+    old=path.stat();os.utime(path,ns=(old.st_atime_ns,old.st_mtime_ns+1))
+
+def error_cause(result):
+    detail=result['error_detail']
+    return detail.get('command',{}).get('host_error',detail)

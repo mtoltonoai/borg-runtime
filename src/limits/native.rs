@@ -39,6 +39,18 @@ pub struct NativeLimits {
     pub task_tool_identity_bytes: usize,
 }
 impl NativeLimits {
+    /// Encoding capacity for an original parsed response, not another provider
+    /// allowance. Strings/keys never grow beyond their JSON wire encoding;
+    /// each finite serde_json number takes at most 24 canonical bytes. The
+    /// accepted decoder counts keys and values against json_nodes. Raw HTTP
+    /// bytes, nodes, depth and every enclosing storage bound stay unchanged.
+    pub(crate) fn canonical_output_bytes(&self) -> Result<usize, String> {
+        self.json_nodes.checked_mul(24)
+            .and_then(|overhead| self.response_wire_bytes.checked_add(overhead))
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or_else(|| "native canonical output extent exceeds addressable representation".into())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self
             .json_depth
@@ -403,5 +415,21 @@ impl NativeLimits {
         };
         value.validate()?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod canonical_output_extent_tests {
+    #[test]
+    fn canonical_extent_is_checked_and_counts_encoding_not_more_provider_bytes() {
+        let mut p=crate::limits::RuntimeLimits::seed().unwrap().execution.native;
+        p.response_wire_bytes=u32::MAX as usize;p.json_nodes=8192;
+        assert_eq!(p.canonical_output_bytes().unwrap(),4_295_163_903);
+        assert_eq!(p.canonical_output_bytes().unwrap().div_ceil(524_288),8193);
+        assert!(p.canonical_output_bytes().unwrap()+1<=p.response_wire_bytes+25*p.json_nodes);
+        assert_eq!(p.response_wire_bytes,u32::MAX as usize);
+        p.json_nodes=usize::MAX;assert!(p.canonical_output_bytes().is_err());
+        p.json_nodes=1;p.response_wire_bytes=usize::MAX;
+        assert!(p.canonical_output_bytes().is_err());
     }
 }

@@ -2,6 +2,23 @@
 use crate::limits::{NativeLimits, WorkerLimits};
 use std::{fs::File, path::PathBuf, sync::Arc};
 
+/// Exact serialized model input, excluding transport headers/credentials.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRequestBinding {
+    pub bytes: u64,
+    pub sha256: String,
+}
+impl ProviderRequestBinding {
+    pub fn validate(&self, bound: usize) -> Result<(), String> {
+        if self.bytes == 0 || self.bytes > bound as u64 || self.sha256.len() != 64
+            || !self.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err("native_request_binding_invalid".into());
+        }
+        Ok(())
+    }
+}
+
 pub struct ValidationRuntime {
     pub(super) worker_limits: Arc<WorkerLimits>,
     pub(super) slots: Arc<tokio::sync::Semaphore>,
@@ -36,6 +53,9 @@ pub struct ValidationHost {
     pub program: PathBuf,
     pub registry: PathBuf,
     owner_lock: Option<Arc<File>>,
+    pub(super) charter: Option<Arc<super::charter::CharterExchange>>,
+    request_binding: Arc<std::sync::Mutex<Option<ProviderRequestBinding>>>,
+    expected_request_binding: Option<ProviderRequestBinding>,
     pub(super) request_correlation: Option<super::request_observation::Correlation>,
     #[cfg(test)]
     pub(super) request_capture: Option<Arc<super::request_observation::Sink>>,
@@ -56,6 +76,9 @@ impl ValidationHost {
             registry,
             owner_lock: None,
             request_correlation: None,
+            charter: None,
+            request_binding: Arc::new(std::sync::Mutex::new(None)),
+            expected_request_binding: None,
             #[cfg(test)]
             request_capture: None,
             #[cfg(debug_assertions)]
@@ -78,11 +101,42 @@ impl ValidationHost {
             registry,
             owner_lock: Some(owner_lock),
             request_correlation: None,
+            charter: None,
+            request_binding: Arc::new(std::sync::Mutex::new(None)),
+            expected_request_binding: None,
             #[cfg(test)]
             request_capture: None,
             #[cfg(debug_assertions)]
             fixture_registry: None,
         }
+    }
+    /// Host-only projection from a canonical charter turn. This does not adopt
+    /// a revision or manufacture a current controller permission.
+    pub fn with_charter(mut self, charter: Arc<super::charter::CharterExchange>) -> Self {
+        self.charter = Some(charter);
+        self
+    }
+    /// Each actual POST gets isolated observation storage. A retry may require
+    /// exact original bytes before polling the HTTP future.
+    pub fn for_request(&self, expected: Option<ProviderRequestBinding>) -> Self {
+        let mut host = self.clone();
+        host.request_binding = Arc::new(std::sync::Mutex::new(None));
+        host.expected_request_binding = expected;
+        host
+    }
+    pub fn request_binding(&self) -> Result<Option<ProviderRequestBinding>, String> {
+        Ok(self.request_binding.lock().map_err(|_| "native_request_binding_unavailable")?.clone())
+    }
+    pub(super) fn bind_request(&self, body: &[u8]) -> Result<(), String> {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body);
+        let binding = ProviderRequestBinding { bytes: u64::try_from(body.len()).map_err(|_| "native_request_binding_bound")?,
+            sha256: digest.as_ref().iter().map(|b| format!("{b:02x}")).collect() };
+        binding.validate(self.native_limits.request_bytes)?;
+        if self.expected_request_binding.as_ref().is_some_and(|expected| expected != &binding) {
+            return Err("native_retry_original_input_changed_no_post".into());
+        }
+        *self.request_binding.lock().map_err(|_| "native_request_binding_unavailable")? = Some(binding);
+        Ok(())
     }
     pub fn with_limits(mut self, limits: Arc<NativeLimits>) -> Self {
         self.native_limits = limits;

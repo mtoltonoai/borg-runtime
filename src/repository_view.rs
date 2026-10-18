@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum SourceSelector {
     Start,
     Checkpoint,
+    Instructions,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

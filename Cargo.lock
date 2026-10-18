@@ -232,6 +232,8 @@ dependencies = [
 name = "borg-runtime"
 version = "0.2.0"
 dependencies = [
+ "httpdate",
+ "aws-lc-rs",
  "bach",
  "bolero",
  "bytes",

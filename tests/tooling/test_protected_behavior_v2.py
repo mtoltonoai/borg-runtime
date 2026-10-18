@@ -89,6 +89,23 @@ print(json.dumps({'revision':1,'subject_sha256':c['subject_sha256'],'recipe_sha2
         work=work or self.work()
         with patch.object(behavior,'Execution',FixtureExecution):
             return behavior.behavior_check(self.config,self.subject,self.package,self.recipe_path,work,'check-original')
+    def test_trusted_operator_can_have_distinct_roles_without_worker_authority(self):
+        for role in ('human','repository','rollout'):
+            self.controller_config['producers'].append({'id':role,'uid':self.config['producer_uid'],'role':role})
+        self.write_controller()
+        result=self.run_check()
+        self.assertTrue(result['cleanup_verified']);self.assertTrue(all(result['results'].values()))
+        # The candidate remains a separate configured worker, never a producer.
+        self.assertNotEqual(self.recipe['execution_uid'],self.config['producer_uid'])
+        self.controller_config['worker_uids'].append(self.config['producer_uid']);self.write_controller()
+        with self.assertRaisesRegex(ValueError,'identities overlap'):self.run_check()
+    def test_duplicate_operator_role_or_producer_id_refuses_before_execution(self):
+        for item in ({'id':'second-checker','uid':self.config['producer_uid'],'role':'checker'},
+                     {'id':'checker','uid':self.config['producer_uid'],'role':'human'}):
+            self.write_recipe();self.controller_config['producers'].append(item);self.write_controller()
+            with patch.object(behavior,'Execution') as execution:
+                with self.assertRaisesRegex(ValueError,'identities overlap'):self.run_check()
+                execution.assert_not_called()
     def test_execution_identity_cannot_be_another_protected_role(self):
         for role in ('human','repository','rollout'):
             self.write_recipe();self.controller_config['producers'].append({'id':role,'uid':self.recipe['execution_uid'],'role':role});self.write_controller()

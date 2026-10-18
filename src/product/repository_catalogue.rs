@@ -11,6 +11,7 @@ const REGISTRATION_FIELDS: &[&str] = &[
     "checkpoint_endpoint",
     "source_store_key",
     "checkpoint_store_key",
+    "pull_request_target",
 ];
 
 fn identity_field(fields: &Form, key: &str, metadata: &RuntimeLimits) -> Result<String, String> {
@@ -40,6 +41,9 @@ pub(super) fn binding(
 // changes, provided the HTTP/form transport still admits its bytes.
 fn registration(fields: &Form) -> Result<Registration, String> {
     Ok(Registration {
+        pull_request_target: fields.get("pull_request_target").filter(|value| !value.trim().is_empty())
+            .map(|value| serde_json::from_str(value).map_err(|_| "Invalid closed pull request target configuration".to_string()))
+            .transpose()?,
         repository_id: required(fields, "repository_id")?.into(),
         registration_revision: required(fields, "registration_revision")?.into(),
         display_name: required(fields, "display_name")?.into(),
@@ -93,6 +97,7 @@ mod tests {
     #[test]
     fn registration_views_escape_public_metadata_and_preserve_unresolved_operation_identity() {
         let entry = Entry {
+            pull_request_available: false,
             repository_id: "repo/<x>".into(),
             registration_revision: "r&1".into(),
             display_name: "<script>label</script>".into(),
@@ -245,6 +250,9 @@ fn registration_form(
             escape(value(name))
         );
     }
+    // This operator-only field is intentionally blank on every render,
+    // including refusals. Entry cannot reconstruct private target configuration.
+    body.push_str("<label>Pull request target configuration (optional JSON)<textarea name=\"pull_request_target\" rows=\"6\" autocomplete=\"off\"></textarea></label><p>Supply an explicitly configured target to enable pull request requests for this new revision. Empty means no pull request capability for the new revision. Earlier accepted tasks keep their original configuration. Private target values are not redisplayed; retain the exact submitted configuration with its operation ID for reconciliation.</p>");
     let _ = write!(
         body,
         "<button type=\"submit\">{}</button></form>",
@@ -283,6 +291,7 @@ fn detail(entry: &Entry) -> UiResponse {
     ] {
         let _ = write!(body, "<dt>{label}</dt><dd>{}</dd>", escape(value));
     }
+    let _ = write!(body, "<dt>Pull request publication configured</dt><dd>{}</dd>", if entry.pull_request_available { "yes" } else { "no" });
     let _ = write!(
         body,
         "<dt>Generation</dt><dd>{}</dd><dt>Enabled for new tasks</dt><dd>{}</dd></dl><p><a href=\"{}/revise\">Record a new immutable revision</a> · <a href=\"{}\">Refresh current registration</a></p><form method=\"get\" action=\"{}\">{}<button>Read exact revision</button></form><form method=\"post\" action=\"{}/enabled\">{}{}{}<button>{}</button></form>",
@@ -355,12 +364,12 @@ pub(super) async fn get(controller: &Controller, path: &str, query: &str) -> UiR
             return not_task(reply);
         };
         let mut body = String::from(
-            "<p><a href=\"/repositories/new\">Register repository</a></p><p>Choose explicit IDs and immutable revisions when creating tasks. Duplicate display names do not identify the same repository. Registration does not prove material is available.</p><table><thead><tr><th>Repository ID</th><th>Display name</th><th>Current revision</th><th>Enabled for new tasks</th></tr></thead><tbody>",
+            "<p><a href=\"/repositories/new\">Register repository</a></p><p>Choose explicit IDs and immutable revisions when creating tasks. Duplicate display names do not identify the same repository. Registration does not prove material is available.</p><table><thead><tr><th>Repository ID</th><th>Display name</th><th>Current revision</th><th>Enabled for new tasks</th><th>Pull request publication configured</th></tr></thead><tbody>",
         );
         for entry in entries.items {
             let _ = write!(
                 body,
-                "<tr><td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape(&entry_path(
                     &entry.repository_id,
                     Some(&entry.registration_revision)
@@ -368,7 +377,8 @@ pub(super) async fn get(controller: &Controller, path: &str, query: &str) -> UiR
                 escape(&entry.repository_id),
                 escape(&entry.display_name),
                 escape(&entry.current_revision),
-                entry.enabled_for_new_tasks
+                entry.enabled_for_new_tasks,
+                if entry.pull_request_available { "yes" } else { "no" }
             );
         }
         body.push_str("</tbody></table>");

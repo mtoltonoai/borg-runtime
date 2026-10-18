@@ -202,6 +202,10 @@ impl Phase {
         self.publish_may_have_started = true;
         self.save(&path(state, attempt))
     }
+    pub(super) fn cleanup_checkpoint(&self) -> Result<&Checkpoint, String> {
+        if !self.retired_for_checks { return Err("cleanup checkpoint publication remains unresolved".into()); }
+        Ok(&self.checkpoint)
+    }
     pub(super) fn retire(&mut self, state: &Path, attempt: &Attempt) -> Result<(), String> {
         self.retired_for_checks = true;
         self.save(&path(state, attempt))
@@ -234,6 +238,22 @@ pub(super) fn read(file: &Path, command: &WorkerCommand) -> Result<Option<Phase>
     }
     phase.validate(command)?;
     Ok(Some(phase))
+}
+
+/// A local terminal-report attempt cannot hide a retained unresolved external
+/// effect. Unreadable/corrupt phase reads never turn uncertainty into completion.
+pub(super) fn completion_ready(state: &Path, command: &WorkerCommand) -> Result<bool, String> {
+    let WorkerCommand::RunAttempt { attempt, task, .. } = command else { return Ok(true); };
+    if task.definition.executor != ExecutorKind::Coding { return Ok(true); }
+    Ok(read(&path(state, attempt), command)?.is_none_or(|phase| phase.retired_for_checks))
+}
+
+fn recovery_phase(state: &Path, receipt: &Receipt) -> Result<Option<Phase>, String> {
+    if !receipt.effects_started { return Ok(None); }
+    let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { return Ok(None); };
+    if task.definition.executor != ExecutorKind::Coding { return Ok(None); }
+    // `completed` predates this fix and is deliberately not a selection guard.
+    Ok(read(&path(state, attempt), &receipt.command)?.filter(|p| !p.retired_for_checks))
 }
 
 pub(super) async fn prepare(
@@ -307,7 +327,7 @@ pub(super) async fn prepare(
     Ok(phase)
 }
 
-fn original_task(task: &Task, command: &WorkerCommand) -> bool {
+pub(super) fn original_task(task: &Task, command: &WorkerCommand) -> bool {
     if super::validate_command_session(command).is_err() {
         return false;
     }
@@ -339,6 +359,11 @@ fn original_task(task: &Task, command: &WorkerCommand) -> bool {
 }
 fn failed_candidate(observation: &Observation) -> bool {
     matches!(observation,Observation::ResultCandidate{checks_passed:false,checkpoint:None,validation,output:None,..} if validation.is_empty())
+}
+fn stopped_terminal(task: &Task, command: &WorkerCommand) -> bool {
+    original_task(task, command)
+        && matches!(task.status, TaskStatus::Cancelled | TaskStatus::Failed | TaskStatus::Succeeded)
+        && task.attempt.as_ref().is_some_and(|a| a.stopped)
 }
 async fn historical_completion(
     client: &ApiClient,
@@ -411,9 +436,7 @@ async fn terminal_refusal(
     )
     .await?;
     Ok(
-        matches!(reply.outcome,Outcome::Ok{data:Data::Task(ref task)} if original_task(task,&phase.command)
-        && matches!(task.status,TaskStatus::Cancelled|TaskStatus::Failed|TaskStatus::Succeeded)
-        &&task.attempt.as_ref().is_some_and(|a|a.stopped)),
+        matches!(reply.outcome,Outcome::Ok{data:Data::Task(ref task)} if stopped_terminal(task,&phase.command)),
     )
 }
 
@@ -481,6 +504,15 @@ async fn recover_one(
         || !matches!(prepared.outcome,Outcome::Ok{data:Data::Operation(ref record)} if record==&phase.prepared)
     {
         return Err("publication original prepare acknowledgment changed".into());
+    }
+    // Completed local markers written by earlier workers are not effect proof.
+    // Once exact recovery receipts exist, however, their terminal disposition
+    // closes this old launch without another Git read or terminal-report cycle.
+    // Unavailable/incomplete receipts never take this shortcut.
+    if original.state == "settled" && stopped_terminal(&task, &phase.command)
+        && matches!(historical_completion(client, state, phase, attempt).await, Ok(true))
+    {
+        return Ok(());
     }
     if !same_task {
         if historical_completion(client, state, phase, attempt).await? {
@@ -604,6 +636,27 @@ async fn recover_one(
     .await?;
     Ok(())
 }
+// Checkpoint settlement recovery must retain the original publication identity,
+// including a not-applied decision whose checkpoint field is absent.
+pub(super) fn validate_saved_settlement(
+    state: &Path,
+    command: &WorkerCommand,
+    request: &Operation,
+) -> Result<(), String> {
+    let WorkerCommand::RunAttempt { attempt, .. } = command else {
+        return Err("settlement has no original run command".into());
+    };
+    let Operation::SettleOperation { operation_id, checkpoint, .. } = request else {
+        return Err("unexpected settlement journal operation".into());
+    };
+    if checkpoint.is_some() || operation_id == &format!("checkpoint-{}", attempt.id) {
+        let phase = read(&path(state, attempt), command)?
+            .ok_or("settlement original publication missing")?;
+        validate_settlement(request, &phase, attempt)?;
+    }
+    Ok(())
+}
+
 fn validate_settlement(
     request: &Operation,
     phase: &Phase,
@@ -644,23 +697,20 @@ pub(super) async fn recover(
     validation_runtime: &Arc<crate::native::ValidationRuntime>,
 ) -> Result<(), String> {
     for (file, mut receipt) in command_receipts(state, client.limits())? {
-        if receipt.completed || !receipt.effects_started {
-            continue;
-        }
+        let Some(phase) = recovery_phase(state, &receipt)? else { continue; };
         let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else {
             continue;
         };
-        if task.definition.executor != ExecutorKind::Coding {
-            continue;
-        }
-        let Some(phase) = read(&path(state, attempt), &receipt.command)? else {
-            continue;
-        };
-        if phase.retired_for_checks {
-            continue;
-        }
         if attempt.worker_id != config.id {
             return Err("publication belongs to another worker".into());
+        }
+        // Repair the previous completion bug before a remote lookup can fail.
+        // The unchanged phase, original operation and reports determine closure.
+        if receipt.completed {
+            receipt.completed = false;
+            bounded_json_size(&receipt, client.limits().worker.command_record_bytes)
+                .map_err(|_| "publication command receipt exceeds bound (worker.command_record_bytes)")?;
+            atomic_json(&file, &receipt)?;
         }
         let original_client = ApiClient::new(
             config.controller_url.clone(),
@@ -692,6 +742,100 @@ pub(super) async fn recover(
 mod catalogue_tests {
     use super::*;
 
+    fn retained_phase() -> Phase {
+        let limits = super::super::test_limits();
+        let definition = Definition { id: "publication-agent".into(), revision: "r1".into(),
+            executor: ExecutorKind::Coding, charter: None, limit_overrides: None,
+            inference: Some(InferenceSettings::selected()),
+            execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }) };
+        let repository = Repository { registration: Some(crate::repository_catalogue::Revision {
+            repository_id: "repository".into(), registration_revision: "r1".into() }),
+            url: "/fixture/source.git".into(), checkpoint_remote: "/fixture/checkpoint.git".into(),
+            start_commit: "a".repeat(40), pull_request_target: None };
+        let mut input = TaskInput { instruction_source: None, resolved_limits: None, repository_read: None, instruction: "controlled publication".into(),
+            definition: definition.clone(), repository: Some(repository.clone()), acceptance_commands: vec![],
+            output_schema: None, limits: Limits { deadline_unix_ms: 10_000, model_requests: 1, output_bytes: 1024,
+                result_bytes: limits.task_defaults.result_bytes, max_delegation_depth: 0 }, dependencies: vec![], native_workflow: None,
+            pull_request: None };
+        input.resolved_limits = Some(limits.resolve_task(&input).unwrap());
+        let attempt = Attempt { id: "publication-attempt".into(), task_id: "publication-task".into(),
+            session_id: "publication-session".into(), generation: 1, worker_id: "worker".into(),
+            worker_incarnation: "original".into(), phase: AttemptPhase::Running, deadline_unix_ms: 10_000,
+            stopped: false, uncertain: false };
+        let session = Session { id: attempt.session_id.clone(), task_id: attempt.task_id.clone(),
+            agent_id: definition.id.clone(), definition };
+        let proof = |suffix: &str, observation, revision| {
+            let report_id = format!("{}-{suffix}", attempt.id);
+            ReportProof { report: Report { report_id: report_id.clone(), worker_id: attempt.worker_id.clone(),
+                incarnation: attempt.worker_incarnation.clone(), task_id: attempt.task_id.clone(),
+                attempt_id: attempt.id.clone(), generation: attempt.generation, observation },
+                commit: MutationCommit { operation_id: report_id, controller_revision: revision } }
+        };
+        let association = proof("completed-association", Observation::Started { thread_id: Some("thread".into()), turn_id: Some("turn".into()) }, 1);
+        let completion = proof("completed-executor", Observation::ExecutorOutcome { success: true, summary: "controlled".into() }, 2);
+        let checkpoint = git::checkpoint(&repository, &attempt.task_id, &attempt.id, "b".repeat(40)).unwrap();
+        let prepared = intent(&attempt, &checkpoint);
+        Phase { revision: 2, command: WorkerCommand::RunAttempt { command_id: "run".into(), session, attempt,
+                task: input, checkpoint: None, continuation: None, workflow_continuation: None, completion_continuation: None },
+            association, completion, prepare_commit: MutationCommit { operation_id: checkpoint.operation_id.clone(), controller_revision: 3 },
+            prepared, checkpoint, settlement_id: "settlement".into(), retired_for_checks: false, publish_may_have_started: false }
+    }
+
+    #[test]
+    fn unretired_phase_blocks_local_completion_until_original_settlement_handoff() {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::temp_dir().join(format!("borg-publication-completion-{}-{}-{}",
+            std::process::id(), process::now_ms(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("publications")).unwrap();
+        let mut phase = retained_phase();
+        let WorkerCommand::RunAttempt { attempt, .. } = &phase.command else { unreachable!() };
+        let attempt = attempt.clone();
+        let file = path(&root, &attempt);
+        assert!(completion_ready(&root, &phase.command).unwrap());
+        phase.save(&file).unwrap();
+        assert!(!completion_ready(&root, &phase.command).unwrap(), "persisted but never-entered publication still needs original disposition");
+        phase.mark_started(&root, &attempt).unwrap();
+        assert!(!completion_ready(&root, &phase.command).unwrap(), "physical cleanup or generic error is not remote acknowledgment");
+        let mut receipt = Receipt { command: phase.command.clone(), completed: true, effects_started: true };
+        let recovered = recovery_phase(&root, &receipt).unwrap().expect("old completed launch must still enter original recovery");
+        assert_eq!(recovered.checkpoint, phase.checkpoint);
+        assert_eq!(recovered.settlement_id, phase.settlement_id);
+        receipt.completed &= completion_ready(&root, &receipt.command).unwrap();
+        assert!(!receipt.completed, "a stale completed marker cannot override the retained phase");
+        std::fs::write(&file, b"{\"revision\":2}").unwrap();
+        assert!(completion_ready(&root, &phase.command).is_err(), "corrupt retained phase cannot authorize completion");
+        phase.retire(&root, &attempt).unwrap();
+        assert!(completion_ready(&root, &phase.command).unwrap());
+        receipt.completed = true;
+        assert!(recovery_phase(&root, &receipt).unwrap().is_none(), "settled retired pipeline must not recover again");
+        assert_eq!(read(&file, &phase.command).unwrap().unwrap().checkpoint, phase.checkpoint);
+    }
+
+    #[test]
+    fn terminal_refusal_requires_original_stopped_owner_not_just_expiry_or_status() {
+        let phase = retained_phase();
+        let WorkerCommand::RunAttempt { session, attempt, task: input, .. } = &phase.command else { unreachable!() };
+        let mut task = Task { id: attempt.task_id.clone(), session_id: session.id.clone(), input: input.clone(),
+            assigned_agent_id: session.agent_id.clone(), status: TaskStatus::Active, revision: 1,
+            attempt: Some(attempt.clone()), selected_checkpoint: None, result: None, blocked_reason: None,
+            pending_assignment: None, native_retry_block: None, progress: String::new(), recent_output: String::new(), output_truncated: false,
+            parent_task_id: None, waiting_child_id: None, completed_child: None };
+        assert!(!stopped_terminal(&task, &phase.command));
+        task.attempt.as_mut().unwrap().stopped = true;
+        task.attempt.as_mut().unwrap().phase = AttemptPhase::Stopped;
+        assert!(!stopped_terminal(&task, &phase.command), "stopped active task is not terminal refusal proof");
+        for status in [TaskStatus::Cancelled, TaskStatus::Failed, TaskStatus::Succeeded] {
+            task.status = status;
+            assert!(stopped_terminal(&task, &phase.command));
+        }
+        task.attempt.as_mut().unwrap().generation += 1;
+        assert!(!stopped_terminal(&task, &phase.command), "successor generation cannot close original ownership");
+        task.attempt.as_mut().unwrap().generation -= 1;
+        task.input.limits.deadline_unix_ms -= 1;
+        assert!(!stopped_terminal(&task, &phase.command), "expiry cannot replace accepted input identity");
+    }
+
     #[test]
     // Traceability scope: Worker intent from a fixed accepted-shaped repository fixture; tuple mismatch and serialization checks, not controller admission or actual Git.
     //= spec/impl/v2/implementation.md#repository-associations-are-versioned-metadata
@@ -704,6 +848,7 @@ mod catalogue_tests {
             phase: AttemptPhase::Running, deadline_unix_ms: 1000, stopped: false, uncertain: false,
         };
         let repository = Repository {
+            pull_request_target: None,
             registration: Some(crate::repository_catalogue::Revision {
                 repository_id: "repository".into(), registration_revision: "revision-one".into(),
             }),

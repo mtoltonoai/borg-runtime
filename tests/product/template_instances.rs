@@ -51,11 +51,14 @@ async fn remember(controller: &Controller, attempt: &Attempt, revision: Option<u
 async fn finish(controller: &Controller, attempt: &Attempt, answer: &str) -> Task {
     for observation in [
         Observation::Usage {
+            native_diagnostic_reserved: false,
             model_requests: 1,
             input_tokens: None,
             output_tokens: None,
         },
         Observation::NativeLoopCompleted {
+            requests: Vec::new(),
+            final_response_index: None,
             model_requests: 1,
             calls: vec![],
         },

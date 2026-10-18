@@ -315,6 +315,7 @@ impl Lab {
             ],
         );
         let repository = Repository {
+            pull_request_target: None,
             registration: Some(borg_runtime::repository_catalogue::Revision {
                 repository_id: "load-repository".into(),
                 registration_revision: "1".into(),
@@ -529,11 +530,13 @@ impl Lab {
         } else {
             format!("controlled-native-{index}")
         };
-        TaskInput {
+        TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             repository_read: None,
             instruction: instruction.clone(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(InferenceSettings::selected()),
                 execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -631,6 +634,7 @@ async fn run_case(
     mut events: mpsc::Receiver<()>,
 ) {
     let registration = borg_runtime::repository_catalogue::Registration {
+        pull_request_target: None,
         repository_id: "load-repository".into(),
         registration_revision: "1".into(),
         display_name: "Local load repository".into(),

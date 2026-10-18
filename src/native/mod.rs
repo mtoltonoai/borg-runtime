@@ -4,8 +4,20 @@
 //! worker to execute; it never runs arbitrary tools. Provider-side cancellation
 //! or accounting is not claimed by local drop.
 mod cpu;
+mod charter;
+mod compaction;
+pub use compaction::execute_charter_compaction;
+pub use charter::{CharterExchange, CharterInput, CharterReply};
 mod decode;
+mod format;
+pub use format::{FormatIssue, SchemaRule};
 mod error;
+mod diagnostic;
+#[cfg(test)]
+mod diagnostic_carrier_tests;
+pub use diagnostic::{ProviderFailureClass, ProviderFailureDiagnostic, HttpDiagnostic,
+    DiagnosticBodyState, NumericDiagnostic, RetryHeaderDiagnostic, HttpStatusDiagnostic,
+    CategoryDiagnostic, SchedulerRetryDiagnostic, QuotaDimension, QuotaValues, QuotaDiagnostic};
 mod host;
 mod loop_step;
 mod request_observation;
@@ -13,8 +25,9 @@ mod schema;
 mod step;
 mod task_tool;
 pub use loop_step::{
-    NativeFunction, NativeLoopCall, NativeLoopObservation, NativeLoopProfile, NativeLoopReply,
+    NativeFunction, NativeLoopRepair, NativeLoopCap, NativeLoopFinal, NativeLoopCall, NativeLoopObservation, NativeLoopProfile, NativeLoopReply,
     NativeLoopStep, NativeWebSearch, execute_loop_step, execute_loop_step_with_notice,
+    execute_loop_step_with_host_inputs, execute_loop_step_with_host_inputs_at, execute_loop_step_after_completion, execute_loop_step_after_completion_at, execute_loop_step_after_format_at, execute_loop_step_after_output_cap_at, execute_loop_step_with_completion_input, execute_loop_step_with_completion_input_at,
 };
 pub use task_tool::{
     CurrentTaskCall, ToolCallObservation, continue_current_task, request_current_task,
@@ -28,10 +41,11 @@ pub use cpu::qualification_hold_next_validation;
 #[cfg(debug_assertions)]
 pub use cpu::qualification_hold_provider_after_usage;
 pub use cpu::{validation_cleanup_pending, validation_worker_stdio};
-pub use host::{ValidationHost, ValidationRuntime};
+pub use host::{ProviderRequestBinding, ValidationHost, ValidationRuntime};
 pub use step::{NativeStep, NativeStepObservation};
 pub use usage::{
     NativeObservation, ProviderOutcome, ProviderTokenUsage, RequestExposure, UsageObservation,
+    ProviderErrorCategory, ProviderRejection, RejectionKind, RetryAfter, RetryBlockReason, NativeRetryBlock,
 };
 pub use validation::{
     JsonValidationError, ValidatedJson, validate_json_with_host, validate_json_with_program,
@@ -87,12 +101,15 @@ pub async fn execute_cancellable<F: Future<Output = ()> + Send>(
         .result
 }
 
+// Traceability scope: Reassignment configuration is not a child-decision protocol; this path keeps the supplied accepted input and never creates a session.
+//= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+//# A task reassignment MUST retain the task's prior session and execution-input history.
 pub async fn execute_observed_cancellable<F: Future<Output = ()> + Send>(
     input: &TaskInput,
     config: &NativeConfig,
     cancelled: F,
 ) -> NativeObservation {
-    if input.native_workflow.is_some() {
+    if crate::delegation::template(input).is_some() || crate::task_tool::enabled(input) {
         return NativeObservation::not_started("native_step_consumer_required");
     }
     let Ok(program) = std::env::current_exe() else {
@@ -121,7 +138,7 @@ pub async fn execute_observed_with_validation_program<F: Future<Output = ()> + S
     program: &Path,
     cancelled: F,
 ) -> NativeObservation {
-    if input.native_workflow.is_some() {
+    if crate::delegation::template(input).is_some() || crate::task_tool::enabled(input) {
         return NativeObservation::not_started("native_step_consumer_required");
     }
     let step =
@@ -135,6 +152,7 @@ pub async fn execute_observed_with_validation_program<F: Future<Output = ()> + S
         request_exposure: step.request_exposure,
         usage: step.usage,
         provider_outcome: step.provider_outcome,
+        diagnostic: step.diagnostic,
     }
 }
 
@@ -203,10 +221,15 @@ pub async fn execute_step_observed_with_host<F: Future<Output = ()> + Send>(
 ) -> NativeStepObservation {
     let deadline = match deadline(input.limits.deadline_unix_ms) {
         Ok(deadline) => deadline,
-        Err(error) => return NativeStepObservation::not_started(error),
+        Err(error) => {
+            let mut value = NativeStepObservation::not_started(error);
+            value.diagnostic = Some(ProviderFailureDiagnostic::new(ProviderFailureClass::Deadline));
+            return value;
+        }
     };
     let mut cpu = cpu::State::new(host);
     let mut exposure = RequestExposure::NotStarted;
+    let mut interrupted = None;
     let mut result = {
         let work = execute_before(
             input,
@@ -220,22 +243,29 @@ pub async fn execute_step_observed_with_host<F: Future<Output = ()> + Send>(
         tokio::pin!(work, cancelled);
         tokio::select! {
             biased;
-            _ = &mut cancelled => Err("native_cancelled".into()),
-            _ = tokio::time::sleep_until(deadline) => Err("native_deadline_exceeded".into()),
+            _ = &mut cancelled => { interrupted = Some(ProviderFailureClass::Cancelled); Err("native_cancelled".into()) },
+            _ = tokio::time::sleep_until(deadline) => { interrupted = Some(ProviderFailureClass::Deadline); Err("native_deadline_exceeded".into()) },
             result = &mut work => result,
         }
     };
+    if let Some(class) = interrupted { cpu.record_failure(class); }
+    if result.is_err() { cpu.record_result_failure(exposure, deadline); }
     // This is deliberately outside the attempt's timed work: kill immediately,
     // then verify reaping before the caller may report local termination.
     if let Err(error) = cpu.finish(true).await {
+        cpu.record_failure(ProviderFailureClass::ValidationCleanup);
         result = Err(error);
     }
+    let diagnostic = cpu.finish_diagnostic(result.is_err(), exposure);
     NativeStepObservation {
         result,
+        diagnostic,
         request_exposure: exposure,
         usage: cpu.provider_usage(),
         provider_outcome: if exposure == RequestExposure::NotStarted {
             ProviderOutcome::NotStarted
+        } else if let Some(rejection) = cpu.provider_rejection() {
+            ProviderOutcome::Rejected(rejection)
         } else if cpu.provider_completed() {
             ProviderOutcome::Completed
         } else {
@@ -276,6 +306,9 @@ async fn execute_before(
     exposure: &mut RequestExposure,
 ) -> Result<NativeStep, String> {
     let policy = &input.execution_limits()?.native;
+    if input.definition.charter.is_some() && host.charter.is_none() {
+        return Err("native_charter_consumer_required".into());
+    }
     policy.validate()?;
     if *policy != *host.native_limits {
         return Err("native_validation_policy_mismatch".into());
@@ -371,7 +404,7 @@ async fn execute_before(
         "max_output_tokens": policy.max_output_tokens,
         "text": {"format": format}
     });
-    let (wire, key) = send_request(
+    let (wire, key) = send_request_observed(
         url,
         config,
         &body,
@@ -379,6 +412,7 @@ async fn execute_before(
         deadline,
         exposure,
         host,
+        cpu,
     )
     .await?;
     let validated = cpu
@@ -450,7 +484,18 @@ async fn execute_before(
     }))
 }
 
+#[cfg(test)]
 async fn send_request(
+    url: Url, config: &NativeConfig, request_body: &Value, response_bound: usize,
+    deadline: Instant, exposure: &mut RequestExposure, host: &ValidationHost,
+) -> Result<(Vec<u8>, String), String> {
+    let mut cpu = cpu::State::new(host);
+    send_request_observed(url, config, request_body, response_bound, deadline, exposure, host, &mut cpu).await
+}
+
+//= spec/impl/v2/implementation.md#platform-owned-model-retries
+//# A failed platform-owned provider request MUST retain bounded diagnostics sufficient to identify the observed failure class and available provider retry or quota information.
+async fn send_request_observed(
     url: Url,
     config: &NativeConfig,
     request_body: &Value,
@@ -458,16 +503,21 @@ async fn send_request(
     deadline: Instant,
     exposure: &mut RequestExposure,
     host: &ValidationHost,
+    cpu: &mut cpu::State,
 ) -> Result<(Vec<u8>, String), String> {
     let policy = &host.native_limits;
     policy.validate()?;
-    schema::measure(
+    let charter_body = host.charter.as_ref().map(|c| c.prepare(request_body, policy)).transpose()?;
+    let request_body = charter_body.as_ref().unwrap_or(request_body);
+    let (body_bytes, _) = schema::measure(
         request_body,
         policy.request_bytes,
         policy,
         "native_request_bytes",
     )?;
-    let body = serde_json::to_vec(request_body).map_err(|_| "native_request_encoding")?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(body_bytes).map_err(|_| "native_request_allocation_failed")?;
+    serde_json::to_writer(&mut body, request_body).map_err(|_| "native_request_encoding")?;
     if config.api_key_env.len() > policy.api_key_env_bytes {
         return Err("native_key_configuration_invalid_native_api_key_env_bytes".into());
     }
@@ -489,6 +539,9 @@ async fn send_request(
     if contains_credential(request_body, &key) {
         return Err("native_input_contains_credential".into());
     }
+    // Retain only a digest of exact serialized safe input, never its contents.
+    // This guard precedes exposure and prevents changed-input automatic retry.
+    host.bind_request(&body)?;
     let mut authorization =
         HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| "native_api_key_invalid")?;
     authorization.set_sensitive(true);
@@ -506,18 +559,28 @@ async fn send_request(
         Ok(response) => response,
         Err(error) => {
             interval.finish(End::TransportFailed);
+            cpu.record_failure(transport_failure_class(&error));
             return Err(transport_failure(&error).into());
         }
     };
     *exposure = RequestExposure::HttpResponseReceived;
     interval.headers(response.status().as_u16());
+    // Own the admitted snapshot outside every cancellable body/helper future.
+    // This is observation only; neither headers nor diagnostic class prove a
+    // completed provider request or authorize another POST.
+    let initial = error::head(&response, &key, policy);
+    cpu.record_diagnostic(ProviderFailureDiagnostic::http(
+        ProviderFailureClass::HttpResponsePending, initial.facts.clone()));
     if !response.status().is_success() {
-        let diagnostic = error::diagnostic(&mut response, &key, deadline, policy).await;
+        let observed = error::inspect(&mut response, &key, deadline, policy, initial).await;
+        cpu.record_rejection(observed.rejection);
+        cpu.record_diagnostic(observed.facts);
         interval.finish(End::HttpRefused);
-        return Err(diagnostic);
+        return Err(observed.diagnostic);
     }
     let wire_limit = policy.response_wire_bytes;
     if response_bound > policy.helper_value_bytes {
+        cpu.record_failure(ProviderFailureClass::ResponseBound);
         return Err("native_response_byte_bound_native_helper_value_bytes".into());
     }
     if response
@@ -525,6 +588,8 @@ async fn send_request(
         .is_some_and(|n| n > wire_limit as u64)
     {
         interval.finish(End::ByteBound);
+        cpu.diagnostic_body(DiagnosticBodyState::AdvertisedBound);
+        cpu.record_failure(ProviderFailureClass::ResponseBound);
         return Err("native_response_byte_bound_native_response_wire_bytes".into());
     }
     let mut wire = Vec::new();
@@ -533,28 +598,54 @@ async fn send_request(
             Ok(Some(chunk)) => chunk,
             Ok(None) => {
                 interval.body_eof();
+                cpu.diagnostic_body(DiagnosticBodyState::Complete);
                 break;
             }
             Err(_) => {
                 interval.finish(End::BodyFailed);
+                cpu.diagnostic_body(DiagnosticBodyState::ReadFailed);
+                cpu.record_failure(ProviderFailureClass::ResponseRead);
                 return Err("native_response_incomplete".into());
             }
         };
         if let Err(error) = live(deadline) {
             interval.finish(End::Deadline);
+            cpu.record_failure(ProviderFailureClass::Deadline);
             return Err(error);
         }
         if wire.len().saturating_add(chunk.len()) > wire_limit {
             interval.finish(End::ByteBound);
+            cpu.diagnostic_body(DiagnosticBodyState::StreamBound);
+            cpu.record_failure(ProviderFailureClass::ResponseBound);
             return Err("native_response_byte_bound_native_response_wire_bytes".into());
+        }
+        if wire.try_reserve(chunk.len()).is_err() {
+            interval.finish(End::BodyFailed);
+            cpu.diagnostic_body(DiagnosticBodyState::ReadFailed);
+            cpu.record_failure(ProviderFailureClass::ResponseRead);
+            return Err("native_response_allocation_failed".into());
         }
         wire.extend_from_slice(&chunk);
     }
     if let Err(error) = live(deadline) {
         interval.finish(End::Deadline);
+        cpu.record_failure(ProviderFailureClass::Deadline);
         return Err(error);
     }
     interval.finish(End::BodyComplete);
+    let wire = if let Some(charter) = &host.charter {
+        match charter.capture(&wire, &key, deadline, policy) {
+            Ok(projected) => projected,
+            Err(error) => {
+                // The existing helper must still observe actual provider usage
+                // and completion before this local capture failure is reported.
+                // Worker take_reply refuses later execution after recording usage.
+                cpu.record_failure(ProviderFailureClass::ResponseValidation);
+                charter.failed_capture(error);
+                wire
+            }
+        }
+    } else { wire };
     Ok((wire, key))
 }
 
@@ -566,8 +657,15 @@ async fn send_request(
 // Its public predicate checks that marker plus the public alternatives excluded
 // below. No error formatting, URL, pattern, body or credential is returned.
 fn transport_failure(error: &reqwest::Error) -> &'static str {
+    match transport_failure_class(error) {
+        ProviderFailureClass::ConnectTimeout => "native_transport_failed_outcome_unknown_native_http_connect_timeout_ms",
+        _ => "native_transport_failed_outcome_unknown",
+    }
+}
+
+fn transport_failure_class(error: &reqwest::Error) -> ProviderFailureClass {
     use std::error::Error as _;
-    const GENERAL: &str = "native_transport_failed_outcome_unknown";
+    const GENERAL: ProviderFailureClass = ProviderFailureClass::TransportUnknown;
     if !error.is_connect() || !error.is_timeout() {
         return GENERAL;
     }
@@ -590,7 +688,7 @@ fn transport_failure(error: &reqwest::Error) -> &'static str {
         }
         cause = error.source();
     }
-    "native_transport_failed_outcome_unknown_native_http_connect_timeout_ms"
+    ProviderFailureClass::ConnectTimeout
 }
 
 fn client(

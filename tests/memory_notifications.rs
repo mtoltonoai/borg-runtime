@@ -1,101 +1,1058 @@
-//! Clean-state canonical agent/session qualification through real controller SQL.
-//! Worker reports are controlled inputs; no provider, Codex or host qualification.
-use borg_runtime::{controller::{Controller,ControllerConfig},protocol::*,collaboration::{Query,QueryResult},mcp::{Caller,Invocation}};
-use serde_json::json;
-use std::{path::{Path,PathBuf},sync::{Arc,atomic::{AtomicU64,AtomicBool,Ordering}},time::Duration};
-static NEXT:AtomicU64=AtomicU64::new(1);
-fn dir()->PathBuf{let p=std::env::temp_dir().join(format!("borg-agent-sessions-{}-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),NEXT.fetch_add(1,Ordering::SeqCst)));std::fs::create_dir(&p).unwrap();p.join("task.db")}
-fn cfg()->ControllerConfig{let mut policy=borg_runtime::limits::RuntimeLimits::seed().unwrap();policy.controller.command_wait_ms=10;ControllerConfig{limits:Arc::new(policy),validation_executable:env!("CARGO_BIN_EXE_borg-runtime").into(),..Default::default()}}
-fn input(agent:&str)->TaskInput{TaskInput{ resolved_limits: None,repository_read:None,instruction:"controlled session work".into(),definition:Definition{ limit_overrides: None,id:agent.into(),revision:"v1".into(),executor:ExecutorKind::Native,inference:Some(InferenceSettings::selected()),execution_profile:Some(ExecutionProfile::CollaborationV1{web_search:None})},repository:None,acceptance_commands:vec![],output_schema:Some(json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false})),limits:Limits{deadline_unix_ms:now()+600_000,model_requests:20,output_bytes:4096,result_bytes:borg_runtime::limits::RuntimeLimits::seed().unwrap().task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None}}
-fn now()->u64{std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64}
-async fn x(c:&Controller,command:Operation)->Reply{let r=c.handle(Request{protocol_revision:WIRE_REVISION,request_id:format!("request-{}",NEXT.fetch_add(1,Ordering::SeqCst)),command:command.clone()}).await;r.validate_for(&command).unwrap();r}
-fn task(r:Reply)->Task{match r.outcome{Outcome::Ok{data:Data::Task(t)}=>*t,o=>panic!("expected task {o:?}")}}
-fn refused(r:Reply,code:&str){assert!(matches!(r.outcome,Outcome::Refused{code:ref c,..} if c==code),"{r:?}");}
-async fn submit(c:&Controller,id:&str,t:TaskInput)->Task{task(x(c,Operation::SubmitTask{operation_id:id.into(),input:t}).await)}
-async fn get(c:&Controller,id:&str)->Task{task(x(c,Operation::GetTask{task_id:id.into()}).await)}
-async fn session(c:&Controller,id:&str)->Session{match x(c,Operation::QueryCollaboration{query:Query::Session{session_id:id.into()}}).await.outcome{Outcome::Ok{data:Data::Collaboration(QueryResult::Session(s))}=>s,o=>panic!("{o:?}")}}
-async fn sessions(c:&Controller,agent:Option<&str>,after:Option<String>,limit:usize)->borg_runtime::collaboration::Page<Session>{match x(c,Operation::QueryCollaboration{query:Query::Sessions{agent_id:agent.map(Into::into),after,limit}}).await.outcome{Outcome::Ok{data:Data::Collaboration(QueryResult::Sessions(s))}=>s,o=>panic!("{o:?}")}}
-fn worker(n:usize,c:usize)->Worker{Worker{id:"worker".into(),incarnation:"incarnation-1".into(),native_capacity:n,coding_capacity:c}}
-async fn register(c:&Controller,w:&Worker){assert!(matches!(x(c,Operation::RegisterWorker{operation_id:format!("register-{}-{}",w.id,w.incarnation),worker:w.clone()}).await.outcome,Outcome::Ok{data:Data::Worker(_)}));}
-async fn commands(c:&Controller,w:&Worker,ack:Vec<String>)->Vec<WorkerCommand>{match x(c,Operation::AwaitCommands{operation_id:format!("await-{}",NEXT.fetch_add(1,Ordering::SeqCst)),worker_id:w.id.clone(),incarnation:w.incarnation.clone(),acknowledged:ack}).await.outcome{Outcome::Ok{data:Data::Commands(v)}=>v,Outcome::Pending{..}=>vec![],o=>panic!("{o:?}")}}
-fn launch(v:&[WorkerCommand],id:&str)->(String,Session,Attempt,TaskInput){v.iter().find_map(|c|match c{WorkerCommand::RunAttempt{command_id,session,attempt,task,..} if attempt.task_id==id=>Some((command_id.clone(),session.clone(),attempt.clone(),task.clone())),_=>None}).unwrap_or_else(||panic!("no launch for {id}: {v:?}"))}
-async fn report(c:&Controller,a:&Attempt,id:&str,observation:Observation)->Reply{x(c,Operation::ObserveWorker{report:Report{report_id:id.into(),task_id:a.task_id.clone(),attempt_id:a.id.clone(),generation:a.generation,worker_id:a.worker_id.clone(),incarnation:a.worker_incarnation.clone(),observation}}).await}
-async fn start(c:&Controller,a:&Attempt,label:&str){task(report(c,a,&format!("{label}-started"),Observation::Started{thread_id:None,turn_id:None}).await);}
-fn actor(a:&Attempt)->Caller{Caller{task_id:a.task_id.clone(),attempt_id:a.id.clone(),generation:a.generation,worker_id:a.worker_id.clone(),incarnation:a.worker_incarnation.clone()}}
-fn invoke(a:&Attempt,id:&str,tool:&str,args:serde_json::Value)->Operation{Operation::CallCollaboration{call:Invocation{operation_id:id.into(),logical_call_id:format!("logical-{id}"),caller:actor(a),tool:tool.into(),arguments:args}}}
-async fn failure(c:&Controller,a:&Attempt,label:&str)->Task{task(report(c,a,&format!("{label}-executor"),Observation::ExecutorOutcome{success:false,summary:"controlled failed executor".into()}).await);task(report(c,a,&format!("{label}-stopped"),Observation::ProcessTreeStopped).await);task(report(c,a,&format!("{label}-candidate"),Observation::ResultCandidate{summary:"controlled failure".into(),checkpoint:None,checks_passed:false,validation:vec![],output:None}).await)}
-async fn closed(p:&Path){tokio::time::timeout(Duration::from_secs(3),async{loop{let f=std::fs::OpenOptions::new().read(true).write(true).open(p.with_extension("db.controller-lock")).unwrap();if f.try_lock().is_ok(){break}tokio::time::sleep(Duration::from_millis(5)).await}}).await.unwrap();}
+//! Automatic notices are retired; explicit agent memory remains canonical.
+//! Real Controller SQL and a pinned prior Controller qualify retained history.
+//! No worker/model/provider behavior is inferred from these fixtures.
+use borg_runtime::{
+    collaboration::{
+        AgentMemoryBatch, AgentMemoryCursor, AgentMemoryObservation, AgentMemoryPage, QueryResult,
+    },
+    controller::{Controller, ControllerConfig},
+    mcp::{Caller, Invocation},
+    protocol::*,
+};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+static NEXT: AtomicU64 = AtomicU64::new(1);
+const PRIOR_SHA: &str = "7b518b38b151d04be14bf8a735408592772b2ec1caed5ec6aace99dd365207ad";
+const DISABLED: &str = "automatic shared-memory change notifications are retired";
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+fn dir() -> PathBuf {
+    let base = std::env::var_os("BORG_TEST_ARTIFACT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let p = base.join(format!(
+        "borg-memory-retirement-{}-{}-{}",
+        std::process::id(),
+        now(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir(&p).unwrap();
+    p.join("task.db")
+}
+fn cfg() -> ControllerConfig {
+    let mut p = borg_runtime::limits::RuntimeLimits::seed().unwrap();
+    p.controller.command_wait_ms = 10;
+    ControllerConfig {
+        limits: Arc::new(p),
+        validation_executable: env!("CARGO_BIN_EXE_borg-runtime").into(),
+        ..Default::default()
+    }
+}
+fn input(agent: &str) -> TaskInput {
+    TaskInput { instruction_source: None,
+        pull_request: None,
+        resolved_limits: None,
+        repository_read: None,
+        instruction: "controlled explicit memory work".into(),
+        definition: Definition {
+            charter: None,
+            limit_overrides: None,
+            id: agent.into(),
+            revision: "v1".into(),
+            executor: ExecutorKind::Native,
+            inference: Some(InferenceSettings::selected()),
+            execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
+        },
+        repository: None,
+        acceptance_commands: vec![],
+        output_schema: Some(
+            json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}),
+        ),
+        limits: Limits {
+            deadline_unix_ms: now() + 600_000,
+            model_requests: 20,
+            output_bytes: 4096,
+            result_bytes: cfg().limits.task_defaults.result_bytes,
+            max_delegation_depth: 4,
+        },
+        dependencies: vec![],
+        native_workflow: None,
+    }
+}
+enum Api {
+    Current(Controller),
+    Prior {
+        origin: String,
+        client: reqwest::Client,
+        maximum: usize,
+    },
+}
+fn open(p: &Path, config: ControllerConfig) -> Api {
+    Api::Current(Controller::open_with_config(p, config).unwrap())
+}
+async fn x(c: &Api, command: Operation) -> Reply {
+    let request = Request {
+        protocol_revision: if matches!(c, Api::Prior { .. }) {
+            17
+        } else {
+            WIRE_REVISION
+        },
+        request_id: format!("memory-request-{}", NEXT.fetch_add(1, Ordering::SeqCst)),
+        command: command.clone(),
+    };
+    let r = match c {
+        Api::Current(c) => Box::pin(c.handle(request)).await,
+        Api::Prior {
+            origin,
+            client,
+            maximum,
+        } => {
+            let bytes = serde_json::to_vec(&request).unwrap();
+            assert!(bytes.len() <= *maximum);
+            let mut response = client
+                .post(format!("{origin}/api/operations"))
+                .header("content-type", "application/json")
+                .body(bytes)
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                assert!(bytes.len().saturating_add(chunk.len()) <= *maximum);
+                bytes.extend_from_slice(&chunk);
+            }
+            let r: Reply = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(r.request_id, request.request_id);
+            r
+        }
+    };
+    r.validate_for(&command).unwrap();
+    r
+}
+fn task(r: Reply) -> Task {
+    match r.outcome {
+        Outcome::Ok {
+            data: Data::Task(t),
+        } => *t,
+        o => panic!("expected task {o:?}"),
+    }
+}
+fn value(r: Reply) -> Option<MemoryValue> {
+    match r.outcome {
+        Outcome::Ok {
+            data: Data::Memory(v),
+        } => v,
+        o => panic!("expected memory {o:?}"),
+    }
+}
+fn memory(r: Reply) -> AgentMemoryObservation {
+    match r.outcome {
+        Outcome::Ok {
+            data: Data::AgentMemory(v),
+        } => v,
+        o => panic!("expected prior notice {o:?}"),
+    }
+}
+fn refused(r: &Reply, code: &str) {
+    assert!(
+        matches!(&r.outcome, Outcome::Refused { code: c, .. } if c == code),
+        "{r:?}"
+    );
+}
+fn disabled(r: &Reply) {
+    assert!(
+        matches!(&r.outcome, Outcome::Refused { code, message } if code == "disabled" && message == DISABLED),
+        "{r:?}"
+    );
+}
+fn actor(a: &Attempt) -> Caller {
+    Caller {
+        task_id: a.task_id.clone(),
+        attempt_id: a.id.clone(),
+        generation: a.generation,
+        worker_id: a.worker_id.clone(),
+        incarnation: a.worker_incarnation.clone(),
+    }
+}
+fn invoke(a: &Attempt, id: &str, tool: &str, arguments: Value) -> Operation {
+    Operation::CallCollaboration {
+        call: Invocation {
+            operation_id: id.into(),
+            logical_call_id: format!("logical-{id}"),
+            caller: actor(a),
+            tool: tool.into(),
+            arguments,
+        },
+    }
+}
+fn write(a: &Attempt, id: &str, key: &str, revision: Option<u64>, v: Value) -> Operation {
+    invoke(
+        a,
+        id,
+        "collab_memory_set",
+        json!({"key":key,"expected_revision":revision,"value":v}),
+    )
+}
+async fn get(c: &Api, id: &str) -> Task {
+    task(x(c, Operation::GetTask { task_id: id.into() }).await)
+}
+async fn read(c: &Api, a: &Attempt, key: &str) -> Option<MemoryValue> {
+    value(
+        x(
+            c,
+            invoke(
+                a,
+                &format!("read-{}", NEXT.fetch_add(1, Ordering::SeqCst)),
+                "collab_memory_get",
+                json!({"key":key}),
+            ),
+        )
+        .await,
+    )
+}
+async fn keys(c: &Api, a: &Attempt) -> Vec<borg_runtime::collaboration::MemoryKey> {
+    match x(
+        c,
+        invoke(
+            a,
+            &format!("keys-{}", NEXT.fetch_add(1, Ordering::SeqCst)),
+            "collab_memory_list",
+            json!({"cursor":null,"limit":20}),
+        ),
+    )
+    .await
+    .outcome
+    {
+        Outcome::Ok {
+            data: Data::Collaboration(QueryResult::MemoryKeys(p)),
+        } => {
+            assert!(p.next_cursor.is_none());
+            p.items
+        }
+        o => panic!("{o:?}"),
+    }
+}
+async fn report(c: &Api, a: &Attempt, id: &str, observation: Observation) -> Reply {
+    x(
+        c,
+        Operation::ObserveWorker {
+            report: Report {
+                report_id: id.into(),
+                task_id: a.task_id.clone(),
+                attempt_id: a.id.clone(),
+                generation: a.generation,
+                worker_id: a.worker_id.clone(),
+                incarnation: a.worker_incarnation.clone(),
+                observation,
+            },
+        },
+    )
+    .await
+}
+async fn actors(c: &Api) -> (Task, Attempt, Task, Attempt, Attempt) {
+    let ta = task(
+        x(
+            c,
+            Operation::SubmitTask {
+                operation_id: "actor-a".into(),
+                input: input("shared"),
+            },
+        )
+        .await,
+    );
+    let tb = task(
+        x(
+            c,
+            Operation::SubmitTask {
+                operation_id: "actor-b".into(),
+                input: input("shared"),
+            },
+        )
+        .await,
+    );
+    let tc = task(
+        x(
+            c,
+            Operation::SubmitTask {
+                operation_id: "actor-c".into(),
+                input: input("unrelated"),
+            },
+        )
+        .await,
+    );
+    let w = Worker {
+        id: "worker".into(),
+        incarnation: "incarnation-1".into(),
+        native_capacity: 3,
+        coding_capacity: 0,
+    };
+    assert!(matches!(
+        x(
+            c,
+            Operation::RegisterWorker {
+                operation_id: "register".into(),
+                worker: w.clone()
+            }
+        )
+        .await
+        .outcome,
+        Outcome::Ok {
+            data: Data::Worker(_)
+        }
+    ));
+    let commands = match x(
+        c,
+        Operation::AwaitCommands {
+            operation_id: "await-original".into(),
+            worker_id: w.id,
+            incarnation: w.incarnation,
+            acknowledged: vec![],
+        },
+    )
+    .await
+    .outcome
+    {
+        Outcome::Ok {
+            data: Data::Commands(v),
+        } => v,
+        o => panic!("{o:?}"),
+    };
+    let attempt = |id: &str| {
+        commands
+            .iter()
+            .find_map(|v| match v {
+                WorkerCommand::RunAttempt { attempt, .. } if attempt.task_id == id => {
+                    Some(attempt.clone())
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    let a = attempt(&ta.id);
+    let b = attempt(&tb.id);
+    let other = attempt(&tc.id);
+    for (label, a) in [("a", &a), ("b", &b), ("other", &other)] {
+        task(
+            report(
+                c,
+                a,
+                &format!("{label}-started"),
+                Observation::Started {
+                    thread_id: None,
+                    turn_id: None,
+                },
+            )
+            .await,
+        );
+    }
+    (ta, a, tb, b, other)
+}
+async fn closed(p: &Path) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p.with_extension("db.controller-lock"))
+                .unwrap();
+            if f.try_lock().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+// Read only after the owner has released its real SQLite/lock ownership.
+// Retain complete rows and explicit overflow sentinels, not just counts.
+fn projection(p: &Path) -> BTreeMap<String, Vec<String>> {
+    let db = rusqlite::Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let mut out = BTreeMap::new();
+    for (name, sql) in [
+        (
+            "sessions",
+            "SELECT json_array(id,seq,agent,task_id,body,memory_start_seq,memory_cursor_seq,memory_pending) FROM sessions ORDER BY id",
+        ),
+        (
+            "memories",
+            "SELECT json_array(agent,key,revision,body,operation_id) FROM memories ORDER BY agent,key",
+        ),
+        (
+            "history",
+            "SELECT json_array(seq,task_id,revision,kind,body) FROM history ORDER BY seq",
+        ),
+        (
+            "batch_counter",
+            "SELECT json_array(kind,value) FROM counters WHERE kind='memory_batch' ORDER BY kind",
+        ),
+    ] {
+        let mut q = db.prepare(&format!("{sql} LIMIT 513")).unwrap();
+        let rows = q
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(rows.len() <= 512);
+        out.insert(name.into(), rows);
+    }
+    out
+}
+fn cursor(p: &Path, session: &str) -> AgentMemoryCursor {
+    let db = rusqlite::Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let database_id = db
+        .query_row(
+            "SELECT value FROM settings WHERE name='database_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (agent_id, sequence): (String, i64) = db
+        .query_row(
+            "SELECT agent,memory_cursor_seq FROM sessions WHERE id=?1",
+            [session],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    AgentMemoryCursor {
+        database_id,
+        agent_id,
+        session_id: session.into(),
+        sequence: u64::try_from(sequence).expect("nonnegative retained memory cursor"),
+    }
+}
+fn notice_ops(a: &Attempt, c: &AgentMemoryCursor, suffix: &str) -> Vec<Operation> {
+    vec![
+        Operation::ObserveAgentMemory {
+            caller: actor(a),
+            limit: 20,
+        },
+        Operation::PrepareAgentMemory {
+            operation_id: format!("disabled-prepare-{suffix}"),
+            caller: actor(a),
+            expected_cursor: c.clone(),
+            through_sequence: c.sequence,
+            limit: 20,
+        },
+        Operation::AcknowledgeAgentMemory {
+            operation_id: format!("disabled-ack-{suffix}"),
+            caller: actor(a),
+            batch_id: "absent-batch".into(),
+        },
+    ]
+}
+async fn original(c: &Api, op: &Operation, expected: &Reply) {
+    let replay = x(c, op.clone()).await;
+    assert_eq!(replay.outcome, expected.outcome);
+    assert_eq!(replay.commit, expected.commit);
+    let id = op.mutation_id().unwrap();
+    match x(
+        c,
+        Operation::GetOperation {
+            operation_id: id.into(),
+        },
+    )
+    .await
+    .outcome
+    {
+        Outcome::Ok {
+            data: Data::Operation(record),
+        } => {
+            assert_eq!(record.id, id);
+            assert_eq!(record.intended, serde_json::to_value(op).unwrap());
+            assert_eq!(
+                serde_json::from_value::<Outcome>(record.outcome.unwrap()).unwrap(),
+                expected.outcome
+            );
+        }
+        o => panic!("{o:?}"),
+    }
+}
 
-use borg_runtime::collaboration::{AgentMemoryObservation,AgentMemoryPage};
-fn memory(r:Reply)->AgentMemoryObservation{match r.outcome{Outcome::Ok{data:Data::AgentMemory(v)}=>v,o=>panic!("memory response: {o:?}")}}
-async fn observe(c:&Controller,a:&Attempt,n:usize)->AgentMemoryObservation{memory(x(c,Operation::ObserveAgentMemory{caller:actor(a),limit:n}).await)}
-fn prepare(a:&Attempt,id:&str,p:&AgentMemoryPage,n:usize)->Operation{Operation::PrepareAgentMemory{operation_id:id.into(),caller:actor(a),expected_cursor:p.from_cursor.clone(),through_sequence:p.through_sequence,limit:n}}
-async fn acknowledge(c:&Controller,a:&Attempt,id:&str,batch:&str)->Reply{x(c,Operation::AcknowledgeAgentMemory{operation_id:id.into(),caller:actor(a),batch_id:batch.into()}).await}
-async fn clear(c:&Controller,a:&Attempt){for _ in 0..100{let state=observe(c,a,100).await;let batch=if let Some(b)=state.pending{b}else if let Some(p)=state.available{memory(x(c,prepare(a,&format!("clear-{}",NEXT.fetch_add(1,Ordering::SeqCst)),&p,100)).await).pending.unwrap()}else{return};assert!(batch.page.notices.is_empty(),"unexpected notice during fixture baseline");memory(acknowledge(c,a,&format!("ack-{}",NEXT.fetch_add(1,Ordering::SeqCst)),&batch.batch_id).await);}panic!("unbounded fixture clear")}
-async fn write(c:&Controller,a:&Attempt,id:&str,key:&str,expected:Option<u64>)->Reply{x(c,invoke(a,id,"collab_memory_set",json!({"key":key,"expected_revision":expected,"value":{"data":"not-a-notice"}}))).await}
-async fn actors(c:&Controller)->(Task,Attempt,Task,Attempt,Attempt){let ta=submit(c,"actor-a",input("shared")).await;let tb=submit(c,"actor-b",input("shared")).await;let tc=submit(c,"actor-c",input("unrelated")).await;let w=worker(3,0);register(c,&w).await;let v=commands(c,&w,vec![]).await;let (_,_,a,_)=launch(&v,&ta.id);let (_,_,b,_)=launch(&v,&tb.id);let (_,_,other,_)=launch(&v,&tc.id);start(c,&a,"a").await;start(c,&b,"b").await;start(c,&other,"c").await;(ta,a,tb,b,other)}
-// Traceability scope: Real controller writes expose the committed key/revision to other same-agent sessions, exclude own/foreign writes and omit memory values.
-//= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
+// Explicit reads/writes retain the existing agent scope and never create a batch.
+//= spec/impl/v2/implementation.md#accepted-state-has-one-durable-owner
 //= type=test
-//# A committed memory update MUST make its changed key and committed revision available to other active sessions of the same agent.
+//# The platform MUST persist explicitly recorded agent memory in its database.
+//= spec/impl/v2/implementation.md#definitions-select-execution
+//= type=test
+//# A memory MUST be keyed by agent identity rather than by session.
+//= spec/impl/v2/implementation.md#definitions-select-execution
+//= type=test
+//# An agent's memories MUST persist across every session of that agent identity.
 #[tokio::test]
-async fn memory_notices_origin_filter_precedes_coalescing_and_values_never_flow(){
- let c=Controller::open_with_config(dir(),cfg()).unwrap();let (_,a,_,b,other)=actors(&c).await;clear(&c,&a).await;clear(&c,&b).await;
- assert!(matches!(write(&c,&a,"a-k1","k",None).await.outcome,Outcome::Ok{..}));assert!(matches!(write(&c,&b,"b-k2","k",Some(1)).await.outcome,Outcome::Ok{..}));assert!(matches!(write(&c,&a,"a-k3","k",Some(2)).await.outcome,Outcome::Ok{..}));write(&c,&other,"other-secret","foreign",None).await;
- let pa=observe(&c,&a,100).await.available.unwrap();let pb=observe(&c,&b,100).await.available.unwrap();assert_eq!(pa.notices,vec![borg_runtime::collaboration::AgentMemoryNotice{key:"k".into(),revision:2}]);assert_eq!(pb.notices[0].revision,3);assert_eq!(pb.notices.len(),1);assert!(!serde_json::to_string(&pa).unwrap().contains("not-a-notice"));
+async fn explicit_memory_cas_scope_and_reopen_survive_notification_retirement() {
+    let p = dir();
+    let c = open(&p, cfg());
+    let (ta, a, tb, b, other) = actors(&c).await;
+    drop(c);
+    closed(&p).await;
+    let initial = projection(&p);
+    let c = open(&p, cfg());
+    let first = write(
+        &a,
+        "first",
+        "shared-key",
+        None,
+        json!({"text":"original value"}),
+    );
+    let one = x(&c, first.clone()).await;
+    assert_eq!(value(one.clone()).unwrap().revision, 1);
+    let two = value(
+        x(
+            &c,
+            write(
+                &b,
+                "second",
+                "shared-key",
+                Some(1),
+                json!({"text":"replacement value"}),
+            ),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(two.revision, 2);
+    assert_eq!(two.agent_id, "shared");
+    assert_eq!(read(&c, &a, "shared-key").await, Some(two.clone()));
+    assert_eq!(read(&c, &b, "shared-key").await, Some(two.clone()));
+    assert!(read(&c, &other, "shared-key").await.is_none());
+    let foreign = value(
+        x(
+            &c,
+            write(
+                &other,
+                "foreign",
+                "shared-key",
+                None,
+                json!({"text":"foreign value"}),
+            ),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(foreign.agent_id, "unrelated");
+    assert_eq!(foreign.revision, 1);
+    assert_eq!(read(&c, &a, "shared-key").await, Some(two.clone()));
+    for a in [&a, &b, &other] {
+        let list = keys(&c, a).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].key, "shared-key");
+        assert_eq!(
+            list[0].revision,
+            if a.task_id == other.task_id { 1 } else { 2 }
+        );
+    }
+    refused(
+        &x(
+            &c,
+            write(&a, "stale", "shared-key", Some(1), json!("stale")),
+        )
+        .await,
+        "stale_revision",
+    );
+    original(&c, &first, &one).await;
+    assert_eq!(get(&c, &ta.id).await.input, ta.input);
+    assert_eq!(get(&c, &tb.id).await.input, tb.input);
+    drop(c);
+    closed(&p).await;
+    let retained = projection(&p);
+    assert_eq!(retained["sessions"], initial["sessions"]);
+    assert_eq!(retained["batch_counter"], initial["batch_counter"]);
+    let c = open(&p, cfg());
+    assert_eq!(read(&c, &b, "shared-key").await, Some(two));
+    assert_eq!(read(&c, &other, "shared-key").await, Some(foreign));
+    original(&c, &first, &one).await;
+    drop(c);
+    closed(&p).await;
+    assert_eq!(projection(&p), retained);
 }
 #[tokio::test]
-async fn memory_notices_new_session_starts_at_creation_not_inventory(){
- let c=Controller::open_with_config(dir(),cfg()).unwrap();let ta=submit(&c,"first",input("shared")).await;let w=worker(2,0);register(&c,&w).await;let v=commands(&c,&w,vec![]).await;let (_,_,a,_)=launch(&v,&ta.id);start(&c,&a,"first").await;write(&c,&a,"old-memory","old",None).await;
- let tb=submit(&c,"second",input("shared")).await;write(&c,&a,"after-instantiation","new",None).await;let v=commands(&c,&w,vec![]).await;let (_,_,b,_)=launch(&v,&tb.id);start(&c,&b,"second").await;let o=observe(&c,&b,100).await;assert!(o.start_sequence>0);let p=o.available.unwrap();assert_eq!(p.notices.len(),1);assert_eq!(p.notices[0].key,"new");
+async fn fresh_notification_operations_are_disabled_without_cursor_batch_history_or_session_changes()
+ {
+    let p = dir();
+    let c = open(&p, cfg());
+    let (_, a, tb, b, _) = actors(&c).await;
+    value(
+        x(
+            &c,
+            write(&a, "notice-candidate", "key", None, json!("explicit only")),
+        )
+        .await,
+    )
+    .unwrap();
+    drop(c);
+    closed(&p).await;
+    let before = projection(&p);
+    let current_cursor = cursor(&p, &tb.session_id);
+    let c = open(&p, cfg());
+    for op in notice_ops(&b, &current_cursor, "first") {
+        let first = x(&c, op.clone()).await;
+        disabled(&first);
+        if op.mutation_id().is_some() {
+            original(&c, &op, &first).await;
+        } else {
+            assert!(first.commit.is_none());
+            for _ in 0..3 {
+                let next = x(&c, op.clone()).await;
+                disabled(&next);
+                assert_eq!(
+                    next.observed_controller_revision,
+                    first.observed_controller_revision
+                );
+            }
+        }
+    }
+    drop(c);
+    closed(&p).await;
+    assert_eq!(projection(&p), before);
+    let c = open(&p, cfg());
+    for op in notice_ops(&b, &current_cursor, "after-reopen") {
+        disabled(&x(&c, op).await);
+    }
+    drop(c);
+    closed(&p).await;
+    assert_eq!(projection(&p), before);
 }
 #[tokio::test]
-async fn memory_pending_and_ack_original_receipts_survive_loss_restart_and_new_worker(){
- let p=dir();let c=Controller::open_with_config(&p,cfg()).unwrap();let (_,a,tb,b,_)=actors(&c).await;clear(&c,&b).await;write(&c,&a,"write-first","key",None).await;let page=observe(&c,&b,100).await.available.unwrap();let op=prepare(&b,"prepare-original",&page,100);let prepared=x(&c,op.clone()).await;let pending=memory(prepared.clone()).pending.unwrap();drop(prepared.clone());
- write(&c,&a,"write-after-pending","key",Some(1)).await;assert_eq!(observe(&c,&b,100).await.pending,Some(pending.clone()));let replay=x(&c,op.clone()).await;assert_eq!(replay.outcome,prepared.outcome);assert_eq!(replay.commit,prepared.commit);
- let failed=failure(&c,&b,"receiver-failure").await;assert_eq!(failed.status,TaskStatus::Failed);let retried=task(x(&c,Operation::RetryTask{operation_id:"receiver-retry".into(),task_id:tb.id.clone(),expected_revision:failed.revision}).await);assert_eq!(retried.session_id,tb.session_id);
- let mut new=worker(1,0);new.id="replacement-worker".into();new.incarnation="replacement".into();register(&c,&new).await;let offered=commands(&c,&new,vec![]).await;let (_,_,successor,_)=launch(&offered,&tb.id);start(&c,&successor,"replacement").await;assert_ne!(successor.id,b.id);
- refused(x(&c,Operation::ObserveAgentMemory{caller:actor(&b),limit:100}).await,"stale_generation");refused(acknowledge(&c,&b,"stale-worker-ack",&pending.batch_id).await,"stale_generation");drop(c);closed(&p).await;let c=Controller::open_with_config(&p,cfg()).unwrap();assert_eq!(observe(&c,&successor,100).await.pending,Some(pending.clone()));let ack=Operation::AcknowledgeAgentMemory{operation_id:"ack-original".into(),caller:actor(&successor),batch_id:pending.batch_id.clone()};let ar=x(&c,ack.clone()).await;let done=memory(ar.clone());assert!(done.pending.is_none());assert_eq!(done.acknowledged_cursor,pending.page.to_cursor);let replay=x(&c,ack).await;assert_eq!(replay.outcome,ar.outcome);assert_eq!(replay.commit,ar.commit);let later=observe(&c,&successor,100).await.available.unwrap();assert!(later.notices.iter().any(|n|n.key=="key"&&n.revision==2));
+async fn memory_commit_failure_and_stale_cas_preserve_explicit_value_and_no_notice_state() {
+    let p = dir();
+    let probe = Arc::new(AtomicBool::new(false));
+    let mut config = cfg();
+    config.qualification_fail_next_commit = Some(probe.clone());
+    let c = open(&p, config.clone());
+    let (_, a, _, b, _) = actors(&c).await;
+    let op = write(&a, "rolled-back-memory", "key", None, json!("exact value"));
+    probe.store(true, Ordering::SeqCst);
+    refused(&x(&c, op.clone()).await, "store_unavailable");
+    assert!(!probe.load(Ordering::SeqCst));
+    assert!(read(&c, &b, "key").await.is_none());
+    let committed = x(&c, op.clone()).await;
+    let v = value(committed.clone()).unwrap();
+    assert_eq!(v.revision, 1);
+    refused(
+        &x(
+            &c,
+            write(&b, "stale-after-commit", "key", None, json!("wrong")),
+        )
+        .await,
+        "stale_revision",
+    );
+    assert_eq!(read(&c, &b, "key").await, Some(v.clone()));
+    original(&c, &op, &committed).await;
+    drop(c);
+    closed(&p).await;
+    let before = projection(&p);
+    let c = open(&p, config);
+    assert_eq!(read(&c, &b, "key").await, Some(v));
+    original(&c, &op, &committed).await;
+    drop(c);
+    closed(&p).await;
+    assert_eq!(projection(&p), before);
 }
 #[tokio::test]
-async fn memory_observation_empty_poll_and_ack_do_not_create_history_wake_loop(){
- let c=Controller::open_with_config(dir(),cfg()).unwrap();let (_,_,_,b,_)=actors(&c).await;clear(&c,&b).await;let op=Operation::ObserveAgentMemory{caller:actor(&b),limit:100};let first=x(&c,op.clone()).await;assert!(first.commit.is_none());assert!(memory(first.clone()).available.is_none());let revision=first.observed_controller_revision.unwrap();for _ in 0..5{let r=x(&c,op.clone()).await;assert_eq!(r.observed_controller_revision,Some(revision));assert!(r.commit.is_none());assert!(memory(r).available.is_none());}let change=c.wait_for_change(revision).await.unwrap();assert!(!change.changed);assert_eq!(change.revision,revision);
-}
-#[tokio::test]
-async fn memory_scan_bounds_raw_rows_and_item_overflow_never_skip_notices(){
- let c=Controller::open_with_config(dir(),cfg()).unwrap();let (_,a,_,b,other)=actors(&c).await;clear(&c,&b).await;
- for n in 0..140{task(report(&c,&other,&format!("noise-{n}"),Observation::Progress{text:"bounded unrelated event".into(),output:String::new(),truncated:false}).await);if n==65{write(&c,&a,"middle-write","first",None).await;}}
- write(&c,&a,"last-first","first",Some(1)).await;write(&c,&a,"last-second","second",None).await;let mut observed=std::collections::BTreeMap::new();let mut pages=0;
- loop{let o=observe(&c,&b,1).await;let Some(p)=o.available else{break};assert!(p.to_cursor.sequence-p.from_cursor.sequence<=64);assert!(p.notices.len()<=1);for n in &p.notices{let v=observed.entry(n.key.clone()).or_insert(0);*v=(*v).max(n.revision);}let pending=memory(x(&c,prepare(&b,&format!("scan-prepare-{pages}"),&p,1)).await).pending.unwrap();assert_eq!(pending.page,p);memory(acknowledge(&c,&b,&format!("scan-ack-{pages}"),&pending.batch_id).await);pages+=1;assert!(pages<10);}
- assert!(pages>=3);assert_eq!(observed.get("first"),Some(&2));assert_eq!(observed.get("second"),Some(&1));
-}
-#[tokio::test]
-async fn memory_prepare_commit_rollback_and_stale_cas_emit_no_phantom_delivery(){
- let p=dir();let probe=Arc::new(AtomicBool::new(false));let mut config=cfg();config.qualification_fail_next_commit=Some(probe.clone());let c=Controller::open_with_config(&p,config).unwrap();let (_,a,_,b,_)=actors(&c).await;clear(&c,&b).await;
- probe.store(true,Ordering::SeqCst);refused(write(&c,&a,"rolled-back","x",None).await,"store_unavailable");assert!(observe(&c,&b,100).await.available.is_none());write(&c,&a,"committed","x",None).await;let page=observe(&c,&b,100).await.available.unwrap();refused(write(&c,&a,"stale-write","x",None).await,"stale_revision");assert_eq!(observe(&c,&b,100).await.available,Some(page.clone()));let op=prepare(&b,"rolled-prepare",&page,100);probe.store(true,Ordering::SeqCst);refused(x(&c,op.clone()).await,"store_unavailable");let unchanged=observe(&c,&b,100).await;assert!(unchanged.pending.is_none());assert_eq!(unchanged.available,Some(page));let prepared=x(&c,op.clone()).await;assert!(memory(prepared.clone()).pending.is_some());let replay=x(&c,op).await;assert_eq!(replay.commit,prepared.commit);assert_eq!(replay.outcome,prepared.outcome);
-}
-#[tokio::test]
-async fn memory_scope_future_cursor_deadline_cancel_and_wrong_batch_refuse(){
- let clock=Arc::new(AtomicU64::new(now()));let mut config=cfg();let cl=clock.clone();config.clock=Arc::new(move||cl.load(Ordering::SeqCst));let c=Controller::open_with_config(dir(),config).unwrap();let (_,a,tb,b,_)=actors(&c).await;clear(&c,&b).await;write(&c,&a,"fence-memory","key",None).await;let p=observe(&c,&b,100).await.available.unwrap();
- for (n,field) in ["database","agent","session"].into_iter().enumerate(){let mut page=p.clone();match field{"database"=>page.from_cursor.database_id="wrong".into(),"agent"=>page.from_cursor.agent_id="wrong".into(),_=>page.from_cursor.session_id="wrong".into()};refused(x(&c,prepare(&b,&format!("wrong-{n}"),&page,100)).await,"stale_revision");}
- let mut future=p.clone();future.through_sequence=u64::MAX;refused(x(&c,prepare(&b,"future-window",&future,100)).await,"invalid_input");refused(x(&c,Operation::ObserveAgentMemory{caller:actor(&b),limit:0}).await,"invalid_input");let prepared=memory(x(&c,prepare(&b,"valid-pending",&p,100)).await);let batch=prepared.pending.unwrap();refused(acknowledge(&c,&b,"wrong-batch-ack","not-the-batch").await,"batch_mismatch");
- let current=get(&c,&tb.id).await;task(x(&c,Operation::CancelTask{operation_id:"cancel-receiver".into(),task_id:tb.id,expected_revision:current.revision}).await);assert!(matches!(acknowledge(&c,&b,"cancelled-ack",&batch.batch_id).await.outcome,Outcome::Refused{..}));clock.store(a.deadline_unix_ms+1,Ordering::SeqCst);assert!(matches!(x(&c,Operation::ObserveAgentMemory{caller:actor(&a),limit:100}).await.outcome,Outcome::Refused{..}));
-}
-#[tokio::test]
-async fn memory_corrupt_pending_batch_and_cursor_refuse_without_repair(){
- for field in ["notice","cursor","start"]{let p=dir();let c=Controller::open_with_config(&p,cfg()).unwrap();let (_,a,tb,b,_)=actors(&c).await;clear(&c,&b).await;write(&c,&a,"corrupt-test-write","key",None).await;let page=observe(&c,&b,100).await.available.unwrap();memory(x(&c,prepare(&b,"corrupt-test-prepare",&page,100)).await);drop(c);closed(&p).await;let db=rusqlite::Connection::open(&p).unwrap();match field{"notice"=>{let raw:String=db.query_row("SELECT memory_pending FROM sessions WHERE id=?1",[&tb.session_id],|r|r.get(0)).unwrap();let mut batch:borg_runtime::collaboration::AgentMemoryBatch=serde_json::from_str(&raw).unwrap();batch.page.notices[0].revision+=1;db.execute("UPDATE sessions SET memory_pending=?2 WHERE id=?1",rusqlite::params![tb.session_id,serde_json::to_string(&batch).unwrap()]).unwrap();},"cursor"=>{db.execute("UPDATE sessions SET memory_cursor_seq=-1 WHERE id=?1",[&tb.session_id]).unwrap();},_=>{db.execute("UPDATE sessions SET memory_start_seq=9223372036854775807 WHERE id=?1",[&tb.session_id]).unwrap();}}drop(db);let before=std::fs::read(&p).unwrap();assert!(Controller::open_with_config(&p,cfg()).is_err());assert_eq!(std::fs::read(&p).unwrap(),before);}
+async fn retired_notification_routes_still_check_current_caller_before_disabled() {
+    let p = dir();
+    let c = open(&p, cfg());
+    let (_, _, tb, b, _) = actors(&c).await;
+    drop(c);
+    closed(&p).await;
+    let cur = cursor(&p, &tb.session_id);
+    let c = open(&p, cfg());
+    for mut op in notice_ops(&b, &cur, "stale") {
+        match &mut op {
+            Operation::ObserveAgentMemory { caller, .. }
+            | Operation::PrepareAgentMemory { caller, .. }
+            | Operation::AcknowledgeAgentMemory { caller, .. } => caller.generation += 1,
+            _ => unreachable!(),
+        }
+        refused(&x(&c, op).await, "stale_generation");
+    }
+    let current = get(&c, &tb.id).await;
+    task(
+        x(
+            &c,
+            Operation::CancelTask {
+                operation_id: "cancel-receiver".into(),
+                task_id: tb.id.clone(),
+                expected_revision: current.revision,
+            },
+        )
+        .await,
+    );
+    for op in notice_ops(&b, &cur, "cancelled") {
+        refused(&x(&c, op).await, "invalid_transition");
+    }
 }
 
+struct PriorProcess(std::process::Child);
+impl PriorProcess {
+    async fn stop(mut self) {
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-INT", "--", &self.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(s) = self.0.try_wait().unwrap() {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(status.success(), "prior Controller: {status}");
+    }
+}
+impl Drop for PriorProcess {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+async fn prior(p: &Path) -> (PriorProcess, Api) {
+    let image = PathBuf::from(
+        std::env::var_os("BORG_MEMORY_NOTICE_PRIOR_BINARY")
+            .expect("explicit genuine prior17 Controller required"),
+    );
+    assert!(image.is_absolute());
+    let hash = std::process::Command::new("/usr/bin/sha256sum")
+        .arg("--")
+        .arg(&image)
+        .output()
+        .unwrap();
+    assert!(hash.status.success());
+    assert_eq!(
+        String::from_utf8(hash.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next(),
+        Some(PRIOR_SHA)
+    );
+    let config = cfg();
+    let metadata = p.parent().unwrap().join("prior-limits.json");
+    std::fs::write(&metadata, serde_json::to_vec(&*config.limits).unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let origin = format!("http://{address}");
+    let mut process = PriorProcess(
+        std::process::Command::new(image)
+            .arg("controller")
+            .arg("--limits")
+            .arg(metadata)
+            .arg("--db")
+            .arg(p)
+            .arg("--listen")
+            .arg(address.to_string())
+            .arg("--origin")
+            .arg(&origin)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(p.parent().unwrap().join("prior.stdout")).unwrap())
+            .stderr(std::fs::File::create(p.parent().unwrap().join("prior.stderr")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(process.0.try_wait().unwrap().is_none());
+            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    (
+        process,
+        Api::Prior {
+            origin,
+            client,
+            maximum: config.limits.transport.body_bytes,
+        },
+    )
+}
+fn prepare(a: &Attempt, id: &str, p: &AgentMemoryPage) -> Operation {
+    Operation::PrepareAgentMemory {
+        operation_id: id.into(),
+        caller: actor(a),
+        expected_cursor: p.from_cursor.clone(),
+        through_sequence: p.through_sequence,
+        limit: 100,
+    }
+}
+async fn observe(c: &Api, a: &Attempt) -> AgentMemoryObservation {
+    memory(
+        x(
+            c,
+            Operation::ObserveAgentMemory {
+                caller: actor(a),
+                limit: 100,
+            },
+        )
+        .await,
+    )
+}
+async fn clear_prior(c: &Api, a: &Attempt) {
+    for n in 0..32 {
+        let o = observe(c, a).await;
+        let b = if let Some(b) = o.pending {
+            b
+        } else if let Some(p) = o.available {
+            memory(x(c, prepare(a, &format!("prior-clear-{n}"), &p)).await)
+                .pending
+                .unwrap()
+        } else {
+            return;
+        };
+        assert!(b.page.notices.is_empty());
+        memory(
+            x(
+                c,
+                Operation::AcknowledgeAgentMemory {
+                    operation_id: format!("prior-clear-ack-{n}"),
+                    caller: actor(a),
+                    batch_id: b.batch_id,
+                },
+            )
+            .await,
+        );
+    }
+    panic!("prior fixture baseline exceeds finite pages")
+}
+struct Historical {
+    p: PathBuf,
+    receiver: Attempt,
+    task: Task,
+    pending: AgentMemoryBatch,
+    originals: Vec<(Operation, Reply)>,
+}
+async fn historical() -> Historical {
+    let p = dir();
+    let (process, c) = prior(&p).await;
+    let (_, a, tb, b, _) = actors(&c).await;
+    clear_prior(&c, &b).await;
+    value(x(&c, write(&a, "prior-memory-1", "key", None, json!("one"))).await).unwrap();
+    let page = observe(&c, &b).await.available.unwrap();
+    let prepared_op = prepare(&b, "prior-prepared-1", &page);
+    let prepared = x(&c, prepared_op.clone()).await;
+    let batch = memory(prepared.clone()).pending.unwrap();
+    assert_eq!(batch.page.notices.len(), 1);
+    assert_eq!(batch.page.notices[0].revision, 1);
+    let ack_op = Operation::AcknowledgeAgentMemory {
+        operation_id: "prior-ack-1".into(),
+        caller: actor(&b),
+        batch_id: batch.batch_id,
+    };
+    let ack = x(&c, ack_op.clone()).await;
+    assert!(memory(ack.clone()).pending.is_none());
+    value(
+        x(
+            &c,
+            write(&a, "prior-memory-2", "key", Some(1), json!("two")),
+        )
+        .await,
+    )
+    .unwrap();
+    let page = observe(&c, &b).await.available.unwrap();
+    let pending_op = prepare(&b, "prior-prepared-2", &page);
+    let pending_reply = x(&c, pending_op.clone()).await;
+    let pending = memory(pending_reply.clone()).pending.unwrap();
+    assert_eq!(pending.page.notices[0].revision, 2);
+    value(
+        x(
+            &c,
+            write(&a, "prior-memory-3", "key", Some(2), json!("three")),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(observe(&c, &b).await.pending, Some(pending.clone()));
+    drop(c);
+    process.stop().await;
+    closed(&p).await;
+    Historical {
+        p,
+        receiver: b,
+        task: tb,
+        pending,
+        originals: vec![
+            (prepared_op, prepared),
+            (ack_op, ack),
+            (pending_op, pending_reply),
+        ],
+    }
+}
 #[tokio::test]
-async fn memory_concurrent_prepare_ack_receipts_and_failed_ack_preserve_exact_pending(){
- let probe=Arc::new(AtomicBool::new(false));let mut config=cfg();config.qualification_fail_next_commit=Some(probe.clone());let c=Controller::open_with_config(dir(),config).unwrap();let (_,a,_,b,_)=actors(&c).await;clear(&c,&b).await;
- write(&c,&a,"concurrent-memory","key",None).await;let page=observe(&c,&b,100).await.available.unwrap();let op=prepare(&b,"concurrent-prepare",&page,100);
- let (one,two)=tokio::join!(x(&c,op.clone()),x(&c,op.clone()));assert_eq!(one.commit,two.commit);assert_eq!(one.outcome,two.outcome);let pending=memory(one.clone()).pending.unwrap();
- let mut changed=op.clone();if let Operation::PrepareAgentMemory{limit,..}=&mut changed{*limit=99;}refused(x(&c,changed).await,"operation_conflict");
- let different=prepare(&b,"separate-prepare-occurrence",&page,100);let more=x(&c,different).await;assert_eq!(memory(more).pending,Some(pending.clone()));
- write(&c,&a,"concurrent-after-pending","key",Some(1)).await;let ack=Operation::AcknowledgeAgentMemory{operation_id:"concurrent-ack".into(),caller:actor(&b),batch_id:pending.batch_id.clone()};
- probe.store(true,Ordering::SeqCst);refused(x(&c,ack.clone()).await,"store_unavailable");assert!(!probe.load(Ordering::SeqCst));let still=observe(&c,&b,100).await;assert_eq!(still.pending,Some(pending.clone()));assert_eq!(still.acknowledged_cursor,page.from_cursor);
- let (one,two)=tokio::join!(x(&c,ack.clone()),x(&c,ack.clone()));assert_eq!(one.commit,two.commit);assert_eq!(one.outcome,two.outcome);let done=memory(one);assert!(done.pending.is_none());assert_eq!(done.acknowledged_cursor,pending.page.to_cursor);
- refused(x(&c,prepare(&b,"stale-cursor-after-ack",&page,100)).await,"stale_revision");refused(acknowledge(&c,&b,"fresh-id-old-batch",&pending.batch_id).await,"not_found");
- let later=observe(&c,&b,100).await.available.unwrap();assert!(later.notices.iter().any(|n|n.key=="key"&&n.revision==2));
+#[ignore = "requires exact genuine prior17 BORG_MEMORY_NOTICE_PRIOR_BINARY"]
+async fn historical_pending_and_original_prepare_ack_receipts_remain_exact_after_retirement() {
+    let h = historical().await;
+    let before = projection(&h.p);
+    let cur = cursor(&h.p, &h.task.session_id);
+    for cycle in 0..2 {
+        let c = open(&h.p, cfg());
+        for (op, reply) in &h.originals {
+            original(&c, op, reply).await;
+        }
+        assert_eq!(
+            read(&c, &h.receiver, "key").await.unwrap().value,
+            json!("three")
+        );
+        for mut op in notice_ops(&h.receiver, &cur, &format!("historical-{cycle}")) {
+            if let Operation::AcknowledgeAgentMemory { batch_id, .. } = &mut op {
+                *batch_id = h.pending.batch_id.clone();
+            }
+            disabled(&x(&c, op).await);
+        }
+        assert_eq!(get(&c, &h.task.id).await.input, h.task.input);
+        drop(c);
+        closed(&h.p).await;
+        assert_eq!(projection(&h.p), before);
+    }
+    // Successful original occurrences still replay after the original caller
+    // loses authority; a fresh ACK cannot consume the retained pending batch.
+    let c = open(&h.p, cfg());
+    let current = get(&c, &h.task.id).await;
+    task(
+        x(
+            &c,
+            Operation::CancelTask {
+                operation_id: "historical-cancel".into(),
+                task_id: h.task.id.clone(),
+                expected_revision: current.revision,
+            },
+        )
+        .await,
+    );
+    for (op, reply) in &h.originals {
+        original(&c, op, reply).await;
+    }
+    refused(
+        &x(
+            &c,
+            Operation::AcknowledgeAgentMemory {
+                operation_id: "fresh-after-cancel".into(),
+                caller: actor(&h.receiver),
+                batch_id: h.pending.batch_id.clone(),
+            },
+        )
+        .await,
+        "invalid_transition",
+    );
+    drop(c);
+    closed(&h.p).await;
+    let cancelled = projection(&h.p);
+    assert_eq!(cancelled["sessions"], before["sessions"]);
+    assert_eq!(cancelled["memories"], before["memories"]);
+    assert_eq!(cancelled["batch_counter"], before["batch_counter"]);
+    let c = open(&h.p, cfg());
+    for (op, reply) in &h.originals {
+        original(&c, op, reply).await;
+    }
+    drop(c);
+    closed(&h.p).await;
+    assert_eq!(projection(&h.p), cancelled);
+}
+fn database_bytes(p: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for f in [
+        p.to_owned(),
+        p.with_extension("db-wal"),
+        p.with_extension("db-shm"),
+    ] {
+        if f.exists() {
+            assert!(std::fs::metadata(&f).unwrap().len() <= 32 * 1024 * 1024);
+            let bytes = std::fs::read(&f).unwrap();
+            out.insert(f, bytes);
+        }
+    }
+    out
+}
+#[tokio::test]
+#[ignore = "requires exact genuine prior17 BORG_MEMORY_NOTICE_PRIOR_BINARY"]
+async fn corrupt_historical_pending_cursor_and_start_refuse_without_repair_after_retirement() {
+    let h = historical().await;
+    // A valid successor reopen must succeed before any deliberate corruption.
+    let valid = projection(&h.p);
+    let c = open(&h.p, cfg());
+    for (op, reply) in &h.originals {
+        original(&c, op, reply).await;
+    }
+    drop(c);
+    closed(&h.p).await;
+    assert_eq!(projection(&h.p), valid);
+    let original = database_bytes(&h.p);
+    for field in ["notice", "cursor", "start"] {
+        let p = dir();
+        for (f, bytes) in &original {
+            std::fs::write(p.parent().unwrap().join(f.file_name().unwrap()), bytes).unwrap();
+        }
+        let db = rusqlite::Connection::open(&p).unwrap();
+        match field {
+            "notice" => {
+                let mut pending = h.pending.clone();
+                pending.page.notices[0].revision += 1;
+                assert_eq!(
+                    db.execute(
+                        "UPDATE sessions SET memory_pending=?2 WHERE id=?1",
+                        rusqlite::params![
+                            h.task.session_id,
+                            serde_json::to_string(&pending).unwrap()
+                        ]
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            "cursor" => {
+                assert_eq!(
+                    db.execute(
+                        "UPDATE sessions SET memory_cursor_seq=-1 WHERE id=?1",
+                        [&h.task.session_id]
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            _ => {
+                assert_eq!(
+                    db.execute(
+                        "UPDATE sessions SET memory_start_seq=9223372036854775807 WHERE id=?1",
+                        [&h.task.session_id]
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+        }
+        drop(db);
+        let before = database_bytes(&p);
+        assert!(
+            Controller::open_with_config(&p, cfg()).is_err(),
+            "corrupt {field} admitted"
+        );
+        assert_eq!(
+            database_bytes(&p),
+            before,
+            "corrupt {field} bytes rewritten"
+        );
+    }
 }

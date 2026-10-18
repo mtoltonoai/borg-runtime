@@ -77,21 +77,11 @@ async fn reserve(
     control: &Control,
     usage: &Usage,
     requests: u32,
+    diagnostic: &mut NativeDiagnosticRequest,
 ) -> Result<(), String> {
     control.check()?;
-    if !reporter
-        .send_identified(
-            format!("{}-native-request-{requests}", reporter.attempt.id),
-            Observation::Usage {
-                model_requests: requests,
-                input_tokens: usage.input,
-                output_tokens: usage.output,
-            },
-        )
-        .await?
-    {
-        return Err("native request reservation unacknowledged; no provider request sent".into());
-    }
+    if diagnostic.index != requests {return Err("native diagnostic request index differs".into());}
+    diagnostic.reserve(reporter,control,usage.input,usage.output).await?;
     control.check()?;
     read_current(reporter, control).await?;
     Ok(())
@@ -107,11 +97,13 @@ async fn observed<T>(
     if outcome == ProviderOutcome::Unknown {
         reporter.provider_uncertain.store(true, Ordering::Relaxed);
     }
-    if usage.add(tokens)? {
+    let publication=async {
+      if usage.add(tokens)? {
         if !reporter
             .send_identified(
                 format!("{}-native-usage-{request}", reporter.attempt.id),
                 Observation::Usage {
+                    native_diagnostic_reserved: false,
                     model_requests: request,
                     input_tokens: usage.input,
                     output_tokens: usage.output,
@@ -121,6 +113,14 @@ async fn observed<T>(
         {
             return Err("native usage observation unacknowledged; later request withheld".into());
         }
+      }
+      Ok::<(),String>(())
+    }.await;
+    if let Err(publication)=publication {
+        return Err(match result {
+            Err(original)=>format!("{original}; native usage recording failed: {publication}"),
+            Ok(_)=>publication,
+        });
     }
     if reporter.provider_uncertain.load(Ordering::Relaxed) && result.is_ok() {
         return Err("native provider outcome remains unknown".into());
@@ -181,16 +181,31 @@ pub(super) async fn execute(
         model: inference.model.clone(),
     };
     let mut usage = Usage::default();
-    reserve(reporter, control, &usage, 1).await?;
+    let mut first_diagnostic=NativeDiagnosticRequest::preflight(reporter,input,&native_config,1)?;
+    let prepared=async {
+        reserve(reporter,control,&usage,1,&mut first_diagnostic).await?;
+        charter::begin(reporter,input,state,control,1).await
+    }.await;
+    let first_turn=match prepared {
+        Ok(value)=>value,
+        Err(error)=>{
+            let retained=first_diagnostic.unstarted(reporter);
+            return charter::with_secondary(Err(error),acknowledge_native_diagnostic(reporter,control,retained).await,
+                "native terminal diagnostic failed");
+        },
+    };
     let mut stopped = control.clone();
+    let first_host=host.for_request(None);
+    let first_host = match &first_turn { Some(turn) => first_host.with_charter(turn.exchange.clone()), None => first_host };
     let first = crate::native::request_current_task(
         input,
         &native_config,
-        &host,
+        &first_host,
         async { read_current(reporter, control).await.map(|_| ()) },
         stopped.stopped(),
     )
     .await;
+    let retained=first_diagnostic.retain(reporter,&first_host,first.provider_outcome,first.diagnostic.as_ref());
     let call = observed(
         reporter,
         &mut usage,
@@ -199,7 +214,11 @@ pub(super) async fn execute(
         first.usage,
         first.provider_outcome,
     )
-    .await?;
+    .await;
+    let recorded = charter::record(reporter, input, state, control, first_turn.as_ref()).await;
+    let diagnostic_ack=acknowledge_native_diagnostic(reporter,control,retained).await;
+    let call=charter::with_secondary(call,recorded,"native charter recording failed");
+    let call=charter::with_secondary(call,diagnostic_ack,"native terminal diagnostic failed")?;
     control.check()?;
     //= spec/impl/v2/implementation.md#the-native-executor-is-bounded
     //# A native tool invocation MUST be restricted to the task's configured tool interface.
@@ -234,7 +253,24 @@ pub(super) async fn execute(
     }
     control.check()?;
     read_current(reporter, control).await?;
-    reserve(reporter, control, &usage, 2).await?;
+    charter::close(reporter, state, control, first_turn.as_ref(), vec![crate::charter::CharterResultReceipt::CurrentTask {
+        call_id: call.call_id().into(), report_id: contract::report_id(&reporter.attempt.id),
+    }]).await?;
+    let mut final_diagnostic=NativeDiagnosticRequest::preflight(reporter,input,&native_config,2)?;
+    let prepared=async {
+        reserve(reporter,control,&usage,2,&mut final_diagnostic).await?;
+        charter::begin(reporter,input,state,control,2).await
+    }.await;
+    let final_turn=match prepared {
+        Ok(value)=>value,
+        Err(error)=>{
+            let retained=final_diagnostic.unstarted(reporter);
+            return charter::with_secondary(Err(error),acknowledge_native_diagnostic(reporter,control,retained).await,
+                "native terminal diagnostic failed");
+        },
+    };
+    let final_host=host.for_request(None);
+    let final_host = match &final_turn { Some(turn) => final_host.with_charter(turn.exchange.clone()), None => final_host };
     //= spec/impl/v2/implementation.md#the-native-executor-is-bounded
     //# A native model continuation MUST consume the actual result of its preceding tool invocation.
     // Forward the exact call/context and acknowledged read projection; another
@@ -245,11 +281,12 @@ pub(super) async fn execute(
         &native_config,
         &call,
         &observation,
-        &host,
+        &final_host,
         async { read_current(reporter, control).await.map(|_| ()) },
         stopped.stopped(),
     )
     .await;
+    let retained=final_diagnostic.retain(reporter,&final_host,final_value.provider_outcome,final_value.diagnostic.as_ref());
     let result = observed(
         reporter,
         &mut usage,
@@ -258,7 +295,12 @@ pub(super) async fn execute(
         final_value.usage,
         final_value.provider_outcome,
     )
-    .await?;
+    .await;
+    let recorded = charter::record(reporter, input, state, control, final_turn.as_ref()).await;
+    let diagnostic_ack=acknowledge_native_diagnostic(reporter,control,retained).await;
+    let result=charter::with_secondary(result,recorded,"native charter recording failed");
+    let result=charter::with_secondary(result,diagnostic_ack,"native terminal diagnostic failed")?;
+    charter::close(reporter, state, control, final_turn.as_ref(), Vec::new()).await?;
     control.check()?;
     read_current(reporter, control).await?;
     reporter

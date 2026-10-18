@@ -762,6 +762,7 @@ async fn large_ack_exchange_keeps_lookup_and_maximum_correlation_replay_bounded(
                 task: t.input.clone(),
                 checkpoint: None,
                 continuation: None,
+                workflow_continuation: None, completion_continuation: None,
             }
         })
         .collect();

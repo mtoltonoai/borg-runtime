@@ -155,6 +155,7 @@ mod metadata_tests {
                 task_id: "task".into(),
                 agent_id: "agent".into(),
                 definition: Definition {
+                    charter: None,
                     id: "definition".into(),
                     revision: "r1".into(),
                     executor: ExecutorKind::Native,

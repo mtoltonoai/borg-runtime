@@ -148,7 +148,8 @@ impl Drop for Peer {
     }
 }
 fn input(deadline: u64, limits: &RuntimeLimits) -> TaskInput {
-    TaskInput {
+    TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         instruction:"Inspect your current task using its configured tool, then return its task_id, agent_id, attempt_id and generation as JSON.".into(),
         definition:selected_definition("native-task-inspector",ExecutorKind::Native),repository:None,repository_read:None,acceptance_commands:vec![],dependencies:vec![],
@@ -274,7 +275,7 @@ async fn actual_tool_read_two_requests_durable_evidence_usage_and_restart() {
             panic!("missing typed completion")
         };
         assert!(
-            matches!(report.observation,Observation::NativeLoopCompleted{model_requests:2,ref calls} if calls.len()==1 && calls[0].operation_id==call.operation_id && calls[0].logical_call_id==call.logical_call_id && calls[0].request_index==1)
+            matches!(report.observation,Observation::NativeLoopCompleted{ref requests, final_response_index: None, model_requests:2,ref calls} if requests.is_empty() && calls.len()==1 && calls[0].operation_id==call.operation_id && calls[0].logical_call_id==call.logical_call_id && calls[0].request_index==1)
         );
         let replay = lab.client.call(request).await.unwrap();
         assert_eq!(replay.commit, tool_reply.commit);
@@ -297,7 +298,7 @@ async fn actual_tool_read_two_requests_durable_evidence_usage_and_restart() {
             panic!()
         };
         assert!(
-            matches!(report.observation,Observation::Usage{model_requests:2,input_tokens:Some(i),output_tokens:Some(o)} if i==if partial{17}else{34} && o==if partial{9}else{18})
+            matches!(report.observation,Observation::Usage{model_requests:2,input_tokens:Some(i),output_tokens:Some(o), ..} if i==if partial{17}else{34} && o==if partial{9}else{18})
         );
         tokio::time::timeout(TIMEOUT, &mut peer.join)
             .await
@@ -557,7 +558,7 @@ async fn explicit_small_tool_output_bound_refuses_committed_observation_without_
         Observation::Usage {
             model_requests: 1,
             input_tokens: Some(17),
-            output_tokens: Some(9)
+            output_tokens: Some(9), ..
         }
     ));
     assert!(!matches!(

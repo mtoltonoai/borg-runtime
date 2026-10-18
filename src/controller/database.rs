@@ -1,6 +1,6 @@
 use super::{ControllerConfig, bounded_json_size, tracking, validation};
 use crate::protocol::*;
-use rusqlite::{Connection as SqlConnection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection as SqlConnection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
@@ -9,10 +9,29 @@ use std::{path::Path, time::Duration};
 pub(crate) struct StoreContext<'a> {
     sql: &'a SqlConnection,
     pub limits: &'a crate::limits::RuntimeLimits,
+    /// Established by the in-process invocation path, never by request fields.
+    pub invocation_path: crate::collaboration::workflow::TrustedHostPath,
+    /// Root transaction policy and buffer survive nested accepted-policy views.
+    pub(super) workflow_policy: Option<&'a crate::limits::WorkflowLimits>,
+    pub(super) workflow_terminals: super::collaboration_finalizer::TerminalBuffer,
+    /// Current root change policy is never replaced by accepted execution limits.
+    pub(super) governance_limits: &'a crate::limits::RuntimeLimits,
+    /// Shared across accepted-policy views and action savepoint rollback only.
+    pub(super) governance_decisions: super::governance::DecisionBuffer,
 }
 impl<'a> StoreContext<'a> {
     pub fn new(sql: &'a SqlConnection, limits: &'a crate::limits::RuntimeLimits) -> Self {
-        Self { sql, limits }
+        Self { sql, limits, invocation_path: crate::collaboration::workflow::TrustedHostPath::OperatorApi,
+            workflow_policy: limits.workflow.as_ref(),
+            workflow_terminals: super::collaboration_finalizer::TerminalBuffer::new(),
+            governance_limits: limits, governance_decisions: super::governance::DecisionBuffer::new() }
+    }
+    /// Borrow another accepted policy without losing request provenance or the
+    /// root transaction's terminal buffer. This never creates a SQL transaction.
+    pub fn with_limits<'b>(&'b self, limits: &'b crate::limits::RuntimeLimits) -> StoreContext<'b> {
+        StoreContext { sql: self.sql, limits, invocation_path: self.invocation_path,
+            workflow_policy: self.workflow_policy, workflow_terminals: self.workflow_terminals.clone(),
+            governance_limits: self.governance_limits, governance_decisions: self.governance_decisions.clone() }
     }
 }
 impl std::ops::Deref for StoreContext<'_> {
@@ -25,13 +44,15 @@ type Connection<'a> = StoreContext<'a>;
 
 //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
 //# The application MUST identify the schema version of its stored task state.
-const SCHEMA: i64 = 12;
+const SCHEMA: i64 = super::application_schema::VERSION;
 const APPLICATION: i64 = 0x424f5232;
 
 #[derive(Debug)]
 pub(crate) enum Fault {
     Refused(&'static str, String),
     Store(String),
+    Sqlite(rusqlite::Error),
+    Transaction(Box<super::checked_transaction::Failure>),
     Validation(Box<validation::Ticket>),
     Repository(Box<super::repository_queries::Ticket>),
     TemporaryValidation(&'static str, &'static str),
@@ -40,7 +61,7 @@ pub(crate) enum Fault {
 pub(crate) type Result<T> = std::result::Result<T, Fault>;
 impl From<rusqlite::Error> for Fault {
     fn from(e: rusqlite::Error) -> Self {
-        Self::Store(e.to_string())
+        Self::Sqlite(e)
     }
 }
 impl From<serde_json::Error> for Fault {
@@ -57,6 +78,12 @@ pub(crate) fn valid_id(limits: &crate::limits::RuntimeLimits, s: &str) -> bool {
 pub(crate) fn integer(n: u64) -> Result<i64> {
     i64::try_from(n)
         .map_err(|_| Fault::Refused("invalid_input", "integer exceeds durable range".into()))
+}
+/// A host-sized configured SQL bound must fit SQLite's signed integer domain.
+/// Refuse an unrepresentable value instead of wrapping it into a negative LIMIT.
+pub(crate) fn sql_bound(n: usize) -> Result<i64> {
+    i64::try_from(n)
+        .map_err(|_| Fault::Refused("input_bound", "configured SQL bound exceeds durable range".into()))
 }
 pub(crate) fn unsigned(n: i64) -> Result<u64> {
     u64::try_from(n).map_err(|_| Fault::Store("negative stored unsigned integer".into()))
@@ -83,6 +110,11 @@ pub(crate) fn terminal(s: TaskStatus) -> bool {
         TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
     )
 }
+
+// Traceability scope: Physical slot accounting retains an attempt until its stopped observation is committed.
+//= spec/impl/v2/implementation.md#collaboration-waits-are-separate-from-execution-prerequisites
+//# A task suspended on a collaboration wait MUST release its execution slot after its current execution has stopped.
+
 pub(crate) fn active(t: &Task) -> bool {
     t.attempt.as_ref().is_some_and(|a| !a.stopped)
 }
@@ -96,6 +128,7 @@ fn status(s: TaskStatus) -> &'static str {
     match s {
         TaskStatus::Queued => "queued",
         TaskStatus::Active => "active",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::Succeeded => "succeeded",
         TaskStatus::Failed => "failed",
         TaskStatus::Cancelled => "cancelled",
@@ -116,18 +149,62 @@ pub(crate) struct StoredTask {
     pub unresolved_execution: bool,
     /// Already reserved terminal receipt slots for this queued task/attempt.
     pub cleanup_remaining: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_hold: Option<crate::governance::CompletionHold>,
 }
 
 pub(super) enum Response {
     Reply(Reply),
     Validation(Box<validation::Ticket>),
     Repository(Box<super::repository_queries::Ticket>),
+    StoreFailure(Box<StoreFailure>),
+}
+
+/// No wire or durable representation: the original request/proof and typed cause
+/// remain together until the application boundary selects its existing outcome.
+pub(super) struct StoreFailure {
+    pub(super) original: super::OriginalRequest,
+    cause: Fault,
+}
+impl StoreFailure {
+    pub(super) fn disposition(&self) -> super::checked_transaction::RetryDisposition {
+        match &self.cause {
+            Fault::Transaction(failure) => failure.retry_disposition(),
+            _ => super::checked_transaction::RetryDisposition::Ineligible,
+        }
+    }
+
+    /// Does not dispatch, sleep, or grant a retry lifetime. The chosen consumer
+    /// must supply an applicable accepted policy and rerun normal admission.
+    /// Keeping the proof in this owned bundle prevents an accidental second
+    /// validator/repository operation while reconciling the same transaction.
+    pub(super) fn into_retry_candidate(self) -> std::result::Result<super::OriginalRequest, Self> {
+        if matches!(self.disposition(),
+            super::checked_transaction::RetryDisposition::RolledBackTransient { .. }) {
+            Ok(self.original)
+        } else { Err(self) }
+    }
+
+    pub(super) fn into_reply(self) -> Reply {
+        let request = self.original.request;
+        match request.command {
+            Operation::ReconcileResult(input) => Reply {
+                request_id: request.request_id,
+                commit: None,
+                observed_controller_revision: None,
+                outcome: Outcome::Pending { operation_id: input.operation_id },
+            },
+            _ => Reply::refused(request.request_id, "store_unavailable",
+                "store operation failed; reconcile original operation before retry"),
+        }
+    }
 }
 
 pub(crate) struct Database {
     validation_issuer: std::sync::Arc<()>,
     pub(super) conn: SqlConnection,
     pub config: ControllerConfig,
+    pub(super) maintenance_pending: bool,
     // Declared after conn: close SQLite before releasing this lifetime owner.
     pub validation_host: std::sync::Arc<crate::native::ValidationHost>,
 }
@@ -135,7 +212,13 @@ impl Database {
     //= spec/impl/v2/implementation.md#accepted-state-has-one-durable-owner
     //# Committed platform task state MUST survive an application-process restart while the durable store remains intact.
     pub fn open(path: &Path, config: ControllerConfig) -> std::result::Result<Self, String> {
-        let mut tracking = tracking::Tracking::acquire(path, &config.limits.controller)?;
+        Self::open_cancellable(path, config, &super::StartupCancellation::default())
+    }
+    pub(super) fn open_cancellable(path: &Path, config: ControllerConfig,
+        cancellation: &super::StartupCancellation) -> std::result::Result<Self, String> {
+        cancellation.check()?;
+        let mut tracking = tracking::Tracking::acquire_cancellable(path, &config.limits.controller, cancellation)?;
+        cancellation.check()?;
         tracking.before_sqlite()?;
         let path = &tracking.path;
         let startup_wal = tracking::StartupWal::before(path)?;
@@ -144,7 +227,7 @@ impl Database {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| e.to_string())?;
-        let startup = Self::initialize(&mut conn, &tracking, &config);
+        let startup = Self::initialize(&mut conn, &tracking, &config, cancellation);
         #[cfg(debug_assertions)]
         let startup = startup.and_then(|host| {
             if let Some(probe) = &config.qualification_fail_next_commit {
@@ -184,6 +267,7 @@ impl Database {
                 conn,
                 validation_host,
                 config,
+                maintenance_pending: false,
                 validation_issuer: std::sync::Arc::new(()),
             }),
             Err(error) => {
@@ -207,10 +291,12 @@ impl Database {
     }
 
     fn initialize(
-        conn: &mut SqlConnection,
+        sql: &mut SqlConnection,
         tracking: &tracking::Tracking,
         config: &ControllerConfig,
+        cancellation: &super::StartupCancellation,
     ) -> std::result::Result<std::sync::Arc<crate::native::ValidationHost>, String> {
+        let conn = &mut *sql;
         tracking.check_database_identity()?;
         // Pinned SQLite 3.54: NO_CKPT_ON_CLOSE suppresses destructor WAL
         // checkpoint/deletion. EXCLUSIVE before any page read uses a heap WAL
@@ -251,32 +337,22 @@ impl Database {
         }
         //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
         //# An unsupported stored schema version MUST be refused without rewriting its data.
-        if !fresh && (app != APPLICATION || version != SCHEMA) {
+        if !fresh && (app != APPLICATION || ![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, SCHEMA].contains(&version)) {
             return Err("unsupported controller database schema; clean development reset required; original data retained".into());
         }
         // The OS owner lock also excludes validators whose original DB thread
         // has exited. SQLite continues to own every database transaction.
         if fresh {
-            conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")
-                .map_err(|e| e.to_string())?;
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
-            tx.execute_batch(include_str!("schema12.sql"))
-                .map_err(|e| e.to_string())?;
-            let id: String = tx
-                .query_row(
-                    "SELECT value FROM settings WHERE name='database_id'",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            let binding = tracking.create(&id)?;
-            tx.execute(
-                "INSERT INTO settings(name,value) VALUES('native_helper_binding',?1)",
-                [&binding],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
+            // Capture identity once before any retryable body. The schema's
+            // ordinary generator is replaced by this parameterized insertion,
+            // so rollback never draws or substitutes a second identity.
+            let mut original = super::store_phase::FreshSchema::new(conn).map_err(|e| format!("{e:?}"))?;
+            super::store_phase::transaction(conn, config.store_retry.as_ref(), cancellation, true, |tx| {
+                original.write(tx, tracking)?;
+                Ok(super::checked_transaction::Completion::Commit(()))
+            })?;
         }
+        let stored_version = if fresh { SCHEMA } else { version };
         let context = StoreContext::new(conn, &config.limits);
         let conn = &context;
         //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
@@ -321,9 +397,17 @@ impl Database {
                     return Err("existing task count exceeds configured capacity".into());
                 }
                 let id: String = row.get(0).map_err(|e| e.to_string())?;
-                load(conn, &id).map_err(|_| {
+                let stored = load(conn, &id).map_err(|_| {
                     "corrupt stored task/index association; original bytes retained".to_string()
                 })?;
+                super::native_retry_validation::validate_task(conn, &stored.task)
+                    .map_err(|_| "invalid retained native retry block; original bytes retained".to_string())?;
+                // Outside load: the original receipt validator itself loads its task.
+                // Historical absence is inert; present state must have its exact audit.
+                if let Some(hold) = &stored.completion_hold {
+                    super::governance_completion::validate_hold(conn, &stored.task, hold)
+                        .map_err(|_| "invalid retained completion hold; original bytes retained".to_string())?;
+                }
             }
         }
         super::metadata::validate_existing(conn, config).map_err(|_| {
@@ -332,17 +416,42 @@ impl Database {
         super::credits::validate_existing(conn, config).map_err(|_| {
             "invalid control/effect credit association; original bytes retained".to_string()
         })?;
+        super::native_request_diagnostics::validate_existing(conn, stored_version >= 18)
+            .map_err(|_| "invalid native diagnostic credit association; original bytes retained".to_string())?;
         super::operations::releases::validate_existing(conn, config).map_err(|_| {
             "corrupt or unsupported release candidate state; original bytes retained".to_string()
         })?;
         super::protected::validate_existing(conn, config).map_err(|_| {
             "corrupt protected release records; original bytes retained".to_string()
         })?;
-        super::compatibility::validate_shape(conn)?;
+        super::compatibility::validate_shape(conn, stored_version)?;
         super::compatibility::validate_records(conn)?;
+        super::task_submission::validate_existing(conn, config, stored_version)
+            .map_err(|_| "invalid retained default assignment; original bytes retained".to_string())?;
+        super::agents::validate_existing(conn, config, stored_version)
+            .map_err(|_| "invalid retained agent lifecycle; original bytes retained".to_string())?;
         super::repositories::validate_existing(conn)
             .map_err(|_| "invalid repository catalogue; original bytes retained".to_string())?;
-        super::sessions::validate_existing(conn, config)?;
+        super::repositories::validate_instruction_sources(conn, config, stored_version)
+            .map_err(|_| "invalid retained instruction source; original bytes retained".to_string())?;
+        if stored_version >= super::workflow_schema::VERSION {
+            super::collaboration_workflow::validate_existing(conn, (config.clock)())
+                .map_err(|_| "invalid stored collaboration state; original bytes retained".to_string())?;
+        }
+        super::sessions::validate_existing(conn, config, stored_version >= super::workflow_schema::VERSION)?;
+        super::task_handoffs::validate_existing(conn, config, stored_version).map_err(|_| "invalid task handoff lineage; original bytes retained".to_string())?;
+        super::pull_request::validate_existing(conn, config, stored_version)
+            .map_err(|_| "invalid retained PR publication; original bytes retained".to_string())?;
+        // Root's composed schema14 has all additive governance structures.
+        // Historical schemas use their exact query-only readers before migration.
+        if stored_version >= 14 {
+            super::charters::validate_existing(conn)
+                .map_err(|_| "invalid stored charter state; original bytes retained".to_string())?;
+            super::native_request_coordination::validate_stored(conn, config)
+                .map_err(|_| "invalid stored native coordination; original bytes retained".to_string())?;
+            super::governance_validation::validate_stored(conn, config)
+                .map_err(|_| "invalid retained governance; original bytes retained".to_string())?;
+        }
         if !cleanup_available(conn, config, 0)
             .map_err(|_| "invalid cleanup reservation ledger".to_string())?
         {
@@ -361,6 +470,7 @@ impl Database {
         ));
         // Run on this existing database thread, outside any SQL transaction.
         // Readiness is withheld until prior recorded process trees are stopped.
+        cancellation.check()?;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -369,17 +479,39 @@ impl Database {
                 &validation_host.registry,
                 &config.limits.worker,
             ))?;
+        cancellation.check()?;
         // Only a validated store and reconciled helper owner may enter normal
         // write mode and restore SQLite's normal checkpoint-on-close behavior.
         conn.pragma_update(None, "query_only", false)
             .map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;").map_err(|e|e.to_string())?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA locking_mode=EXCLUSIVE;").map_err(|e|e.to_string())?;
+        // Release the metadata view before borrowing the same owned connection.
+        let conn = &mut *sql;
+        super::store_phase::transaction(conn, config.store_retry.as_ref(), cancellation, true,
+            |_| Ok(super::checked_transaction::Completion::Commit(())))?;
+        if stored_version < SCHEMA {
+            // Exact historical shape and records passed read-only validation.
+            // Additive steps and the vocabulary barrier share one owner transaction: failed COMMIT
+            // preserves the original version and every retained body.
+            super::store_phase::transaction(conn, config.store_retry.as_ref(), cancellation, false, |tx| {
+                tracking.verify(&database_id, &binding).map_err(Fault::Store)?;
+                super::application_schema::upgrade_checked(tx, stored_version)?;
+                Ok(super::checked_transaction::Completion::Commit(()))
+            })?;
+        }
         conn.set_db_config(
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             false,
         )
         .map_err(|e| e.to_string())?;
         Ok(validation_host)
+    }
+
+    #[cfg(test)]
+    pub(super) fn initialize_for_qualification(sql: &mut SqlConnection, tracking: &tracking::Tracking,
+        config: &ControllerConfig, cancellation: &super::StartupCancellation)
+        -> std::result::Result<std::sync::Arc<crate::native::ValidationHost>, String> {
+        Self::initialize(sql, tracking, config, cancellation)
     }
 
     pub fn next_deadline_delay(&self) -> Result<Option<Duration>> {
@@ -393,10 +525,12 @@ impl Database {
 
     pub fn expire(&mut self) -> Result<bool> {
         let now = (self.config.clock)();
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let tx = StoreContext::new(&transaction, &self.config.limits);
+        self.expire_at(now)
+    }
+
+    pub(super) fn expire_at(&mut self, now: u64) -> Result<bool> {
+        super::checked_transaction::immediate(&mut self.conn, |sql| {
+        let tx = StoreContext::new(sql, &self.config.limits);
         let ids = {
             let mut q=tx.prepare("SELECT id FROM tasks WHERE status IN ('queued','active') AND deadline<=?1 ORDER BY seq")?;
             q.query_map([integer(now)?], |r| r.get::<_, String>(0))?
@@ -404,6 +538,14 @@ impl Database {
         };
         for id in &ids {
             let mut t = load(&tx, id)?;
+            // This controller-owned expiry consumes only an already committed
+            // rejection. It is not a synthetic worker report or an unknown-POST
+            // reconciliation, and the typed nonterminal hold does not settle a
+            // waiting parent as though this task had failed.
+            if let Some(block) = super::operations::native_retry::deadline_block(&tx, &mut t, now)? {
+                save(&tx, &mut t, "native_retry_deadline", &block)?;
+                continue;
+            }
             t.task.status = TaskStatus::Failed;
             t.task.blocked_reason = Some("execution_deadline".into());
             stop(&tx, &mut t)?;
@@ -411,23 +553,32 @@ impl Database {
             settle_parent(&tx, &t)?;
         }
         if !ids.is_empty() {
+            super::collaboration_finalizer::finalize_expiry(&tx, now)?;
             super::metadata::advance(&tx)?;
         }
-        transaction.commit()?;
-        Ok(!ids.is_empty())
+        Ok(super::checked_transaction::Completion::Commit(!ids.is_empty()))
+        })
     }
 
     pub fn handle(
         &mut self,
-        request: Request,
-        proof: Option<super::ExternalProof>,
+        original: super::OriginalRequest,
     ) -> (Response, bool) {
+        self.handle_mode(original, false)
+    }
+
+    pub(super) fn handle_replay(&mut self, original: super::OriginalRequest) -> (Response, bool) {
+        self.handle_mode(original, true)
+    }
+
+    fn handle_mode(&mut self, original: super::OriginalRequest, receipt_only: bool) -> (Response, bool) {
+        let request = &original.request;
         let retry_id = match &request.command {
             Operation::ReconcileResult(input) => Some(input.operation_id.clone()),
             _ => None,
         };
-        let id = request.request_id;
-        let result = self.process(&id, &request.command, proof.as_ref());
+        let id = request.request_id.clone();
+        let result = self.process(&id, &request.command, original.validation.as_ref(), original.invocation_path, receipt_only);
         match result {
             Ok((reply, changed)) => (Response::Reply(reply), changed),
             Err(Fault::Validation(ticket)) => (Response::Validation(ticket), false),
@@ -458,23 +609,8 @@ impl Database {
             Err(Fault::Refused(code, message)) => {
                 (Response::Reply(Reply::refused(id, code, message)), false)
             }
-            Err(Fault::Store(_)) if retry_id.is_some() => (
-                Response::Reply(Reply {
-                    request_id: id,
-                    commit: None,
-                    observed_controller_revision: None,
-                    outcome: Outcome::Pending {
-                        operation_id: retry_id.unwrap(),
-                    },
-                }),
-                false,
-            ),
-            Err(Fault::Store(_details)) => (
-                Response::Reply(Reply::refused(
-                    id,
-                    "store_unavailable",
-                    "store operation failed; reconcile original operation before retry",
-                )),
+            Err(cause @ (Fault::Store(_) | Fault::Sqlite(_) | Fault::Transaction(_))) => (
+                Response::StoreFailure(Box::new(StoreFailure { original, cause })),
                 false,
             ),
         }
@@ -491,16 +627,21 @@ impl Database {
         request_id: &str,
         operation: &Operation,
         proof: Option<&super::ExternalProof>,
+        invocation_path: crate::collaboration::workflow::TrustedHostPath,
+        receipt_only: bool,
     ) -> Result<(Reply, bool)> {
         let limits = &self.config.limits;
         let now = (self.config.clock)();
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let tx = StoreContext::new(&transaction, &self.config.limits);
+        super::checked_transaction::immediate(&mut self.conn, |sql| {
+        let mut tx = StoreContext::new(sql, &self.config.limits);
+        tx.invocation_path = invocation_path;
         let observed = super::metadata::current(&tx)?;
         let request = encode(operation)?;
         let identity = operation_identity(operation);
+        if receipt_only && identity.is_none() {
+            return Err(Fault::TemporaryValidation("store_unavailable",
+                "receipt-only reentry requires an original mutation identity"));
+        }
         let mut cleanup_task = None;
         let mut regular_room = true;
         // Traceability scope: Typed task mutation IDs are validated independently of transport request_id.
@@ -529,7 +670,15 @@ impl Database {
                     Some(receipt.commit),
                     observed,
                 )?;
-                return Ok((reply, false));
+                return Ok(super::checked_transaction::Completion::Rollback((reply, false)));
+            }
+            if receipt_only {
+                return Err(Fault::TemporaryValidation("store_unavailable",
+                    "original receipt unavailable; no replacement operation was executed"));
+            }
+            if self.maintenance_pending && !super::store_retry::maintenance_safe(operation) {
+                return Err(Fault::TemporaryValidation("store_unavailable",
+                    "maintenance is unresolved; original receipt replay and protective controls remain available"));
             }
             regular_room = regular_receipt_room(&tx, &self.config)?;
             cleanup_task = cleanup_candidate(&tx, operation)?;
@@ -537,6 +686,7 @@ impl Database {
                 && cleanup_task.is_none()
                 && !matches!(operation, Operation::AwaitCommands { .. })
                 && super::credits::final_candidate(&tx, operation)?.is_none()
+                && super::native_request_diagnostics::candidate(&tx, operation)?.is_none()
             {
                 return refuse(
                     "capacity",
@@ -572,8 +722,9 @@ impl Database {
         };
         let mut control_credit = None;
         let final_credit = super::credits::final_candidate(&tx, operation)?;
+        let diagnostic_credit = super::native_request_diagnostics::candidate(&tx, operation)?;
         let action = if matches!(operation, Operation::AwaitCommands { .. }) {
-            super::operations::await_request(&tx, operation, &self.config, now).map(
+            super::operations::await_request(&tx, operation, &self.config, now, self.maintenance_pending).map(
                 |(data, changed, credit)| {
                     control_credit = credit;
                     (data, changed)
@@ -582,18 +733,41 @@ impl Database {
         } else {
             super::operations::apply(&tx, operation, &self.config, now, &context)
         };
+        // Finish domain activity and actual first Task-terminal transitions
+        // before the action savepoint is released or a receipt is persisted.
+        let action = action.and_then(|(data, changed)| {
+            if matches!(operation, Operation::ObserveWorker { report: Report {
+                observation: Observation::NativeRequestDiagnostic { .. }, ..
+            } }) {
+                // This append has no task/domain transition. In particular it
+                // must not resolve its old actor through today's task owner.
+                return Ok((data, changed));
+            }
+            let workflow_changed = super::collaboration_finalizer::finalize_request(&tx, operation, now)?;
+            Ok((data, changed || workflow_changed))
+        });
         let (mut outcome, mut changed) = match action {
             Ok((data, changed)) => {
                 // Mutation receipts keep the snapshot observed at their own
                 // commit; future Get/List recompute diagnostics, not receipts.
                 let data = match data {
                     Data::Task(task) if identity.is_some() && task.status == TaskStatus::Queued => {
-                        Data::Task(Box::new(super::operations::view(
+                        let task = super::operations::view(
                             &tx,
                             load(&tx, &task.id)?,
                             &self.config,
                             now,
-                        )?))
+                        )?;
+                        // Refreshing commit-time diagnostics reloads canonical
+                        // input after the collaboration adapter projected it.
+                        // Preserve the public boundary in the original receipt;
+                        // canonical GetTask/RunAttempt authority stays unchanged.
+                        let task = if matches!(operation, Operation::CallCollaboration { .. }) {
+                            crate::pull_request_view::task(&task)
+                        } else {
+                            task
+                        };
+                        Data::Task(Box::new(task))
                     }
                     other => other,
                 };
@@ -604,6 +778,7 @@ impl Database {
                     return Err(Fault::Pending(input.operation_id.clone()));
                 }
                 tx.execute_batch("ROLLBACK TO request_action")?;
+                tx.workflow_terminals.clear();
                 (
                     Outcome::Refused {
                         code: code.into(),
@@ -614,6 +789,7 @@ impl Database {
             }
             Err(Fault::Refused(code, message)) => {
                 tx.execute_batch("ROLLBACK TO request_action")?;
+                tx.workflow_terminals.clear();
                 (
                     Outcome::Refused {
                         code: code.into(),
@@ -650,6 +826,7 @@ impl Database {
             };
             if super::metadata::complete_call_bound(transport, call, &outcome, cap).is_err() {
                 tx.execute_batch("ROLLBACK TO request_action")?;
+                tx.workflow_terminals.clear();
                 outcome = super::metadata::complete_call_refusal();
                 changed = false;
                 // Metadata admission guarantees the bounded refusal fits. A
@@ -673,7 +850,12 @@ impl Database {
             let task_cleanup = cleanup_task.is_some() && successful_change;
             let control_cleanup = control_credit.is_some() && successful_change && !regular_room;
             let effect_cleanup = final_credit.is_some() && successful_change;
-            let cleanup = task_cleanup || control_cleanup || effect_cleanup;
+            // A terminal diagnostic records an immutable fact without changing
+            // today's task. Its original reserved credit is consumed exactly
+            // once even when ordinary receipt capacity is still available.
+            let diagnostic_cleanup = diagnostic_credit.is_some()
+                && matches!(&outcome, Outcome::Ok { data: Data::Acknowledged });
+            let cleanup = task_cleanup || control_cleanup || effect_cleanup || diagnostic_cleanup;
             if !cleanup && !regular_room {
                 // A malformed/repeated/nonterminal request cannot spend the
                 // reserved cleanup slots. Its action has not been committed.
@@ -699,13 +881,28 @@ impl Database {
             if effect_cleanup {
                 super::credits::debit_effect(&tx, final_credit.as_deref().unwrap())?;
             }
+            if diagnostic_cleanup {
+                super::native_request_diagnostics::debit(&tx, diagnostic_credit.unwrap(), &outcome)?;
+            }
             let revision = super::metadata::advance(&tx)?;
+            // Drafts survive only the action savepoint. Final replacement
+            // refusals are audited here, after all response and credit guards.
+            // Audit, any applicable typed hold and the original receipt share
+            // this transaction; a failed insert/commit rolls back all three.
+            let governance = super::governance::commit_decisions(&tx, operation, &outcome, revision, now)?;
+            changed |= governance.is_some();
             tx.execute(
                 //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
                 //# Task submission MUST commit its input and submission outcome atomically.
-                "INSERT INTO receipts(id,request,outcome,cleanup,controller_revision) VALUES(?1,?2,?3,?4,?5)",
-                params![op, request, encode(&outcome)?, cleanup, integer(revision)?],
+                "INSERT INTO receipts(id,request,outcome,cleanup,controller_revision,governance) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![op, request, encode(&outcome)?, cleanup, integer(revision)?, governance],
             )?;
+            // Closure readers validate the exact original report/ACK receipt.
+            // Advance pending assignment only after that receipt exists in this
+            // same transaction; returned observation remains its original snapshot.
+            if successful_change {
+                changed |= super::task_handoffs::progress(&tx, operation, &self.config, now)?;
+            }
             commit = Some(MutationCommit {
                 operation_id: op.into(),
                 controller_revision: revision,
@@ -741,10 +938,10 @@ impl Database {
             commit,
             observed,
         )?;
-        transaction.commit()?;
         //= spec/impl/v2/implementation.md#accepted-state-has-one-durable-owner
         //# A terminal task result MUST be committed before it is reported as final.
-        Ok((reply, changed))
+        Ok(super::checked_transaction::Completion::Commit((reply, changed)))
+        })
     }
 }
 
@@ -780,15 +977,23 @@ pub(crate) fn cleanup_available(
         [],
         |r| r.get(0),
     )?;
+    let diagnostics = super::native_request_diagnostics::outstanding_credits(tx)?;
     let total = unsigned(used)?
         .checked_add(unsigned(reserved)?)
         .and_then(|n| n.checked_add(u64::try_from(control).ok()?))
         .and_then(|n| n.checked_add(u64::try_from(effects).ok()?))
+        .and_then(|n| n.checked_add(diagnostics))
         .and_then(|n| n.checked_add(u64::from(extra)));
     Ok(total.is_some_and(|n| n <= cfg.max_cleanup_receipts as u64))
 }
 
 fn cleanup_candidate(tx: &Connection, op: &Operation) -> Result<Option<String>> {
+    if matches!(op, Operation::ObserveWorker { report: Report {
+        observation: Observation::NativeRequestDiagnostic { .. }, ..
+    } }) {
+        // Late original facts do not borrow a successor task's cleanup grant.
+        return Ok(None);
+    }
     if let Operation::CallCollaboration { call } = op {
         return match super::collaboration_calls::cancel_operation(tx.limits, call) {
             Some(inner) => cleanup_candidate(tx, &inner),
@@ -806,7 +1011,8 @@ fn cleanup_candidate(tx: &Connection, op: &Operation) -> Result<Option<String>> 
         };
     }
     let id = match op {
-        Operation::CancelTask { task_id, .. } => task_id,
+        Operation::CancelTask { task_id, .. }
+        | Operation::MutateGovernance { mutation: crate::governance::GovernanceMutation::Stop { task_id, .. }, .. } => task_id,
         Operation::ObserveWorker { report } => &report.task_id,
         _ => return Ok(None),
     };
@@ -819,9 +1025,9 @@ fn cleanup_candidate(tx: &Connection, op: &Operation) -> Result<Option<String>> 
         return Ok(None);
     }
     let eligible = match op {
-        Operation::CancelTask {
-            expected_revision, ..
-        } => !terminal(t.task.status) && t.task.revision == *expected_revision,
+        Operation::CancelTask { expected_revision, .. }
+        | Operation::MutateGovernance { mutation: crate::governance::GovernanceMutation::Stop { expected_revision, .. }, .. }
+            => !terminal(t.task.status) && t.task.revision == *expected_revision,
         Operation::ObserveWorker { report } => {
             let Some(a) = &t.task.attempt else {
                 return Ok(None);
@@ -902,7 +1108,8 @@ pub(crate) fn load(tx: &Connection, id: &str) -> Result<StoredTask> {
                 || is_active != active(&t.task)
                 || deadline != integer(t.task.input.limits.deadline_unix_ms)?
                 || cleanup != t.cleanup_remaining
-                || (a.is_none() && (t.generation != 0 || t.attempt_counter != 0))
+                || (a.is_none() && (t.generation != 0 || t.attempt_counter != 0)
+                    && !super::sessions::is_successor(tx, &t.task.session_id)?)
                 || a.is_some_and(|a| {
                     a.task_id != t.task.id
                         || a.session_id != t.task.session_id
@@ -924,7 +1131,7 @@ pub(crate) fn load(tx: &Connection, id: &str) -> Result<StoredTask> {
                 .ok_or_else(|| Fault::Store("stored task policy absent".into()))?
                 .global_metadata
                 .as_ref();
-            let accepted_context = StoreContext::new(tx, accepted_policy);
+            let accepted_context = tx.with_limits(accepted_policy);
             super::repositories::resolve_input(&accepted_context, &mut checked_input, true)
                 .map_err(|_| {
                     Fault::Store(
@@ -978,17 +1185,27 @@ pub(crate) fn save<T: Serialize>(
     event: &T,
 ) -> Result<()> {
     super::sessions::validate_task(tx, &t.task)?;
+    let first_terminal = if tx.workflow_policy.is_some() && terminal(t.task.status) {
+        let previous_status: String = tx.query_row("SELECT status FROM tasks WHERE id=?1", [&t.task.id], |r| r.get(0))?;
+        match previous_status.as_str() {
+            "queued" | "active" | "blocked" => true,
+            "succeeded" | "failed" | "cancelled" => false,
+            _ => return Err(Fault::Store("unknown pre-transition task status".into())),
+        }
+    } else { false };
     t.task.revision = t
         .task
         .revision
         .checked_add(1)
         .ok_or_else(|| Fault::Store("revision exhausted".into()))?;
     let a = t.task.attempt.as_ref();
-    tx.execute("UPDATE tasks SET agent=?2,executor=?3,status=?4,worker=?5,incarnation=?6,active=?7,deadline=?8,body=?9,cleanup=?10 WHERE id=?1",params![t.task.id,t.task.assigned_agent_id,executor(t.task.input.definition.executor),status(t.task.status),a.map(|x|x.worker_id.as_str()),a.map(|x|x.worker_incarnation.as_str()),active(&t.task),integer(t.task.input.limits.deadline_unix_ms)?,encode(t)?,t.cleanup_remaining])?;
+    tx.execute("UPDATE tasks SET agent=?2,executor=?3,status=?4,worker=?5,incarnation=?6,active=?7,deadline=?8,body=?9,cleanup=?10,session=?11 WHERE id=?1",params![t.task.id,t.task.assigned_agent_id,executor(t.task.input.definition.executor),status(t.task.status),a.map(|x|x.worker_id.as_str()),a.map(|x|x.worker_incarnation.as_str()),active(&t.task),integer(t.task.input.limits.deadline_unix_ms)?,encode(t)?,t.cleanup_remaining,t.task.session_id])?;
     if let Some(a) = a {
         tx.execute("INSERT INTO attempts(id,task_id,body) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![a.id,t.task.id,encode(a)?])?;
     }
-    history(tx, &t.task, kind, event)
+    history(tx, &t.task, kind, event)?;
+    if first_terminal { tx.workflow_terminals.record(tx, &t.task)?; }
+    Ok(())
 }
 pub(crate) fn command(
     tx: &Connection,
@@ -1074,7 +1291,8 @@ pub(crate) fn settle_parent(tx: &Connection, t: &StoredTask) -> Result<()> {
                     "inline child outcome exceeds parent response bound; child acceptance was not committed",
                 );
             }
-            if !terminal(p.task.status) && !active(&p.task) {
+            if !terminal(p.task.status) && !active(&p.task)
+                && p.task.status != TaskStatus::Blocked && p.task.native_retry_block.is_none() {
                 p.task.status = TaskStatus::Queued;
                 p.task.blocked_reason = Some("child_outcome_ready".into());
             }

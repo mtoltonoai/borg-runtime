@@ -205,6 +205,13 @@ fn history_body(
     }
     if kind == "external_intent" {
         let r: OperationRecord = read_record(limits, raw)?;
+        if matches!(r.kind.as_str(), crate::pull_request::HEAD_KIND | crate::pull_request::CREATE_KIND) {
+            // Older generic effects can share this kind without the new closed
+            // PR intent. Keep their existing opaque view; never expose raw data.
+            if let Ok(public) = crate::pull_request_view::record(&r) {
+                return Ok(serde_json::to_value(public)?);
+            }
+        }
         // Original effect payload may contain arbitrary adapter data. The
         // checkpoint-specific query is the typed publication reader.
         return Ok(
@@ -276,6 +283,13 @@ fn check_record(
         _ => Ok((key, None)),
     }
 }
+// Traceability scope: Limits, bounded History/Attempts and typed worker/checkpoint/release-check projections provide operational evidence through the existing MCP wrapper. These read-only queries neither issue worker commands nor protected decisions; they do not implement an automatic diagnostic scheduler or a general evaluator.
+//= spec/impl/v2/implementation.md#operational-feedback-applies-supported-configuration
+//# The shared agent interface MUST support diagnosis of configuration refusals using existing bounded operational records.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//# The collaboration tool interface MUST provide read-only views of worker capacity, task attempts, checkpoints and release-check records.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//# Operational queries MUST NOT grant authority to mutate worker controls or protected release state.
 pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> Result<QueryResult> {
     let limits = tx.limits;
     match query {
@@ -309,6 +323,12 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
         }
         Query::Session { session_id } => {
             super::sessions::get(tx, session_id).map(QueryResult::Session)
+        }
+        Query::SessionInput { session_id } => {
+            let session=super::sessions::get(tx,session_id)?;
+            let input=super::sessions::input(tx,&session)?;
+            let current=load(tx,&session.task_id)?.task.session_id==session.id;
+            Ok(QueryResult::SessionInput { session, input:Box::new(input), current })
         }
         Query::Sessions {
             agent_id,

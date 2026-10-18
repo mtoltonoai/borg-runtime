@@ -1,5 +1,5 @@
-//! A bounded view of committed memory history plus one durable delivery prefix.
-//! Model visibility belongs to consumers; these acknowledgments do not prove it.
+//! Read-only validation of historical shared-memory notification state.
+//! Fresh automatic delivery operations are retired; stored memory is separate.
 use super::database::StoreContext as Connection;
 use super::{ControllerConfig, database::*};
 use crate::{collaboration::*, protocol::*};
@@ -45,24 +45,6 @@ fn cursor(tx: &Connection, s: &Session, sequence: u64) -> Result<AgentMemoryCurs
         sequence,
     })
 }
-fn limit(cfg: &ControllerConfig, n: usize) -> Result<usize> {
-    if n == 0 {
-        return refuse("invalid_input", "invalid memory observation limit");
-    }
-    if n > cfg.max_list_tasks {
-        return refuse(
-            "invalid_input",
-            "invalid memory observation limit: controller.max_list_tasks",
-        );
-    }
-    if n > cfg.memory_notice_items {
-        return refuse(
-            "invalid_input",
-            "invalid memory observation limit: controller.memory_notice_items",
-        );
-    }
-    Ok(n)
-}
 fn state(tx: &Connection, s: Session) -> Result<State> {
     let limits = tx.limits;
     let (start,ack,pending):(i64,i64,Option<String>)=tx.query_row(
@@ -91,9 +73,8 @@ fn state(tx: &Connection, s: Session) -> Result<State> {
     }
     Ok(st)
 }
-// Traceability scope: Committed history exposes only changed key/revision to other sessions with the same agent identity; own-session and foreign-agent events are filtered.
-//= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-//# A committed memory update MUST make its changed key and committed revision available to other active sessions of the same agent.
+// Historical pending batches are validated against the original filtered audit
+// prefix. Validation does not expose or deliver fresh memory notifications.
 fn event_notice(
     limits: &crate::limits::RuntimeLimits,
     tx: &Connection,
@@ -115,20 +96,19 @@ fn event_notice(
             "invalid memory event identity/revision".into(),
         ));
     }
-    let source: Option<(String, String)> = tx
-        .query_row(
-            "SELECT agent,session FROM tasks WHERE id=?1",
-            [task_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((agent, session_id)) = source else {
-        return Err(Fault::Store("memory event task missing".into()));
+    let record=super::metadata::read(tx,&event.operation_id)?.ok_or_else(||Fault::Store("memory event original receipt absent".into()))?;
+    let attempt_id=match &record.request {
+        Operation::SetMemory { task_id:owner,attempt_id,.. } if owner==task_id => attempt_id,
+        Operation::CallCollaboration { call } if call.caller.task_id==task_id && call.tool=="collab_memory_set" => &call.caller.attempt_id,
+        _=>return Err(Fault::Store("memory event original mutation differs".into())),
     };
-    if agent != s.agent_id || session_id == s.id {
-        return Ok(None);
-    }
-    let source = super::sessions::get(tx, &session_id)?;
+    if !matches!(record.outcome,Outcome::Ok{..}){return Err(Fault::Store("memory event original mutation was refused".into()))}
+    let raw:String=tx.query_row("SELECT body FROM attempts WHERE id=?1 AND task_id=?2",params![attempt_id,task_id],|r|r.get(0))?;
+    let attempt:Attempt=decode(&raw)?;
+    let source=super::sessions::get(tx,&attempt.session_id)?;
+    let agent=source.agent_id.clone();
+    let session_id=source.id.clone();
+    if agent != s.agent_id || session_id == s.id {return Ok(None)}
     if source.agent_id != agent || source.task_id != task_id {
         return Err(Fault::Store("memory event origin differs".into()));
     }
@@ -265,121 +245,21 @@ fn validate_batch(tx: &Connection, st: &State, b: &AgentMemoryBatch) -> Result<(
 pub(super) fn validate_existing(tx: &Connection, s: &Session) -> Result<()> {
     state(tx, s.clone()).map(|_| ())
 }
-fn observation(
-    limits: &crate::limits::RuntimeLimits,
-    st: State,
-    available: Option<AgentMemoryPage>,
-) -> Result<Data> {
-    let value = AgentMemoryObservation {
-        start_sequence: st.start,
-        acknowledged_cursor: st.cursor,
-        pending: st.pending,
-        available,
-    };
-    bounded_json_size(&value, limits.controller.memory_pending_bytes).map_err(|_| {
-        Fault::Refused(
-            "capacity",
-            "memory observation exceeds bound: controller.memory_pending_bytes".into(),
-        )
-    })?;
-    Ok(Data::AgentMemory(value))
-}
-// Traceability scope: Observe, prepare and acknowledge resolve an existing current task/session and update only its notification state; they allocate no session.
-//= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-//# Memory-change notices MUST NOT create a session.
+/// The notification protocol remains decodable for historical receipts only.
+/// The database owner resolves an existing exact receipt before this handler.
+/// Fresh requests never scan history, prepare a batch, or acknowledge delivery.
 pub(super) fn apply(
     tx: &Connection,
     op: &Operation,
-    cfg: &ControllerConfig,
+    _cfg: &ControllerConfig,
     now: u64,
 ) -> Result<(Data, bool)> {
-    let limits = tx.limits;
     let caller = match op {
         Operation::ObserveAgentMemory { caller, .. }
         | Operation::PrepareAgentMemory { caller, .. }
         | Operation::AcknowledgeAgentMemory { caller, .. } => caller,
         _ => unreachable!(),
     };
-    let task = super::collaboration_calls::caller(tx, caller, now)?;
-    let session = super::sessions::get(tx, &task.task.session_id)?;
-    let mut st = state(tx, session)?;
-    let result = match op {
-        Operation::ObserveAgentMemory { limit: n, .. } => {
-            let n = limit(cfg, *n)?;
-            let available = if st.pending.is_none() {
-                page(tx, &st.session, &st.cursor, head(tx)?, n)?
-            } else {
-                None
-            };
-            (observation(limits, st, available)?, false)
-        }
-        Operation::PrepareAgentMemory {
-            expected_cursor,
-            through_sequence,
-            limit: n,
-            ..
-        } => {
-            let n = limit(cfg, *n)?;
-            if expected_cursor != &st.cursor {
-                return refuse(
-                    "stale_revision",
-                    "memory acknowledged cursor changed or scope differs",
-                );
-            }
-            if st.pending.is_some() {
-                (observation(limits, st, None)?, false)
-            } else {
-                let available = page(tx, &st.session, &st.cursor, *through_sequence, n)?
-                    .ok_or_else(|| {
-                        Fault::Refused("no_changes", "memory window has no unaccounted rows".into())
-                    })?;
-                let sequence = next(tx, "memory_batch")?;
-                let batch = AgentMemoryBatch {
-                    batch_id: AgentMemoryBatch::identifier(&st.cursor.database_id, sequence),
-                    page: available,
-                };
-                bounded_json_size(&batch, limits.controller.memory_pending_bytes).map_err(
-                    |_| {
-                        Fault::Refused(
-                            "capacity",
-                            "memory pending batch exceeds bound: controller.memory_pending_bytes"
-                                .into(),
-                        )
-                    },
-                )?;
-                if tx.execute("UPDATE sessions SET memory_pending=?2 WHERE id=?1 AND memory_pending IS NULL AND memory_cursor_seq=?3",params![st.session.id,encode(&batch)?,integer(st.cursor.sequence)?])?!=1 {return Err(Fault::Store("memory prepare binding changed".into()));}
-                st.pending = Some(batch);
-                (observation(limits, st, None)?, true)
-            }
-        }
-        Operation::AcknowledgeAgentMemory { batch_id, .. } => {
-            if !valid_id(limits, batch_id) {
-                return refuse("invalid_input", "invalid memory batch identity");
-            }
-            let Some(batch) = st.pending.as_ref() else {
-                return refuse("not_found", "session has no pending memory batch");
-            };
-            if &batch.batch_id != batch_id {
-                return refuse(
-                    "batch_mismatch",
-                    "acknowledgment differs from pending memory batch",
-                );
-            }
-            let next_cursor = batch.page.to_cursor.clone();
-            if tx.execute("UPDATE sessions SET memory_cursor_seq=?2,memory_pending=NULL WHERE id=?1 AND memory_cursor_seq=?3",params![st.session.id,integer(next_cursor.sequence)?,integer(st.cursor.sequence)?])?!=1 {return Err(Fault::Store("memory acknowledgment binding changed".into()));}
-            st.cursor = next_cursor;
-            st.pending = None;
-            (observation(limits, st, None)?, true)
-        }
-        _ => unreachable!(),
-    };
-    let final_now = (cfg.clock)();
-    if final_now < now {
-        return refuse(
-            "clock_unavailable",
-            "clock moved backwards during memory observation",
-        );
-    }
-    super::collaboration_calls::caller(tx, caller, final_now)?;
-    Ok(result)
+    super::collaboration_calls::caller(tx, caller, now)?;
+    refuse("disabled", "automatic shared-memory change notifications are retired")
 }

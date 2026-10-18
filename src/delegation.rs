@@ -15,12 +15,28 @@ pub fn template(input: &TaskInput) -> Option<&CodingTaskTemplate> {
         .as_deref()
         .and_then(|workflow| match workflow {
             NativeWorkflow::CodingThenContinue { child } => Some(child),
-            NativeWorkflow::InspectCurrentTaskThenContinue {} => None,
+            NativeWorkflow::InspectCurrentTaskThenContinue {} | NativeWorkflow::Reassign { .. } => None,
         })
+}
+
+/// Same-task work scope, never a child-delegation decision or continuation.
+pub fn handoff_template(input: &TaskInput) -> Option<&CodingTaskTemplate> {
+    match input.native_workflow.as_deref() {
+        Some(NativeWorkflow::Reassign { target }) => Some(target),
+        _ => None,
+    }
+}
+
+/// Shared validation only: callers must not infer child creation from this helper.
+pub fn configured_template(input: &TaskInput) -> Option<&CodingTaskTemplate> {
+    template(input).or_else(|| handoff_template(input))
 }
 
 /// Checks immutable configuration. The controller separately checks existing
 /// prerequisites, current authority, consumed budget and current deadlines.
+// Traceability scope: The accepted handoff target keeps the exact root task limits and dependencies; controller ownership and session history are validated separately.
+//= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+//# A task reassignment MUST preserve the task's accepted deadline.
 pub fn validate_workflow(input: &TaskInput) -> Result<(), String> {
     if crate::task_tool::enabled(input) {
         if input.definition.executor != ExecutorKind::Native || input.limits.model_requests < 2 {
@@ -28,7 +44,7 @@ pub fn validate_workflow(input: &TaskInput) -> Result<(), String> {
         }
         return Ok(());
     }
-    let Some(child) = template(input) else {
+    let Some(child) = configured_template(input) else {
         return Ok(());
     };
     if input.definition.executor != ExecutorKind::Native
@@ -45,6 +61,23 @@ pub fn validate_workflow(input: &TaskInput) -> Result<(), String> {
         .resolved_limits
         .as_ref()
         .ok_or("execution limits are not bound at admission")?;
+    input.execution_limits()?;
+    if handoff_template(input).is_some() {
+        // RunAttempt carries only the unspent request allowance. Original
+        // admission separately requires exact target/root limits equality.
+        let mut remaining = child.limits.clone();
+        remaining.model_requests = input.limits.model_requests;
+        if !child.instruction_prefix.is_empty()
+            || child.dependencies != input.dependencies
+            || remaining != input.limits
+            || child.limits.model_requests < input.limits.model_requests
+        {
+            return Err("native_reassignment_obligations_differ".into());
+        }
+        // No decision/continuation or separate child budget is reserved. The
+        // controller retains this task's instruction, result schema and usage.
+        return Ok(());
+    }
     let native = &input.execution_limits()?.native;
     if child.limits.model_requests == 0
         || child.limits.result_bytes == 0
@@ -82,6 +115,11 @@ pub fn validate_workflow(input: &TaskInput) -> Result<(), String> {
 
 /// A model supplies only bounded instruction data. Every execution choice is
 /// copied from immutable configured input, never read from model JSON fields.
+
+// Traceability scope: Delegation supplies instruction text to the accepted template; execution settings and repository remain configured.
+//= spec/impl/v2/implementation.md#delegation-is-a-task-handoff
+//# A delegation request MUST NOT change configured host, repository or provider access.
+
 pub fn coding_child(input: &TaskInput, instruction: &str) -> Result<TaskInput, String> {
     let child = template(input).ok_or("native_workflow_missing")?;
     if crate::credential::repository_contains_credentials(&child.repository.url)
@@ -98,6 +136,8 @@ pub fn coding_child(input: &TaskInput, instruction: &str) -> Result<TaskInput, S
         format!("{}\n\n{instruction}", child.instruction_prefix)
     };
     let mut result = TaskInput {
+        instruction_source: child.instruction_source.clone(),
+        pull_request: child.pull_request.clone(),
         resolved_limits: None,
         repository_read: None,
         instruction,
@@ -144,6 +184,9 @@ pub fn decision_instruction(input: &TaskInput) -> Result<String, String> {
 }
 
 pub fn continuation_instruction(input: &TaskInput, child: &ChildOutcome) -> Result<String, String> {
+    if handoff_template(input).is_some() {
+        return Err("native_reassignment_has_no_child_continuation".into());
+    }
     if !matches!(
         child.status,
         TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
@@ -188,12 +231,16 @@ mod metadata_tests {
 
     #[test]
     fn decision_context_uses_bound_agent_metadata_and_refuses_missing_snapshot() {
-        let global = crate::limits::RuntimeLimits::seed().unwrap();
+        let mut global = crate::limits::RuntimeLimits::seed().unwrap();
+        global.execution.native.context_bytes=65_536;
         let mut input = TaskInput {
+            instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             repository_read: None,
             instruction: "x".repeat(global.execution.native.context_bytes),
             definition: Definition {
+                charter: None,
                 id: "definition".into(),
                 revision: "r1".into(),
                 executor: ExecutorKind::Native,
@@ -227,4 +274,58 @@ mod metadata_tests {
         input.resolved_limits = Some(global.resolve_task(&input).unwrap());
         assert!(decision_instruction(&input).is_ok());
     }
+    #[test]
+    // Traceability scope: Pure accepted-scope validation: equal task limits, explicit target and no child conversion; no execution or session transaction is claimed.
+    //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+    //= type=test
+    //# A task reassignment MUST preserve the task's accepted deadline.
+    fn reassignment_scope_preserves_task_obligations_without_a_child_budget() {
+        let metadata = crate::limits::RuntimeLimits::seed().unwrap();
+        let mut input = TaskInput {
+            instruction_source: None, pull_request: None, resolved_limits: None, repository_read: None,
+            instruction: "Keep this exact work".into(),
+            definition: Definition { charter: None, id: "triage".into(), revision: "r1".into(),
+                executor: ExecutorKind::Native, inference: Some(InferenceSettings::selected()),
+                execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }), limit_overrides: None },
+            repository: None, acceptance_commands: vec![], output_schema: Some(serde_json::json!({"type":"object"})),
+            limits: metadata.task_defaults.at(0).unwrap(), dependencies: vec!["prerequisite".into()], native_workflow: None,
+        };
+        // These values cannot reserve one child plus two native requests.
+        input.limits.model_requests = 1; input.limits.max_delegation_depth = 0;
+        let mut coding = input.definition.clone(); coding.id = "coding".into(); coding.executor = ExecutorKind::Coding;
+        let target = CodingTaskTemplate {
+            instruction_source: None, pull_request: None, instruction_prefix: String::new(), definition: coding,
+            repository: Repository { registration: None, url: "file:///repo".into(), start_commit: "a".repeat(40),
+                checkpoint_remote: "origin".into(), pull_request_target: None },
+            acceptance_commands: vec![vec!["check".into()]], dependencies: input.dependencies.clone(), limits: input.limits.clone(),
+        };
+        input.native_workflow = Some(Box::new(NativeWorkflow::Reassign { target: target.clone() }));
+        input.resolved_limits = Some(metadata.resolve_task(&input).unwrap());
+        let before = input.clone();
+        validate_workflow(&input).unwrap(); crate::execution_profile::validate(&input).unwrap();
+        assert!(template(&input).is_none()); assert_eq!(handoff_template(&input), Some(&target));
+        assert_eq!(configured_template(&input), Some(&target));
+        assert_eq!(coding_child(&input, "new instruction").unwrap_err(), "native_workflow_missing");
+        assert_eq!(input, before);
+        let mut remaining = input.clone();
+        remaining.limits.model_requests = 0;
+        validate_workflow(&remaining).unwrap();
+        assert_eq!(handoff_template(&remaining).unwrap().limits, input.limits);
+        assert_eq!(remaining.limits.model_requests, 0, "validation never refunds consumed requests");
+        for field in ["prefix", "dependencies", "limits", "request_allowance", "executor", "credentials"] {
+            let mut changed = input.clone();
+            let Some(NativeWorkflow::Reassign { target }) = changed.native_workflow.as_deref_mut() else { unreachable!() };
+            match field {
+                "prefix" => target.instruction_prefix = "Replace the instruction".into(),
+                "dependencies" => target.dependencies.clear(),
+                "limits" => target.limits.deadline_unix_ms += 1,
+                "request_allowance" => target.limits.model_requests = 0,
+                "executor" => target.definition.executor = ExecutorKind::Native,
+                "credentials" => target.repository.url = "https://user:secret@example.com/repo".into(),
+                _ => unreachable!(),
+            }
+            assert!(validate_workflow(&changed).is_err(), "{field}");
+        }
+    }
+
 }

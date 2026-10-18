@@ -2,15 +2,17 @@ use borg_runtime::{delegation::*, protocol::*};
 use serde_json::json;
 
 fn metadata() -> borg_runtime::limits::RuntimeLimits {
-    borg_runtime::limits::RuntimeLimits::seed().unwrap()
+    { let mut p=borg_runtime::limits::RuntimeLimits::seed().unwrap(); p.execution.native.context_bytes=65_536; p }
 }
 
 fn parent() -> TaskInput {
-    let mut input = TaskInput {
+    let mut input = TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         repository_read: None,
         instruction: "Use a coding child when source changes are needed.".into(),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             inference: Some(InferenceSettings::selected()),
             execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -30,9 +32,11 @@ fn parent() -> TaskInput {
         },
         dependencies: vec![],
         native_workflow: Some(Box::new(NativeWorkflow::CodingThenContinue {
-            child: CodingTaskTemplate {
+            child: CodingTaskTemplate { instruction_source: None,
+                pull_request: None,
                 instruction_prefix: "Preserve the configured repository and checks.".into(),
                 definition: Definition {
+                    charter: None,
                     limit_overrides: None,
                     inference: Some(InferenceSettings::selected()),
                     execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -41,6 +45,7 @@ fn parent() -> TaskInput {
                     executor: ExecutorKind::Coding,
                 },
                 repository: Repository {
+                    pull_request_target: None,
                     registration: Some(borg_runtime::repository_catalogue::Revision {
                         repository_id: "fixture-repository".into(),
                         registration_revision: "1".into(),
@@ -124,6 +129,7 @@ fn outcome() -> ChildOutcome {
         status: TaskStatus::Succeeded,
         summary: "quoted \"value\"\n\u{0001}".into(),
         result: Some(AcceptedResult {
+            pull_request: None,
             attempt_id: "child-attempt".into(),
             summary: "quoted \"value\"\n\u{0001}".into(),
             checkpoint: Some(Checkpoint {

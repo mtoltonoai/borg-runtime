@@ -17,9 +17,9 @@ import tarfile
 import tempfile
 import time
 
-MANIFEST_SHA = "221f255d5f2317caf59e4c7ac3df9929dbe248852a33752b78376a97df80ff83"
-LOCK_SHA = "aeac8e626ea3e28dd88700353075859e12d3e5624e5ca23f6451e3a29ee1cf7b"
-BUILDER_SHA = "58824f23621606202f351751b45f199179c22aa350a6d1f39525d6fdae743888"
+MANIFEST_SHA = "20f1acdf87b07698a2881653d76c579e81c3c98eacbfdd735e161a20bb80cc1d"
+LOCK_SHA = "df189e6ea91a5e05839f2773611a59830bafc0114f13a06cbc8359b44195c28b"
+BUILDER_SHA = "a6c3f47c946bb96f121d617f7c141e7513f597d63556bb56f3c439989332172c"
 SQLITE_SHA3 = "7b670a62fdfbd672b75fef004cb703c8a3e87d3a5cc7d675b4a08337004a2d93"
 SQLITE_SOURCE = "2026-10-09 15:46:58 be8d059e9a49089ab2dce5ed26dd87aaf598fdc5fbe0b107c0dd758464bcd5e3"
 MANAGED_CONFIG_SHA = "24095bd6315880162c8f660917100ac36638cb73778dd9ec6f1c9026ea87b178"
@@ -36,7 +36,8 @@ TOOL_SHA = {"cargo": "e951141cc55a6cd7b9876d187bd30a3720e6086b99413af95e3b8de1cd
             "pkg-config": "7e8152db1b0c7e49d47b4b82a70dc9997b557951c5d4d938b0e7f208ce9eb10b"}
 READER_SHA = {"git_sha256": "2a8c18fbf43da9f692d75474c72bea9dfd796c260b0f3dfe456376abc3bbd668",
               "python_sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f"}
-ENV_PROFILE = {"locale": "C", "timezone": "UTC", "cargo_incremental": "0", "network": "offline"}
+ENV_PROFILE = {"locale": "C", "timezone": "UTC", "cargo_incremental": "0", "network": "offline",
+               "path_normalization": "borg-v2-build-paths/1"}
 TARGET = "x86_64-unknown-linux-gnu"
 PROFILE = {"cargo_manifest_sha256": MANIFEST_SHA, "cargo_lock_sha256": LOCK_SHA,
            "build_helper_sha256": BUILDER_SHA, "cargo_arguments": ["build", "--locked", "--offline", "--release"],
@@ -267,7 +268,7 @@ def run_builder(checkout: Path, output: Path, builder: Path, archive: Path, tool
     (output / "home").mkdir()
     command = ["/usr/bin/python3", "-I", "-S", "-B", str(builder), "--root", str(checkout),
                "--build-dir", str(output / "sqlite"), "--archive", str(archive),
-               "--toolchain-dir", str(toolchain), "--offline", "--cargo", "build", "--release"]
+               "--toolchain-dir", str(toolchain), "--offline", "--cargo", "build", "--release", "--reproducible-paths"]
     invocation = {"command": command, "environment": env}
     with (output / "build.log").open("xb") as log:
         child = subprocess.Popen(command, env=env, cwd=output, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -299,6 +300,9 @@ def run_builder(checkout: Path, output: Path, builder: Path, archive: Path, tool
             or cargo.get("manifest_sha256") != MANIFEST_SHA or cargo.get("lock_sha256") != LOCK_SHA
             or cargo.get("sqlite_receipt_sha256") != digest(output / "sqlite/build-receipt.json")):
         raise ValueError("build receipt association mismatch")
+    if (cargo.get("path_normalization") != ENV_PROFILE["path_normalization"]
+            or set(cargo.get("path_environment", {})) != {"CARGO_ENCODED_RUSTFLAGS", "CFLAGS", "CXXFLAGS"}):
+        raise ValueError("build path-normalization receipt missing or incompatible")
     if sqlite["profile"]["builder_sha256"] != BUILDER_SHA or sqlite["profile"]["archive_sha3_256"] != SQLITE_SHA3:
         raise ValueError("SQLite recipe identity mismatch")
     if sqlite["identity"] != {"version": "3.54.0", "source_id": SQLITE_SOURCE, "threadsafe": 1, "api_armor": 1, "foreign_keys": 1}:

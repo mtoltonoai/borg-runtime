@@ -17,10 +17,44 @@ use tokio::{
 
 const MAGIC: &[u8; 4] = b"NV1\0";
 const HEADER: usize = 27;
-const REVISION: u8 = 6;
+const REVISION: u8 = 8;
 const REPLY_MAGIC: &[u8; 4] = b"NVR\0";
 const USAGE_HEADER: usize = 31;
 const OUTCOME_HEADER: usize = 5;
+
+const BODY_CHUNK: usize = 8192;
+fn append_body(body: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> {
+    body.try_reserve(bytes.len()).map_err(|_| "native_validation_allocation_failed")?;
+    body.extend_from_slice(bytes);
+    Ok(())
+}
+fn read_body(input: &mut impl Read, length: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; BODY_CHUNK];
+    while body.len() < length {
+        let take = (length - body.len()).min(chunk.len());
+        let count = match input.read(&mut chunk[..take]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err("native_validation_frame_invalid".into()),
+        };
+        if count == 0 { return Err("native_validation_frame_invalid".into()); }
+        append_body(&mut body, &chunk[..count])?;
+    }
+    Ok(body)
+}
+async fn read_async_body(input: &mut (impl tokio::io::AsyncRead + Unpin), length: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; BODY_CHUNK];
+    while body.len() < length {
+        let take = (length - body.len()).min(chunk.len());
+        let count = input.read(&mut chunk[..take]).await.map_err(|_| "native_validation_io")?;
+        if count == 0 { return Err("native_validation_io".into()); }
+        append_body(&mut body, &chunk[..count])?;
+    }
+    Ok(body)
+}
+
 
 /// Identity of the caller-selected value bound. This is a closed part of the
 /// same-binary protocol, never an error label supplied by provider content.
@@ -66,11 +100,11 @@ fn decode_outcome_header(
 ) -> Result<Outcome, String> {
     let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
     match header[0] {
-        0 if length <= limit => {}
+        0 | 4 | 5 if length <= limit => {}
         1 if length <= policy.helper_error_bytes => {}
         // These fixed discriminators carry no error string or value payload.
         2 | 3 if length == 0 => {}
-        0 => return Err(bound.reply_error()),
+        0 | 4 | 5 => return Err(bound.reply_error()),
         1 => return Err("native_validation_reply_bound_native_helper_error_bytes".into()),
         _ => return Err("native_validation_reply_invalid".into()),
     }
@@ -179,6 +213,10 @@ pub(super) struct State {
     permit: Option<OwnedSemaphorePermit>,
     provider_usage: UsageObservation,
     provider_completed: bool,
+    provider_rejection: Option<super::ProviderRejection>,
+    provider_diagnostic: Option<super::ProviderFailureDiagnostic>,
+    format_issue: Option<super::FormatIssue>,
+    output_capped: bool,
     owner_lock: Option<Arc<std::fs::File>>,
     #[cfg(debug_assertions)]
     fixture_registry: Option<Arc<super::host::FixtureRegistry>>,
@@ -209,13 +247,72 @@ impl State {
             permit: None,
             provider_usage: UsageObservation::Unknown,
             provider_completed: false,
+            provider_rejection: None,
+            provider_diagnostic: None,
+            format_issue: None,
+            output_capped: false,
             owner_lock: host.retain_owner_lock(),
             #[cfg(debug_assertions)]
             fixture_registry: host.retain_fixture_registry(),
         }
     }
+    pub(super) fn provider_output_capped(&self) -> bool { self.output_capped }
+    pub(super) fn format_issue(&self) -> Option<&super::FormatIssue> { self.format_issue.as_ref() }
     pub(super) fn provider_usage(&self) -> UsageObservation {
         self.provider_usage
+    }
+    pub(super) fn provider_rejection(&self) -> Option<super::ProviderRejection> {
+        self.provider_rejection
+    }
+    pub(super) fn record_rejection(&mut self, rejection: Option<super::ProviderRejection>) {
+        self.provider_rejection = rejection;
+    }
+    pub(super) fn record_diagnostic(&mut self, diagnostic: super::ProviderFailureDiagnostic) {
+        self.provider_diagnostic = Some(diagnostic);
+    }
+    /// Keep the first concrete cause and all observed HTTP facts when later
+    /// cleanup replaces the public error. Pending headers alone are not a cause.
+    pub(super) fn record_failure(&mut self, class: super::ProviderFailureClass) {
+        if self.provider_diagnostic.as_ref().and_then(|v| v.http.as_ref())
+            .is_some_and(|v| v.body == super::DiagnosticBodyState::Pending) {
+            match class {
+                super::ProviderFailureClass::Cancelled => self.diagnostic_body(super::DiagnosticBodyState::Cancelled),
+                super::ProviderFailureClass::Deadline => self.diagnostic_body(super::DiagnosticBodyState::TaskDeadline),
+                _ => {},
+            }
+        }
+        match self.provider_diagnostic.as_mut() {
+            Some(value) if value.class == super::ProviderFailureClass::HttpResponsePending => value.set_class(class),
+            None => self.provider_diagnostic = Some(super::ProviderFailureDiagnostic::new(class)),
+            Some(_) => {},
+        }
+    }
+    pub(super) fn diagnostic_body(&mut self, body: super::DiagnosticBodyState) {
+        if let Some(value) = self.provider_diagnostic.as_mut() {
+            if value.http.as_ref().is_some_and(|http| http.body != super::DiagnosticBodyState::Redacted) {
+                value.set_body(body);
+            }
+        }
+    }
+    pub(super) fn record_result_failure(&mut self, exposure: super::RequestExposure, deadline: tokio::time::Instant) {
+        use super::ProviderFailureClass as Class;
+        self.record_failure(if tokio::time::Instant::now() >= deadline { Class::Deadline }
+            else if exposure == super::RequestExposure::NotStarted { Class::LocalAdmission }
+            else { Class::ResponseValidation });
+    }
+    pub(super) fn finish_diagnostic(&mut self, failed: bool, exposure: super::RequestExposure)
+        -> Option<super::ProviderFailureDiagnostic> {
+        use super::ProviderFailureClass as Class;
+        if self.output_capped { self.record_failure(Class::OutputLimit); }
+        else if self.format_issue.is_some() { self.record_failure(Class::ResponseValidation); }
+        else if failed {
+            self.record_failure(if exposure == super::RequestExposure::NotStarted {
+                Class::LocalAdmission
+            } else { Class::ResponseValidation });
+        } else if self.provider_diagnostic.as_ref().is_none_or(|value| value.class == Class::HttpResponsePending) {
+            return None;
+        }
+        self.provider_diagnostic.take()
     }
     pub(super) fn provider_completed(&self) -> bool {
         self.provider_completed
@@ -229,7 +326,7 @@ impl State {
         };
         // Keep ownership and the CPU slot in self across this await. Cancellation
         // of a normal finish therefore leaves the child available to outer cleanup.
-        let status = child
+        let status = match child
             .finish_registered(
                 kill,
                 tokio::time::Instant::now()
@@ -237,8 +334,13 @@ impl State {
                         self.worker_limits.native_validation_cleanup_timeout_ms,
                     ),
             )
-            .await
-            .map_err(|_| "native_validation_cleanup_unverified")?;
+            .await {
+                Ok(status) => status,
+                Err(_) => {
+                    self.record_failure(super::ProviderFailureClass::ValidationCleanup);
+                    return Err("native_validation_cleanup_unverified".into());
+                }
+            };
         self.child.take();
         self.permit.take();
         Ok(Some(status))
@@ -325,6 +427,8 @@ impl State {
         tool_call: bool,
         loop_call: bool,
     ) -> Result<Option<Vec<u8>>, String> {
+        self.format_issue = None;
+        self.output_capped = false;
         let policy = &host.native_limits;
         policy.validate()?;
         schema::measure(
@@ -494,11 +598,7 @@ impl State {
             .await
             .map_err(|_| "native_validation_io")?;
         let outcome = decode_outcome_header(&outcome_header, limit, reply_bound, policy)?;
-        let mut response = vec![0; outcome.length];
-        stdout
-            .read_exact(&mut response)
-            .await
-            .map_err(|_| "native_validation_io")?;
+        let response = read_async_body(&mut stdout, outcome.length).await?;
         if stdout
             .read(&mut [0])
             .await
@@ -517,6 +617,24 @@ impl State {
         match outcome.kind {
             0 if wire.is_none() && response.is_empty() => Ok(None),
             0 if wire.is_some() => Ok(Some(response)),
+            4 if loop_call && wire.is_some() && completed
+                && schema_value.get("repair_enabled").and_then(Value::as_bool) == Some(true) => {
+                // Typed repair is admitted only after full payload, EOF and a
+                // successful reaped child. A usage header alone cannot grant it.
+                let value = decode::parse(&response, limit, super::deadline(deadline_unix_ms)?,
+                    "native_validation_reply_invalid", policy, reply_bound.field())?;
+                let typed: FormatReply = serde_json::from_value(value).map_err(|_| "native_validation_reply_invalid")?;
+                let items = serde_json::to_vec(&typed.items).map_err(|_| "native_validation_reply_invalid")?;
+                self.format_issue = Some(typed.issue);
+                Ok(Some(items))
+            },
+            5 if loop_call && wire.is_some() && !completed
+                && schema_value.get("repair_enabled").and_then(Value::as_bool)==Some(true) => {
+                let value=decode::parse(&response,limit,super::deadline(deadline_unix_ms)?,
+                    "native_validation_reply_invalid",policy,reply_bound.field())?;
+                if !value.is_array() {return Err("native_validation_reply_invalid".into());}
+                self.output_capped=true;Ok(Some(response))
+            },
             1 => {
                 let error = std::str::from_utf8(&response)
                     .map_err(|_| "native_validation_reply_invalid")?;
@@ -580,11 +698,17 @@ fn decode_usage_header(header: &[u8]) -> Result<(UsageObservation, bool), String
     Ok((usage?, header[30] == 1))
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormatReply { items: Value, issue: super::FormatIssue }
+
 struct ReplyWriter<'a, W: Write> {
     output: &'a mut W,
     usage_sent: bool,
     limits: Option<crate::limits::NativeLimits>,
     value_limit: usize,
+    format_reply: bool,
+    cap_reply: bool,
 }
 impl<W: Write> ReplyWriter<'_, W> {
     fn usage(&mut self, usage: UsageObservation, completed: bool) -> Result<(), String> {
@@ -603,7 +727,7 @@ impl<W: Write> ReplyWriter<'_, W> {
             self.usage(UsageObservation::Unknown, false)?;
         }
         let (kind, payload) = match result {
-            Ok(bytes) if bytes.len() <= self.value_limit => (0, bytes),
+            Ok(bytes) if bytes.len() <= self.value_limit => (if self.cap_reply {5} else if self.format_reply { 4 } else { 0 }, bytes),
             Ok(_) => (3, Vec::new()),
             Err(code) => {
                 // Malformed internal errors remain protocol failures, even if
@@ -648,6 +772,8 @@ pub fn validation_worker_stdio() -> Result<(), String> {
         usage_sent: false,
         limits: None,
         value_limit: 0,
+        format_reply: false,
+        cap_reply: false,
     };
     let result = worker(&mut std::io::stdin().lock(), &mut reply);
     reply.finish(result)
@@ -699,14 +825,8 @@ fn worker(
         ));
     }
     let deadline = super::deadline(deadline_ms)?;
-    let mut encoded = vec![0; schema_len];
-    input
-        .read_exact(&mut encoded)
-        .map_err(|_| "native_validation_frame_invalid")?;
-    let mut wire = vec![0; wire_len];
-    input
-        .read_exact(&mut wire)
-        .map_err(|_| "native_validation_frame_invalid")?;
+    let encoded = read_body(input, schema_len)?;
+    let wire = read_body(input, wire_len)?;
     if input
         .read(&mut [0])
         .map_err(|_| "native_validation_frame_invalid")?
@@ -796,7 +916,17 @@ fn worker(
     }
     schema::measure(&envelope, wire_limit, &policy, "native_response_wire_bytes")?;
     if let Some(input) = loop_input {
-        return super::loop_step::validate_response(&envelope, &input, limit, deadline, &policy);
+        let (bytes, issue) = super::loop_step::validate_response_typed(&envelope, &input, limit, deadline, &policy)?;
+        if super::loop_step::capped(&envelope,&input,deadline,&policy) {
+            reply.cap_reply=true;return Ok(bytes);
+        }
+        if let Some(issue) = issue {
+            let items = decode::parse(&bytes, limit, deadline, "native_tool_context_invalid", &policy, reply_bound.field())?;
+            let encoded = serde_json::to_vec(&FormatReply { items, issue }).map_err(|_| "native_validation_reply_invalid")?;
+            reply.format_reply = true;
+            return Ok(encoded);
+        }
+        return Ok(bytes);
     }
     if let Some(result) = tool {
         let context = super::task_tool::context(result?);
@@ -827,7 +957,7 @@ mod tests {
         let known = UsageObservation::Reported(ProviderTokenUsage::checked(17, 9, 26).unwrap());
         let header = encode_usage_header(known, true);
         assert_eq!(decode_usage_header(&header).unwrap(), (known, true));
-        for revision in [0, 1, 2, 3, 4, 5, 255] {
+        for revision in [0, 1, 2, 3, 4, 5, 6, 7, 255] {
             let mut wrong = header;
             wrong[4] = revision;
             assert!(decode_usage_header(&wrong).is_err());
@@ -897,6 +1027,8 @@ mod helper_diagnostics_tests {
             usage_sent: true,
             limits: Some(policy),
             value_limit,
+            format_reply: false,
+        cap_reply: false,
         }
         .finish(result);
         (result, output)
@@ -904,12 +1036,12 @@ mod helper_diagnostics_tests {
 
     #[test]
     fn helper_revision_and_bound_sources_are_explicit() {
-        assert_eq!(REVISION, 6);
+        assert_eq!(REVISION, 8);
         assert_eq!(HEADER, 27);
         assert_eq!(OUTCOME_HEADER, 5);
         assert_eq!(
             &encode_usage_header(UsageObservation::Unknown, false)[..6],
-            b"NVR\0\x06\x00"
+            b"NVR\0\x08\x00"
         );
         assert_eq!(
             ReplyBound::TaskOutput.reply_error(),
@@ -1002,7 +1134,7 @@ mod helper_diagnostics_tests {
                 );
             }
         }
-        for kind in [4, u8::MAX] {
+        for kind in [6, u8::MAX] {
             assert_eq!(
                 decode_outcome_header(&header(kind, 0), 1, ReplyBound::TaskOutput, &policy)
                     .err()
@@ -1061,5 +1193,123 @@ mod helper_diagnostics_tests {
                 "malformed error must not emit an overflow frame"
             );
         }
+    }
+}
+
+
+#[cfg(test)]
+mod maximum_context_frame_tests {
+    use super::*;
+    struct ShortBody { bytes: std::io::Cursor<Vec<u8>>, largest_read: usize }
+    impl Read for ShortBody {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.largest_read = self.largest_read.max(out.len());
+            Read::read(&mut self.bytes, out)
+        }
+    }
+    #[test]
+    fn advertised_maximum_frame_does_not_allocate_its_declared_length() {
+        let mut source=ShortBody { bytes:std::io::Cursor::new(b"abc".to_vec()), largest_read:0 };
+        assert_eq!(read_body(&mut source,u32::MAX as usize).unwrap_err(),"native_validation_frame_invalid");
+        assert!(source.largest_read <= BODY_CHUNK);
+        assert_eq!(read_body(&mut &b"abc"[..],3).unwrap(),b"abc");
+        assert_eq!(read_body(&mut &b""[..],0).unwrap(),Vec::<u8>::new());
+    }
+    #[tokio::test]
+    async fn advertised_maximum_reply_reads_only_received_chunks() {
+        assert_eq!(read_async_body(&mut &b"abc"[..],u32::MAX as usize).await.unwrap_err(),"native_validation_io");
+        assert_eq!(read_async_body(&mut &b"abc"[..],3).await.unwrap(),b"abc");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_cleanup_source_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Area(std::path::PathBuf);
+    impl Drop for Area {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    // An actual registered child exercises State::finish's error source. This
+    // does not claim a provider response or native helper-protocol observation.
+    #[tokio::test]
+    async fn actual_registry_cleanup_failure_records_cause_before_wrapper_fallback() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_nanos();
+        let area = Area(std::env::temp_dir().join(format!("borg-native-cleanup-cause-{}-{nonce}-{}",
+            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))));
+        std::fs::create_dir(&area.0).unwrap();
+        let registry = area.0.join("processes");
+        let limits = crate::limits::RuntimeLimits::seed().unwrap();
+        let worker = Arc::new(limits.worker);
+        let runtime = Arc::new(super::super::ValidationRuntime::new(worker.clone()).unwrap());
+        let slots = runtime.slots.clone();
+        let available_before = slots.available_permits();
+        let host = ValidationHost::new("/bin/sleep".into(), registry.clone(),
+            Arc::new(limits.execution.native), runtime);
+        let mut state = State::new(&host);
+        state.permit = Some(slots.clone().acquire_owned().await.unwrap());
+        state.child = Some(ManagedProcess::spawn(Path::new("/bin/sleep"), &["60".into()],
+            &area.0, &registry, &[], worker.clone()).await.unwrap());
+        let pid = state.child.as_ref().and_then(|owner| owner.child.id()).unwrap();
+        let record = registry.join(format!("{pid}.json"));
+        let backup = area.0.join("original-record.json");
+        let original = std::fs::read(&record);
+        let mut moved = false;
+        let injected = (|| -> std::io::Result<()> {
+            std::fs::rename(&record, &backup)?;
+            moved = true;
+            std::fs::create_dir(&record)
+        })();
+        // A directory at the exact owned record makes refresh_ownership's
+        // atomic rename fail. No cancellation or outer error classifier runs.
+        let failed_finish = if injected.is_ok() { Some(state.finish(false).await) } else { None };
+        let retained_child = state.child.as_ref().and_then(|owner| owner.child.id()) == Some(pid);
+        let retained_permit = state.permit.is_some();
+        let available_at_failure = slots.available_permits();
+        let diagnostic = state.finish_diagnostic(true, super::super::RequestExposure::NotStarted);
+
+        // Restore and kill/reap before any fault-result assertion can panic.
+        let restored = (|| -> std::io::Result<()> {
+            if moved {
+                if record.is_dir() { std::fs::remove_dir(&record)?; }
+                std::fs::rename(&backup, &record)?;
+            }
+            Ok(())
+        })();
+        let restored_bytes = std::fs::read(&record);
+        let cleanup = state.finish(true).await;
+        // Even unexpected restore/cleanup failure must not let an assertion
+        // leave this fixture's simple, non-forking child alive or unreaped.
+        let fallback_reap = if cleanup.is_err() {
+            if let Some(owner) = state.child.as_mut() {
+                Some(tokio::time::timeout(
+                    Duration::from_millis(worker.native_validation_cleanup_timeout_ms),
+                    owner.child.kill(),
+                ).await)
+            } else { None }
+        } else { None };
+        let pid_absent = !Path::new(&format!("/proc/{pid}")).exists();
+        let state_released = state.child.is_none() && state.permit.is_none();
+
+        assert!(cleanup.is_ok(), "restored cleanup: {cleanup:?}; fallback: {fallback_reap:?}");
+        assert!(pid_absent, "registered child was killed and reaped before assertions");
+        assert!(injected.is_ok(), "exact record fault setup: {injected:?}");
+        assert!(restored.is_ok(), "exact record restoration: {restored:?}");
+        assert_eq!(original.unwrap(), restored_bytes.unwrap());
+        assert_eq!(failed_finish.unwrap().unwrap_err(), "native_validation_cleanup_unverified");
+        assert!(retained_child && retained_permit);
+        assert_eq!(available_at_failure + 1, available_before);
+        assert_eq!(diagnostic.unwrap().class, super::super::ProviderFailureClass::ValidationCleanup);
+        assert!(state_released);
+        assert_eq!(slots.available_permits(), available_before);
+        assert!(!record.exists());
+        assert!(!record.with_extension("pending").exists());
+        assert_eq!(state.provider_usage(), UsageObservation::Unknown);
+        assert!(!state.provider_completed());
+        assert!(state.provider_rejection().is_none());
     }
 }

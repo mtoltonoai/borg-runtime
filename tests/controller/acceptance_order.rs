@@ -55,19 +55,7 @@ fn candidate(a: &Attempt, id: &str) -> Operation {
     }
 }
 async fn completed_before_acceptance(c: &Controller, a: &Attempt, label: &str) {
-    task(
-        report(
-            c,
-            a,
-            &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: Some(2),
-                output_tokens: Some(1),
-            },
-        )
-        .await,
-    );
+    controlled_native_request(c, a, 1, Some(2), Some(1)).await;
     complete_native_loop(c, a).await;
     task(
         report(
@@ -318,19 +306,7 @@ async fn child_settles_before_parent_stop_without_overlapping_successor_across_r
     let pw = worker("parent-worker", "inc", 1, 0);
     register(&c, &pw).await;
     let pa = run(&commands(&c, &pw, vec![]).await);
-    task(
-        report(
-            &c,
-            &pa,
-            "parent-used-one",
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: Some(2),
-                output_tokens: Some(1),
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &pa, 1, Some(2), Some(1)).await;
     let child = controlled_delegate(&c, &parent, &pa, "early-delegate", "early-child", 1).await;
     let cw = worker("child-worker", "inc", 0, 1);
     register(&c, &cw).await;
@@ -407,7 +383,34 @@ async fn child_settles_before_parent_stop_without_overlapping_successor_across_r
 }
 
 #[tokio::test]
-async fn over_budget_usage_commits_exact_total_and_stop_without_refund_or_retry_reset() {
+async fn native_malformed_overage_and_exhausted_reservation_preserve_exact_debits_and_owner() {
+    // Controller-only admission/receipt proof. No provider is started, so this
+    // does not claim to observe physical provider non-execution.
+    fn retained(
+        p: &std::path::Path,
+        a: &Attempt,
+    ) -> (
+        (i64, Option<i64>, Option<i64>),
+        Vec<(i64, String, String, i64)>,
+        Vec<String>,
+    ) {
+        // Every call is after Controller drop and owner-release confirmation.
+        let db = Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let usage = db.query_row(
+            "SELECT model_requests,input_tokens,output_tokens FROM attempts WHERE id=?1",
+            [&a.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        let credits = db.prepare(
+            "SELECT request_index,reservation_id,diagnostic_id,consumed FROM native_request_diagnostic_credits WHERE attempt_id=?1 ORDER BY request_index",
+        ).unwrap().query_map([&a.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let commands = db.prepare("SELECT body FROM commands WHERE task_id=?1 ORDER BY seq")
+            .unwrap().query_map([&a.task_id], |r| r.get(0))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        (usage, credits, commands)
+    }
     let p = path();
     let c = Controller::open_with_config(&p, config()).unwrap();
     let mut input = native("over-budget-agent");
@@ -416,7 +419,123 @@ async fn over_budget_usage_commits_exact_total_and_stop_without_refund_or_retry_
     let w = worker("over-budget-worker", "inc", 1, 0);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
+    let initial = get(&c, &submitted.id).await;
+    assert_eq!(initial.status, TaskStatus::Active);
+    assert_eq!(initial.attempt.as_ref().unwrap().id, a.id);
+    let operation = |report_id: &str, observation| Operation::ObserveWorker {
+        report: Report {
+            report_id: report_id.into(),
+            worker_id: a.worker_id.clone(),
+            incarnation: a.worker_incarnation.clone(),
+            task_id: a.task_id.clone(),
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            observation,
+        },
+    };
+    // Preserve the exact original0737 malformed Native packet, including its
+    // unmarked 0->3 cumulative jump, original ID and reported token values.
+    let malformed = operation("over-budget-observed", Observation::Usage {
+        native_diagnostic_reserved: false,
+        model_requests: 3,
+        input_tokens: Some(30),
+        output_tokens: Some(9),
+    });
+    let refused = exchange(&c, malformed.clone()).await;
+    assert_eq!(refused.outcome, Outcome::Refused {
+        code: "source_mismatch".into(),
+        message: "new native charge requires exactly one marked original Usage reservation".into(),
+    });
+    assert!(refused.commit.is_some());
+    same_receipt(&exchange(&c, malformed.clone()).await, &refused);
+    assert_eq!(get(&c, &submitted.id).await, initial);
+    drop(c);
+    controller_owner_released(&p).await;
+    let uncharged = retained(&p, &a);
+    assert_eq!(uncharged.0, (0, None, None));
+    assert!(uncharged.1.is_empty());
+    assert_eq!(uncharged.2.len(), 1);
+    assert!(matches!(serde_json::from_str::<WorkerCommand>(&uncharged.2[0]).unwrap(),
+        WorkerCommand::RunAttempt {attempt,..} if attempt == a));
+
+    let c = Controller::open_with_config(&p, config()).unwrap();
+    same_receipt(&exchange(&c, malformed.clone()).await, &refused);
+    assert_eq!(get(&c, &submitted.id).await, initial);
+    controlled_native_request(&c, &a, 1, Some(10), Some(3)).await;
+    controlled_native_request(&c, &a, 2, Some(20), Some(6)).await;
+    let charged = get(&c, &submitted.id).await;
+    assert_eq!(charged.status, TaskStatus::Active);
+    assert_eq!(charged.attempt.as_ref().unwrap().id, a.id);
+    let first_id = borg_runtime::native_loop_contract::reservation_id(&a.id, 1);
+    let first = lookup(&c, &first_id).await;
+    let first_operation = operation(&first_id, Observation::Usage {
+        native_diagnostic_reserved: true,
+        model_requests: 1,
+        input_tokens: Some(10),
+        output_tokens: Some(3),
+    });
+    // Exact earlier receipt replay may not roll cumulative usage back to one.
+    let first_replay = exchange(&c, first_operation.clone()).await;
+    let Outcome::Ok {data: Data::Operation(first_record)} = &first.outcome else {
+        panic!("original reservation lookup: {first:?}");
+    };
+    assert_eq!(first_record.intended, serde_json::to_value(&first_operation).unwrap());
+    assert_eq!(first_record.outcome, Some(serde_json::to_value(&first_replay.outcome).unwrap()));
+    assert_eq!(first.commit, first_replay.commit);
+    let third = operation(&borg_runtime::native_loop_contract::reservation_id(&a.id, 3),
+        Observation::Usage {
+            native_diagnostic_reserved: true,
+            model_requests: 3,
+            input_tokens: Some(30),
+            output_tokens: Some(9),
+        });
+    let exhausted = exchange(&c, third.clone()).await;
+    assert_eq!(exhausted.outcome, Outcome::Refused {
+        code: "capacity".into(),
+        message: "native diagnostic reservation exceeds original model-request allowance".into(),
+    });
+    assert!(exhausted.commit.is_some());
+    same_receipt(&exchange(&c, third.clone()).await, &exhausted);
+    same_receipt(&exchange(&c, malformed.clone()).await, &refused);
+    assert_eq!(get(&c, &submitted.id).await, charged);
+    drop(c);
+    controller_owner_released(&p).await;
+    let exhausted_state = retained(&p, &a);
+    assert_eq!(exhausted_state.0, (2, Some(20), Some(6)));
+    assert_eq!(exhausted_state.1, (1..=2).map(|index| (
+        i64::from(index),
+        borg_runtime::native_loop_contract::reservation_id(&a.id, index),
+        borg_runtime::native_loop_contract::diagnostic_id(&a.id, index),
+        1,
+    )).collect::<Vec<_>>());
+    assert_eq!(exhausted_state.2, uncharged.2);
+
+    let c = Controller::open_with_config(&p, config()).unwrap();
+    same_receipt(&exchange(&c, malformed).await, &refused);
+    same_receipt(&exchange(&c, third).await, &exhausted);
+    same_receipt(&exchange(&c, first_operation).await, &first_replay);
+    assert_eq!(get(&c, &submitted.id).await, charged);
+    drop(c);
+    controller_owner_released(&p).await;
+    assert_eq!(retained(&p, &a), exhausted_state);
+}
+
+// Defensive Controller-consumer regression with injected cumulative Usage.
+// These are controlled non-native observations, not measured Codex inner calls.
+// The current supplied-executor adapter does not emit this overage: inner request
+// counts remain unknown and its platform outer-turn reservations precheck bounds.
+#[tokio::test]
+async fn controlled_non_native_observed_overage_commits_exact_total_and_stop_without_refund_or_retry_reset() {
+    let p = path();
+    let c = Controller::open_with_config(&p, config()).unwrap();
+    let mut input = coding("over-budget-agent");
+    input.limits.model_requests = 2;
+    let submitted = submit(&c, "over-budget-submit", input).await;
+    let w = worker("over-budget-worker", "inc", 0, 1);
+    register(&c, &w).await;
+    let a = run(&commands(&c, &w, vec![]).await);
     let usage = Observation::Usage {
+        native_diagnostic_reserved: false,
         model_requests: 3,
         input_tokens: Some(30),
         output_tokens: Some(9),
@@ -446,6 +565,7 @@ async fn over_budget_usage_commits_exact_total_and_stop_without_refund_or_retry_
                 &a,
                 "over-budget-decrease",
                 Observation::Usage {
+                    native_diagnostic_reserved: false,
                     model_requests: 2,
                     input_tokens: Some(30),
                     output_tokens: Some(9)

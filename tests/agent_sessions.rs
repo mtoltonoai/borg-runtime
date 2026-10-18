@@ -39,11 +39,13 @@ fn cfg() -> ControllerConfig {
     }
 }
 fn input(agent: &str) -> TaskInput {
-    TaskInput {
+    TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         repository_read: None,
         instruction: "controlled session work".into(),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             id: agent.into(),
             revision: "v1".into(),
@@ -337,6 +339,10 @@ async fn closed(p: &Path) {
 //= type=test
 //# Every session MUST carry the agent identity it runs as.
 #[tokio::test]
+// Traceability scope: Two same-agent sessions consume the registered capacity while a third is explicitly blocked by executor_capacity; this is not an operating-system quota test.
+//= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
+//= type=test
+//# Admission MUST enforce configured queue and resource bounds.
 async fn sessions_concurrent_same_agent_share_identity_not_execution_or_capacity() {
     let c = Controller::open_with_config(dir(), cfg()).unwrap();
     let a = submit(&c, "submit-a", input("shared-agent")).await;
@@ -601,10 +607,11 @@ async fn sessions_revision_and_assignment_cannot_retarget_existing_session() {
     newer.definition.revision = "v2".into();
     let second = submit(&c, "revision-second", newer.clone()).await;
     assert_eq!(session(&c, &first.session_id).await, s);
-    assert_eq!(
-        session(&c, &second.session_id).await.definition,
-        newer.definition
-    );
+    let second_session = session(&c, &second.session_id).await;
+    assert_eq!(second_session.definition, newer.definition);
+    let selected = x(&c, Operation::GetAgent { agent_id: "agent-one".into() }).await.outcome;
+    assert!(matches!(&selected, Outcome::Ok { data: Data::Agent(agent) }
+        if agent.definition == first.input.definition));
     let other = submit(&c, "revision-other", input("agent-two")).await;
     refused(
         x(
@@ -619,8 +626,9 @@ async fn sessions_revision_and_assignment_cannot_retarget_existing_session() {
         .await,
         "definition_conflict",
     );
-    // Same identity can retain its pinned old revision even after a newer revision
-    // becomes the current directory selection. Assignment must not rewrite it.
+    assert_eq!(get(&c, &first.id).await, first);
+    // Explicit submission of v2 preserves the selected v1 head. Both accepted
+    // revisions remain assignable to this agent without retargeting a session.
     let assigned = x(
         &c,
         Operation::AssignTask {
@@ -631,7 +639,23 @@ async fn sessions_revision_and_assignment_cannot_retarget_existing_session() {
         },
     )
     .await;
-    refused(assigned, "definition_conflict");
+    let assigned = task(assigned);
+    assert!(assigned.revision > first.revision);
+    assert_eq!(assigned.input, first.input);
+    assert_eq!(assigned.assigned_agent_id, first.assigned_agent_id);
+    assert_eq!(assigned.session_id, first.session_id);
+    assert_eq!(session(&c, &first.session_id).await, s);
+    assert_eq!(x(&c, Operation::GetAgent { agent_id: "agent-one".into() }).await.outcome, selected);
+    refused(
+        x(&c, Operation::AssignTask {
+            operation_id: "same-assignment-stale".into(),
+            task_id: first.id.clone(),
+            expected_revision: first.revision,
+            agent_id: "agent-one".into(),
+        }).await,
+        "stale_revision",
+    );
+    assert_eq!(get(&c, &first.id).await, assigned);
     assert_eq!(session(&c, &first.session_id).await, s);
     let current = task(
         x(
@@ -645,7 +669,14 @@ async fn sessions_revision_and_assignment_cannot_retarget_existing_session() {
         )
         .await,
     );
+    assert!(current.revision > second.revision);
     assert_eq!(current.session_id, second.session_id);
+    assert_eq!(current.input, second.input);
+    assert_eq!(current.assigned_agent_id, second.assigned_agent_id);
+    assert_eq!(session(&c, &second.session_id).await, second_session);
+    // Assignment of v2 is a discriminating check that the v1 selected head did
+    // not follow the assigned task's definition revision.
+    assert_eq!(x(&c, Operation::GetAgent { agent_id: "agent-one".into() }).await.outcome, selected);
     let mut conflict = input("agent-one");
     conflict.definition.execution_profile = Some(ExecutionProfile::CollaborationV1 {
         web_search: Some(NativeSearchProfile { max_tool_calls: 2 }),
@@ -661,6 +692,11 @@ async fn sessions_revision_and_assignment_cannot_retarget_existing_session() {
         .await,
         "definition_conflict",
     );
+    assert_eq!(get(&c, &first.id).await, assigned);
+    assert_eq!(get(&c, &second.id).await, current);
+    assert_eq!(session(&c, &first.session_id).await, s);
+    assert_eq!(session(&c, &second.session_id).await, second_session);
+    assert_eq!(x(&c, Operation::GetAgent { agent_id: "agent-one".into() }).await.outcome, selected);
 }
 #[tokio::test]
 async fn sessions_submission_commit_failure_rolls_back_allocation_and_exact_replay() {
@@ -710,7 +746,8 @@ async fn sessions_http_catalogue_and_closed_query_association() {
     let server = tokio::spawn(async move { borg_runtime::server::serve(cc, listener, bb).await });
     let client = borg_runtime::mcp::Client::new(&base, actor(&a), c.limits().clone()).unwrap();
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 33);
+    assert!(tools.iter().any(|tool| tool.name == "collab_definition_update"));
     assert!(tools.iter().any(|tool| tool.name == "collab_limits_get"));
     assert_eq!(tools, borg_runtime::mcp::catalogue(c.limits()));
     // The real client and server check the complete HTTP JSON-RPC frame against
@@ -866,10 +903,12 @@ async fn sessions_configured_child_gets_distinct_session_parent_continuation_ret
     limits.model_requests = 4;
     limits.result_bytes = 4096;
     parent.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {
-        child: CodingTaskTemplate {
+        child: CodingTaskTemplate { instruction_source: None,
+            pull_request: None,
             instruction_prefix: "configured".into(),
             definition: child_definition,
             repository: Repository {
+                pull_request_target: None,
                 registration: Some(borg_runtime::repository_catalogue::Revision {
                     repository_id: "sessions-child".into(),
                     registration_revision: "1".into(),
@@ -884,6 +923,7 @@ async fn sessions_configured_child_gets_distinct_session_parent_continuation_ret
         },
     }));
     let registration = borg_runtime::repository_catalogue::Registration {
+        pull_request_target: None,
         repository_id: "sessions-child".into(),
         registration_revision: "1".into(),
         display_name: "Session child fixture".into(),
@@ -968,4 +1008,87 @@ async fn sessions_configured_child_gets_distinct_session_parent_continuation_ret
     assert!(current.waiting_child_id.is_none());
     assert_eq!(session(&c, &child.session_id).await, child_session);
     assert_eq!(sessions(&c, Some("family"), None, 100).await.items.len(), 2);
+}
+
+// Distinct agents, identical key: actual caller-bound memory writes/readbacks,
+// then original receipt replay and canonical state after the owner is reopened.
+#[tokio::test]
+async fn distinct_agents_keep_same_key_memory_and_revisions_separate_after_restart_and_replay() {
+    const KEY: &str = "same-key";
+    fn memory(reply: &Reply, agent: &str, revision: u64, value: &serde_json::Value) {
+        let Outcome::Ok { data: Data::Memory(Some(memory)) } = &reply.outcome else {
+            panic!("canonical agent memory expected: {reply:?}")
+        };
+        assert_eq!(memory.agent_id, agent);
+        assert_eq!(memory.key, KEY);
+        assert_eq!(memory.revision, revision);
+        assert_eq!(&memory.value, value);
+    }
+    let p = dir();
+    let c = Controller::open_with_config(&p, cfg()).unwrap();
+    let a = submit(&c, "separate-memory-submit-a", input("separate-memory-agent-a")).await;
+    let b = submit(&c, "separate-memory-submit-b", input("separate-memory-agent-b")).await;
+    assert_ne!(a.id, b.id);
+    assert_ne!(a.assigned_agent_id, b.assigned_agent_id);
+    assert_ne!(a.session_id, b.session_id);
+    let w = worker(2, 0);
+    register(&c, &w).await;
+    let issued = commands(&c, &w, vec![]).await;
+    let (_, sa, aa, ia) = launch(&issued, &a.id);
+    let (_, sb, ab, ib) = launch(&issued, &b.id);
+    sa.validate_for(&aa, &ia).unwrap();
+    sb.validate_for(&ab, &ib).unwrap();
+    assert_eq!(sa.agent_id, a.assigned_agent_id);
+    assert_eq!(sb.agent_id, b.assigned_agent_id);
+    start(&c, &aa, "separate-memory-a").await;
+    start(&c, &ab, "separate-memory-b").await;
+    let write = |attempt: &Attempt, id: &str, expected: Option<u64>, value: serde_json::Value| {
+        invoke(attempt, id, "collab_memory_set",
+            json!({"key":KEY,"expected_revision":expected,"value":value}))
+    };
+    let read = |attempt: &Attempt, id: &str| invoke(attempt, id, "collab_memory_get", json!({"key":KEY}));
+    let a1 = json!({"owner":"A","value":1});
+    let b1 = json!({"owner":"B","value":17});
+    let a2 = json!({"owner":"A","value":2});
+    let first_a = write(&aa, "separate-memory-a-first", None, a1.clone());
+    let original_a = x(&c, first_a.clone()).await;
+    memory(&original_a, &a.assigned_agent_id, 1, &a1);
+    assert_eq!(original_a.commit.as_ref().unwrap().operation_id, "separate-memory-a-first");
+    let absent_b = x(&c, read(&ab, "separate-memory-b-absent")).await;
+    assert!(matches!(absent_b.outcome, Outcome::Ok { data: Data::Memory(None) }),
+        "A's identical key must remain absent to B: {absent_b:?}");
+    let first_b = write(&ab, "separate-memory-b-first", None, b1.clone());
+    let original_b = x(&c, first_b.clone()).await;
+    memory(&original_b, &b.assigned_agent_id, 1, &b1);
+    assert_eq!(original_b.commit.as_ref().unwrap().operation_id, "separate-memory-b-first");
+    memory(&x(&c, read(&aa, "separate-memory-a-read-one")).await, &a.assigned_agent_id, 1, &a1);
+    memory(&x(&c, read(&ab, "separate-memory-b-read-one")).await, &b.assigned_agent_id, 1, &b1);
+    let update_a = write(&aa, "separate-memory-a-update", Some(1), a2.clone());
+    let original_update = x(&c, update_a.clone()).await;
+    memory(&original_update, &a.assigned_agent_id, 2, &a2);
+    assert_eq!(original_update.commit.as_ref().unwrap().operation_id, "separate-memory-a-update");
+    memory(&x(&c, read(&ab, "separate-memory-b-after-a-update")).await, &b.assigned_agent_id, 1, &b1);
+
+    drop(c);
+    closed(&p).await;
+    let c = Controller::open_with_config(&p, cfg()).unwrap();
+    assert_eq!(session(&c, &a.session_id).await.agent_id, a.assigned_agent_id);
+    assert_eq!(session(&c, &b.session_id).await.agent_id, b.assigned_agent_id);
+    for (agent, revision, value) in [(&a.assigned_agent_id, 2, &a2), (&b.assigned_agent_id, 1, &b1)] {
+        memory(&x(&c, Operation::GetMemory { agent_id: agent.clone(), key: KEY.into() }).await,
+            agent, revision, value);
+    }
+    // Replay includes A's older revision-1 write after revision 2 exists. It
+    // must return its original receipt, never roll either agent's state back.
+    for (command, original) in [(first_a, original_a), (first_b, original_b), (update_a, original_update)] {
+        let replay = x(&c, command).await;
+        assert_eq!(replay.outcome, original.outcome);
+        assert_eq!(replay.commit, original.commit);
+    }
+    for (agent, revision, value) in [(&a.assigned_agent_id, 2, &a2), (&b.assigned_agent_id, 1, &b1)] {
+        memory(&x(&c, Operation::GetMemory { agent_id: agent.clone(), key: KEY.into() }).await,
+            agent, revision, value);
+    }
+    drop(c);
+    closed(&p).await;
 }

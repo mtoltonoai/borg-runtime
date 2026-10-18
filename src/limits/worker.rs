@@ -733,6 +733,9 @@ impl WorkerLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodingLimits {
+    /// None retains the historical executor-selected window; bytes are not tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<usize>,
     pub frame_bytes: usize,
     pub pending_notifications: usize,
     pub progress_queue_items: usize,
@@ -747,6 +750,9 @@ pub struct CodingLimits {
 }
 impl CodingLimits {
     pub fn validate(&self) -> Result<(), String> {
+        if self.model_context_window.is_some_and(|n| n == 0 || n > super::SELECTED_MODEL_CONTEXT_TOKENS) {
+            return Err("coding.model_context_window exceeds the selected model supported context window".into());
+        }
         if self.progress_queue_items > tokio::sync::Semaphore::MAX_PERMITS {
             return Err("coding progress queue exceeds library representation".into());
         }

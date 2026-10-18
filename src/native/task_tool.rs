@@ -19,6 +19,7 @@ pub struct ToolCallObservation {
     pub request_exposure: RequestExposure,
     pub usage: UsageObservation,
     pub provider_outcome: ProviderOutcome,
+    pub diagnostic: Option<ProviderFailureDiagnostic>,
 }
 
 enum Phase<'a> {
@@ -37,6 +38,7 @@ struct Observed {
     request_exposure: RequestExposure,
     usage: UsageObservation,
     provider_outcome: ProviderOutcome,
+    diagnostic: Option<ProviderFailureDiagnostic>,
 }
 
 //= spec/impl/v2/implementation.md#the-native-executor-is-bounded
@@ -60,6 +62,7 @@ pub async fn request_current_task<
         request_exposure: value.request_exposure,
         usage: value.usage,
         provider_outcome: value.provider_outcome,
+        diagnostic: value.diagnostic,
     }
 }
 
@@ -92,6 +95,7 @@ pub async fn continue_current_task<
         request_exposure: value.request_exposure,
         usage: value.usage,
         provider_outcome: value.provider_outcome,
+        diagnostic: value.diagnostic,
     }
 }
 
@@ -111,11 +115,13 @@ async fn execute<F: Future<Output = ()> + Send, G: Future<Output = Result<(), St
                 request_exposure: RequestExposure::NotStarted,
                 usage: UsageObservation::Unknown,
                 provider_outcome: ProviderOutcome::NotStarted,
+                diagnostic: Some(ProviderFailureDiagnostic::new(ProviderFailureClass::Deadline)),
             };
         }
     };
     let mut cpu = cpu::State::new(host);
     let mut exposure = RequestExposure::NotStarted;
+    let mut interrupted = None;
     let mut result = {
         let work = before(
             input,
@@ -129,20 +135,27 @@ async fn execute<F: Future<Output = ()> + Send, G: Future<Output = Result<(), St
         );
         tokio::pin!(work, cancelled);
         tokio::select! { biased;
-            _=&mut cancelled=>Err("native_cancelled".into()),
-            _=tokio::time::sleep_until(deadline)=>Err("native_deadline_exceeded".into()),
+            _=&mut cancelled=>{ interrupted=Some(ProviderFailureClass::Cancelled); Err("native_cancelled".into()) },
+            _=tokio::time::sleep_until(deadline)=>{ interrupted=Some(ProviderFailureClass::Deadline); Err("native_deadline_exceeded".into()) },
             result=&mut work=>result,
         }
     };
+    if let Some(class) = interrupted { cpu.record_failure(class); }
+    if result.is_err() { cpu.record_result_failure(exposure, deadline); }
     if let Err(error) = cpu.finish(true).await {
+        cpu.record_failure(ProviderFailureClass::ValidationCleanup);
         result = Err(error);
     }
+    let diagnostic = cpu.finish_diagnostic(result.is_err(), exposure);
     Observed {
         result,
+        diagnostic,
         request_exposure: exposure,
         usage: cpu.provider_usage(),
         provider_outcome: if exposure == RequestExposure::NotStarted {
             ProviderOutcome::NotStarted
+        } else if let Some(rejection) = cpu.provider_rejection() {
+            ProviderOutcome::Rejected(rejection)
         } else if cpu.provider_completed() {
             ProviderOutcome::Completed
         } else {
@@ -162,6 +175,9 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
     before_send: G,
 ) -> Result<Output, String> {
     let policy = &input.execution_limits()?.native;
+    if input.definition.charter.is_some() && host.charter.is_none() {
+        return Err("native_charter_consumer_required".into());
+    }
     if *policy != *host.native_limits {
         return Err("native_validation_policy_mismatch".into());
     }
@@ -255,7 +271,7 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
     // select also covers this read with the original deadline/cancellation.
     before_send.await?;
     live(deadline)?;
-    let (wire, key) = send_request(url, config, &body, bound, deadline, exposure, host).await?;
+    let (wire, key) = send_request_observed(url, config, &body, bound, deadline, exposure, host, cpu).await?;
     if requesting {
         let encoded = cpu
             .run_tool(

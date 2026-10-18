@@ -1,5 +1,18 @@
 # Borg Runtime v2 And Duvet Cap
 
+## Memory Notification Retirement
+
+The wire18 successor removes automatic shared-memory notification production and
+native/Codex delivery. Explicit shared-memory reads/writes, agent scope, revision
+conflicts and persistence remain. Question/review resolution and charter delivery
+remain separate. Historical notification records and exact operation receipts are
+retained; new notification operations refuse. This source change does not mean
+the deployed services have been upgraded. The earlier notification receipts below
+describe their original source, not a current delivery requirement. The current
+[source decision](../borg/spec/impl/v2/decisions.md#automatic-memory-notifications-removed-from-v2)
+and [compatibility disposition](../borg/spec/impl/v2/protocol.md#memory-notification-retirement)
+record the boundary.
+
 ## Runtime Repository
 
 The runtime repository is [mtoltonoai/borg-runtime](https://github.com/mtoltonoai/borg-runtime).

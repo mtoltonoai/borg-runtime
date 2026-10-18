@@ -40,11 +40,14 @@ struct Process {
 }
 impl Process {
     fn start(args: &[String], root: &Path, label: &str) -> Self {
+        Self::start_with_limits(args, root, label, &root.join("limits.json"))
+    }
+    fn start_with_limits(args: &[String], root: &Path, label: &str, limits: &Path) -> Self {
         let log = std::fs::File::create(root.join(format!("{label}.log"))).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_borg-runtime"))
             .args(args)
             .arg("--limits")
-            .arg(root.join("limits.json"))
+            .arg(limits)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", root)
@@ -193,6 +196,7 @@ struct Proxy {
     dropped: Arc<AtomicBool>,
     hide_lookup: Arc<AtomicBool>,
     registrations: Arc<AtomicU64>,
+    await_replies: Arc<Mutex<Vec<(String, String)>>>,
     cancel_before_tool: Arc<Mutex<Option<String>>>,
     seed_memory_before_tool: Arc<Mutex<Option<Value>>>,
     held_reply: Arc<Mutex<Option<Arc<HeldToolReply>>>>,
@@ -211,6 +215,8 @@ impl Proxy {
         let dropped = Arc::new(AtomicBool::new(false));
         let hide_lookup = Arc::new(AtomicBool::new(hide));
         let registrations = Arc::new(AtomicU64::new(0));
+        let await_replies = Arc::new(Mutex::new(Vec::new()));
+        let awaits = await_replies.clone();
         let cancel_before_tool = Arc::new(Mutex::new(None::<String>));
         let cancel = cancel_before_tool.clone();
         let seed_memory_before_tool = Arc::new(Mutex::new(None::<Value>));
@@ -224,8 +230,8 @@ impl Proxy {
             let mut joins = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
-                    accepted=listener.accept()=>{let(stream,_)=accepted.unwrap();let(upstream,client,d,h,regs,tool,cancel,seed,api,held)=(upstream.clone(),client.clone(),d.clone(),h.clone(),regs.clone(),drop_tool.clone(),cancel.clone(),seed.clone(),api.clone(),held.clone());joins.spawn(async move{
-                        let service=service_fn(move|request:HttpRequest<Incoming>|{let(upstream,client,d,h,regs,tool,cancel,seed,api,held)=(upstream.clone(),client.clone(),d.clone(),h.clone(),regs.clone(),tool.clone(),cancel.clone(),seed.clone(),api.clone(),held.clone());async move{
+                    accepted=listener.accept()=>{let(stream,_)=accepted.unwrap();let(upstream,client,d,h,regs,tool,cancel,seed,api,held,awaits)=(upstream.clone(),client.clone(),d.clone(),h.clone(),regs.clone(),drop_tool.clone(),cancel.clone(),seed.clone(),api.clone(),held.clone(),awaits.clone());joins.spawn(async move{
+                        let service=service_fn(move|request:HttpRequest<Incoming>|{let(upstream,client,d,h,regs,tool,cancel,seed,api,held,awaits)=(upstream.clone(),client.clone(),d.clone(),h.clone(),regs.clone(),tool.clone(),cancel.clone(),seed.clone(),api.clone(),held.clone(),awaits.clone());async move{
                             let path=request.uri().path().to_owned();let caller=request.headers().get("x-borg-caller").cloned();let version=request.headers().get("mcp-protocol-version").cloned();
                             let bytes=request.into_body().collect().await.unwrap().to_bytes();let value:Value=serde_json::from_slice(&bytes).unwrap();
                             if path=="/mcp" && value["method"]=="tools/call" {
@@ -238,7 +244,32 @@ impl Proxy {
                             let mut req=client.post(format!("{upstream}{path}")).header("content-type","application/json").body(bytes.to_vec());if let Some(c)=caller{req=req.header("x-borg-caller",c);}if let Some(v)=version{req=req.header("mcp-protocol-version",v);}
                             let response=req.send().await.map_err(io::Error::other)?;let status=response.status();let bytes=response.bytes().await.map_err(io::Error::other)?;
                             if path=="/api/operations" && value["operation"]=="register_worker" && serde_json::from_slice::<Value>(&bytes).unwrap()["status"]=="ok" {regs.fetch_add(1,Ordering::SeqCst);}
-                            if path=="/mcp" && value["method"]=="tools/call" && tool.as_ref().is_some_and(|s|value["params"]["name"]==*s) && !d.swap(true,Ordering::SeqCst){return Ok(Response::builder().status(503).body(Full::new(Bytes::new())).unwrap());}
+                            if path=="/api/operations" && value["operation"]=="await_commands" && status.is_success() {
+                                let original: Request = serde_json::from_value(value.clone()).unwrap();
+                                let reply: Reply = serde_json::from_slice(&bytes).unwrap();
+                                assert_eq!(reply.request_id, original.request_id);
+                                reply.validate_for(&original.command).unwrap();
+                                if matches!(reply.outcome, Outcome::Ok { data: Data::Commands(_) } | Outcome::Pending { .. }) {
+                                    let Operation::AwaitCommands {worker_id, incarnation, ..} = original.command else {unreachable!()};
+                                    awaits.lock().unwrap().push((worker_id, incarnation));
+                                }
+                            }
+                            if path=="/mcp" && value["method"]=="tools/call" && tool.as_ref().is_some_and(|s|value["params"]["name"]==*s) && !d.swap(true,Ordering::SeqCst){
+                                assert_eq!(status, reqwest::StatusCode::OK);
+                                let original: Value = serde_json::from_slice(&bytes).unwrap();
+                                assert_eq!(original["id"], value["id"]);
+                                assert_eq!(original["result"]["isError"], false);
+                                let committed: borg_runtime::mcp::CallResult = serde_json::from_str(
+                                    original["result"]["content"][0]["text"].as_str().unwrap()
+                                ).unwrap();
+                                assert!(matches!(committed.reply.outcome, Outcome::Ok { .. }));
+                                assert_eq!(committed.reply.commit.as_ref().unwrap().operation_id,
+                                    value["params"]["_meta"]["borg"]["operation_id"].as_str().unwrap());
+                                // The canonical mutation completed. Lose its transport reply
+                                // before response headers, rather than returning an HTTP refusal.
+                                return Err(io::Error::new(io::ErrorKind::ConnectionAborted,
+                                    "controlled loss of committed MCP reply"));
+                            }
                             let held = { held.lock().unwrap().clone() };
                             if let Some(gate) = held.filter(|gate| path == "/mcp"
                                 && value["method"] == "tools/call"
@@ -263,6 +294,7 @@ impl Proxy {
             dropped,
             hide_lookup,
             registrations,
+            await_replies,
             cancel_before_tool,
             seed_memory_before_tool,
             held_reply,
@@ -275,6 +307,7 @@ struct Lab {
     address: String,
     url: String,
     limits: Arc<RuntimeLimits>,
+    worker_limits_file: PathBuf,
 }
 impl Lab {
     fn new(label: &str) -> Self {
@@ -291,6 +324,7 @@ impl Lab {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = l.local_addr().unwrap().to_string();
         Self {
+            worker_limits_file: root.join("limits.json"),
             root,
             url: format!("http://{address}"),
             address,
@@ -336,7 +370,7 @@ impl Lab {
         self.worker_with_codex(url, endpoint, inc, Path::new("/usr/bin/false"))
     }
     fn worker_with_codex(&self, url: &str, endpoint: &str, inc: &str, codex: &Path) -> Process {
-        Process::start(
+        Process::start_with_limits(
             &[
                 "worker".into(),
                 "--controller".into(),
@@ -354,14 +388,17 @@ impl Lab {
             ],
             &self.root,
             inc,
+            &self.worker_limits_file,
         )
     }
     fn input(&self, requests: u32) -> TaskInput {
-        TaskInput {
+        TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             repository_read: None,
             instruction: "Use the configured collaboration interface; return integer seven.".into(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(InferenceSettings::selected()),
                 execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -401,6 +438,40 @@ impl Lab {
         )
         .unwrap()
     }
+}
+/// Observe the exact persisted usage through the controller while it owns the
+/// exclusive SQLite connection. These charter fixtures each have one attempt;
+/// reject a truncated or different attempt instead of polling an external DB.
+async fn live_usage(api: &ApiClient, attempt: &Attempt) -> (u32, Option<i64>, Option<i64>) {
+    let reply = api
+        .call(Operation::QueryCollaboration {
+            query: borg_runtime::collaboration::Query::TaskAttempts {
+                task_id: attempt.task_id.clone(),
+                after: None,
+                limit: 1,
+            },
+        })
+        .await
+        .unwrap();
+    let Outcome::Ok {
+        data: Data::Collaboration(borg_runtime::collaboration::QueryResult::TaskAttempts(page)),
+    } = reply.outcome else {
+        panic!("canonical attempt usage required: {reply:?}")
+    };
+    assert!(page.next_cursor.is_none(), "usage query must contain the complete one-attempt fixture");
+    assert_eq!(page.items.len(), 1);
+    let saved = &page.items[0];
+    assert_eq!(saved.attempt.id, attempt.id);
+    assert_eq!(saved.attempt.task_id, attempt.task_id);
+    assert_eq!(saved.attempt.session_id, attempt.session_id);
+    assert_eq!(saved.attempt.generation, attempt.generation);
+    assert_eq!(saved.attempt.worker_id, attempt.worker_id);
+    assert_eq!(saved.attempt.worker_incarnation, attempt.worker_incarnation);
+    (
+        saved.reported_model_requests,
+        saved.input_tokens.map(|value| i64::try_from(value).unwrap()),
+        saved.output_tokens.map(|value| i64::try_from(value).unwrap()),
+    )
 }
 async fn submit(api: &ApiClient, input: TaskInput) -> Task {
     submit_identified(api, input, "submit-loop").await
@@ -465,46 +536,20 @@ async fn memory(api: &ApiClient) -> Outcome {
     .outcome
 }
 
-//= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-//# A memory-change notice MUST NOT initiate a model request by itself.
-// Controlled actual-controller/native case: exact three independently required
-// requests, two original tool results, and no notice-only continuation.
-// Traceability scope: After two actual native notice batches are appended and acknowledged, the durable session count remains the two explicit submissions.
-//= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-//= type=test
-//# Memory-change notices MUST NOT create a session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_memory_notices_cross_sessions_join_required_requests_and_preserve_tool_results() {
-    fn notices(request: &Value) -> Vec<Value> {
-        request["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|item| {
-                if item["role"] != "developer" {
-                    return None;
-                }
-                let value: Value = serde_json::from_str(item["content"].as_str()?).ok()?;
-                if value["type"] != "agent_memory_hints" {
-                    return None;
-                }
-                assert_eq!(value.as_object().unwrap().len(), 4);
-                assert!(
-                    value["instruction"]
-                        .as_str()
-                        .unwrap()
-                        .contains("collab_memory_get")
-                );
-                let hints = value["notices"].as_array().unwrap();
-                assert_eq!(hints.len(), 1);
-                assert_eq!(hints[0].as_object().unwrap().len(), 2);
-                assert_eq!(hints[0]["key"], "note");
-                assert!(hints[0].get("value").is_none());
-                assert!(!value.to_string().contains("writer-revision-"));
-                Some(value)
-            })
-            .collect()
+fn no_memory_notices(request: &Value) {
+    for item in request["input"].as_array().unwrap() {
+        if item["role"] == "developer" {
+            assert!(!item.to_string().contains("agent_memory_hints"),
+                "retired automatic memory notice reached the provider");
+        }
     }
+}
+
+// Controlled actual-controller/native case: explicit agent-scoped writes remain
+// visible through requested MCP reads, without an automatic context append,
+// model request, session, or delivery cursor advancement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_explicit_memory_cross_sessions_preserves_tool_results_without_notices() {
     fn tool_item(request: &Value, call_id: &str) -> Value {
         let items: Vec<_> = request["input"]
             .as_array()
@@ -533,7 +578,7 @@ async fn native_memory_notices_cross_sessions_join_required_requests_and_preserv
             .unwrap();
         assert!(matches!(reply.outcome, Outcome::Ok { .. }), "{reply:?}");
     }
-    let lab = Lab::new("cross-session-memory-notices");
+    let lab = Lab::new("cross-session-explicit-memory");
     let mut controller = lab.controller("controller").await;
     let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
     // Only the writer exists while this controlled API actor claims its slot.
@@ -624,11 +669,9 @@ async fn native_memory_notices_cross_sessions_join_required_requests_and_preserv
         let actor = writer_actor.clone();
         let saved_output = saved_output.clone();
         async move {
-            let hints = notices(&request);
+            no_memory_notices(&request);
             match index {
                 0 => {
-                    assert_eq!(hints.len(), 1);
-                    assert_eq!(hints[0]["notices"], json!([{"key":"note","revision":1}]));
                     assert!(!request["input"].to_string().contains("writer-revision-one"));
                     // Await this actual controller write before returning the first
                     // already-required provider response: no timing sleeps/proxy.
@@ -651,10 +694,6 @@ async fn native_memory_notices_cross_sessions_join_required_requests_and_preserv
                     Some(function(index, "collab_memory_get", json!({"key":"note"})))
                 }
                 1 => {
-                    assert_eq!(hints.len(), 2);
-                    assert_eq!(hints[0]["notices"], json!([{"key":"note","revision":1}]));
-                    assert_eq!(hints[1]["notices"], json!([{"key":"note","revision":2}]));
-                    assert_ne!(hints[0]["batch_id"], hints[1]["batch_id"]);
                     let original = tool_item(&request, "call-0");
                     let result: Value =
                         serde_json::from_str(original["output"].as_str().unwrap()).unwrap();
@@ -665,11 +704,10 @@ async fn native_memory_notices_cross_sessions_join_required_requests_and_preserv
                         json!({"answer":7,"source":"writer-revision-two"})
                     );
                     *saved_output.lock().unwrap() = Some(original);
-                    // A hint remains a hint: request another canonical read.
+                    // Only an explicit tool call reads the canonical value.
                     Some(function(index, "collab_memory_get", json!({"key":"note"})))
                 }
                 2 => {
-                    assert_eq!(hints.len(), 2, "no duplicate notice or extra model turn");
                     assert_eq!(
                         tool_item(&request, "call-0"),
                         saved_output.lock().unwrap().as_ref().unwrap().clone()
@@ -696,6 +734,7 @@ async fn native_memory_notices_cross_sessions_join_required_requests_and_preserv
     let accepted = until(&api, &reader.id, |t| t.status == TaskStatus::Succeeded).await;
     assert_eq!(accepted.result.as_ref().unwrap().output, Some(json!(7)));
     assert_eq!(peer.count(), 3);
+    assert!(!lab.state().join("memory-notices").exists());
     let attempt = accepted.attempt.as_ref().unwrap();
     assert_eq!(attempt.session_id, reader.session_id);
     let journal_dir = lab
@@ -740,19 +779,18 @@ async fn native_memory_notices_cross_sessions_join_required_requests_and_preserv
     assert!(get(&api, &writer.id).await.attempt.unwrap().stopped);
     controller.stop().await;
 
-    // Terminal callers cannot ObserveAgentMemory. Inspect durable state only
-    // after the controller has closed its exclusive SQLite connection.
+    // Inspect retained inert delivery fields only after the controller has
+    // closed its exclusive SQLite connection; explicit memory still persists.
     let db = rusqlite::Connection::open_with_flags(
         lab.root.join("tasks.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
-    // Only the two explicit writer/reader submissions may create sessions.
-    // Both notice batches have been appended and acknowledged above.
+    // Only the two explicit writer/reader submissions create sessions.
     let session_count: i64 = db
         .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(session_count, 2, "memory notices must not create a session");
+    assert_eq!(session_count, 2, "memory writes must not create a session");
     let (start, cursor, pending): (i64, i64, Option<String>) = db
         .query_row(
             "SELECT memory_start_seq,memory_cursor_seq,memory_pending FROM sessions WHERE id=?1",
@@ -768,11 +806,9 @@ async fn native_memory_notices_cross_sessions_join_required_requests_and_preserv
         .map(Result::unwrap)
         .collect();
     assert_eq!(writes.len(), 2);
-    assert!(start < writes[0] && writes[1] <= cursor);
-    assert!(
-        pending.is_none(),
-        "both actually submitted batches must be acknowledged"
-    );
+    assert!(start < writes[0] && writes[0] < writes[1]);
+    assert_eq!(cursor, start, "retired automatic delivery advanced its cursor");
+    assert!(pending.is_none(), "retired automatic delivery prepared a batch");
     drop(db);
     assert_eq!(lab.usage(&attempt.id), (3, Some(15), Some(6)));
 }
@@ -782,15 +818,23 @@ async fn native_collaboration_actual_read_write_read_final_and_lost_ack_restart(
     let lab = Lab::new("read-write");
     let mut c = lab.controller("controller-one").await;
     let peer = Peer::start(|index, request| {
+        no_memory_notices(request);
         assert_eq!(request["store"], false);
         assert_eq!(request["parallel_tool_calls"], false);
-        assert_eq!(request["tools"].as_array().unwrap().len(), 32);
+        assert_eq!(request["tools"].as_array().unwrap().len(), 33);
         assert!(
             request["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|tool| tool["name"] == "collab_limits_get")
+        );
+        assert!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "collab_definition_update")
         );
         match index {
             0 => Some(function(index, "collab_memory_get", json!({"key":"note"}))),
@@ -865,6 +909,9 @@ async fn native_collaboration_actual_read_write_read_final_and_lost_ack_restart(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(get(&api, &task.id).await, accepted);
+    assert!(matches!(memory(&api).await, Outcome::Ok { data: Data::Memory(Some(ref value)) }
+        if value.revision == 1 && value.value == json!({"answer":7})));
+    assert!(!lab.state().join("memory-notices").exists());
     assert_eq!(peer.count(), 4);
     w.stop().await;
     c.stop().await;
@@ -1022,12 +1069,18 @@ fn native_collaboration_profile_absence_roundtrips_and_ambiguities_refuse() {
         web_search: Some(NativeSearchProfile { max_tool_calls: 1 }),
     });
     assert!(borg_runtime::execution_profile::validate(&bad).is_err());
+    // The original unknown-kind specimen is now an explicitly supported profile.
+    let current_value = json!({"kind":"collaboration_v2"});
+    let current: ExecutionProfile = serde_json::from_value(current_value.clone()).unwrap();
+    assert_eq!(current, ExecutionProfile::CollaborationV2 { web_search: None });
+    assert_eq!(serde_json::to_value(current).unwrap(), current_value);
     for value in [
-        json!({"kind":"collaboration_v2"}),
+        json!({"kind":"unsupported_profile_fixture"}),
         json!({"kind":"collaboration_v1","unknown":true}),
         json!({"kind":"collaboration_v1","web_search":{"max_tool_calls":1,"extra":1}}),
     ] {
-        assert!(serde_json::from_value::<ExecutionProfile>(value).is_err());
+        let decoded = serde_json::from_value::<ExecutionProfile>(value.clone());
+        assert!(decoded.is_err(), "unsupported or ambiguous profile accepted: {value}; decoded={decoded:?}");
     }
 }
 
@@ -1090,6 +1143,7 @@ async fn native_collaboration_configured_child_quiesces_and_restarts_without_ano
     limits.model_requests = 1;
     limits.result_bytes = 8192;
     let repository_registration = borg_runtime::repository_catalogue::Registration {
+        pull_request_target: None,
         repository_id: "configured-child-repository".into(),
         registration_revision: "1".into(),
         display_name: "Configured child fixture".into(),
@@ -1119,9 +1173,11 @@ async fn native_collaboration_configured_child_quiesces_and_restarts_without_ano
         }
     ));
     input.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {
-        child: CodingTaskTemplate {
+        child: CodingTaskTemplate { instruction_source: None,
+            pull_request: None,
             instruction_prefix: "Bounded configured child".into(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(InferenceSettings::selected()),
                 execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -1130,6 +1186,7 @@ async fn native_collaboration_configured_child_quiesces_and_restarts_without_ano
                 executor: ExecutorKind::Coding,
             },
             repository: Repository {
+                pull_request_target: None,
                 registration: Some(repository_registration.binding()),
                 url: String::new(),
                 start_commit: "a".repeat(40),
@@ -1722,16 +1779,12 @@ async fn native_failures_preserve_executor_and_never_launch_configured_coding_tr
     }
 }
 
-// Traceability scope: A canonical MCP read has committed while its exact reply
-// remains in flight to the real native worker. A same-agent write must not
-// cancel that invocation or replace its result; the notice joins the next
-// required request only after the original reply is released. This does not
-// hold computation inside the controller or qualify Codex-internal tools.
-//= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-//= type=test
-//# Memory-change notification delivery MUST NOT interrupt a tool that has begun execution.
+// A canonical MCP read has committed while its exact reply remains in flight
+// to the real native worker. A later same-agent write neither changes that
+// original result nor injects a notice into the next required request. This
+// does not hold computation inside the controller or qualify Codex tools.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
+async fn native_explicit_memory_write_preserves_in_flight_mcp_reply_without_notice() {
     async fn report(api: &ApiClient, attempt: &Attempt, id: &str, observation: Observation) {
         let reply = api
             .call(Operation::ObserveWorker {
@@ -1749,7 +1802,7 @@ async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
             .unwrap();
         assert!(matches!(reply.outcome, Outcome::Ok { .. }), "{reply:?}");
     }
-    let lab = Lab::new("notice-held-tool-reply");
+    let lab = Lab::new("explicit-memory-held-tool-reply");
     let mut controller = lab.controller("controller").await;
     let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
     let writer = submit_identified(&api, lab.input(1), "held-notice-writer").await;
@@ -1828,6 +1881,7 @@ async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
     let observed_by_peer = observed.clone();
     let held_by_peer = held.clone();
     let peer = Peer::start(move |index, request| {
+        no_memory_notices(request);
         match index {
             0 => Some(function(index, "collab_memory_get", json!({"key":"note"}))),
             1 => {
@@ -1844,14 +1898,6 @@ async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
                 let result: Value = serde_json::from_str(outputs[0].1["output"].as_str().unwrap()).unwrap();
                 assert_eq!(result["outcome"]["data"]["value"]["revision"], 1);
                 assert_eq!(result["outcome"]["data"]["value"]["value"], 1);
-                let notices: Vec<_> = items.iter().enumerate().filter_map(|(position, item)| {
-                    if item["role"] != "developer" { return None; }
-                    let value: Value = serde_json::from_str(item["content"].as_str()?).ok()?;
-                    (value["type"] == "agent_memory_hints").then_some((position, value))
-                }).collect();
-                assert_eq!(notices.len(), 1);
-                assert!(notices[0].0 > outputs[0].0, "notice must follow the original completed tool result");
-                assert_eq!(notices[0].1["notices"], json!([{"key":"note","revision":2}]));
                 *observed_by_peer.lock().unwrap() = Some(expected);
                 Some(final_value())
             }
@@ -1911,20 +1957,9 @@ async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
         })
         .await
         .unwrap();
-    let Outcome::Ok {
-        data: Data::AgentMemory(observation),
-    } = observation.outcome
-    else {
-        panic!("memory observation missing")
-    };
-    assert!(observation.pending.is_none());
-    assert_eq!(
-        observation.available.unwrap().notices,
-        vec![borg_runtime::collaboration::AgentMemoryNotice {
-            key: "note".into(),
-            revision: 2
-        }]
-    );
+    assert!(matches!(observation.outcome, Outcome::Refused { code, message }
+        if code == "disabled" && message == "automatic shared-memory change notifications are retired"));
+    assert!(observation.commit.is_none(), "retired Observe must remain read only");
     // The operation is committed, but the worker's tool future is still held.
     // Give the concurrent controller/worker wake path a finite opportunity to act.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1935,13 +1970,13 @@ async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
     assert_eq!(
         peer.count(),
         1,
-        "pending notice released another model request while the tool was in flight"
+        "memory write released another model request while the tool was in flight"
     );
     assert!(!held.released.load(Ordering::SeqCst));
     assert_eq!(
         std::fs::read(&journal_path).unwrap(),
         before,
-        "notice changed the unresolved original tool journal"
+        "memory write changed the unresolved original tool journal"
     );
     held.release.notify_one();
 
@@ -1952,6 +1987,7 @@ async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
     .await;
     assert_eq!(peer.count(), 2);
     assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+    assert!(!lab.state().join("memory-notices").exists());
     assert_eq!(accepted.result.as_ref().unwrap().output, Some(json!(7)));
     let journal: Value = serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
     assert_eq!(journal["consumed"], true);
@@ -1987,3 +2023,349 @@ async fn native_pending_notice_preserves_in_flight_mcp_reply_before_delivery() {
     controller.stop().await;
     assert_eq!(lab.usage(&reader_attempt.id), (2, Some(10), Some(4)));
 }
+
+// Controlled Responses peer, actual native worker and MCP/controller: the
+// permitted update affects a later task while the calling attempt stays pinned.
+// No real provider, automatic diagnostic scheduling or deployment is exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_definition_update_consumes_original_receipt_and_changes_only_later_work() {
+    definition_update_native_consumer(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_definition_update_retains_old_worker_policy_with_new_task_snapshots() {
+    definition_update_native_consumer(Some(include_bytes!(
+        "fixtures/definition-update-old-worker-limits.json"
+    )))
+    .await;
+}
+
+async fn definition_update_native_consumer(old_worker_bytes: Option<&[u8]>) {
+    let mut lab = Lab::new(if old_worker_bytes.is_some() {
+        "definition-update-mixed-metadata"
+    } else {
+        "definition-update-consumer"
+    });
+    let startup_limits = if let Some(bytes) = old_worker_bytes {
+        let old = RuntimeLimits::parse(bytes).unwrap();
+        assert!(old.definition_updates.is_none());
+        assert!(!serde_json::from_slice::<Value>(bytes)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("definition_updates"));
+        assert_ne!(old.revision, lab.limits.revision);
+        lab.worker_limits_file = lab.root.join("old-worker-limits.json");
+        std::fs::write(&lab.worker_limits_file, bytes).unwrap();
+        old
+    } else {
+        (*lab.limits).clone()
+    };
+    let selected_worker_bytes = std::fs::read(&lab.worker_limits_file).unwrap();
+    let expected_retained_bytes = serde_json::to_vec(&startup_limits).unwrap();
+    let retained_limits_path = lab.state().join("limits.json");
+    let old_max = lab.limits.execution.native.max_output_tokens;
+    let new_max = old_max.checked_add(1).unwrap();
+    let policy = lab.limits.definition_updates.as_ref().unwrap().clone();
+    assert!(policy
+        .allowed_fields
+        .contains(&borg_runtime::limits::DefinitionLimitField::NativeMaxOutputTokens));
+    let mut controller = lab.controller("definition-controller-one").await;
+    let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
+    let original = submit_identified(&api, lab.input(2), "definition-caller").await;
+    let original_input = serde_json::to_vec(&original.input).unwrap();
+    assert_eq!(
+        *original
+            .input
+            .resolved_limits
+            .as_ref()
+            .unwrap()
+            .global_metadata,
+        *lab.limits
+    );
+    assert!(original
+        .input
+        .resolved_limits
+        .as_ref()
+        .unwrap()
+        .global_metadata
+        .definition_updates
+        .is_some());
+    let expected_journal_limits = serde_json::to_value(&*lab.limits).unwrap();
+    let args = json!({
+        "agent_id": original.input.definition.id,
+        "expected_revision": original.input.definition.revision,
+        "expected_global_revision": lab.limits.revision,
+        "expected_policy_revision": policy.revision,
+        "changes": {"native.max_output_tokens": new_max}
+    });
+    let journal_root = lab.state().join("collaboration");
+    let caller_task_id = original.id.clone();
+    let retained = Arc::new(Mutex::new(None));
+    let observed = retained.clone();
+    let peer = Peer::start(move |index, request| {
+        assert_eq!(
+            request["max_output_tokens"],
+            if index < 2 { old_max } else { new_max }
+        );
+        assert!(request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "collab_definition_update"));
+        match index {
+            0 => Some(function(index, "collab_definition_update", args.clone())),
+            1 => {
+                let outputs: Vec<_> = request["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item["type"] == "function_call_output")
+                    .collect();
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0]["call_id"], "call-0");
+                let mut attempts = std::fs::read_dir(&journal_root).unwrap();
+                let path = attempts
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path()
+                    .join("0000000001.json");
+                assert!(attempts.next().is_none());
+                let bytes = std::fs::read(&path).unwrap();
+                let journal: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(journal["limits"], expected_journal_limits);
+                assert_eq!(journal["consumed"], true);
+                let call: borg_runtime::mcp::Invocation =
+                    serde_json::from_value(journal["request"]["input"]["call"].clone()).unwrap();
+                assert_eq!(call.caller.task_id, caller_task_id);
+                assert_eq!(
+                    call.operation_id,
+                    format!("native-collab-{}-1", call.caller.attempt_id)
+                );
+                assert_eq!(call.logical_call_id, "call-0");
+                assert_eq!(call.tool, "collab_definition_update");
+                assert_eq!(call.arguments, args);
+                let exact = json!({
+                    "operation_id": call.operation_id,
+                    "logical_call_id": call.logical_call_id,
+                    "outcome": journal["outcome"],
+                    "commit": journal["outcome_context"]["commit"]
+                });
+                assert_eq!(outputs[0]["output"], exact.to_string());
+                assert_eq!(exact["commit"]["operation_id"], call.operation_id);
+                let outcome: Outcome = serde_json::from_value(exact["outcome"].clone()).unwrap();
+                let Outcome::Ok {
+                    data: Data::DefinitionUpdate(update),
+                } = outcome
+                else {
+                    panic!("definition update did not commit an application outcome")
+                };
+                assert_eq!(
+                    update.previous_revision,
+                    args["expected_revision"].as_str().unwrap()
+                );
+                assert_eq!(update.effective_for, ConfigurationEffect::FutureSubmissions);
+                assert_eq!(update.classification, ConfigurationChangeClass::Widening);
+                assert_eq!(
+                    update.changed_fields,
+                    vec![borg_runtime::limits::DefinitionLimitField::NativeMaxOutputTokens]
+                );
+                assert_ne!(
+                    update.selected_definition.revision,
+                    update.previous_revision
+                );
+                *observed.lock().unwrap() = Some((call, exact, update, path, bytes));
+                Some(final_value())
+            }
+            2 => {
+                assert!(!request["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output"));
+                Some(final_value())
+            }
+            _ => panic!("definition change added an unplanned model request"),
+        }
+    })
+    .await;
+    let proxy = Proxy::start(
+        lab.url.clone(),
+        Some("collab_definition_update"),
+        false,
+        lab.limits.clone(),
+    )
+    .await;
+    let mut worker = lab.worker(&proxy.url, &peer.endpoint, "definition-worker-one");
+    let first = until(&api, &original.id, |task| {
+        task.status == TaskStatus::Succeeded
+            && task.attempt.as_ref().is_some_and(|attempt| attempt.stopped)
+    })
+    .await;
+    assert_eq!(first.result.as_ref().unwrap().output, Some(json!(7)));
+    assert!(!first.attempt.as_ref().unwrap().uncertain);
+    assert_eq!(serde_json::to_vec(&first.input).unwrap(), original_input);
+    assert!(proxy.dropped.load(Ordering::SeqCst));
+    assert_eq!(peer.count(), 2);
+    let (call, exact, update, journal_path, journal_bytes) =
+        retained.lock().unwrap().clone().unwrap();
+    assert_eq!(update.global_revision, lab.limits.revision);
+    assert_eq!(update.policy, policy);
+    let mut expected_definition = original.input.definition.clone();
+    expected_definition.revision = update.selected_definition.revision.clone();
+    let mut native = original.input.execution_limits().unwrap().native.clone();
+    native.max_output_tokens = new_max;
+    expected_definition.limit_overrides =
+        Some(Box::new(borg_runtime::limits::ExecutionLimitOverrides {
+            native: Some(native),
+            ..Default::default()
+        }));
+    assert_eq!(update.selected_definition, expected_definition);
+    let retained_worker_bytes = std::fs::read(&retained_limits_path).unwrap();
+    assert_eq!(retained_worker_bytes, expected_retained_bytes);
+    assert_eq!(
+        RuntimeLimits::parse(&retained_worker_bytes).unwrap(),
+        startup_limits
+    );
+    assert_eq!(
+        std::fs::read(&lab.worker_limits_file).unwrap(),
+        selected_worker_bytes
+    );
+    worker.stop().await;
+    controller.stop().await;
+
+    let mut controller = lab.controller("definition-controller-two").await;
+    assert_eq!(get(&api, &original.id).await, first);
+    let selected = match api
+        .call(Operation::GetAgent {
+            agent_id: original.assigned_agent_id.clone(),
+        })
+        .await
+        .unwrap()
+        .outcome
+    {
+        Outcome::Ok {
+            data: Data::Agent(agent),
+        } => agent.definition,
+        other => panic!("selected definition unavailable: {other:?}"),
+    };
+    assert_eq!(selected, update.selected_definition);
+    let lookup = api
+        .call(Operation::GetCollaborationCall {
+            caller: call.caller.clone(),
+            operation_id: call.operation_id.clone(),
+        })
+        .await
+        .unwrap();
+    let recovered = borg_runtime::mcp::recovered(&call, lookup).unwrap();
+    assert_eq!(
+        serde_json::to_value(&recovered.reply.outcome).unwrap(),
+        exact["outcome"]
+    );
+    assert_eq!(
+        serde_json::to_value(&recovered.reply.commit).unwrap(),
+        exact["commit"]
+    );
+    let mut next_input = lab.input(1);
+    next_input.definition = selected;
+    let later = submit_identified(&api, next_input, "definition-later").await;
+    let mut expected_limits = original.input.execution_limits().unwrap().clone();
+    expected_limits.native.max_output_tokens = new_max;
+    assert_eq!(later.input.execution_limits().unwrap(), &expected_limits);
+    assert_eq!(
+        later
+            .input
+            .resolved_limits
+            .as_ref()
+            .unwrap()
+            .global_metadata,
+        original
+            .input
+            .resolved_limits
+            .as_ref()
+            .unwrap()
+            .global_metadata
+    );
+    let assigned = api
+        .call(Operation::AssignTask {
+            operation_id: "assign-definition-later".into(),
+            task_id: later.id.clone(),
+            expected_revision: later.revision,
+            agent_id: later.assigned_agent_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(assigned.outcome, Outcome::Ok { data: Data::Task(ref task) } if task.input == later.input)
+    );
+    assert_eq!(
+        std::fs::read(&retained_limits_path).unwrap(),
+        retained_worker_bytes
+    );
+    let mut worker = lab.worker(&proxy.url, &peer.endpoint, "definition-worker-two");
+    let completed = until(&api, &later.id, |task| {
+        task.status == TaskStatus::Succeeded
+            && task.attempt.as_ref().is_some_and(|attempt| attempt.stopped)
+    })
+    .await;
+    assert_eq!(completed.input, later.input);
+    assert_eq!(completed.result.as_ref().unwrap().output, Some(json!(7)));
+    assert!(!completed.attempt.as_ref().unwrap().uncertain);
+    assert_eq!(get(&api, &original.id).await, first);
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_bytes);
+    assert_eq!(
+        std::fs::read(&retained_limits_path).unwrap(),
+        retained_worker_bytes
+    );
+    assert_eq!(
+        std::fs::read(&lab.worker_limits_file).unwrap(),
+        selected_worker_bytes
+    );
+    assert_eq!(peer.count(), 3);
+    worker.stop().await;
+    controller.stop().await;
+    assert_eq!(
+        lab.usage(&first.attempt.as_ref().unwrap().id),
+        (2, Some(10), Some(4))
+    );
+    assert_eq!(
+        lab.usage(&completed.attempt.as_ref().unwrap().id),
+        (1, Some(5), Some(2))
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        lab.root.join("tasks.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM definitions WHERE id=?1",
+            [&original.assigned_agent_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM receipts WHERE id=?1",
+            [&call.operation_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[path = "native/workflow_join.rs"]
+mod workflow_join;
+
+#[path = "native/charter_worker.rs"]
+mod charter_worker;
+
+#[path = "native/http_route_stack.rs"]
+mod http_route_stack;
+
+#[path = "native/task_reassignment.rs"]
+mod task_reassignment;

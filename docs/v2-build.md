@@ -4,7 +4,10 @@
 pinned official source archive. It uses existing system Python, GCC 13.3.0,
 Binutils 2.42, pkgconf 1.8.1 and the exact selected Rust/Cargo 1.99 binaries. It
 installs nothing and changes no global configuration. The selected inputs are
-specified in the sibling Borg repository's `spec/impl/v2/dependency-profile.md`.
+specified in the separate Borg specification repository's
+`spec/impl/v2/dependency-profile.md`; the build tool carries their exact pins and
+does not require a sibling specification checkout. Resolve any required source
+instructions as described in the runtime repository's `AGENTS.md`.
 
 The runtime checkout must contain its ordinary `Cargo.lock`. Use the existing
 managed Cargo registry and its normal configured access; this tool does not
@@ -98,3 +101,26 @@ subdirectory. Source changes, provider requests, browser acceptance and rollout
 are separate operations. A local successful build does not authorize deployment,
 prove the four-host capacity target, or replace the protected checker and final
 human rollout approval required by the implementation specification.
+
+## Local qualification test-image lifetime
+
+On the coordinator host, the selected local packet is
+`artifacts/v2/parallel-integration-o1p7h0uc/release/test-image-retention-lifecycle-01/ordinary-workflow-successor.json`.
+Its pinned `ordinary_workflow.py` delegates compilation and tests to the existing
+runner with the same profile and bounds. The selected root adoption receipt
+binds the standing policy; this local artifact path is not a dependency for
+workers or other checkouts.
+
+Use the owned compiler test output directly instead of making an always-retained
+copy. After tests and any required review finish, invoke the workflow's mandatory
+`finish` command. It automatically retires eligible test payloads under the
+standing policy, with no new per-payload approval. Keep source/build identities,
+hashes, logs, results and retirement receipts. Historical evidence checks accept
+explicit retirement records for released test payloads; execution still requires
+the exact live image.
+
+Keep a payload only for a named active consumer or pending candidate, deployed
+or rollback use, with an owner and reference that can release the hold. Runtime
+and package images are outside this test-payload finalizer. Reconstructible
+compiler caches remain a separate bounded local resource policy. This workflow
+does not change worker product cleanup, runtime features or package policy.

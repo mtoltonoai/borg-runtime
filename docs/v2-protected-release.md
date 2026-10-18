@@ -15,12 +15,20 @@ current eligibility. The browser has no protected mutation controls.
 The controller accepts `--protected-release-config /absolute/operator/config.json`.
 Without this option, protected operations remain unavailable. The configuration
 is closed JSON corresponding to `protected_release::Config`: socket path; actual
-worker UIDs; distinct checker, repository, human and rollout producer UIDs/IDs;
+worker UIDs; distinct checker, repository, human and rollout producer IDs;
 policy and recipe digest; mandatory check names and finite freshness bound;
 canonical repository identity and local bare Git directory; exact target ref;
 deployment target/revision and current installed package digest; retained-record
 capacity. A missing role cannot produce that role's receipt. No default accepting
 producer or target is supplied.
+
+A trusted operator UID may be explicitly listed for several distinct logical
+roles. Each producer ID and each UID/role pair is unique; worker/execution UIDs
+remain excluded. The command selects its configured typed role, not the first
+role listed for that UID. The historical receipt retains ID, UID and role;
+removing a role does not transfer its receipts to another role. This models a
+trusted operator, not isolation between that operator's own roles. Existing
+single-role configurations remain valid.
 
 The operator creates a protected socket directory and read-protected configuration
 outside worker write access. The runtime refuses aliased or broadly writable
@@ -333,3 +341,25 @@ without changing the configured recipe digest. The full built artifact must
 match that candidate before journey qualification. Existing additional required
 checks, configured protected identities and final human rollout authority remain
 separate. The local generated build/journey receipt is not protected-host proof.
+
+## Fixed operator exchange over existing SSH
+
+`exchange-stdio` is a one-request transport endpoint for existing operator
+commands. It does not accept raw Check or internal finish/observation commands.
+The local caller retains its original request before invoking the fixed endpoint.
+On an unknown outcome it queries that original receipt; it does not replace the
+operation identity or repeat a rollout effect.
+
+The invocation supplies `--config`, `--config-sha256`, `--module-sha256`,
+`--python-sha256`, `--max-bytes`, and `--timeout-ms`. The installed helper verifies
+those exact bytes, its actual producer UID and the kernel controller UID. It
+reads one bounded JSON request through EOF and writes one bounded JSON reply,
+under one deadline. Explicit positive byte/timeout metadata is preserved; the
+local client's default values are not remote ceilings. Existing private-protocol
+frame representation and the controller's selected admission bounds still apply.
+Invocation alone does not create a grant or a successful Check.
+
+This is an operator-owned existing-SSH join. It does not install accounts,
+services, routes, keys or credentials. A worker must not be able to invoke the
+operator's selected transport. A remote error or lost output is an unknown
+outcome, not evidence of refusal before commit.

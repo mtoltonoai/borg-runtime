@@ -5,15 +5,55 @@
 it never repeats install/start/stop, even when a prior response was lost.
 """
 from __future__ import annotations
-import argparse, hashlib, importlib.util, json, os, shlex, sys
+import argparse, hashlib, importlib.util, json, os, shlex, stat, sys
 from pathlib import Path
-_COMMON_SHA = '036041acb527b629e08f2f71749f6015b4ce8851cbba6a8fbceeec3688677868'
+_COMMON_SHA = 'e0cbc1b20eeb19aded6c88fc42191982bd1614218baa66d90367d42dedd37156'
 
 def _common():
     p=Path(__file__).with_name('rollout_common_v2.py');raw=p.read_bytes()
     if hashlib.sha256(raw).hexdigest()!=_COMMON_SHA:raise ValueError('installed rollout common changed')
     m=importlib.util.module_from_spec(importlib.util.spec_from_file_location('rollout_common_v2',p));exec(compile(raw,str(p),'exec'),m.__dict__);return m
 c=_common()
+
+
+def verified_task_context(preflight_raw, result):
+    preflight=c.strict(preflight_raw)
+    if result['tasks']!=preflight['tasks']:raise ValueError('cleanup_complete_original_tasks_changed')
+    return result['tasks'],{'original_preflight_sha256':c.digest(preflight_raw),
+        'current_controller_proof_sha256':c.digest(c.canonical(result))}
+
+
+def project_cleanup_authority(host, context):
+    if context is None:raise ValueError('cleanup_controller_proof_required_first')
+    tasks,binding=context;projected={}
+    for task_id,task in tasks.items():
+        attempt=task.get('attempt')
+        if attempt is None or attempt.get('worker_id')!=host['api']['worker_id']:continue
+        if task['id']!=task_id or task['status'] not in ('succeeded','failed','cancelled'):raise ValueError('cleanup_canonical_task_identity')
+        result=task.get('result')
+        projected[task_id]={'id':task_id,'session_id':task['session_id'],'assigned_agent_id':task['assigned_agent_id'],
+            'status':task['status'],'input_sha256':c.digest(c.canonical(task['input'])),
+            'attempt':attempt,'selected_checkpoint':task.get('selected_checkpoint'),
+            'result_binding':None if result is None else {'attempt_id':result['attempt_id'],'checkpoint':result.get('checkpoint')},
+            'task_sha256':c.digest(c.canonical(task))}
+    return {'worker_id':host['api']['worker_id'],'workspace_root':str(Path(host['state']['root']).parent.parent),
+        'tasks':projected,'binding':binding}
+
+
+def saved_proof(path,bound,expected):
+    """Recheck the exact durable private proof before publishing its reference."""
+    path=c.protected(path)
+    identity=lambda m:(m.st_dev,m.st_ino,m.st_uid,m.st_gid,m.st_mode,m.st_nlink,m.st_size,m.st_mtime_ns,m.st_ctime_ns)
+    before=path.lstat()
+    if before.st_uid!=os.geteuid() or stat.S_IMODE(before.st_mode)!=0o600 or before.st_size>bound:raise ValueError('saved_proof_metadata')
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        if identity(os.fstat(fd))!=identity(before):raise ValueError('saved_proof_open_race')
+        with os.fdopen(fd,'rb',closefd=False) as stream:raw=stream.read(bound+1)
+        if len(raw)>bound or len(raw)!=before.st_size or identity(os.fstat(fd))!=identity(before) or identity(path.lstat())!=identity(before):raise ValueError('saved_proof_changed')
+    finally:os.close(fd)
+    if raw!=c.canonical(expected):raise ValueError('saved_proof_content_changed')
+    return {'path':str(path),'bytes':len(raw),'sha256':c.digest(raw)}
 
 
 class Refused(ValueError):
@@ -29,19 +69,44 @@ class Rollout:
         self.producer=c.load_module('rollout_producer',profile['modules']['producer'],self.l['module_bytes'])
         raw=c.pin(profile['producer'],self.profile_bytes);self.config=c.strict(raw)
         c.fields(self.config,'socket server_uid producer_uid policy recipe_sha256 valid_for_ms','producer')
-        if self.config['producer_uid']!=os.geteuid() or self.config['policy']!=subject['policy']:raise ValueError('producer UID/policy mismatch')
+        self.producer_host=None
+        if 'producer_transport' in profile:
+            self.producer_host=next(h for h in profile['hosts'] if h['id']==profile['producer_transport']['host_id'])
+        actual_uid=self.producer_host['helper_uid'] if self.producer_host else os.geteuid()
+        if self.config['producer_uid']!=actual_uid or self.config['policy']!=subject['policy']:raise ValueError('producer UID/policy mismatch')
         self.controller=c.strict(c.pin(profile['controller_config'],self.profile_bytes))
         for k in ('socket','policy','recipe_sha256'):
             if self.controller[k]!=self.config[k]:raise ValueError('actual controller configuration differs')
         for k in ('repository','target_ref','deployment_target','target_revision','installed_package_sha256','policy'):
             if self.controller[k]!=subject[k]:raise ValueError('controller subject differs')
-        if not any(x['uid']==os.geteuid() and x['role']=='rollout' for x in self.controller['producers']) or os.geteuid() in self.controller['worker_uids']:raise ValueError('configured rollout authority unavailable')
-        self.producer_identity=next(x for x in self.controller['producers'] if x['uid']==os.geteuid() and x['role']=='rollout')
+        if not any(x['uid']==actual_uid and x['role']=='rollout' for x in self.controller['producers']) or actual_uid in self.controller['worker_uids']:raise ValueError('configured rollout authority unavailable')
+        self.producer_identity=next(x for x in self.controller['producers'] if x['uid']==actual_uid and x['role']=='rollout')
         self.work=Path(profile['state_root'])/('action-'+c.digest(action_id.encode()));self.original=None
     def exchange(self,q):
         remaining=min(self.l['transport_timeout_ms'],self.end-c.now_ms())
         if remaining<=0:raise ValueError('operation deadline before protected transport')
-        return self.producer.exchange(self.config,q,max_bytes=self.l['transport_bytes'],timeout_ms=remaining)
+        if self.producer_host is None:
+            return self.producer.exchange(self.config,q,max_bytes=self.l['transport_bytes'],timeout_ms=remaining)
+        raw=c.canonical(q)
+        bound=self.l['transport_bytes']
+        if len(raw)>bound:raise ValueError('remote producer request bound')
+        h=self.producer_host;transport=self.p['producer_transport'];module=self.p['modules']['producer']
+        c.pin(self.p['producer'],self.profile_bytes);c.pin(module,self.l['module_bytes'])
+        c.pin(h['transport']['ssh_config'],self.profile_bytes)
+        for item in self.p['transport_tools'].values():c.pin(item,self.l['module_bytes'])
+        c.pin(self.p['python'],self.l['module_bytes'])
+        remaining=min(remaining,self.end-c.now_ms())
+        if remaining<=0:raise ValueError('operation deadline before remote producer')
+        remote=[self.p['python']['path'],'-I','-S','-B',module['path'],'exchange-stdio',
+                '--config',transport['config_path'],'--config-sha256',self.p['producer']['sha256'],
+                '--module-sha256',module['sha256'],'--python-sha256',self.p['python']['sha256'],
+                '--max-bytes',str(bound),'--timeout-ms',str(remaining)]
+        argv=['/usr/bin/ssh','-F',h['transport']['ssh_config']['path'],'-T','-o','BatchMode=yes','-o','ControlMaster=no','-o','ControlPath=none',h['transport']['alias'],
+              shlex.join(['/usr/bin/sudo','-n','/usr/bin/env','-i','PATH=/usr/bin:/bin',*remote])]
+        limits={**self.l,'command_timeout_ms':min(self.l['command_timeout_ms'],remaining),'command_output_bytes':min(self.l['command_output_bytes'],bound)}
+        reply=c.run(argv,limits,min(self.end,c.now_ms()+remaining),raw)
+        if len(reply)>bound:raise ValueError('remote producer reply bound')
+        return c.strict(reply)
     def read_action(self):
         q={'revision':1,'operation_id':self.action_id+':action-read','command':{'operation':'get_action','input':{'action_id':self.action_id}}}
         reply=self.exchange(q)
@@ -85,6 +150,10 @@ class Rollout:
     def host(self,h,phase,recovery=False):
         request={'revision':1,'action_id':self.action_id,'subject':self.s,'profile_path':h['profile_path'],'profile_sha256':self.sha,'profile_bytes':self.profile_bytes,'phase':phase,
                  'dispatch_until_ms':self.original['dispatch_until_ms'] if self.original else 0,'deadline_ms':self.end}
+        if phase=='inspect' and h['role']=='worker':
+            stop=c.strict(c.read(self.work/('stop-'+c.digest(h['id'].encode())+'.result.json'),self.l['receipt_bytes'],True))
+            if stop.get('cleanup_records'):
+                request['cleanup_authority']=project_cleanup_authority(h,getattr(self,'_cleanup_controller_context',None))
         key=phase+'-'+c.digest(h['id'].encode());path=self.work/(key+'.request.json');out=self.work/(key+'.result.json')
         mutating=phase in ('stop','install','start')
         if mutating and path.exists():raise ValueError('possible host effect; read-only reconciliation required')
@@ -93,20 +162,30 @@ class Rollout:
         if h['transport']['kind']=='ssh':
             c.pin(h['transport']['ssh_config'],self.profile_bytes)
             argv=['/usr/bin/ssh','-F',h['transport']['ssh_config']['path'],'-T','-o','BatchMode=yes','-o','ControlMaster=no','-o','ControlPath=none',h['transport']['alias'],shlex.join(['/usr/bin/sudo','-n','/usr/bin/env','-i','PATH=/usr/bin:/bin',*argv])]
-        raw=c.run(argv,self.l,self.end,c.canonical(request))
+        request_raw=c.canonical(request)
+        if len(request_raw)>self.l['transport_bytes']:raise ValueError('host request bound')
+        raw=c.run(argv,self.l,self.end,request_raw)
         if len(raw)>self.l['transport_bytes']:raise ValueError('host response bound')
         result=c.strict(raw)
         if not out.exists():c.save(out,result,self.l['receipt_bytes'])
         elif recovery:
             n=len(list(self.work.glob(key+'.readback-*.json')))
             if len(list(self.work.iterdir()))>=self.l['state_entries']:raise ValueError('readback inventory bound')
-            c.save(self.work/(key+'.readback-'+str(n)+'.json'),result,self.l['receipt_bytes'])
+            out=self.work/(key+'.readback-'+str(n)+'.json')
+            c.save(out,result,self.l['receipt_bytes'])
         elif c.strict(c.read(out,self.l['receipt_bytes'],True))!=result:raise ValueError('host observation changed')
+        if phase=='inspect':
+            if not hasattr(self,'_full_proof_paths'):self._full_proof_paths={}
+            self._full_proof_paths[h['id']]=out
         return result
     def final_readback(self,recovery=False):
         rows={};controller=next(h for h in self.p['hosts'] if h['role']=='controller')
-        before=c.strict(c.read(self.work/('preflight-'+c.digest(controller['id'].encode())+'.result.json'),self.l['receipt_bytes'],True))
-        for h in self.p['hosts']:
+        preflight_raw=c.read(self.work/('preflight-'+c.digest(controller['id'].encode())+'.result.json'),self.l['receipt_bytes'],True)
+        before=c.strict(preflight_raw)
+        self._cleanup_controller_context=None
+        # Workers receive only authority projected from this same complete,
+        # current controller proof, after exact original task-map equality.
+        for h in [controller,*[h for h in self.p['hosts'] if h['role']=='worker']]:
             # Read original remote phase receipts, never repeat an effect to
             # resolve a lost transport acknowledgment.
             row=self.host(h,'inspect',recovery)
@@ -120,8 +199,28 @@ class Rollout:
             prior=c.strict(c.read(self.work/('preflight-'+c.digest(h['id'].encode())+'.result.json'),self.l['receipt_bytes'],True))
             if row['artifact']!=self.s['artifact'] or row['metadata']!=prior['metadata']:raise ValueError('target artifact/preserved metadata differs')
             if h['role']=='controller' and row['tasks']!=before['tasks']:raise ValueError('complete original tasks changed')
+            if h['role']=='controller':self._cleanup_controller_context=verified_task_context(preflight_raw,row)
             rows[h['id']]=row
-        return rows
+        compact={}
+        for host_id,row in rows.items():
+            compact[host_id]={'full_proof':saved_proof(self._full_proof_paths[host_id],self.l['receipt_bytes'],row),
+                'service':row['service'],'artifact':row['artifact'],'registration':row['registration'],
+                'metadata_sha256':c.digest(c.canonical(row['metadata'])),
+                'tasks_sha256':c.digest(c.canonical(row['tasks'])),
+                'tasks_count':len(row['tasks']) if row['tasks'] is not None else None,
+                'worker_preserved_records':len(row['preserved_worker_state']),
+                'worker_preserved_sha256':c.digest(c.canonical(row['preserved_worker_state'])),
+                'cleanup_observations_sha256':c.digest(c.canonical(row['cleanup_observations'])),
+                'original_controller_receipts':len(row['preserved_controller_receipts']),
+                'controller_receipt_proof':row.get('controller_receipt_proof'),
+                'cleanup_capture_proof':row.get('cleanup_capture_proof'),
+                'cleanup_transition_proof':row.get('cleanup_transition_proof'),
+                'stop_marker_proof':row.get('stop_marker_proof'),
+                'reconciliation_scope':row['reconciliation_scope']}
+        if len(list(self.work.iterdir()))>=self.l['state_entries']:raise ValueError('proof reference inventory bound')
+        index=len(list(self.work.glob('verified-host-proof-references-*.json')))
+        c.save(self.work/('verified-host-proof-references-'+str(index)+'.json'),compact,self.l['receipt_bytes'])
+        return compact
     def observe(self,observed):
         return self.mutation('observe-applied' if observed else 'observe-unknown',{'operation':'observe_rollout','input':{'action_id':self.action_id,'subject':self.s,'installed_package_sha256':self.s['artifact']['package_sha256'] if observed else 'unknown','observed':observed}})
     def execute(self,mode):
@@ -143,8 +242,11 @@ class Rollout:
                 if mode=='apply':
                     current=self.read_action()
                     if current['state']!='prepared':raise ValueError('action is not freshly Prepared')
+                    if c.per_host_forward(self.p):c.format_contract(self.p)
                     for h in self.p['hosts']:
-                        if h['old_artifact']['package_sha256']!=self.s['installed_package_sha256']:raise ValueError('expected installed package differs across target')
+                        # The protected Subject anchors the controller baseline;
+                        # same-format workers retain their exact per-host baseline.
+                        if (h['role']=='controller' or c.forward(self.p) and not c.per_host_forward(self.p)) and h['old_artifact']['package_sha256']!=self.s['installed_package_sha256']:raise ValueError('expected installed package differs across target')
                         self.host(h,'preflight')
                     self.original_start()
                     controller=next(h for h in self.p['hosts'] if h['role']=='controller');workers=[h for h in self.p['hosts'] if h['role']=='worker']
@@ -165,10 +267,10 @@ class Rollout:
             except Exception as error:
                 # Do not invent cleanup/absence from local transport termination.
                 if isinstance(error,Refused) and self.original is None: result['status']='REFUSED_NO_HOST_EFFECT'
-                result['error']=str(error);result['remote_effect_and_cleanup']='unverified unless retained host phase/readback proves it'
+                result['error_detail']=c.error_record(error,mode);result['error']=result['error_detail']['code'];result['remote_effect_and_cleanup']='unverified unless retained host phase/readback proves it'
                 if self.original is not None:
                     try:result['observation']=self.observe(False)
-                    except Exception as e:result['observation_error']=str(e)
+                    except Exception as e:result['observation_error']=c.error_record(e,mode)
             name='result-'+str(len(list(self.work.glob('result-*.json'))))+'.json'
             if len(list(self.work.iterdir()))>=self.l['state_entries']:raise ValueError('operation receipt inventory bound')
             c.save(self.work/name,result,self.l['receipt_bytes']);return result
@@ -181,4 +283,4 @@ def main():
     print(json.dumps(value,sort_keys=True));return 0 if value['status']=='APPLIED' else 2
 if __name__=='__main__':
     try:sys.exit(main())
-    except Exception as e:print('protected rollout: '+str(e),file=sys.stderr);sys.exit(1)
+    except Exception as e:print(json.dumps({'rollout_error':c.error_record(e,'startup')},sort_keys=True),file=sys.stderr);sys.exit(1)

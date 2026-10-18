@@ -161,11 +161,13 @@ async fn browser_pagination_and_private_boundary_use_the_actual_http_adapter() {
     let mut ids = Vec::new();
     let mut sessions = std::collections::BTreeSet::new();
     for i in 0..51 {
-        let input = TaskInput {
+        let input = TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             repository_read: None,
             instruction: format!("page-fixture-{i:02}"),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(InferenceSettings::selected()),
                 execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),

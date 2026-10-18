@@ -328,6 +328,7 @@ async fn controlled_release_source(fixture: &Fixture, commit: &str) -> Task {
         Operation::RegisterRepository {
             operation_id: "register-protected-ui-fixture".into(),
             registration: crate::repository_catalogue::Registration {
+                pull_request_target: None,
                 repository_id: "protected-ui-fixture".into(),
                 registration_revision: "r1".into(),
                 display_name: "Protected UI source fixture".into(),
@@ -472,6 +473,128 @@ fn task_id(response: &UiResponse) -> &str {
         .strip_prefix("/tasks/")
         .unwrap()
 }
+async fn operator_fixture() -> Fixture {
+    let f = Fixture::new();
+    let (path, mut config, clock) = f.close().await;
+    let protected = config.protected_release.as_mut().unwrap();
+    for producer in &mut protected.producers {
+        producer.uid = 9000;
+    }
+    // Deliberately put neither the checker nor the human first.
+    protected.producers.rotate_left(1);
+    protected.validate(&config.limits.interface).unwrap();
+    let controller = Controller::open_with_config(&path, config.clone()).unwrap();
+    Fixture { controller, path, config, clock }
+}
+
+#[tokio::test]
+async fn one_trusted_operator_retains_typed_receipts_and_unknown_rollout_reconciliation() {
+    let f = operator_fixture().await;
+    let s = f.seed().await;
+    let check = Pc::Check(f.check(&s));
+    assert_eq!(f.p(9004, "worker-check", check.clone()).await.status, "unauthenticated");
+    assert_eq!(f.p(9005, "unknown-check", check.clone()).await.status, "unauthenticated");
+    assert_eq!(f.p(9000, "operator-check", check.clone()).await.status, "ok");
+    assert!(f.p(9000, "operator-check", check).await.replayed);
+    let grant = Pc::Grant {
+        subject: s.clone(), valid_until_ms: f.clock.load(Ordering::SeqCst) + 20_000,
+    };
+    assert_eq!(f.p(9000, "operator-grant", grant).await.status, "ok");
+    for (id, kind, grant_id) in [
+        ("operator-merge", Kind::Merge, None),
+        ("operator-rollout", Kind::Rollout, Some("operator-grant".into())),
+    ] {
+        assert_eq!(f.p(9000, id, Pc::Prepare {
+            kind, subject: s.clone(), check_id: "operator-check".into(), grant_id,
+        }).await.status, "ok");
+    }
+    for (id, role) in [
+        ("operator-check", "checker"), ("operator-grant", "human"),
+        ("operator-merge", "repository"), ("operator-rollout", "rollout"),
+    ] {
+        let receipt = f.p(9000, "read", Pc::GetReceipt { operation_id: id.into() }).await;
+        assert_eq!(receipt.status, "ok");
+        assert_eq!(receipt.data["producer"]["uid"], 9000);
+        assert_eq!(receipt.data["producer"]["id"], role);
+        assert_eq!(receipt.data["producer"]["role"], role);
+    }
+    let start = Pc::StartRollout { action_id: "operator-rollout".into(), subject: s.clone() };
+    let started = f.p(9000, "operator-start", start.clone()).await;
+    assert_eq!(started.status, "ok");
+    assert_eq!(started.data["state"], "started");
+    // A lost acknowledgement is resolved by the original stored request/reply.
+    let readback = f.p(9000, "read-start", Pc::GetReceipt { operation_id: "operator-start".into() }).await;
+    assert_eq!(readback.data["producer"]["role"], "rollout");
+    assert_eq!(readback.data["request"]["command"], serde_json::to_value(&start).unwrap());
+    assert_eq!(readback.data["reply"], serde_json::to_value(&started).unwrap());
+    assert!(f.p(9000, "operator-start", start).await.replayed);
+    let mut changed = s.clone(); changed.target_revision = "other-target".into();
+    assert_eq!(f.p(9000, "operator-start", Pc::StartRollout {
+        action_id: "operator-rollout".into(), subject: changed,
+    }).await.status, "operation_conflict");
+    assert_eq!(f.p(9000, "observe-unknown", Pc::ObserveRollout {
+        action_id: "operator-rollout".into(), subject: s.clone(),
+        installed_package_sha256: s.installed_package_sha256.clone(), observed: false,
+    }).await.data["state"], "unknown");
+    assert_eq!(f.p(9000, "observe-wrong", Pc::ObserveRollout {
+        action_id: "operator-rollout".into(), subject: s.clone(),
+        installed_package_sha256: s.installed_package_sha256.clone(), observed: true,
+    }).await.status, "wrong_installed_artifact");
+    assert_eq!(f.p(9000, "observe-applied", Pc::ObserveRollout {
+        action_id: "operator-rollout".into(), subject: s.clone(),
+        installed_package_sha256: s.artifact.package_sha256.clone(), observed: true,
+    }).await.data["state"], "applied");
+    let (path, mut config, clock) = f.close().await;
+    config.protected_release.as_mut().unwrap().producers.reverse();
+    let controller = Controller::open_with_config(&path, config.clone()).unwrap();
+    let f = Fixture { controller, path, config, clock };
+    let record = f.p(9000, "after-restart", Pc::GetReceipt { operation_id: "operator-start".into() }).await;
+    assert_eq!(record.data, readback.data);
+    let replay = f.p(9000, "operator-start", Pc::StartRollout {
+        action_id: "operator-rollout".into(), subject: s,
+    }).await;
+    assert!(replay.replayed); assert_eq!(replay.data, started.data);
+}
+
+//= spec/impl/v2/implementation.md#changes-can-be-prepared-without-per-change-human-approval
+//# The final rollout MUST require human authorization bound to that artifact and target.
+//= spec/impl/v2/implementation.md#changes-can-be-prepared-without-per-change-human-approval
+//# Human authorization MUST NOT bypass applicable mandatory validation.
+#[tokio::test]
+async fn trusted_operator_still_needs_current_exact_checks_and_human_grant() {
+    let f = operator_fixture().await;
+    let s = f.seed().await;
+    let prepare = |check_id: &str, grant_id: Option<&str>| Pc::Prepare {
+        kind: Kind::Rollout, subject: s.clone(), check_id: check_id.into(),
+        grant_id: grant_id.map(str::to_string),
+    };
+    let mut failed = f.check(&s); failed.results.insert("behavior".into(), false);
+    assert_eq!(f.p(9000, "failed-check", Pc::Check(failed)).await.status, "ok");
+    assert_eq!(f.p(9000, "grant", Pc::Grant {
+        subject: s.clone(), valid_until_ms: f.clock.load(Ordering::SeqCst) + 1000,
+    }).await.status, "ok");
+    assert_eq!(f.p(9000, "failed-prepare", prepare("failed-check", Some("grant"))).await.status, "failed_or_missing_check");
+    assert_eq!(f.p(9000, "good-check", Pc::Check(f.check(&s))).await.status, "ok");
+    assert_eq!(f.p(9000, "no-grant", prepare("good-check", None)).await.status, "human_authorization_required");
+    let mut changed = s.clone(); changed.target_revision = "other".into();
+    assert_eq!(f.p(9000, "wrong-grant", Pc::Grant {
+        subject: changed, valid_until_ms: f.clock.load(Ordering::SeqCst) + 1000,
+    }).await.status, "subject_mismatch");
+    assert_eq!(f.p(9000, "prepared", prepare("good-check", Some("grant"))).await.status, "ok");
+    f.clock.fetch_add(1001, Ordering::SeqCst);
+    assert_eq!(f.p(9000, "expired-start", Pc::StartRollout {
+        action_id: "prepared".into(), subject: s.clone(),
+    }).await.status, "human_authorization_mismatch");
+    // Removing a logical role does not transfer its historical authority to
+    // another role of the same kernel UID.
+    let (path, mut config, clock) = f.close().await;
+    config.protected_release.as_mut().unwrap().producers.retain(|p| p.role != Role::Checker);
+    let controller = Controller::open_with_config(&path, config.clone()).unwrap();
+    let f = Fixture { controller, path, config, clock };
+    assert_eq!(f.p(9000, "removed-checker", Pc::Check(f.check(&s))).await.status, "wrong_producer_role");
+    assert_eq!(f.p(9000, "untrusted-check-prepare", prepare("good-check", Some("grant"))).await.status, "untrusted_check");
+}
+
 #[tokio::test]
 async fn protected_roles_and_ordinary_claims_never_mint_evidence() {
     let f = Fixture::new();
@@ -664,6 +787,10 @@ async fn exact_receipts_replay_after_restart_and_changed_input_refuses() {
     assert_eq!(current.data["state"], "applied");
 }
 #[tokio::test]
+// Traceability scope: The separate rollout preparation refuses a missing human grant, wrong producer, changed subject and stale grant/check.
+//= spec/impl/v2/implementation.md#configured-actions-and-automatic-merge
+//= type=test
+//# A merge MUST NOT trigger a rollout without the rollout's required human authorization.
 async fn human_grant_is_separate_exact_and_never_bypasses_checks() {
     let f = Fixture::new();
     let s = f.seed().await;
@@ -777,6 +904,10 @@ async fn human_grant_is_separate_exact_and_never_bypasses_checks() {
         "stale_check"
     );
 }
+// Traceability scope: A real private Unix socket uses the actual peer UID, accepts its configured checker role and refuses an unauthorized producer role and internal operations.
+//= spec/impl/v2/implementation.md#transport-and-access-controls-remain
+//= type=test
+//# Same-host communication MAY rely on ordinary host access controls.
 #[tokio::test]
 async fn unix_peer_identity_and_wire_internal_operation_refusal() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -956,6 +1087,14 @@ fn repository_fixture(f: &Fixture) -> (String, String, String) {
     (base, head, tree)
 }
 #[tokio::test]
+// Traceability scope: Actual local protected Git CAS uses the checked exact subject; reopening reads back that merge. This permission does not require automatic merge or qualify hosted branch policies.
+//= spec/impl/v2/implementation.md#configured-actions-and-automatic-merge
+//= type=test
+//# An agent MAY merge a change after protected checks have passed for its exact revision.
+// Traceability scope: The completed merge remains the sole action, automatic_rollout is false and human rollout qualification remains unconfigured.
+//= spec/impl/v2/implementation.md#configured-actions-and-automatic-merge
+//= type=test
+//# A merge MUST NOT trigger a rollout without the rollout's required human authorization.
 async fn actual_git_cas_restart_readback_and_no_rollout() {
     let f = Fixture::new();
     let (base, head, tree) = repository_fixture(&f);
@@ -1119,10 +1258,12 @@ async fn changed_base_and_wrong_tree_never_move_the_branch() {
 async fn agent_directory_pagination_preserves_canonical_identity() {
     let limits = &crate::limits::RuntimeLimits::seed().expect("test metadata");
     let f = Fixture::new();
-    let make = |id: &str| TaskInput {
+    let make = |id: &str| TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         instruction: "canonical directory fixture".into(),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             id: id.into(),
             revision: "v1".into(),

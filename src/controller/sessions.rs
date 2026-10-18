@@ -85,6 +85,7 @@ pub(super) fn validate_task(tx: &Connection, task: &Task) -> Result<()> {
     {
         return Err(Fault::Store("task/session binding differs".into()));
     }
+    if input(tx, &session)? != task.input { return Err(Fault::Store("current task differs from immutable session input".into())); }
     if let Some(attempt) = &task.attempt {
         session
             .validate_for(attempt, &task.input)
@@ -95,11 +96,13 @@ pub(super) fn validate_task(tx: &Connection, task: &Task) -> Result<()> {
 pub(super) fn validate_existing(
     conn: &Connection,
     cfg: &ControllerConfig,
+    workflow_schema: bool,
 ) -> std::result::Result<(), String> {
     let result = (|| -> Result<()> {
         let count: i64 = conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
         let tasks: i64 = conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
-        if count != tasks || unsigned(count)? > cfg.max_tasks as u64 {
+        if count < tasks || unsigned(count)? > bound(cfg)? as u64
+            || (!lineage_schema(conn)? && count != tasks) {
             return Err(Fault::Store("session/task count mismatch".into()));
         }
         let mut q = conn.prepare("SELECT id FROM sessions ORDER BY seq")?;
@@ -107,12 +110,72 @@ pub(super) fn validate_existing(
         while let Some(row) = rows.next()? {
             let session = get(conn, &row.get::<_, String>(0)?)?;
             super::memory_notifications::validate_existing(conn, &session)?;
-            let task = load(conn, &session.task_id)?;
-            if task.task.session_id != session.id {
-                return Err(Fault::Store("session task back-link differs".into()));
+            if workflow_schema {
+                super::collaboration_notifications::validate_existing(conn, &session)?;
             }
+            let task = load(conn, &session.task_id)?;
+            if task.task.id != session.task_id { return Err(Fault::Store("session task back-link differs".into())); }
+            let _ = input(conn, &session)?;
         }
         Ok(())
     })();
     result.map_err(|_| "corrupt session/task association; original bytes retained".into())
+}
+
+pub(super) fn bound(cfg: &ControllerConfig) -> Result<usize> {
+    cfg.max_tasks.checked_add(cfg.max_receipts)
+        .ok_or_else(|| Fault::Store("session retention bound overflow".into()))
+}
+fn lineage_schema(tx: &Connection<'_>) -> Result<bool> {
+    let version: i64=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+    Ok(version >= super::application_schema::DEFAULT_ASSIGNMENT_VERSION)
+}
+pub(super) fn is_successor(tx: &Connection<'_>, id: &str) -> Result<bool> {
+    if !lineage_schema(tx)? {return Ok(false)}
+    Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM session_inputs WHERE session_id=?1 AND previous_session_id IS NOT NULL)",[id],|r|r.get(0))?)
+}
+/// Immutable controller-resolved input for this exact instantiation. Older
+/// stores have one session/task and are read without adding or rewriting rows.
+pub(super) fn input(tx: &Connection<'_>, session: &Session) -> Result<TaskInput> {
+    let maximum=tx.limits.transport.body_bytes;
+    let value=if lineage_schema(tx)? {
+        let row:Option<(String,String)>=tx.query_row(
+            "SELECT task_id,CAST(substr(CAST(body AS BLOB),1,?2) AS TEXT) FROM session_inputs WHERE session_id=?1",
+            params![session.id,sql_bound(maximum.saturating_add(1))?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (task,raw)=row.ok_or_else(||Fault::Store("session accepted input absent".into()))?;
+        if task!=session.task_id || raw.len()>maximum {return Err(Fault::Store("session input identity/bound differs".into()))}
+        decode::<TaskInput>(&raw)?
+    } else {
+        let raw:String=tx.query_row("SELECT CAST(substr(CAST(body AS BLOB),1,?2) AS TEXT) FROM tasks WHERE id=?1",params![session.task_id,sql_bound(maximum.saturating_add(1))?],|r|r.get(0))?;
+        if raw.len()>maximum{return Err(Fault::Store("historical task input exceeds bound".into()))}
+        let task:StoredTask=decode(&raw)?;
+        if task.task.id!=session.task_id||task.task.session_id!=session.id {return Err(Fault::Store("historical session/input differs".into()))}
+        task.task.input
+    };
+    if value.definition!=session.definition {return Err(Fault::Store("session input definition differs".into()))}
+    value.execution_limits().map_err(Fault::Store)?;
+    Ok(value)
+}
+pub(super) fn bind_input(tx:&Connection<'_>,session:&Session,input:&TaskInput,previous:Option<&str>,operation:Option<&str>)->Result<()> {
+    if input.definition!=session.definition || previous.is_some()!=operation.is_some(){return Err(Fault::Store("new session input lineage differs".into()))}
+    input.execution_limits().map_err(Fault::Store)?;
+    let raw=encode(input)?;
+    if raw.len()>tx.limits.transport.body_bytes{return refuse("capacity","session input exceeds transport.body_bytes")}
+    tx.execute("INSERT INTO session_inputs(session_id,task_id,body,previous_session_id,operation_id) VALUES(?1,?2,?3,?4,?5)",params![session.id,session.task_id,raw,previous,operation])?;
+    Ok(())
+}
+pub(super) fn historical_task(tx:&Connection<'_>,task_id:&str,session_id:&str)->Result<Task> {
+    let session=get(tx,session_id)?;
+    if session.task_id!=task_id {return Err(Fault::Store("historical session belongs to another task".into()))}
+    let mut task=load(tx,task_id)?.task;
+    if task.session_id!=session_id { task.pending_assignment=None; }
+    task.input=input(tx,&session)?;
+    task.session_id=session.id;
+    task.assigned_agent_id=session.agent_id;
+    if task.attempt.as_ref().is_some_and(|a|a.session_id!=session_id){task.attempt=None;task.result=None;}
+    Ok(task)
+}
+pub(super) fn initial_input(tx:&Connection<'_>,task_id:&str)->Result<TaskInput> {
+    let id:String=tx.query_row("SELECT id FROM sessions WHERE task_id=?1 ORDER BY seq LIMIT 1",[task_id],|r|r.get(0))?;
+    input(tx,&get(tx,&id)?)
 }

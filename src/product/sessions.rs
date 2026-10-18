@@ -24,7 +24,7 @@ async fn view(
     raw_query: &str,
 ) -> Result<UiResponse, UiResponse> {
     let invalid = |e: String| error(400, &e);
-    let fields = parse_form(raw_query.as_bytes(), controller.limits()).map_err(invalid)?;
+    let fields = parse_form(raw_query.as_bytes(), controller.limits()).map_err(|e| error(400, &e))?;
     if route == "/sessions" {
         fields_only(&fields, &["agent_id", "after"]).map_err(invalid)?;
         let agent_id = fields.get("agent_id").filter(|v| !v.is_empty()).cloned();
@@ -42,7 +42,7 @@ async fn view(
             return Err(error(502, "Unexpected session page"));
         };
         let mut body = String::from(
-            "<p>Each committed task has a durable session pinned to its accepted agent revision. Attempts are executions within that session. Sessions of one agent share agent memory and can run concurrently.</p><form method=\"get\" action=\"/sessions\">",
+            "<p>Each session is pinned to its accepted agent revision. Reassigning a task creates a new session while preserving earlier sessions and their history. Attempts are executions within a session. Sessions of one agent share agent memory and can run concurrently.</p><form method=\"get\" action=\"/sessions\">",
         );
         body.push_str(&field(
             "agent_id",
@@ -89,9 +89,9 @@ async fn view(
         .and_then(|s| decode(s, false).ok())
         .filter(|s| crate::mcp::valid_identity(s, controller.limits().transport.identity_bytes))
         .ok_or_else(|| error(400, "Invalid session identity"))?;
-    let QueryResult::Session(session) = query(
+    let QueryResult::SessionInput { session, input, current } = query(
         controller,
-        Query::Session {
+        Query::SessionInput {
             session_id: id.clone(),
         },
     )
@@ -112,10 +112,21 @@ async fn view(
     else {
         return Err(not_task(reply));
     };
-    if session.id != id
-        || task.session_id != session.id
-        || task.assigned_agent_id != session.agent_id
-        || task.input.definition != session.definition
+    if session.id != id || task.id != session.task_id || input.definition != session.definition {
+        return Err(error(502, "Session and accepted input association disagree"));
+    }
+    // These reads may straddle a committed handoff. A formerly current session
+    // becomes historical; it never borrows a successor's attempt or settings.
+    let current = current && task.session_id == session.id;
+    render(&session, &input, current, &task)
+}
+// Traceability scope: Historical detail renders its retained accepted input and never borrows a successor attempt or current-settings association.
+//= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+//# A task reassignment MUST retain the task's prior session and execution-input history.
+fn render(session: &Session, input: &TaskInput, current: bool, task: &Task) -> Result<UiResponse, UiResponse> {
+    if input.definition != session.definition || task.id != session.task_id
+        || (current && (task.session_id != session.id || task.assigned_agent_id != session.agent_id
+            || task.input.definition != session.definition))
     {
         return Err(error(502, "Session and task association disagree"));
     }
@@ -132,8 +143,9 @@ async fn view(
         "Accepted agent revision",
         &session.definition.revision,
     );
-    term(&mut body, "Task status", status(task.status));
-    if let Some(attempt) = &task.attempt {
+    term(&mut body, "Session authority", if current { "Current" } else { "Historical — authority closed" });
+    term(&mut body, "Current task status", status(task.status));
+    if let Some(attempt) = task.attempt.as_ref().filter(|attempt| current && attempt.session_id == session.id) {
         term(&mut body, "Current attempt", &attempt.id);
         term(&mut body, "Attempt phase", phase(attempt.phase));
         term(
@@ -152,5 +164,69 @@ async fn view(
         &serde_json::to_string_pretty(&session.definition).unwrap_or_default(),
     ));
     body.push_str("</pre>");
+    body.push_str("<h2>Accepted work</h2><pre>");
+    body.push_str(&escape(&input.instruction));
+    body.push_str("</pre><h3>Accepted task limits</h3><pre>");
+    body.push_str(&escape(&serde_json::to_string_pretty(&input.limits).unwrap_or_default()));
+    body.push_str("</pre>");
+    if let Some(snapshot) = &input.resolved_limits {
+        body.push_str("<dl>");
+        term(&mut body, "Accepted metadata revision", &snapshot.global_revision);
+        term(&mut body, "Accepted agent limit revision", &snapshot.agent_revision);
+        body.push_str("</dl>");
+    }
+    if let Some(schema) = &input.output_schema {
+        body.push_str("<h3>Required result schema</h3><pre>");
+        body.push_str(&escape(&serde_json::to_string_pretty(schema).unwrap_or_default()));
+        body.push_str("</pre>");
+    }
+    if current {
+    let _ = write!(body, "<p><a href=\"{}/settings?task_id={}\">Compare selected settings with this session's accepted settings</a></p>", agents::path(&session.agent_id), encode(&task.id));
+    }
     Ok(page(200, &format!("Session {}", session.id), body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // Traceability scope: Renderer discriminator with distinct old session and current task; persistence and current authority are controller-owned.
+    //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+    //= type=test
+    //# A task reassignment MUST retain the task's prior session and execution-input history.
+    fn historical_session_keeps_accepted_input_without_successor_attempt_or_settings_link() {
+        let metadata = RuntimeLimits::seed().unwrap();
+        let mut input = TaskInput {
+            instruction_source: None, pull_request: None, resolved_limits: None, repository_read: None,
+            instruction: "Original <triage> work".into(),
+            definition: Definition { charter: None, id: "triage".into(), revision: "r1".into(),
+                executor: ExecutorKind::Native, inference: Some(InferenceSettings::selected()),
+                execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }), limit_overrides: None },
+            repository: None, acceptance_commands: vec![], output_schema: Some(serde_json::json!({"type":"object"})),
+            limits: metadata.task_defaults.at(0).unwrap(), dependencies: vec![], native_workflow: None,
+        };
+        input.resolved_limits = Some(metadata.resolve_task(&input).unwrap());
+        let session = Session { id: "session-old".into(), agent_id: input.definition.id.clone(),
+            definition: input.definition.clone(), task_id: "same-task".into() };
+        let mut current_input = input.clone(); current_input.definition.id = "coding".into();
+        current_input.definition.executor = ExecutorKind::Coding;
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id":"same-task", "session_id":"session-new", "input":current_input, "assigned_agent_id":"coding",
+            "status":"active", "revision":3, "attempt":{
+                "id":"successor-attempt", "session_id":"session-new", "task_id":"same-task", "generation":2,
+                "worker_id":"worker", "worker_incarnation":"incarnation", "phase":"running",
+                "deadline_unix_ms":input.limits.deadline_unix_ms, "stopped":false, "uncertain":false
+            }, "selected_checkpoint":null, "result":null, "blocked_reason":null, "native_retry_block":null,
+            "progress":"", "recent_output":"", "output_truncated":false,
+            "parent_task_id":null, "waiting_child_id":null, "completed_child":null
+        })).unwrap();
+        let page = render(&session, &input, false, &task).unwrap();
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("Historical") && page.body.contains("Original &lt;triage&gt; work"));
+        assert!(page.body.contains("Accepted metadata revision"));
+        assert!(!page.body.contains("successor-attempt"));
+        assert!(!page.body.contains("settings?task_id="));
+        assert!(render(&session, &input, true, &task).is_err(), "a historical session cannot claim current authority");
+    }
 }

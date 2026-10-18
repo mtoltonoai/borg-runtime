@@ -54,6 +54,16 @@ fn required_retry_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option
     Option::<u64>::deserialize(d)
 }
 impl ProductLimits {
+    /// Encoding feasibility, not an additional operational default or policy cap.
+    pub fn minimum_response_bytes(&self, transport: &super::TransportLimits) -> Result<usize, String> {
+        crate::product::failure::minimum_bytes(self.request_path_bytes, transport.identity_bytes)
+    }
+    pub fn validate_response(&self, transport: &super::TransportLimits) -> Result<(), String> {
+        if self.response_bytes < self.minimum_response_bytes(transport)? {
+            return Err("product.response_bytes cannot encode bounded failure correlation for product.request_path_bytes and transport.identity_bytes".into());
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), String> {
         if [
             self.request_path_bytes,

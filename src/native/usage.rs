@@ -67,11 +67,64 @@ pub enum RequestExposure {
     HttpResponseReceived,
 }
 
+/// A diagnostic category is not proof that repeating a provider request is safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorCategory {
+    RateLimited, Overloaded, InvalidRequest, ContextLimit, PolicyRefused,
+    QuotaExhausted, AuthenticationFailed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionKind { RateLimited, InvalidRequest, ContextLimit, PolicyRefused, QuotaExhausted, AuthenticationFailed }
+impl RejectionKind {
+    pub fn same_input_retryable(self)->bool {matches!(self,Self::RateLimited)}
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RetryAfter { Absent, DelayMs(u64), Invalid }
+/// Produced only from a complete selected rejection envelope, never error text.
+/// Known refusal does not refund the reservation or independently admit a retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRejection {
+    pub kind: RejectionKind,
+    pub retry_after: RetryAfter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all="snake_case")]
+pub enum RetryBlockReason {
+    RequestAllowance,
+    Deadline,
+    RetryPolicyDisabled,
+    InvalidRetryAfter,
+    RetryDelayUnavailable,
+    CoordinationDelayUnavailable,
+    InvalidRequest,
+    ContextLimit,
+    PolicyRefused,
+    QuotaExhausted,
+    AuthenticationFailed,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRetryBlock {
+    pub request_index: u32,
+    /// Exact canonical rejection or reservation receipt; never free-form error text.
+    pub source_operation_id: String,
+    pub reason: RetryBlockReason,
+}
+
 /// Provider disposition is separate from local validation, cleanup, token usage
 /// and controller acceptance. It never authorizes retry or refunds reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderOutcome {
+    /// Complete validated output-cap terminal; partial output is not a final result.
+    OutputCapped,
     NotStarted,
+    /// Complete selected rejection: no accepted model output; retry still needs admission.
+    Rejected(ProviderRejection),
     /// Sending may have begun but no complete selected provider outcome was
     /// observed. HTTP headers, status codes and partial bodies are insufficient.
     Unknown,
@@ -134,6 +187,8 @@ pub struct NativeObservation {
     pub request_exposure: RequestExposure,
     pub usage: UsageObservation,
     pub provider_outcome: ProviderOutcome,
+    /// Observed failure facts, independent of bounded display text and disposition.
+    pub diagnostic: Option<super::ProviderFailureDiagnostic>,
 }
 impl NativeObservation {
     pub(super) fn not_started(code: impl Into<String>) -> Self {
@@ -142,6 +197,29 @@ impl NativeObservation {
             request_exposure: RequestExposure::NotStarted,
             usage: UsageObservation::Unknown,
             provider_outcome: ProviderOutcome::NotStarted,
+            diagnostic: Some(super::ProviderFailureDiagnostic::new(super::ProviderFailureClass::LocalAdmission)),
         }
+    }
+}
+
+#[cfg(test)]
+mod rejection_kind_tests {
+    use super::*;
+
+    #[test]
+    fn complete_known_rejections_keep_their_distinct_wire_kind() {
+        for (kind,label) in [(RejectionKind::RateLimited,"rate_limited"),
+            (RejectionKind::InvalidRequest,"invalid_request"),
+            (RejectionKind::ContextLimit,"context_limit"),
+            (RejectionKind::PolicyRefused,"policy_refused"),
+            (RejectionKind::QuotaExhausted,"quota_exhausted"),
+            (RejectionKind::AuthenticationFailed,"authentication_failed")] {
+            let value=ProviderRejection {kind,retry_after:RetryAfter::Invalid};
+            let json=serde_json::to_value(value).unwrap();
+            assert_eq!(json["kind"],label);
+            assert_eq!(serde_json::from_value::<ProviderRejection>(json).unwrap(),value);
+            assert_eq!(kind.same_input_retryable(),kind==RejectionKind::RateLimited);
+        }
+        assert!(serde_json::from_str::<RejectionKind>("\"overloaded\"").is_err());
     }
 }

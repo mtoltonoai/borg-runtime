@@ -2,14 +2,45 @@
 //! must already be authenticated by the configured private host/HTTP adapter.
 //! Worker identity strings are correlation data, not authentication credentials.
 mod agents;
+mod task_submission;
+mod task_handoffs;
+mod definition_updates;
+mod governance;
+mod governance_control;
+mod governance_validation;
 mod collaboration_calls;
+mod collaboration_workflow;
+mod collaboration_notifications;
+mod collaboration_document_tools;
+mod collaboration_documents;
+mod collaboration_reviews;
+mod collaboration_questions;
+mod collaboration_work;
+mod collaboration_routing;
+mod collaboration_finalizer;
 mod collaboration_queries;
 pub(crate) mod compatibility;
 mod credential_admission;
 mod credits;
+mod charters;
+mod charter_definitions;
+mod checked_transaction;
+mod store_retry;
+mod store_phase;
+pub use store_phase::StartupCancellation;
 mod database;
+mod pull_request;
+#[cfg(test)]
+mod pull_request_tests;
+mod governance_completion;
 mod local_storage;
 mod memory_notifications;
+mod native_retry_state;
+mod native_request_coordination;
+mod native_request_diagnostics;
+#[cfg(test)]
+mod native_diagnostic_compatibility_tests;
+mod native_retry_validation;
 mod metadata;
 mod operations;
 mod protected;
@@ -18,8 +49,11 @@ mod repository_queries;
 mod sessions;
 mod tracking;
 mod validation;
+mod workflow_schema;
+mod application_schema;
 
 use crate::protocol::{Operation, Outcome, Reply, Request, WIRE_REVISION};
+use crate::collaboration::workflow::TrustedHostPath;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
@@ -34,7 +68,9 @@ pub struct Controller {
 }
 
 struct Inner {
-    sender: mpsc::SyncSender<Message>,
+    sender: mpsc::SyncSender<Envelope>,
+    pending: Option<Arc<tokio::sync::Semaphore>>,
+    episodes: store_retry::Episodes,
     changes: watch::Receiver<u64>,
     waiters: tokio::sync::Semaphore,
     ui_waiters: tokio::sync::Semaphore,
@@ -105,14 +141,50 @@ enum Message {
         reply: oneshot::Sender<crate::protected_release::Reply>,
     },
 }
+struct Envelope {
+    message: Message,
+    admitted: std::time::Instant,
+    episode: Option<Arc<store_retry::Episode>>,
+    // Counts queued, active and parked transport waiters together. It never
+    // retains Controller/sender and therefore cannot keep its owner alive.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+impl Inner {
+    // Traceability scope: Configured owner capacity counts queued, active and parked waiters; a full semaphore or bounded channel refuses admission.
+    //= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
+    //# Admission MUST enforce configured queue and resource bounds.
+    fn send(&self, message: Message) -> Result<(), mpsc::TrySendError<Message>> {
+        let permit = if let Some(capacity) = &self.pending {
+            match capacity.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => return Err(mpsc::TrySendError::Full(message)),
+            }
+        } else { None };
+        let admitted = std::time::Instant::now();
+        let episode = self.config.store_retry.as_ref()
+            .and_then(|policy| self.episodes.admit(&message, admitted, policy));
+        let envelope = Envelope { message, admitted, permit, episode };
+        self.sender.try_send(envelope).map_err(|error| match error {
+            mpsc::TrySendError::Full(e) => mpsc::TrySendError::Full(e.message),
+            mpsc::TrySendError::Disconnected(e) => mpsc::TrySendError::Disconnected(e.message),
+        })
+    }
+}
 enum ExternalProof {
     Native(validation::Proof),
     Repository(repository_queries::Proof),
 }
 struct OrdinaryMessage {
-    request: Request,
-    validation: Option<ExternalProof>,
+    original: OriginalRequest,
     reply: oneshot::Sender<database::Response>,
+}
+/// Retained only across the existing in-process owner boundary. A future retry
+/// consumer must select an applicable policy and reenter with these exact inputs;
+/// it must not rerun external validation or replace the original invocation path.
+struct OriginalRequest {
+    request: Request,
+    invocation_path: TrustedHostPath,
+    validation: Option<ExternalProof>,
 }
 
 pub(crate) fn minimum_collaboration_result_bytes(
@@ -133,6 +205,13 @@ impl Controller {
         path: impl AsRef<Path>,
         config: ControllerConfig,
     ) -> Result<Self, String> {
+        Self::open_with_config_cancellable(path, config, StartupCancellation::default())
+    }
+
+    pub fn open_with_config_cancellable(
+        path: impl AsRef<Path>, config: ControllerConfig, cancellation: StartupCancellation,
+    ) -> Result<Self, String> {
+        cancellation.check()?;
         if let Some(c) = &config.protected_release {
             c.validate(&config.limits.interface)?;
         }
@@ -141,15 +220,28 @@ impl Controller {
             return Err("controller requires an absolute trusted validation executable".into());
         }
         let path = path.as_ref().to_path_buf();
-        let (sender, receiver) = mpsc::sync_channel::<Message>(config.queue_capacity);
+        let (sender, receiver) = mpsc::sync_channel::<Envelope>(config.queue_capacity);
         let (changed, changes) = watch::channel(0u64);
         let (started, start) = mpsc::sync_channel(1);
         let settings = config.clone();
-        thread::Builder::new()
+        let startup_cancellation = cancellation.clone();
+        let owner = thread::Builder::new()
             .name("borg-task-database".into())
             .spawn(move || {
-                let mut db = match database::Database::open(&path, settings) {
+                let _startup_owner = startup_cancellation.owner();
+                let mut db = match database::Database::open_cancellable(&path, settings, &startup_cancellation) {
                     Ok(db) => {
+                        if let Err(error) = startup_cancellation.check() {
+                            drop(db);
+                            let _ = started.send(Err(error));
+                            return;
+                        }
+                        #[cfg(test)]
+                        if let Err(error) = governance_ui_test_fixture::after_validated_open(&path, &db.conn) {
+                            drop(db);
+                            let _ = started.send(Err(error));
+                            return;
+                        }
                         let _ = started.send(Ok(db.validation_host.clone()));
                         db
                     }
@@ -158,6 +250,10 @@ impl Controller {
                         return;
                     }
                 };
+                if let Some(policy) = db.config.limits.controller.store_retry.clone() {
+                    store_retry::run(db, receiver, changed, policy);
+                    return;
+                }
                 loop {
                     // This timeout is the next actual task deadline, not a periodic
                     // database/liveness scan. All other wakeups are queued commands.
@@ -172,6 +268,7 @@ impl Controller {
                             Err(_) => break,
                         },
                     };
+                    let message = message.map(|envelope| envelope.message);
                     let maintenance_changed = match db.expire() {
                         Ok(changed) => changed,
                         Err(_) => break,
@@ -188,7 +285,7 @@ impl Controller {
                         }
                         let _ = reply.send(result);
                     } else if let Some(Message::Ordinary(message)) = message {
-                        let (reply, mutated) = db.handle(message.request, message.validation);
+                        let (reply, mutated) = db.handle(message.original);
                         if mutated || maintenance_changed {
                             changed.send_modify(|n| *n = n.wrapping_add(1));
                         }
@@ -213,12 +310,21 @@ impl Controller {
                 // already submitted work, then closes its sole SQLite connection.
             })
             .map_err(|e| e.to_string())?;
-        let validation_host = start
-            .recv()
-            .map_err(|_| "database owner stopped during startup".to_string())??;
+        let validation_host = match start.recv() {
+            Ok(Ok(host)) => host,
+            result => {
+                // Startup cancellation is an owned signal, not cancellation of
+                // this wait. Observe actual owner exit before returning.
+                let _ = owner.join();
+                return Err(match result { Ok(Err(error)) => error,
+                    _ => "database owner stopped during startup".into() });
+            }
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 sender,
+                pending: config.store_retry.as_ref().map(|_| Arc::new(tokio::sync::Semaphore::new(config.queue_capacity))),
+                episodes: store_retry::Episodes::default(),
                 validation_host,
                 changes,
                 waiters: tokio::sync::Semaphore::new(config.worker_waiters),
@@ -245,8 +351,7 @@ impl Controller {
             changes.borrow_and_update();
             let (reply, receive) = oneshot::channel();
             self.inner
-                .sender
-                .try_send(Message::Revision { reply })
+                .send(Message::Revision { reply })
                 .map_err(|e| match e {
                     mpsc::TrySendError::Full(_) => {
                         "controller request queue is full: controller.queue_capacity".to_string()
@@ -288,7 +393,7 @@ impl Controller {
         request: crate::protected_release::Request,
     ) -> crate::protected_release::Reply {
         let (reply, receive) = oneshot::channel();
-        match self.inner.sender.try_send(Message::Protected {
+        match self.inner.send(Message::Protected {
             uid,
             request,
             reply,
@@ -310,15 +415,14 @@ impl Controller {
         &self,
         request: Request,
         validation: Option<ExternalProof>,
+        invocation_path: TrustedHostPath,
     ) -> database::Response {
         let id = request.request_id.clone();
         let (reply, receive) = oneshot::channel();
         match self
             .inner
-            .sender
-            .try_send(Message::Ordinary(OrdinaryMessage {
-                request,
-                validation,
+            .send(Message::Ordinary(OrdinaryMessage {
+                original: OriginalRequest { request, validation, invocation_path },
                 reply,
             })) {
             Ok(()) => receive.await.unwrap_or_else(|_| {
@@ -343,10 +447,13 @@ impl Controller {
 
     //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
     //# A controller transaction MUST NOT remain open across worker, provider or repository I/O.
-    async fn once(&self, request: Request) -> Reply {
-        let response = self.dispatch(request.clone(), None).await;
+    async fn once(&self, request: Request, invocation_path: TrustedHostPath) -> Reply {
+        let response = self.dispatch(request.clone(), None, invocation_path).await;
         let ticket = match response {
             database::Response::Reply(reply) => return reply,
+            // The optional owner scheduler handles eligible failures internally.
+            // Preserve the existing outcome for failures returned by that boundary.
+            database::Response::StoreFailure(failure) => return failure.into_reply(),
             database::Response::Validation(ticket) => ticket,
             database::Response::Repository(ticket) => {
                 // The owned completion survives cancellation of this transport future.
@@ -354,7 +461,7 @@ impl Controller {
                 let controller = self.clone();
                 let id = request.request_id.clone();
                 return tokio::spawn(
-                    async move { controller.finish_repository(request, ticket).await },
+                    async move { controller.finish_repository(request, ticket, invocation_path).await },
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -389,10 +496,11 @@ impl Controller {
             ticket.no_capacity()
         };
         match self
-            .dispatch(request.clone(), Some(ExternalProof::Native(proof)))
+            .dispatch(request.clone(), Some(ExternalProof::Native(proof)), invocation_path)
             .await
         {
             database::Response::Reply(reply) => reply,
+            database::Response::StoreFailure(failure) => failure.into_reply(),
             database::Response::Validation(_) | database::Response::Repository(_) => {
                 Reply::refused(
                     request.request_id,
@@ -407,6 +515,7 @@ impl Controller {
         &self,
         request: Request,
         ticket: Box<repository_queries::Ticket>,
+        invocation_path: TrustedHostPath,
     ) -> Reply {
         let permit = self.inner.validations.try_acquire();
         let proof = if permit.is_ok() {
@@ -431,10 +540,11 @@ impl Controller {
             ticket.no_capacity()
         };
         match self
-            .dispatch(request.clone(), Some(ExternalProof::Repository(proof)))
+            .dispatch(request.clone(), Some(ExternalProof::Repository(proof)), invocation_path)
             .await
         {
             database::Response::Reply(reply) => reply,
+            database::Response::StoreFailure(failure) => failure.into_reply(),
             _ => Reply::refused(
                 request.request_id,
                 "invalid_repository_read",
@@ -465,6 +575,16 @@ impl Controller {
     }
 
     pub async fn handle(&self, request: Request) -> Reply {
+        self.handle_from(request, TrustedHostPath::OperatorApi).await
+    }
+
+    /// Only the in-process product adapter selects browser provenance. The
+    /// serialized request cannot assert this path or authenticated-person identity.
+    pub(crate) async fn handle_browser(&self, request: Request) -> Reply {
+        self.handle_from(request, TrustedHostPath::Browser).await
+    }
+
+    async fn handle_from(&self, request: Request, invocation_path: TrustedHostPath) -> Reply {
         let limits = &self.inner.config.limits;
         if request.protocol_revision != WIRE_REVISION {
             return Reply::refused(
@@ -509,8 +629,9 @@ impl Controller {
                 "invalid or credential-bearing repository identities are not accepted",
             );
         }
-        if !matches!(request.command, Operation::AwaitCommands { .. }) {
-            return self.once(request).await;
+        if !matches!(request.command,
+            Operation::AwaitCommands { .. } | Operation::ObserveNativeRequest { .. }) {
+            return self.once(request, invocation_path).await;
         }
         // Arm before reading. A commit racing the read/sleep gap changes this
         // retained watch version, so changed() completes without losing the wake.
@@ -519,16 +640,25 @@ impl Controller {
         let deadline = tokio::time::Instant::now() + self.inner.config.command_wait();
         loop {
             changed.borrow_and_update();
-            let result = self.once(request.clone()).await;
-            if !matches!(&result.outcome, Outcome::Pending { operation_id } if matches!(&request.command, Operation::AwaitCommands { operation_id: expected, .. } if operation_id == expected))
-            {
+            let result = self.once(request.clone(), invocation_path).await;
+            let awaiting_command = matches!(&result.outcome,
+                Outcome::Pending { operation_id }
+                if matches!(&request.command, Operation::AwaitCommands { operation_id: expected, .. }
+                    if operation_id == expected));
+            let awaiting_readiness = matches!((&request.command, &result.outcome),
+                (Operation::ObserveNativeRequest { acquire_operation_id: expected, .. },
+                 Outcome::Ok { data: crate::protocol::Data::NativeRequestReadiness {
+                    acquire_operation_id, changed: false } }) if acquire_operation_id == expected);
+            if !awaiting_command && !awaiting_readiness {
                 return result;
             }
-            // Already committed outcomes must replay even when every idle
-            // waiting slot is occupied. Only uncommitted Pending needs a slot.
+            // Committed outcomes and changed readiness return before waiter
+            // admission. A readiness read never creates an operation receipt;
+            // without a free wait slot, its unchanged snapshot returns normally.
             if waiting_slot.is_none() {
                 match self.inner.waiters.try_acquire() {
                     Ok(slot) => waiting_slot = Some(slot),
+                    Err(_) if awaiting_readiness => return result,
                     Err(_) => {
                         return Reply::refused(
                             &request.request_id,
@@ -648,3 +778,9 @@ mod waiter_replay_tests {
 
 #[cfg(test)]
 mod limits_tests;
+
+#[cfg(test)]
+pub(crate) mod governance_ui_test_fixture;
+
+#[cfg(test)]
+mod store_retry_tests;

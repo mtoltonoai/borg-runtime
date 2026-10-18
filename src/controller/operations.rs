@@ -6,6 +6,10 @@ use std::collections::HashSet;
 mod admission;
 mod effects;
 mod native_loop;
+pub(crate) mod native_format;
+pub(crate) mod native_output_cap;
+pub(crate) mod native_retry;
+pub(super) use native_loop::{validate_completion_gap, validate_rejection_chain};
 pub(super) mod reconciliation;
 pub(super) mod releases;
 mod reports;
@@ -20,6 +24,64 @@ pub(crate) fn apply(
 ) -> Result<(Data, bool)> {
     let limits = tx.limits;
     match op {
+        Operation::AcquireNativeRequest { .. } | Operation::SettleNativeRequest { .. }
+        | Operation::ObserveNativeRequest { .. } => super::native_request_coordination::apply(tx, op, cfg, now),
+        Operation::MutateGovernance { operation_id, mutation } => {
+            super::governance::operator(tx)?;
+            super::governance::bounded(tx, mutation)?;
+            let result = super::governance::mutate(tx, operation_id, mutation, now, cfg)?;
+            super::governance::bounded(tx, &result)?;
+            Ok((Data::Governance(Box::new(result)), true))
+        }
+        Operation::QueryGovernance { query } => {
+            super::governance::operator(tx)?;
+            super::governance::bounded(tx, query)?;
+            let result = super::governance::query(tx, query)?;
+            super::governance::bounded(tx, &result)?;
+            Ok((Data::Governance(Box::new(result)), false))
+        }
+        Operation::MutateCharter { operation_id, mutation } => {
+            let charter = limits.charter.as_ref().ok_or_else(|| Fault::Refused("not_configured", "charter policy is absent".into()))?;
+            let context = super::charters::Context { tx, operation_id, now_ms: now, limits: charter };
+            Ok((Data::Charter(super::charters::mutate(&context, mutation)?), true))
+        }
+        Operation::ObserveCharter { operation_id, caller, observation } => {
+            let charter = limits.charter.as_ref().ok_or_else(|| Fault::Refused("not_configured", "charter policy is absent".into()))?;
+            let context = super::charters::Context { tx, operation_id, now_ms: now, limits: charter };
+            // The producer distinguishes current new execution from retained
+            // late audit. A blanket current-caller check would lose real replies.
+            Ok((Data::Charter(super::charters::observe(&context, caller, observation)?), true))
+        }
+        Operation::QueryCharter { query } => Ok((Data::CharterQuery(super::charters::query(tx, query)?), false)),
+        Operation::EvaluateCompletion(_)
+        | Operation::BeginCompletionContinuation(_)
+        | Operation::AcknowledgeCompletionInput(_) => {
+            super::governance_completion::apply(tx, op, cfg, now)
+        }
+        Operation::ObserveCollaborationDelivery { .. }
+        | Operation::PrepareCollaborationDelivery { .. }
+        | Operation::BeginCollaborationDelivery { .. }
+        | Operation::AcknowledgeCollaborationDelivery { .. } => {
+            super::governance_completion::before_delivery(tx, op)?;
+            super::collaboration_notifications::apply(tx, op, cfg, now)
+        }
+        Operation::QueryWorkflowActivity { cursor, limit } => Ok((
+            Data::WorkflowActivity(super::collaboration_notifications::activity(tx, cursor, *limit)?),
+            false,
+        )),
+        Operation::MutateQuestion { .. } | Operation::QueryQuestion { .. }
+        | Operation::MutateDocument { .. } | Operation::QueryDocument { .. }
+        | Operation::MutateReview { .. } | Operation::QueryReview { .. }
+        | Operation::MutateWork { .. } | Operation::QueryWork { .. } => {
+            super::collaboration_routing::direct(tx, op, now)
+        }
+        Operation::UpdateDefinition { operation_id, update } => {
+            let actor = crate::collaboration::workflow::RecordedActor {
+                principal: crate::collaboration::workflow::PrincipalRef::TrustedHostOperator,
+                provenance: crate::collaboration::workflow::ActorProvenance::TrustedHost { path: tx.invocation_path },
+            };
+            super::definition_updates::apply(tx, update, cfg, operation_id, &actor)
+        }
         Operation::RegisterRepository { .. }
         | Operation::ReviseRepository { .. }
         | Operation::SetRepositoryEnabled { .. }
@@ -57,7 +119,9 @@ pub(crate) fn apply(
             Data::Collaboration(super::collaboration_queries::apply(tx, query, cfg)?),
             false,
         )),
-        Operation::ListAgents { .. }
+        Operation::RegisterAgent { .. }
+        | Operation::RetireAgent { .. }
+        | Operation::ListAgents { .. }
         | Operation::GetAgent { .. }
         | Operation::ListAgentTasks { .. } => super::agents::apply(tx, op, cfg, now),
         Operation::GetProtectedRelease { release_id } => Ok((
@@ -71,6 +135,11 @@ pub(crate) fn apply(
         Operation::PrepareRelease(_)
         | Operation::GetRelease { .. }
         | Operation::ListReleases { .. } => releases::apply(tx, op, cfg),
+        Operation::SubmitTaskDraft { input, .. } => {
+            let selected = super::task_submission::resolve(tx, input)?;
+            let t = submit(tx, &selected, cfg, now, None, 0, validation)?;
+            Ok((Data::Task(Box::new(t.task)), true))
+        }
         Operation::SubmitTask { input, .. } => {
             if input.resolved_limits.is_some() {
                 return refuse(
@@ -120,51 +189,8 @@ pub(crate) fn apply(
             }
             Ok((Data::Tasks(tasks), false))
         }
-        Operation::AssignTask {
-            task_id,
-            expected_revision,
-            agent_id,
-            ..
-        } => {
-            let mut t = load(tx, task_id)?;
-            revision(&t, *expected_revision)?;
-            if t.task.status != TaskStatus::Queued || t.task.attempt.is_some() {
-                return refuse(
-                    "invalid_transition",
-                    "only never-started queued tasks can be assigned",
-                );
-            }
-            if !valid_id(limits, agent_id) {
-                return refuse("invalid_input", "invalid agent identity");
-            }
-            let original: Option<String> = tx
-                .query_row(
-                    "SELECT definition FROM agents WHERE id=?1",
-                    [agent_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(original) = original else {
-                return refuse(
-                    "unknown_agent",
-                    "agent has no configured definition binding",
-                );
-            };
-            if decode::<Definition>(&original)? != t.task.input.definition {
-                return refuse(
-                    "definition_conflict",
-                    "agent definition or executor differs from submitted task",
-                );
-            }
-            if agent_id != &t.task.input.definition.id {
-                return refuse(
-                    "definition_conflict",
-                    "assignment cannot retarget an immutable agent definition",
-                );
-            }
-            t.task.assigned_agent_id = t.task.input.definition.id.clone();
-            save(tx, &mut t, "assigned", agent_id)?;
-            Ok((Data::Task(Box::new(t.task)), true))
+        Operation::AssignTask { operation_id, task_id, expected_revision, agent_id } => {
+            super::task_handoffs::request(tx, operation_id, task_id, *expected_revision, agent_id, cfg, now, validation)
         }
         //= spec/impl/v2/implementation.md#cancellation-commits-intent-before-interruption
         //# Successful completion and cancellation MUST be ordered by the controller's committed task revision.
@@ -178,6 +204,8 @@ pub(crate) fn apply(
                 return Ok((Data::Task(Box::new(t.task)), false));
             }
             revision(&t, *expected_revision)?;
+            super::task_handoffs::cancel_pending(tx, task_id)?;
+            t.task.pending_assignment = None;
             cancel(tx, &mut t, cfg)?;
             Ok((Data::Task(Box::new(t.task)), true))
         }
@@ -192,17 +220,19 @@ pub(crate) fn apply(
         } => {
             let mut t = load(tx, task_id)?;
             revision(&t, *expected_revision)?;
+            if super::task_handoffs::pending(tx, task_id)? { return refuse("handoff_pending", "assignment awaits original execution closure"); }
             //= spec/impl/v2/implementation.md#task-state-separates-execution-from-acceptance
             //# A succeeded task MUST NOT be reopened by a retry request.
-            if !matches!(t.task.status, TaskStatus::Failed | TaskStatus::Cancelled) {
+            if !matches!(t.task.status, TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked) {
                 return refuse(
                     "invalid_transition",
-                    "only failed or cancelled tasks can retry",
+                    "only failed, cancelled or blocked tasks can retry",
                 );
             }
             //= spec/impl/v2/implementation.md#interrupted-work-is-reconciled
             //# An external effect with an uncertain outcome MUST be reconciled before the platform retries that effect.
             if active(&t.task)
+                || t.unresolved_execution
                 || t.task.attempt.as_ref().is_some_and(|a| a.uncertain)
                 || pending_effects(tx, &t.task.id)? > 0
                 || !descendants_settled(tx, &t.task.id, cfg.max_tasks)?
@@ -221,6 +251,16 @@ pub(crate) fn apply(
             {
                 return refuse("capacity", "retry has no remaining model-request budget");
             }
+            // A new attempt cannot disguise an unchanged fatal request as a
+            // correction. No accepted-input/config remediation proof exists here.
+            if t.task.native_retry_block.as_ref().is_some_and(|block| matches!(block.reason,
+                crate::native::RetryBlockReason::InvalidRequest
+                | crate::native::RetryBlockReason::ContextLimit
+                | crate::native::RetryBlockReason::PolicyRefused
+                | crate::native::RetryBlockReason::QuotaExhausted
+                | crate::native::RetryBlockReason::AuthenticationFailed)) {
+                return refuse("retry_correction_required", "native rejection requires a separately corrected request or configuration");
+            }
             // A fresh attempt cannot reinterpret an older unbound definition.
             require_definition(&t.task.input.definition)?;
             if t.cleanup_remaining == 0 {
@@ -229,6 +269,9 @@ pub(crate) fn apply(
                 }
                 t.cleanup_remaining = 1;
             }
+            // Only explicit retry clears this hold after the existing guards.
+            // Independent completion/uncertainty state is never reset here.
+            t.task.native_retry_block = None;
             t.task.status = TaskStatus::Queued;
             t.task.result = None;
             t.task.blocked_reason = None;
@@ -324,7 +367,7 @@ pub(crate) fn apply(
     }
 }
 
-fn require_definition(definition: &Definition) -> Result<()> {
+pub(super) fn require_definition(definition: &Definition) -> Result<()> {
     definition
         .required_inference()
         .map(|_| ())
@@ -343,7 +386,7 @@ fn require_definition(definition: &Definition) -> Result<()> {
     Ok(())
 }
 
-fn validate(input: &TaskInput, cfg: &ControllerConfig, now: u64) -> Result<()> {
+pub(super) fn validate(input: &TaskInput, cfg: &ControllerConfig, now: u64) -> Result<()> {
     input
         .execution_limits()
         .map_err(|reason| Fault::Refused("invalid_limits", reason))?;
@@ -454,13 +497,21 @@ fn validate(input: &TaskInput, cfg: &ControllerConfig, now: u64) -> Result<()> {
             }
         }
     }
-    if let Some(NativeWorkflow::CodingThenContinue { child }) = input.native_workflow.as_deref() {
+    if let Some(child) = crate::delegation::configured_template(input) {
         require_definition(&child.definition)?;
     }
     crate::execution_profile::validate(input)
         .map_err(|reason| Fault::Refused("invalid_input", reason))?;
+    if let Some(target)=crate::delegation::handoff_template(input) {
+        if target.limits!=input.limits{return refuse("invalid_input","same-task handoff limits must equal the accepted task limits")}
+    }
     crate::delegation::validate_workflow(input)
         .map_err(|reason| Fault::Refused("invalid_input", reason))?;
+    super::pull_request::validate_input(input, limits)?;
+    if let Some(source) = &input.instruction_source {
+        source.validate_instruction_binding(limits)
+            .map_err(|reason| Fault::Refused("invalid_input", reason))?;
+    }
     //= spec/impl/v2/implementation.md#definitions-select-execution
     //# An agent definition MUST identify the executor used for its tasks.
     if let Some(source) = &input.repository_read {
@@ -565,7 +616,7 @@ fn configured_child(parent: &StoredTask, child: &TaskInput) -> Result<u64> {
     Ok(1)
 }
 
-fn configured_sources(
+pub(super) fn configured_sources(
     tx: &Connection,
     input: &TaskInput,
     cfg: &ControllerConfig,
@@ -573,6 +624,11 @@ fn configured_sources(
     cycle_target: Option<&str>,
     depth: u32,
 ) -> Result<()> {
+    if let Some(target) = crate::delegation::handoff_template(input) {
+        // Validate accepted writable scope now without creating or delegating a task.
+        super::task_handoffs::successor(tx, input, &target.definition, cfg, now)?;
+        return Ok(());
+    }
     if crate::delegation::template(input).is_none() {
         return Ok(());
     }
@@ -599,6 +655,7 @@ fn configured_sources(
             .map_err(|reason| Fault::Refused("invalid_limits", reason))?,
     );
     validate(&child, cfg, now)?;
+    super::charters::validate_definition(&tx.with_limits(selected), &child.definition)?;
     for dependency in &child.dependencies {
         load(tx, dependency)?;
         // For a new delegated native task, check its prospective waiting
@@ -675,6 +732,7 @@ fn submit(
     depth: u32,
     validation: &Context<'_>,
 ) -> Result<StoredTask> {
+    super::agents::require_active(tx, &input.definition.id)?;
     // This runs only after the original durable operation receipt lookup.
     // The receipt retains caller bytes; only the accepted task receives this
     // controller-computed snapshot in the same committing transaction.
@@ -700,10 +758,11 @@ fn submit(
     accepted.resolved_limits = Some(snapshot);
     let accepted_child =
         parent.is_some_and(|p| crate::delegation::template(&p.task.input).is_some());
-    let repository_context = super::database::StoreContext::new(tx, selected);
+    let repository_context = tx.with_limits(selected);
     super::repositories::resolve_input(&repository_context, &mut accepted, accepted_child)?;
     let input = &accepted;
     validate(input, cfg, now)?;
+    super::charters::validate_definition(&repository_context, &input.definition)?;
     configured_sources(
         tx,
         input,
@@ -715,6 +774,9 @@ fn submit(
     if input.definition.executor == ExecutorKind::Native {
         validation.require(input, None, parent, now)?;
     }
+    // Traceability scope: Durable task admission checks the configured task count and cancellation reserve; worker and owner-queue bounds are checked at their own admission boundaries.
+    //= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
+    //# Admission MUST enforce configured queue and resource bounds.
     let count: i64 = tx.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
     if count >= cfg.max_tasks as i64 {
         return refuse(
@@ -774,13 +836,12 @@ fn submit(
                 "agent is bound to another definition identity",
             );
         }
-        // Only the agent's selection for new submissions advances. Each existing
-        // task retains its own accepted immutable revision and executor input.
-        tx.execute(
-            "UPDATE agents SET definition=?2 WHERE id=?1",
-            params![input.definition.id, encode(&input.definition)?],
-        )?;
+        // Explicit task inputs never advance or revert an existing selected
+        // head. Definition updates use the canonical revision-CAS operation.
+        //= spec/impl/v2/implementation.md#operational-feedback-applies-supported-configuration
+        //# Submitting an explicitly pinned definition MUST NOT change an existing agent's selected definition revision.
     } else {
+        super::agents::require_directory_capacity(tx, cfg)?;
         tx.execute(
             "INSERT INTO agents(id,definition) VALUES(?1,?2)",
             params![input.definition.id, encode(&input.definition)?],
@@ -822,7 +883,7 @@ fn submit(
     let t = StoredTask {
         task: Task {
             id: task_id,
-            session_id: session.id,
+            session_id: session.id.clone(),
             //= spec/impl/v2/implementation.md#definitions-select-execution
             //# A task MUST retain the definition revision accepted at submission.
             //= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
@@ -836,7 +897,7 @@ fn submit(
             attempt: None,
             selected_checkpoint: None,
             result: None,
-            blocked_reason: None,
+            blocked_reason: None, native_retry_block: None, pending_assignment: None,
             progress: String::new(),
             recent_output: String::new(),
             output_truncated: false,
@@ -853,8 +914,15 @@ fn submit(
         executor_success: None,
         unresolved_execution: false,
         cleanup_remaining: 1,
+        completion_hold: None,
     };
+    // IDs and accepted metadata now exist; reserve the minimal typed failure
+    // envelope before this accepted task can reach a completion boundary.
+    super::governance::validate_failure_envelope(tx, &t)?;
     insert(tx, &t, seq)?;
+    super::sessions::bind_input(tx, &session, input, None, None)?;
+    // Same transaction as accepted immutable definition, session and task.
+    super::charters::initialize(&repository_context, &t.task.session_id)?;
     Ok(t)
 }
 
@@ -954,7 +1022,7 @@ fn delegated_children(tx: &Connection, parent: &str, bound: usize) -> Result<Vec
     Ok(children)
 }
 
-fn descendants_settled(tx: &Connection, root: &str, bound: usize) -> Result<bool> {
+pub(super) fn descendants_settled(tx: &Connection, root: &str, bound: usize) -> Result<bool> {
     let mut pending = vec![root.to_string()];
     let mut visited = HashSet::new();
     while let Some(parent) = pending.pop() {
@@ -999,6 +1067,13 @@ pub(crate) fn view(
 
 //= spec/impl/v2/implementation.md#cancellation-commits-intent-before-interruption
 //# A cancellation request MUST commit cancellation intent and its stop command atomically.
+//= spec/impl/v2/implementation.md#platform-owned-model-retries
+//# Every retry-related blocked state MUST have an explicit canonical exit transition available through the supported adapter or control interface.
+
+// Traceability scope: Authorized cancellation commits its own stop intent without requesting voluntary completion admission.
+//= spec/impl/v2/implementation.md#voluntary-completion-checks-remaining-work
+//# An authorized cancellation or emergency stop MUST NOT wait for voluntary completion admission.
+
 fn cancel(tx: &Connection, t: &mut StoredTask, cfg: &ControllerConfig) -> Result<()> {
     let mut pending = vec![t.task.id.clone()];
     let mut visited = HashSet::new();
@@ -1153,6 +1228,7 @@ pub(crate) fn await_request(
     op: &Operation,
     cfg: &ControllerConfig,
     now: u64,
+    maintenance_pending: bool,
 ) -> Result<(Data, bool, Option<String>)> {
     let Operation::AwaitCommands {
         operation_id,
@@ -1182,6 +1258,7 @@ pub(crate) fn await_request(
         );
     }
     let mut changed = false;
+    let mut stop_acknowledged = false;
     for command in ack {
         let belongs: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM commands WHERE id=?1 AND worker=?2 AND incarnation=?3)",
@@ -1199,6 +1276,18 @@ pub(crate) fn await_request(
             [command],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        if !owner.1 && tx.governance_limits.governance.is_some() {
+            let maximum = cfg.limits.transport.body_bytes;
+            let body: String = tx.query_row(
+                "SELECT CAST(substr(CAST(body AS BLOB),1,?2) AS TEXT) FROM commands WHERE id=?1",
+                params![command, sql_bound(maximum.saturating_add(1))?], |r| r.get(0))?;
+            if body.len() > maximum {
+                return Err(Fault::Store("acknowledged command exceeds transport.body_bytes".into()));
+            }
+            let acknowledged_command: WorkerCommand = decode(&body)?;
+            stop_acknowledged |= matches!(&acknowledged_command,
+                WorkerCommand::StopAttempt { command_id, .. } if command_id == command);
+        }
         if !owner.1 && !ordinary && credit.is_none() {
             if !super::credits::control_available(tx, &owner.0)? {
                 return Err(Fault::Store(
@@ -1212,16 +1301,30 @@ pub(crate) fn await_request(
             [command],
         )? > 0;
     }
+    // A pending Stop or its new ACK must not depend on unrelated ordinary
+    // policy. Use the existing bounded Stop-only projection and original
+    // receipt/credit path; this exchange admits no new work. Replay/identity,
+    // storage, body bounds and delivery accounting below remain mandatory.
+    let stop_commands = if maintenance_pending || tx.governance_limits.governance.is_some() {
+        delivery_snapshot(tx, id, inc, cfg, false)?
+    } else { Vec::new() };
+    let control_exchange = maintenance_pending || stop_acknowledged || !stop_commands.is_empty();
+    // Expiry remains in the original admission transaction. A control-only
+    // exchange defers it along with all fresh admission, without masking errors.
+    if ordinary && !control_exchange {
+        changed |= super::governance_control::reconcile_expiry(tx, operation_id, now)?;
+    }
     //= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
     //# Task admission MUST select the oldest eligible task within the requested executor's available capacity.
-    let ids = if ordinary {
+    let ids = if ordinary && !control_exchange {
         let mut q = tx.prepare("SELECT id FROM tasks WHERE status='queued' ORDER BY seq")?;
         q.query_map([], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
         Vec::new()
     };
-    let mut commands = delivery_snapshot(tx, id, inc, cfg, ordinary)?;
+    let mut commands = if control_exchange { stop_commands }
+        else { delivery_snapshot(tx, id, inc, cfg, ordinary)? };
     // Existing commands remain backed by their original delivery receipts.
     // This exchange must also fit its full ACK/input lookup representation.
     while !super::metadata::commands_fit(&cfg.limits, op, &commands.iter().collect::<Vec<_>>()) {
@@ -1250,7 +1353,12 @@ pub(crate) fn await_request(
         }
         let (a, body, next_counter) = match admission::check(tx, &t, &worker, cfg, fresh_now)? {
             admission::Decision::Blocked(reason) => {
-                if t.task.blocked_reason.as_ref() != Some(&reason) {
+                // Preserve the typed completion marker across capacity/wait
+                // deferrals. Queued views still compute the live admission reason;
+                // a diagnostic deferral cannot erase original resume provenance.
+                let completion_held = t.completion_hold.as_ref().is_some_and(|hold|
+                    matches!(hold.state.disposition, crate::governance::CompletionDisposition::Blocked { .. }));
+                if !completion_held && t.task.blocked_reason.as_ref() != Some(&reason) {
                     t.task.blocked_reason = Some(reason.clone());
                     save(tx, &mut t, "admission_deferred", &reason)?;
                     changed = true;
@@ -1309,6 +1417,9 @@ pub(crate) fn await_request(
                 Err(error) => return Err(error),
             }
         }
+        // Keep the exact pre-admission task for the wait/unknown-owner guard.
+        // The selected attempt must exist before its FK-backed consumption rows.
+        let prior_task = t.task.clone();
         t.generation = a.generation;
         t.attempt_counter = next_counter;
         t.task.attempt = Some(a.clone());
@@ -1320,6 +1431,14 @@ pub(crate) fn await_request(
         //= spec/impl/v2/implementation.md#accepted-state-has-one-durable-owner
         //# An execution attempt MUST have a durable identity before it begins.
         save(tx, &mut t, "attempt_assigned", &a)?;
+        if let Some(limits) = tx.limits.workflow.as_ref() {
+            let WorkerCommand::RunAttempt { workflow_continuation, .. } = &body else {
+                return Err(Fault::Store("admission command is not an execution attempt".into()));
+            };
+            // Same original request transaction: an association failure rolls
+            // back the attempt, task, history and later RunAttempt together.
+            super::collaboration_work::admitted(tx, &prior_task, &a, workflow_continuation.as_ref(), limits)?;
+        }
         tx.execute(
             "UPDATE attempts SET control_remaining=3 WHERE id=?1",
             [&a.id],
@@ -1353,6 +1472,8 @@ pub(crate) fn await_request(
                 attempt_id,
                 ..
             } => (command_id, attempt_id, true),
+            WorkerCommand::CollaborationReady { command_id, caller, .. } =>
+                (command_id, &caller.attempt_id, false),
         };
         let delivered: Option<String> = tx.query_row(
             "SELECT delivery_operation_id FROM commands WHERE id=?1",
@@ -1445,4 +1566,15 @@ pub(super) fn delivery_fits(
     let proposed: Vec<_> = commands.iter().chain(std::iter::once(candidate)).collect();
     bounded_json_size(&proposed, cfg.command_page_bytes).is_ok()
         && super::metadata::commands_fit(&cfg.limits, operation, &proposed)
+}
+
+// Append inside controller::operations; uses the original cancellation body.
+// No physical termination claim and no ordinary completion policy evaluation.
+pub(super) fn governance_stop(
+    tx: &Connection, task_id: &str, expected_revision: u64, cfg: &ControllerConfig,
+) -> Result<()> {
+    let mut stored=load(tx,task_id)?;
+    if terminal(stored.task.status) {return Ok(())}
+    revision(&stored,expected_revision)?;
+    cancel(tx,&mut stored,cfg)
 }

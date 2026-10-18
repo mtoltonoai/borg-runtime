@@ -171,6 +171,7 @@ async fn native_repository_reads_bind_paired_exact_revision_without_coding_or_ch
             Operation::RegisterRepository {
                 operation_id: format!("register-{id}"),
                 registration: borg_runtime::repository_catalogue::Registration {
+                    pull_request_target: None,
                     repository_id: id.into(),
                     registration_revision: "r1".into(),
                     display_name: id.into(),

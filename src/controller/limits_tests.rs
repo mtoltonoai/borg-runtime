@@ -47,11 +47,13 @@ fn coding(limits: &RuntimeLimits, agent: &str) -> TaskInput {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    TaskInput {
+    TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         repository_read: None,
         instruction: "metadata-only admission fixture".into(),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
             inference: Some(InferenceSettings::selected()),
@@ -60,6 +62,7 @@ fn coding(limits: &RuntimeLimits, agent: &str) -> TaskInput {
             executor: ExecutorKind::Coding,
         },
         repository: Some(Repository {
+            pull_request_target: None,
             registration: Some(crate::repository_catalogue::Revision {
                 repository_id: "metadata-fixture".into(),
                 registration_revision: "1".into(),
@@ -77,6 +80,7 @@ fn coding(limits: &RuntimeLimits, agent: &str) -> TaskInput {
 }
 async fn register_fixture(controller: &Controller) {
     let registration = crate::repository_catalogue::Registration {
+        pull_request_target: None,
         repository_id: "metadata-fixture".into(),
         registration_revision: "1".into(),
         display_name: "Metadata fixture".into(),
@@ -126,7 +130,7 @@ fn config(metadata: RuntimeLimits) -> ControllerConfig {
 
 #[test]
 fn metadata_is_closed_and_missing_policy_does_not_acquire_rust_defaults() {
-    let seed = RuntimeLimits::seed().unwrap();
+    let seed = small_context_metadata();
     let mut value = serde_json::to_value(&seed).unwrap();
     value["controller"]
         .as_object_mut()
@@ -144,7 +148,7 @@ fn metadata_is_closed_and_missing_policy_does_not_acquire_rust_defaults() {
 //# An accepted task MUST retain its resolved execution-limit values.
 async fn accepted_snapshot_and_original_receipt_survive_changed_global_defaults() {
     let p = path();
-    let mut first = RuntimeLimits::seed().unwrap();
+    let mut first = small_context_metadata();
     first.revision = "global-before".into();
     let original = coding(&first, "agent-snapshot");
     let op = Operation::SubmitTask {
@@ -213,7 +217,7 @@ async fn accepted_snapshot_and_original_receipt_survive_changed_global_defaults(
 //= type=test
 //# An agent definition MUST carry the execution-limit overrides specific to that agent revision.
 async fn supplied_snapshot_refuses_and_agent_override_is_exact_immutable_revision_data() {
-    let metadata = RuntimeLimits::seed().unwrap();
+    let metadata = small_context_metadata();
     let c = Controller::open_with_config(path(), config(metadata.clone())).unwrap();
     register_fixture(&c).await;
     let mut forged = coding(&metadata, "agent-forged");
@@ -279,7 +283,7 @@ async fn supplied_snapshot_refuses_and_agent_override_is_exact_immutable_revisio
 }
 #[tokio::test]
 async fn explicit_admission_metadata_changes_effective_command_bound() {
-    let mut selected = RuntimeLimits::seed().unwrap();
+    let mut selected = small_context_metadata();
     selected.controller.max_acceptance_commands = 1;
     let c = Controller::open_with_config(path(), config(selected.clone())).unwrap();
     register_fixture(&c).await;
@@ -314,7 +318,7 @@ async fn explicit_admission_metadata_changes_effective_command_bound() {
 async fn retained_call_replay_ignores_new_mcp_policy_and_limits_view_separates_current_from_accepted()
  {
     let p = path();
-    let mut first = RuntimeLimits::seed().unwrap();
+    let mut first = small_context_metadata();
     first.revision = "mcp-before".into();
     let c = Controller::open_with_config(&p, config(first.clone())).unwrap();
     register_fixture(&c).await;
@@ -386,7 +390,7 @@ async fn retained_call_replay_ignores_new_mcp_policy_and_limits_view_separates_c
 
 #[test]
 fn minimum_complete_result_reserve_matches_actual_encoder_and_overflow_refuses() {
-    let mut transport = RuntimeLimits::seed().unwrap().transport;
+    let mut transport = small_context_metadata().transport;
     for identity_bytes in [1, 17, 256] {
         transport.identity_bytes = identity_bytes;
         let bound = minimum_collaboration_result_bytes(&transport).unwrap();
@@ -411,7 +415,7 @@ fn minimum_complete_result_reserve_matches_actual_encoder_and_overflow_refuses()
 #[tokio::test]
 async fn list_tasks_uses_list_page_bytes_independently_of_command_page_bytes() {
     for small_list in [false, true] {
-        let mut selected = RuntimeLimits::seed().unwrap();
+        let mut selected = small_context_metadata();
         if small_list {
             selected.controller.list_page_bytes = 1;
         } else {
@@ -470,7 +474,7 @@ fn assert_limiting_field(reply: &Reply, expected_code: &str, field: &str) {
 #[tokio::test]
 async fn admission_refusals_identify_the_exact_limiting_metadata_field() {
     for case in 0..8 {
-        let mut selected = RuntimeLimits::seed().unwrap();
+        let mut selected = small_context_metadata();
         let mut input = coding(&selected, "field-agent");
         let (code, field) = match case {
             0 => {
@@ -527,3 +531,5 @@ async fn admission_refusals_identify_the_exact_limiting_metadata_field() {
         assert_eq!(replay.commit, original.commit);
     }
 }
+
+fn small_context_metadata() -> RuntimeLimits { let mut p=RuntimeLimits::seed().unwrap(); p.execution.native.context_bytes=65_536; p }

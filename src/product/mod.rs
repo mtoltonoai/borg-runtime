@@ -10,14 +10,27 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod governance;
+#[cfg(test)]
+mod governance_tests;
 mod agents;
 mod collaboration;
+mod collaboration_questions;
+mod collaboration_work;
+mod documents_reviews;
+mod definition_settings;
+pub(crate) mod failure;
 mod live;
 mod protected_view;
 mod repository;
 mod repository_catalogue;
 mod sessions;
 mod task_defaults;
+mod default_task_submission;
+#[cfg(test)]
+mod instruction_source_tests;
+#[cfg(test)]
+mod pull_request_tests;
 
 pub struct UiRequest {
     pub method: String,
@@ -33,6 +46,7 @@ pub struct UiResponse {
     pub content_type: String,
     pub body: String,
     pub location: Option<String>,
+    limiting_field: Option<failure::LimitingField>,
 }
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -105,13 +119,54 @@ fn decode(value: &str, plus_is_space: bool) -> Result<String, String> {
     Ok(out)
 }
 
+trait Diagnostic {
+    fn message(&self) -> &str;
+    fn limiting_field(&self) -> Option<failure::LimitingField> { None }
+}
+impl Diagnostic for str { fn message(&self) -> &str { self } }
+impl Diagnostic for String { fn message(&self) -> &str { self } }
+impl<T: Diagnostic + ?Sized> Diagnostic for &T {
+    fn message(&self) -> &str { T::message(*self) }
+    fn limiting_field(&self) -> Option<failure::LimitingField> { T::limiting_field(*self) }
+}
+#[derive(Debug)]
+struct FormError {
+    message: String,
+    limiting_field: Option<failure::LimitingField>,
+}
+impl FormError {
+    fn limit(field: failure::LimitingField) -> Self {
+        Self { message: format!("Configured limit exceeded: {}", field.name()), limiting_field: Some(field) }
+    }
+}
+impl From<String> for FormError {
+    fn from(message: String) -> Self { Self { message, limiting_field: None } }
+}
+impl From<&str> for FormError {
+    fn from(message: &str) -> Self { message.to_owned().into() }
+}
+impl std::ops::Deref for FormError {
+    type Target = str;
+    fn deref(&self) -> &str { &self.message }
+}
+impl PartialEq<&str> for FormError {
+    fn eq(&self, other: &&str) -> bool { self.message == *other }
+}
+impl std::fmt::Display for FormError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { out.write_str(&self.message) }
+}
+impl Diagnostic for FormError {
+    fn message(&self) -> &str { &self.message }
+    fn limiting_field(&self) -> Option<failure::LimitingField> { self.limiting_field }
+}
+
 // Traceability scope: Form body, field-count and field-name byte refusals identify
 // their configured fields; malformed forms retain separate errors.
 //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
 //# An operation refused by a configured limit MUST identify the limiting metadata field.
-fn parse_form(body: &[u8], metadata: &RuntimeLimits) -> Result<Form, String> {
+fn parse_form(body: &[u8], metadata: &RuntimeLimits) -> Result<Form, FormError> {
     if body.len() > metadata.transport.body_bytes {
-        return Err("Configured limit exceeded: transport.body_bytes".into());
+        return Err(FormError::limit(failure::LimitingField::Body));
     }
     let body = std::str::from_utf8(body).map_err(|_| "Form body is not UTF-8".to_string())?;
     let mut fields = Form::new();
@@ -120,7 +175,7 @@ fn parse_form(body: &[u8], metadata: &RuntimeLimits) -> Result<Form, String> {
     }
     for pair in body.split('&') {
         if fields.len() == metadata.product.form_fields {
-            return Err("Configured limit exceeded: product.form_fields".into());
+            return Err(FormError::limit(failure::LimitingField::FormFields));
         }
         let (key, value) = pair.split_once('=').ok_or("Missing form value")?;
         let key = decode(key, true)?;
@@ -128,7 +183,7 @@ fn parse_form(body: &[u8], metadata: &RuntimeLimits) -> Result<Form, String> {
             return Err("Invalid form field name".into());
         }
         if key.len() > metadata.product.form_key_bytes {
-            return Err("Configured limit exceeded: product.form_key_bytes".into());
+            return Err(FormError::limit(failure::LimitingField::FormKey));
         }
         if fields.insert(key, decode(value, true)?).is_some() {
             return Err("Duplicate form field".into());
@@ -158,13 +213,17 @@ fn fields_only(fields: &Form, allowed: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+// Traceability scope: The shared page shell places the activity aside to the right on wide layouts, with a responsive narrow-screen fallback. live.js fills it from bounded durable activity; this does not assert full browser/API parity.
+//= spec/impl/v2/implementation.md#shared-product-state
+//# The browser interface MUST display a live activity feed on the right side of the page.
 fn page(status: u16, title: &str, content: String) -> UiResponse {
     UiResponse {
         status,
         content_type: "text/html; charset=utf-8".into(),
         location: None,
+        limiting_field: None,
         body: format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{} | Borg</title><style>body{{font-family:system-ui,sans-serif;max-width:1500px;margin:2rem auto;padding:0 1rem;color:#17202a;background:#fafafa}}nav a{{margin-right:1rem}}.workspace{{display:grid;grid-template-columns:minmax(0,1fr) 20rem;gap:2rem}}.activity{{border-left:1px solid #ccd1d1;padding-left:1rem;overflow-wrap:anywhere}}.activity ol{{padding-left:1.2rem}}.activity li{{margin-bottom:1rem}}.activity small{{display:block}}@media(max-width:850px){{.workspace{{display:block}}.activity{{border-left:0;border-top:1px solid #ccd1d1;padding:1rem 0}}}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:.6rem;border-bottom:1px solid #ccd1d1}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#eef0f2;padding:1rem}}label{{display:block;margin:1rem 0}}input,textarea,select{{display:block;box-sizing:border-box;max-width:100%;width:100%;padding:.5rem}}input[type=hidden]{{display:none}}button{{padding:.6rem 1rem}}fieldset{{margin:1rem 0;border:1px solid #bbc}}.notice{{padding:1rem;border-left:4px solid #b56b00;background:#fff3cd}}dt{{font-weight:bold;margin-top:.6rem}}dd{{margin-left:0;overflow-wrap:anywhere}}.actions form{{display:inline-block;margin-right:1rem}}.actions input{{width:auto}}a{{color:#075c93}}small{{color:#455}}</style></head><body><nav aria-label=\"Primary navigation\"><a href=\"/tasks\">Tasks</a><a href=\"/agents\">Agents</a><a href=\"/sessions\">Sessions</a><a href=\"/workers\">Workers</a><a href=\"/collaboration\">Collaboration</a><a href=\"/repositories\">Repositories</a><a href=\"/limits\">Limits</a><a href=\"/tasks/new\">Create task</a></nav><div class=\"workspace\"><main data-live-refresh=\"{}\"><h1>{}</h1>{content}</main><aside class=\"activity\" aria-label=\"Borg activity\"><h2>Borg activity</h2><p id=\"live-status\" role=\"status\">Connecting</p><button id=\"live-refresh\" type=\"button\" hidden>Update this view</button><p>Latest recorded task events</p><p id=\"activity-empty\">No activity received.</p><ol id=\"activity-items\"></ol><p><a href=\"/activity\">Browse activity history</a></p></aside></div><script src=\"/ui/live.js\" defer></script></body></html>",
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{} | Borg</title><style>body{{font-family:system-ui,sans-serif;max-width:1500px;margin:2rem auto;padding:0 1rem;color:#17202a;background:#fafafa}}nav a{{margin-right:1rem}}.workspace{{display:grid;grid-template-columns:minmax(0,1fr) 20rem;gap:2rem}}.activity{{border-left:1px solid #ccd1d1;padding-left:1rem;overflow-wrap:anywhere}}.activity ol{{padding-left:1.2rem}}.activity li{{margin-bottom:1rem}}.activity small{{display:block}}@media(max-width:850px){{.workspace{{display:block}}.activity{{border-left:0;border-top:1px solid #ccd1d1;padding:1rem 0}}}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:.6rem;border-bottom:1px solid #ccd1d1}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#eef0f2;padding:1rem}}label{{display:block;margin:1rem 0}}input,textarea,select{{display:block;box-sizing:border-box;max-width:100%;width:100%;padding:.5rem}}input[type=hidden]{{display:none}}button{{padding:.6rem 1rem}}fieldset{{margin:1rem 0;border:1px solid #bbc}}.notice{{padding:1rem;border-left:4px solid #b56b00;background:#fff3cd}}dt{{font-weight:bold;margin-top:.6rem}}dd{{margin-left:0;overflow-wrap:anywhere}}.actions form{{display:inline-block;margin-right:1rem}}.actions input{{width:auto}}a{{color:#075c93}}small{{color:#455}}</style></head><body><nav aria-label=\"Primary navigation\"><a href=\"/tasks\">Tasks</a><a href=\"/agents\">Agents</a><a href=\"/sessions\">Sessions</a><a href=\"/workers\">Workers</a><a href=\"/collaboration\">Collaboration</a><a href=\"/repositories\">Repositories</a><a href=\"/limits\">Limits</a><a href=\"/governance\">Governance</a><a href=\"/tasks/new\">Create task</a></nav><div class=\"workspace\"><main data-live-refresh=\"{}\"><h1>{}</h1>{content}</main><aside class=\"activity\" aria-label=\"Borg activity\"><h2>Borg activity</h2><p id=\"live-status\" role=\"status\">Connecting</p><button id=\"live-refresh\" type=\"button\" hidden>Update this view</button><p>Latest recorded task events</p><p id=\"activity-empty\">No activity received.</p><ol id=\"activity-items\"></ol><p><a href=\"/activity\">Browse activity history</a></p><section id=\"workflow-activity\" hidden><h3>Workflow activity</h3><p>Latest recorded questions, documents, reviews and waits</p><p id=\"workflow-empty\">No workflow activity received.</p><ol id=\"workflow-items\"></ol></section></aside></div><script src=\"/ui/live.js\" defer></script></body></html>",
             escape(title),
             status < 400
                 && !matches!(
@@ -173,21 +232,29 @@ fn page(status: u16, title: &str, content: String) -> UiResponse {
                         | "Register repository"
                         | "Revise repository"
                         | "Repository registration"
+                        | "Committed settings change"
+                        | "Operation outcome unresolved"
                 ),
             escape(title)
         ),
     }
 }
 
-fn error(status: u16, message: &str) -> UiResponse {
-    page(
+fn error<M: Diagnostic + ?Sized>(status: u16, message: &M) -> UiResponse {
+    let mut response = page(
         status,
         "Request not completed",
         format!(
-            "<p class=\"notice\">{}</p><p><a href=\"/tasks\">Return to committed task state</a></p>",
-            escape(message)
+            "<p class=\"notice\" role=\"alert\" tabindex=\"-1\" autofocus>{}</p><p><a href=\"/tasks\">Return to committed task state</a></p>",
+            escape(message.message())
         ),
-    )
+    );
+    response.limiting_field = message.limiting_field();
+    response
+}
+
+fn limit_error(status: u16, field: failure::LimitingField) -> UiResponse {
+    error(status, &FormError::limit(field))
 }
 
 fn field(name: &str, label: &str, value: &str, kind: &str, required: bool) -> String {
@@ -217,6 +284,7 @@ fn status(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Queued => "queued",
         TaskStatus::Active => "active",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::Succeeded => "succeeded",
         TaskStatus::Failed => "failed",
         TaskStatus::Cancelled => "cancelled",
@@ -238,7 +306,7 @@ fn phase(phase: AttemptPhase) -> &'static str {
 //# The collaboration product MUST NOT create an independent agent inbox.
 async fn call(controller: &Controller, command: Operation) -> Reply {
     controller
-        .handle(Request {
+        .handle_browser(Request {
             protocol_revision: WIRE_REVISION,
             request_id: identity(),
             command,
@@ -282,7 +350,7 @@ fn uncertain(code: u16, operation_id: &str, message: &str, task_id: Option<&str>
         code,
         "Operation outcome unresolved",
         format!(
-            "<p class=\"notice\">{}</p><p>Operation identity: <code>{}</code>. Keep this identity for lookup or retry; do not create a replacement operation to guess the outcome.</p><a href=\"/operations/{}\">Look up this operation</a>{link}",
+            "<p class=\"notice\" role=\"alert\" tabindex=\"-1\" autofocus>{}</p><p>Operation identity: <code>{}</code>. Keep this identity for lookup or retry; do not create a replacement operation to guess the outcome.</p><a href=\"/operations/{}\">Look up this operation</a>{link}",
             escape(message),
             escape(operation_id),
             encode(operation_id)
@@ -328,6 +396,9 @@ fn mutation_reply_for(
         );
     }
     match reply.outcome {
+        Outcome::Ok { data: Data::DefinitionUpdate(outcome) } => {
+            definition_settings::committed(operation_id, &outcome)
+        }
         Outcome::Ok {
             data: Data::RepositoryRegistration(entry),
         } => {
@@ -347,6 +418,10 @@ fn mutation_reply_for(
             response.location = Some(path);
             response
         }
+        Outcome::Ok { data: Data::QuestionMutation(value) } => collaboration_questions::committed(operation_id, &value),
+        Outcome::Ok { data: Data::DocumentMutation(value) } => documents_reviews::document_committed(operation_id, &value),
+        Outcome::Ok { data: Data::ReviewMutation(value) } => documents_reviews::review_committed(operation_id, &value),
+        Outcome::Ok { data: Data::WorkMutation(value) } => collaboration_work::committed(operation_id, &value),
         Outcome::Ok {
             data: Data::Task(task),
         } => {
@@ -362,11 +437,19 @@ fn mutation_reply_for(
             response.location = Some(task_path(&task.id));
             response
         }
+        Outcome::Refused { code, message } if code == "operation_conflict" => page(
+            409,
+            "Action refused: operation identity conflict",
+            format!(
+                "<p class=\"notice\" role=\"alert\" tabindex=\"-1\" autofocus>{}: {}</p><p>This request differs from the original request recorded under operation <code>{}</code>. The original operation may already have committed. Inspect its original outcome before creating another action.</p><a href=\"/operations/{}\">Look up the original operation</a>",
+                escape(&code), escape(&message), escape(operation_id), encode(operation_id)
+            ),
+        ),
         Outcome::Refused { code, message } => page(
             409,
             "Action refused",
             format!(
-                "<p class=\"notice\">{}: {}</p><p>Operation identity: <code>{}</code>. The action was not accepted. Refresh before creating a new action; do not automatically retry a stale form with a new revision.</p><a href=\"{}\">Refresh committed state</a>",
+                "<p class=\"notice\" role=\"alert\" tabindex=\"-1\" autofocus>{}: {}</p><p>Operation identity: <code>{}</code>. The action was not accepted. Refresh before creating a new action; do not automatically retry a stale form with a new revision.</p><a href=\"{}\">Refresh committed state</a>",
                 escape(&code),
                 escape(&message),
                 escape(operation_id),
@@ -476,6 +559,17 @@ fn create_form(
     if let Some(overrides) = fields.get("limit_overrides") {
         body.push_str(&hidden("limit_overrides", overrides));
     }
+    if let Some(charter) = fields.get("charter").filter(|value| !value.is_empty()) {
+        body.push_str(&hidden("charter",charter));
+        body.push_str("<p>The selected revision retains its exact reusable charter.</p>");
+    }
+    if fields.contains_key("charter_definition_id") || fields.contains_key("charter_definition_revision")
+        || (metadata.charter.is_some() && fields.get("charter").is_none_or(|value|value.is_empty())) {
+        body.push_str("<fieldset><legend>Reusable charter</legend><p>Use an already published immutable source. Task instructions describe this task's work.</p>");
+        body.push_str(&field("charter_definition_id","Charter agent ID",value("charter_definition_id"),"text",true));
+        body.push_str(&field("charter_definition_revision","Charter source revision",value("charter_definition_revision"),"text",true));
+        body.push_str("</fieldset>");
+    }
     // Invalid input is redisplayed exactly; never fill in missing settings.
     if fields.contains_key("execution_profile") {
         body.push_str(&hidden("execution_profile", value("execution_profile")));
@@ -548,7 +642,19 @@ fn create_form(
     ] {
         body.push_str(&field(name, label, value(name), "text", false));
     }
-    body.push_str("</fieldset><fieldset><legend>Optional native repository read scope</legend><p>For native analysis, provide the registered repository ID, immutable registration revision and exact starting commit together. This grants read access at that revision, not editing or a checkout from another task. Coding tasks use their own repository above; leave this separate read scope empty.</p>");
+    body.push_str("</fieldset><fieldset><legend>Optional instruction source</legend><p>For a coding task, select an already available read-only repository by its registered ID, immutable revision and exact commit. Leave all three fields empty to keep the task's existing sources. This does not create a checkout or grant repository access.</p>");
+    for (name, label) in [
+        ("instruction_source_id", "Registered instruction repository ID"),
+        ("instruction_source_revision", "Immutable instruction registration revision"),
+        ("instruction_source_commit", "Exact instruction source commit"),
+    ] {
+        body.push_str(&field(name, label, value(name), "text", false));
+    }
+    body.push_str("</fieldset><fieldset><legend>Optional pull request</legend><p>For a coding task, supply a title to request a pull request after its acceptance checks pass. The selected repository revision must have pull request publication configured. Leave both fields empty for a checkpoint result.</p>");
+    body.push_str(&field("pull_request_title", "Pull request title", value("pull_request_title"), "text", false));
+    body.push_str("<label>Pull request body<textarea name=\"pull_request_body\" rows=\"4\">");
+    body.push_str(&escape(value("pull_request_body")));
+    body.push_str("</textarea></label></fieldset><fieldset><legend>Optional native repository read scope</legend><p>For native analysis, provide the registered repository ID, immutable registration revision and exact starting commit together. This grants read access at that revision, not editing or a checkout from another task. Coding tasks use their own repository above; leave this separate read scope empty.</p>");
     for (name, label) in [
         (
             "repository_read_id",
@@ -568,9 +674,11 @@ fn create_form(
     body.push_str("<label>Native output JSON schema (required only for native tasks)<textarea name=\"output_schema\" rows=\"3\">");
     body.push_str(&escape(value("output_schema")));
     body.push_str("</textarea></label>");
-    body.push_str("<fieldset><legend>Optional native workflow</legend><p>Leave empty to use the normal collaboration tools and return a native result. Optional coding_then_continue supplies a fixed coding child with its own agent model, effort and collaboration profile. The child repository JSON must explicitly supply registration.repository_id, registration.registration_revision and start_commit; omit server-owned url and checkpoint_remote. The model can provide only the instruction, not the configured repository, agent, checks or limits. Omit the child model_requests field to use its largest applicable allowance.</p><label>Native workflow JSON (native tasks only)<textarea name=\"native_workflow\" rows=\"8\">");
+    body.push_str("<fieldset><legend>Optional native workflow</legend><p>Leave empty to use the normal collaboration tools and return a native result. An explicit reassign target supplies a coding agent, repository and checks for this same task. Its complete limits and dependencies must match this task, and instruction_prefix must be empty. The original instruction and result schema remain; no child or return continuation is created. Optional coding_then_continue supplies a fixed coding child with its own agent model, effort and collaboration profile. The child repository JSON must explicitly supply registration.repository_id, registration.registration_revision and start_commit; omit server-owned url, checkpoint_remote and pull_request_target. Optional child.pull_request supplies an explicit title and body. The model can provide only the instruction, not the configured repository, publication request, agent, checks or limits. Omit the child model_requests field to use its largest applicable allowance.</p><label>Native workflow JSON (native tasks only)<textarea name=\"native_workflow\" rows=\"8\">");
     body.push_str(&escape(value("native_workflow")));
     body.push_str("</textarea></label></fieldset>");
+    body.push_str(&task_defaults::reassignment_help(fields));
+    body.push_str("<p>A configured coding child may also supply instruction_source with registration.repository_id, registration.registration_revision and start_commit. Omit its server-owned repository endpoint. This fixes the child's separate read source without changing the parent's read scope.</p>");
     body.push_str(&field(
         "dependencies",
         "Existing prerequisite task IDs (one per line or comma separated)",
@@ -620,9 +728,15 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
             "reasoning_effort",
             "execution_profile",
             "limit_overrides",
+            "charter",
+            "charter_definition_id",
+            "charter_definition_revision",
             "repository_read_id",
             "repository_read_revision",
             "repository_read_commit",
+            "instruction_source_id",
+            "instruction_source_revision",
+            "instruction_source_commit",
             "executor",
             "repository_id",
             "registration_revision",
@@ -630,6 +744,8 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
             "acceptance_commands",
             "output_schema",
             "native_workflow",
+            "pull_request_title",
+            "pull_request_body",
             "dependencies",
             "deadline_unix_ms",
             "model_requests",
@@ -646,7 +762,7 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
     };
     if required(fields, "model")? != SELECTED_MODEL
         || required(fields, "reasoning_effort")? != SELECTED_REASONING_EFFORT
-        || required(fields, "execution_profile")? != "collaboration_v1"
+        || !matches!(required(fields, "execution_profile")?, "collaboration_v1" | "collaboration_v2")
     {
         return Err("Unsupported agent model, reasoning effort or collaboration profile".into());
     }
@@ -666,7 +782,27 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
         None => None,
     };
     let inference = Some(InferenceSettings::selected());
-    let execution_profile = Some(ExecutionProfile::CollaborationV1 { web_search });
+    let execution_profile = Some(match required(fields, "execution_profile")? {
+        "collaboration_v1" => ExecutionProfile::CollaborationV1 { web_search },
+        "collaboration_v2" => ExecutionProfile::CollaborationV2 { web_search },
+        _ => unreachable!("validated closed profile"),
+    });
+    // Preserve the original submitted body on replay. Current-policy admission
+    // remains after canonical receipt lookup in the controller.
+    let charter = match fields.get("charter").filter(|value| !value.is_empty()) {
+        Some(value) => {
+            if ["charter_definition_id","charter_definition_revision"].iter().any(|key| fields.get(*key).is_some_and(|v| !v.is_empty())) {
+                return Err("Choose one exact charter source".into());
+            }
+            Some(serde_json::from_str::<crate::charter::DefinitionCharter>(value).map_err(|_| "Invalid charter source".to_string())?)
+        }
+        None if ["charter_definition_id","charter_definition_revision"].iter().any(|key| fields.get(*key).is_some_and(|v| !v.is_empty())) =>
+            Some(crate::charter::DefinitionCharter::Reference {source:crate::charter::CharterSourceRef {
+                definition_id:required(fields,"charter_definition_id")?.into(),
+                definition_revision:required(fields,"charter_definition_revision")?.into(),
+            }}),
+        None => None,
+    };
     let read_fields = [
         "repository_read_id",
         "repository_read_revision",
@@ -704,8 +840,20 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
             start_commit: start_commit.into(),
         })
     };
+    let instruction_source = if ["instruction_source_id", "instruction_source_revision", "instruction_source_commit"]
+        .iter().all(|key| fields.get(*key).is_none_or(|value| value.is_empty()))
+    {
+        None
+    } else {
+        Some(RepositoryReadSource {
+            registration: Some(repository_catalogue::binding(fields, "instruction_source_id", "instruction_source_revision", metadata)?),
+            repository: String::new(),
+            start_commit: required(fields, "instruction_source_commit")?.into(),
+        })
+    };
     let repository = if executor == ExecutorKind::Coding {
         Some(Repository {
+            pull_request_target: None,
             registration: Some(repository_catalogue::binding(
                 fields,
                 "repository_id",
@@ -797,10 +945,21 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
         })
         .transpose()?
         .flatten();
+    let title = fields.get("pull_request_title").map(String::as_str).unwrap_or("");
+    let body = fields.get("pull_request_body").map(String::as_str).unwrap_or("");
+    let pull_request = if title.is_empty() && body.is_empty() {
+        None
+    } else {
+        if executor != ExecutorKind::Coding { return Err("Request the coding child's pull request in its configured workflow; native tasks do not publish a pull request directly".into()); }
+        if title.trim().is_empty() { return Err("A pull request title is required when a body is supplied".into()); }
+        Some(crate::pull_request::Request { title: title.into(), body: body.into() })
+    };
     let input = TaskInput {
+        pull_request,
         resolved_limits: None,
         instruction: required(fields, "instruction")?.into(),
         definition: Definition {
+            charter,
             id: required(fields, "definition_id")?.into(),
             revision: required(fields, "definition_revision")?.into(),
             executor,
@@ -809,6 +968,7 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
             limit_overrides,
         },
         repository_read,
+        instruction_source,
         repository,
         acceptance_commands,
         output_schema,
@@ -816,6 +976,9 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
         dependencies,
         native_workflow,
     };
+    if let Some(source) = &input.instruction_source {
+        task_defaults::validate_instruction_source(source, &input.definition, metadata)?;
+    }
     Ok(input)
 }
 
@@ -905,6 +1068,30 @@ fn safe_external_link(value: &str) -> Option<String> {
         return None;
     }
     Some(url.to_string())
+}
+
+fn pull_request_result_view(value: &crate::pull_request::ResultReference) -> String {
+    let mut body = String::from("<section><h2>Published pull request</h2><dl>");
+    term(&mut body, "Pull request number", &value.number.to_string());
+    term(&mut body, "Provider identity", &value.provider_id.to_string());
+    term(&mut body, "Target revision", &value.target_revision);
+    term(&mut body, "Original publication operation", &value.operation_id);
+    term(&mut body, "Original branch operation", &value.head_operation_id);
+    term(&mut body, "Original checkpoint operation", &value.checkpoint_operation_id);
+    term(&mut body, "Head branch", &format!("{}/{}:{}", value.head.owner, value.head.repository, value.head.branch));
+    term(&mut body, "Head commit", &value.head.commit);
+    term(&mut body, "Base branch", &format!("{}/{}:{}", value.base.owner, value.base.repository, value.base.branch));
+    term(&mut body, "Observed base commit", &value.base.commit);
+    body.push_str("</dl>");
+    if let Some(url) = safe_external_link(&value.url) {
+        let _ = write!(body, "<p><a href=\"{}\" rel=\"noreferrer noopener\">Open pull request</a></p>", escape(&url));
+    } else {
+        body.push_str("<dl>");
+        term(&mut body, "Pull request reference", &value.url);
+        body.push_str("</dl>");
+    }
+    body.push_str("</section>");
+    body
 }
 
 fn child_outcome_view(child: &ChildOutcome) -> String {
@@ -1120,11 +1307,27 @@ fn release_list(task: &Task, candidates: &[ReleaseCandidate]) -> UiResponse {
 // Traceability scope: Controlled event producers with real controller; no full live browser/model journey.
 //= spec/impl/v2/implementation.md#observable-end-to-end-result
 //# The initial system MUST expose the task's actual execution status through its product interface.
-fn render_task(task: &Task) -> UiResponse {
+fn render_task(task: &Task, workflow_enabled: bool) -> UiResponse {
+    let public_task = crate::pull_request_view::task(task);
+    let task = &public_task;
     let path = task_path(&task.id);
     let mut body = format!(
-        "<p><a href=\"{path}\">Refresh committed state</a> | <a href=\"/tasks\">All tasks</a></p><dl>"
+        "<p><a href=\"{path}\">Refresh committed state</a> | <a href=\"/tasks\">All tasks</a></p>"
     );
+    let _ = write!(body, "<p><a href=\"/governance?task_id={}\">Governance decisions and operator controls</a></p>", encode(&task.id));
+    if workflow_enabled {
+        //= spec/impl/v2/implementation.md#collaboration-surfaces-preserve-existing-authority
+        //# The browser interface MUST expose every supported collaboration operation permitted to its caller.
+        let _ = write!(body, "<nav aria-label=\"Task collaboration\"><a href=\"{path}/coordination\">Responsibility and resolver waits</a><a href=\"{path}/comments\">Comments</a>");
+        if task.status == TaskStatus::Succeeded && task.result.is_some() {
+            let _ = write!(body, "<a href=\"{path}/review-target?scope=result\">Request accepted-result review</a>");
+            if task.result.as_ref().is_some_and(|result| result.checkpoint.is_some()) {
+                let _ = write!(body, "<a href=\"{path}/review-target?scope=checkpoint\">Request accepted-checkpoint review</a>");
+            }
+        }
+        body.push_str("</nav>");
+    }
+    body.push_str("<dl>");
     let _ = write!(
         body,
         "<dt>Session</dt><dd><a href=\"/sessions/{}\">{}</a></dd>",
@@ -1156,6 +1359,16 @@ fn render_task(task: &Task) -> UiResponse {
             "native"
         },
     );
+    if repository::instruction_source_enabled(&task.input) {
+        if let Some(source) = &task.input.instruction_source {
+            if let Some(registration) = &source.registration {
+                term(&mut body, "Instruction repository ID", &registration.repository_id);
+                term(&mut body, "Instruction registration revision", &registration.registration_revision);
+            }
+            term(&mut body, "Instruction source commit", &source.start_commit);
+            let _ = write!(body, "<dt>Instruction source</dt><dd><a href=\"{path}/repository?source=instructions\">Read accepted instructions</a></dd>");
+        }
+    }
     if let Some(reason) = &task.blocked_reason {
         term(&mut body, "Blocked reason", reason);
     }
@@ -1190,7 +1403,15 @@ fn render_task(task: &Task) -> UiResponse {
     );
     body.push_str("<h2>Instruction</h2><pre>");
     body.push_str(&escape(&task.input.instruction));
-    body.push_str("</pre><h2>Dependencies</h2>");
+    body.push_str("</pre>");
+    if let Some(request) = &task.input.pull_request {
+        body.push_str("<section><h2>Requested pull request</h2><p>");
+        body.push_str(&escape(&request.title));
+        body.push_str("</p><pre>");
+        body.push_str(&escape(&request.body));
+        body.push_str("</pre></section>");
+    }
+    body.push_str("<h2>Dependencies</h2>");
     if task.input.dependencies.is_empty() {
         body.push_str("<p>No prerequisite tasks.</p>");
     } else {
@@ -1261,6 +1482,7 @@ fn render_task(task: &Task) -> UiResponse {
             "<h2>Accepted result</h2><pre>{}</pre><a href=\"{path}/result\">Result, validation and source references</a>",
             escape(&result.summary)
         );
+        if let Some(reference) = &result.pull_request { body.push_str(&pull_request_result_view(reference)); }
     } else {
         body.push_str("<p>No accepted task result. Executor progress or exit status alone is not task acceptance.</p>");
     }
@@ -1275,6 +1497,10 @@ fn render_task(task: &Task) -> UiResponse {
         encode(&task.input.definition.id),
         encode(&task.input.definition.revision)
     );
+    body.push_str("<details><summary>Accepted task configuration</summary><p>This is the configuration retained when this task was accepted, including its output schema. Later selected definitions and current defaults do not replace it.</p>");
+    body.push_str("<pre>");
+    body.push_str(&escape(&serde_json::to_string_pretty(&task.input).unwrap_or_default()));
+    body.push_str("</pre></details>");
     body.push_str("<h2>Task actions</h2>");
     body.push_str("<p>The task remains bound to its accepted agent definition. Create a new session to choose a different agent.</p>");
     body.push_str("<div class=\"actions\">");
@@ -1282,12 +1508,12 @@ fn render_task(task: &Task) -> UiResponse {
         (
             "cancel",
             "Request cancellation",
-            matches!(task.status, TaskStatus::Queued | TaskStatus::Active),
+            matches!(task.status, TaskStatus::Queued | TaskStatus::Active | TaskStatus::Blocked),
         ),
         (
             "retry",
             "Request retry",
-            matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled),
+            matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked),
         ),
     ] {
         if show {
@@ -1303,32 +1529,58 @@ fn render_task(task: &Task) -> UiResponse {
     page(200, &format!("Task {}", task.id), body)
 }
 
+// Keep construction of a route future out of its caller's polling frame.
+// In debug builds, Box::pin(future()) at the call site still constructs the
+// unboxed future there. Match the worker's concrete noninline constructor.
+#[inline(never)]
+fn boxed_route<F, Fut>(make: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    Box::pin(make())
+}
+
 async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
-    if path == "/repositories" || path.starts_with("/repositories/") {
-        return repository_catalogue::get(controller, path, query).await;
+    if governance::route(path) { return governance::get(controller, path, query); }
+    if let Some(response) = boxed_route(|| documents_reviews::get(controller, path, query)).await { return response; }
+    if collaboration_questions::route(path) { return boxed_route(|| collaboration_questions::get(controller, path, query)).await; }
+    boxed_route(|| get_other(controller, path, query)).await
+}
+
+// These routes retain their original order and body. Their larger state machine
+// is constructed and polled only after the document/question probes decline.
+async fn get_other(controller: &Controller, path: &str, query: &str) -> UiResponse {
+    if collaboration_work::route(path) { return boxed_route(|| collaboration_work::get(controller, path, query)).await; }
+    if let Some(raw_id) = definition_settings::route(path) {
+        return boxed_route(|| definition_settings::get(controller, raw_id, query)).await;
     }
+    if path == "/repositories" || path.starts_with("/repositories/") {
+        return boxed_route(|| repository_catalogue::get(controller, path, query)).await;
+    }
+// Traceability scope: Serve the embedded live.js consumer of /ui/changes and /ui/activity: it refreshes clean views, preserves unsent edits and catches up the activity cursor. Rust endpoint and separate Node script tests cover different parts; this is not a full-browser execution claim.
+//= spec/impl/v2/implementation.md#shared-product-state
+//# The browser interface MUST update displayed state without requiring a manual page reload.
     if path == "/ui/live.js" {
         return UiResponse {
             status: 200,
             content_type: "text/javascript; charset=utf-8".into(),
             body: include_str!("live.js").into(),
             location: None,
+            limiting_field: None,
         };
     }
-    if let Some(response) = live::get(controller, path, query).await {
+    if let Some(response) = boxed_route(|| repository::get(controller, path, query)).await {
         return response;
     }
-    if let Some(response) = repository::get(controller, path, query).await {
-        return response;
-    }
-    if let Some(response) = collaboration::get(controller, path, query).await {
+    if let Some(response) = boxed_route(|| collaboration::get(controller, path, query)).await {
         return response;
     }
     if path == "/sessions" || path.starts_with("/sessions/") {
-        return sessions::get(controller, path, query).await;
+        return boxed_route(|| sessions::get(controller, path, query)).await;
     }
     if path == "/agents" || path.starts_with("/agents/") {
-        return agents::get(controller, path, query).await;
+        return boxed_route(|| agents::get(controller, path, query)).await;
     }
     if path == "/tasks/new" {
         let fields = match parse_form(query.as_bytes(), controller.limits()) {
@@ -1342,12 +1594,12 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
             if fields.contains_key("executor") {
                 return error(400, "An existing agent determines its executor");
             }
-            let reply = call(
+            let reply = boxed_route(|| call(
                 controller,
                 Operation::GetAgent {
                     agent_id: id.clone(),
                 },
-            )
+            ))
             .await;
             let Outcome::Ok {
                 data: Data::Agent(agent),
@@ -1355,14 +1607,15 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
             else {
                 return not_task(reply);
             };
+            if agent.retired { return error(409, "This agent is retired; historical sessions remain available"); }
             let definition = agent.definition;
             let Some(inference) = &definition.inference else {
                 return error(409, "Agent definition has no selected inference settings");
             };
-            let Some(ExecutionProfile::CollaborationV1 { web_search }) =
-                &definition.execution_profile
-            else {
-                return error(409, "Agent definition has no collaboration profile");
+            let (profile_name, web_search) = match &definition.execution_profile {
+                Some(ExecutionProfile::CollaborationV1 { web_search }) => ("collaboration_v1",web_search),
+                Some(ExecutionProfile::CollaborationV2 { web_search }) => ("collaboration_v2",web_search),
+                None => return error(409,"Agent definition has no collaboration profile"),
             };
             let mut draft = match create_defaults(definition.executor, controller.limits()) {
                 Ok(f) => f,
@@ -1373,6 +1626,10 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
                     "limit_overrides".into(),
                     serde_json::to_string(overrides).expect("typed limits serialize"),
                 );
+            }
+            draft.insert("execution_profile".into(), profile_name.into());
+            if let Some(charter) = &definition.charter {
+                draft.insert("charter".into(), serde_json::to_string(charter).expect("typed charter serializes"));
             }
             draft.insert("definition_id".into(), definition.id);
             draft.insert("definition_revision".into(), definition.revision);
@@ -1389,6 +1646,9 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
             }
             return create_form(Some(&draft), None, definition.executor, controller.limits());
         }
+        if !fields.contains_key("executor") {
+            return default_task_submission::form(None, None, controller.limits());
+        }
         let executor = match fields.get("executor").map(String::as_str) {
             Some("native") => ExecutorKind::Native,
             None | Some("coding") => ExecutorKind::Coding,
@@ -1404,13 +1664,13 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
         if let Err(e) = fields_only(&fields, &["after"]) {
             return error(400, &e);
         }
-        let reply = call(
+        let reply = boxed_route(|| call(
             controller,
             Operation::ListTasks {
                 after: fields.get("after").filter(|s| !s.is_empty()).cloned(),
                 limit: controller.limits().product.page_items,
             },
-        )
+        ))
         .await;
         return match reply.outcome {
             Outcome::Ok {
@@ -1452,25 +1712,42 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
             Ok(id) if !id.is_empty() => id,
             _ => return error(400, "Invalid operation ID"),
         };
-        let reply = call(
+        let reply = boxed_route(|| call(
             controller,
             Operation::GetOperation {
                 operation_id: id.clone(),
             },
-        )
+        ))
         .await;
+        if let Some(response) = definition_settings::receipt(&reply, &id) {
+            return response;
+        }
+        if let Some(response) = collaboration_work::receipt(&reply, &id) {
+            return response;
+        }
+        if matches!(&reply.outcome, Outcome::Refused { code, .. } if code == "not_found") {
+            return uncertain(404, &id, "No committed outcome is currently recorded. This does not establish whether an earlier request applied; preserve its original identity and body for reconciliation.", None);
+        }
         return match reply.outcome {
             Outcome::Ok {
                 data: Data::Operation(record),
-            } => page(
-                200,
-                "Recorded operation",
-                format!(
-                    "<pre>{}</pre><a href=\"{}\">Task</a>",
-                    escape(&serde_json::to_string_pretty(&record).unwrap_or_default()),
-                    task_path(&record.task_id)
-                ),
-            ),
+            } => {
+                let public_record = match crate::pull_request_view::record(&record) {
+                    Ok(value) => value,
+                    Err(_) => return error(503, "The public operation view is unavailable; preserve the original request for reconciliation"),
+                };
+                let mut body = String::from("<p>This lookup reads the original recorded operation; it does not retry it. Private publication configuration is omitted from this view.</p>");
+                if let Some(commit) = &reply.commit {
+                    body.push_str("<dl>");
+                    term(&mut body, "Original committed controller revision", &commit.controller_revision.to_string());
+                    body.push_str("</dl>");
+                }
+                let _ = write!(body, "<pre>{}</pre>", escape(&serde_json::to_string_pretty(&public_record).unwrap_or_default()));
+                if !record.task_id.is_empty() {
+                    let _ = write!(body, "<a href=\"{}\">Task</a>", task_path(&record.task_id));
+                }
+                page(200, "Recorded operation", body)
+            },
             _ => not_task(reply),
         };
     }
@@ -1482,10 +1759,10 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
             Ok(id) if !id.is_empty() => id,
             _ => return error(400, "Invalid release candidate ID"),
         };
-        let reply = call(
+        let reply = boxed_route(|| call(
             controller,
             Operation::GetProtectedRelease { release_id: id },
-        )
+        ))
         .await;
         return match reply.outcome {
             Outcome::Ok {
@@ -1505,7 +1782,7 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
     if !["", "checkpoint", "result", "releases"].contains(&subpath) {
         return error(405, "Task mutations require a same-origin POST form");
     }
-    let reply = call(controller, Operation::GetTask { task_id: id }).await;
+    let reply = boxed_route(|| call(controller, Operation::GetTask { task_id: id })).await;
     match reply.outcome {
         Outcome::Ok {
             data: Data::Task(task),
@@ -1518,14 +1795,14 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
                 if let Err(e) = fields_only(&fields, &["after"]) {
                     return error(400, &e);
                 }
-                let reply = call(
+                let reply = boxed_route(|| call(
                     controller,
                     Operation::ListReleases {
                         task_id: task.id.clone(),
                         after: fields.get("after").filter(|id| !id.is_empty()).cloned(),
                         limit: controller.limits().product.page_items,
                     },
-                )
+                ))
                 .await;
                 match reply.outcome {
                     Outcome::Ok {
@@ -1551,10 +1828,11 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
                     if let Some(c) = &r.checkpoint {
                         body.push_str(&checkpoint_view(c));
                     }
+                    if let Some(reference) = &r.pull_request { body.push_str(&pull_request_result_view(reference)); }
                     page(200, "Accepted task result", body)
                 })
                 .unwrap_or_else(|| error(404, "No accepted task result")),
-            _ => render_task(&task),
+            _ => render_task(&task, controller.limits().workflow.is_some()),
         },
         _ => not_task(reply),
     }
@@ -1565,31 +1843,58 @@ async fn post(controller: &Controller, path: &str, fields: Form) -> UiResponse {
         Ok(v) => v.to_string(),
         Err(e) => return error(400, &e),
     };
-    if path == "/repositories" || path.starts_with("/repositories/") {
-        return repository_catalogue::post(controller, path, fields, &operation_id).await;
-    }
     if operation_id.len() > controller.limits().transport.identity_bytes {
-        return error(400, "Operation identity exceeds its bound");
+        return limit_error(400, failure::LimitingField::Identity);
+    }
+    if let Some(response) = boxed_route(|| documents_reviews::post(controller, path, &fields)).await { return response; }
+    if collaboration_questions::route(path) { return boxed_route(|| collaboration_questions::post(controller, path, fields, &operation_id)).await; }
+    boxed_route(|| post_other(controller, path, fields, operation_id)).await
+}
+
+// Identity and document/question checks still precede this unchanged route tail.
+async fn post_other(controller: &Controller, path: &str, fields: Form, operation_id: String) -> UiResponse {
+    if collaboration_work::route(path) { return boxed_route(|| collaboration_work::post(controller, path, fields, &operation_id)).await; }
+    if path == "/repositories" || path.starts_with("/repositories/") {
+        return boxed_route(|| repository_catalogue::post(controller, path, fields, &operation_id)).await;
+    }
+    if let Some(raw_id) = definition_settings::route(path) {
+        return boxed_route(|| definition_settings::post(controller, raw_id, fields, &operation_id)).await;
     }
     if path == "/tasks" {
+        let has_id = fields.get("definition_id").is_some_and(|value| !value.trim().is_empty());
+        let has_revision = fields.get("definition_revision").is_some_and(|value| !value.trim().is_empty());
+        if has_id != has_revision {
+            return error(400, "Specify both agent ID and immutable revision, or omit both to use the default agent");
+        }
+        if !has_id {
+            return boxed_route(|| default_task_submission::post(controller, fields, operation_id)).await;
+        }
         let input = match task_input(&fields, controller.limits()) {
             Ok(input) => input,
             Err(e) => {
+                // A rejected workflow may contain a credential-bearing endpoint
+                // in a server-owned field. Do not echo that draft into the HTML.
+                // Preserve the other safe form fields and the original refusal.
+                let mut redisplay = fields.clone();
+                if redisplay.get("native_workflow").is_some_and(|value|
+                    !task_defaults::may_redisplay_native_workflow(value)) {
+                    redisplay.remove("native_workflow");
+                }
                 return create_form(
-                    Some(&fields),
+                    Some(&redisplay),
                     Some(&e),
                     ExecutorKind::Coding,
                     controller.limits(),
                 );
             }
         };
-        let reply = call(
+        let reply = boxed_route(|| call(
             controller,
             Operation::SubmitTask {
                 operation_id: operation_id.clone(),
                 input,
             },
-        )
+        ))
         .await;
         return mutation_reply(reply, &operation_id, None);
     }
@@ -1637,7 +1942,7 @@ async fn post(controller: &Controller, path: &str, fields: Form) -> UiResponse {
         },
         _ => return error(404, "Unknown browser action"),
     };
-    let reply = call(controller, command).await;
+    let reply = boxed_route(|| call(controller, command)).await;
     mutation_reply(reply, &operation_id, Some(&id))
 }
 
@@ -1647,16 +1952,30 @@ async fn post(controller: &Controller, path: &str, fields: Form) -> UiResponse {
 // Traceability scope: Browser request-path, body and rendered-response policy refusals.
 //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
 //# An operation refused by a configured limit MUST identify the limiting metadata field.
-pub async fn handle(controller: &Controller, request: UiRequest) -> UiResponse {
+async fn dispatch(controller: &Controller, request: UiRequest, response_operation_id: &mut Option<String>) -> UiResponse {
     if request.path.len() > controller.limits().product.request_path_bytes {
-        return error(413, "Configured limit exceeded: product.request_path_bytes");
+        return limit_error(413, failure::LimitingField::RequestPath);
     }
     if request.body.len() > controller.limits().transport.body_bytes {
-        return error(413, "Configured limit exceeded: transport.body_bytes");
+        return limit_error(413, failure::LimitingField::Body);
     }
     let (path, query) = request.path.split_once('?').unwrap_or((&request.path, ""));
-    let mut response = match request.method.as_str() {
-        "GET" => get(controller, path, query).await,
+    *response_operation_id = if request.method == "GET" {
+        path.strip_prefix(failure::OPERATION_PREFIX)
+            .and_then(|raw| decode(raw, false).ok())
+            .filter(|id| !id.is_empty())
+    } else { None };
+    match request.method.as_str() {
+        "GET" => {
+            // Live endpoints retain their exact existing route/response rules.
+            // Dispatch them before polling the much larger ordinary-page future
+            // so their controller call does not nest on that page's stack frame.
+            if let Some(response) = live::get(controller, path, query).await {
+                response
+            } else {
+                boxed_route(|| get(controller, path, query)).await
+            }
+        },
         "POST" => {
             if request.expected_origin.is_empty()
                 || request.origin.as_deref() != Some(request.expected_origin.as_str())
@@ -1672,14 +1991,21 @@ pub async fn handle(controller: &Controller, request: UiRequest) -> UiResponse {
             if path == "/sessions" || path.starts_with("/sessions/") {
                 return error(405, "Sessions have read-only browser views");
             }
-            if path == "/agents" || path.starts_with("/agents/") {
+            if (path == "/agents" || path.starts_with("/agents/"))
+                && definition_settings::route(path).is_none()
+            {
                 return error(405, "Agent identities have read-only browser views");
             }
             if path.starts_with("/releases/") || path.ends_with("/releases") {
                 return error(405, "Release candidates have read-only browser views");
             }
             match parse_form(&request.body, controller.limits()) {
-                Ok(fields) => post(controller, path, fields).await,
+                Ok(fields) => {
+                    *response_operation_id = fields.get("operation_id")
+                        .filter(|id| crate::mcp::valid_identity(id, controller.limits().transport.identity_bytes))
+                        .cloned();
+                    boxed_route(|| post(controller, path, fields)).await
+                },
                 Err(e) => error(400, &e),
             }
         }
@@ -1687,27 +2013,32 @@ pub async fn handle(controller: &Controller, request: UiRequest) -> UiResponse {
             405,
             "Browser routes support GET views and same-origin POST forms",
         ),
-    };
-    // Each page captures the exact metadata used to render its forms and live reader.
-    // Attribute escaping prevents metadata from becoming executable markup.
+    }
+}
+
+pub async fn handle(controller: &Controller, request: UiRequest) -> UiResponse {
+    let mut operation_id = None;
+    let response = boxed_route(|| dispatch(controller, request, &mut operation_id)).await;
+    finalize(controller.limits(), response, operation_id.as_deref())
+}
+
+fn finalize(limits: &RuntimeLimits, mut response: UiResponse, operation_id: Option<&str>) -> UiResponse {
+    // Every product return, including early refusal, passes the same bound after
+    // optional metadata bootstrap. Compact failures never add another full page.
     if response.content_type.starts_with("text/html") {
-        let bootstrap = serde_json::json!({"revision": controller.limits().revision, "product": controller.limits().product, "cursor_max": i64::MAX.to_string()});
+        let bootstrap = serde_json::json!({"revision": limits.revision, "product": limits.product, "cursor_max": i64::MAX.to_string(), "workflow": limits.workflow, "workflow_cursor_bytes": limits.controller.collaboration_cursor_bytes, "workflow_identity_bytes": limits.transport.identity_bytes});
         let attribute = escape(&bootstrap.to_string());
         response.body = response.body.replacen(
-            "<body>",
-            &format!("<body data-runtime-limits=\"{attribute}\">"),
-            1,
+            "<body>", &format!("<body data-runtime-limits=\"{attribute}\">"), 1,
         );
     }
-    // HTML escaping and readable record formatting may expand bounded JSON.
-    if response.body.len() > controller.limits().product.response_bytes {
-        error(
-            502,
-            "Configured limit exceeded: product.response_bytes; use a narrower record page",
-        )
-    } else {
-        response
+    if response.body.len() > limits.product.response_bytes {
+        response = failure::response(response.status, response.limiting_field, operation_id);
     }
+    // Controller construction validates the actual encoder against every admitted
+    // correlation shape. Do not silently truncate an identity or exempt errors.
+    assert!(response.body.len() <= limits.product.response_bytes, "validated product response envelope");
+    response
 }
 
 #[cfg(test)]
@@ -1716,6 +2047,30 @@ mod tests {
     fn metadata() -> RuntimeLimits {
         RuntimeLimits::seed().unwrap()
     }
+    #[test]
+    fn compact_finalization_keeps_pending_identity_and_removes_redirects_and_details() {
+        let mut limits = metadata();
+        limits.product.request_path_bytes = 128;
+        limits.product.response_bytes = limits.product.minimum_response_bytes(&limits.transport).unwrap();
+        limits.validate().unwrap();
+        let original = "original-\"&é";
+        let pending = finalize(&limits, uncertain(202, original, "private error detail", None), Some(original));
+        assert_eq!(pending.status, 202);
+        assert!(pending.body.len() <= limits.product.response_bytes);
+        assert_eq!(pending.content_type, "text/plain; charset=utf-8");
+        assert!(!pending.body.contains("private error detail"));
+        assert!(!pending.body.contains("<script"));
+        let encoded = pending.body.lines().find_map(|line| line.strip_prefix("Original operation: ")).unwrap();
+        assert_eq!(serde_json::from_str::<String>(encoded).unwrap(), original);
+        let mut committed = page(303, "Committed task state", "private record detail".into());
+        committed.location = Some("/tasks/committed".into());
+        let compact = finalize(&limits, committed, Some(original));
+        assert_eq!(compact.status, 502);
+        assert!(compact.location.is_none());
+        assert!(!compact.body.contains("private record detail"));
+        assert!(compact.body.contains("does not establish its outcome"));
+    }
+
     #[test]
     //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
     //= type=test
@@ -1847,11 +2202,14 @@ mod tests {
             operation_id: "checkpoint-original".into(),
         };
         let task = Task {
+            pending_assignment: None,
             id: "task-view".into(),
-            input: TaskInput {
+            input: TaskInput { instruction_source: None,
+                pull_request: None,
                 resolved_limits: None,
                 instruction: "<img src=x onerror=alert(1)>".into(),
                 definition: Definition {
+                    charter: None,
                     id: "template".into(),
                     revision: "r1".into(),
                     executor: ExecutorKind::Coding,
@@ -1891,7 +2249,7 @@ mod tests {
             }),
             selected_checkpoint: Some(checkpoint.clone()),
             result: None,
-            blocked_reason: None,
+            blocked_reason: None, native_retry_block: None,
             progress: "<b>stopping</b>".into(),
             recent_output: "<script>output</script>".into(),
             output_truncated: true,
@@ -1899,7 +2257,7 @@ mod tests {
             waiting_child_id: Some("child/wait".into()),
             completed_child: None,
         };
-        let view = render_task(&task);
+        let view = render_task(&task, false);
         assert!(view.body.contains("stop requested"));
         assert!(view.body.contains("Unresolved outcome"));
         assert!(view.body.contains("Output is truncated"));
@@ -1924,6 +2282,7 @@ mod tests {
             TaskStatus::Succeeded,
         ] {
             let result = AcceptedResult {
+                pull_request: None,
                 attempt_id: "attempt-child".into(),
                 summary: "checked child result".into(),
                 checkpoint: None,

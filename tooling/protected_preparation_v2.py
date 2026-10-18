@@ -57,13 +57,22 @@ def validate_candidate(candidate, subject):
     if len(canonical(candidate))>128*1024:raise ValueError('candidate bound')
 
 
+def application_wire(profile):
+    value=profile.get('application_wire_revision',8)
+    if type(value) is not int or value not in (8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23):
+        raise ValueError('explicit candidate application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 or 23')
+    return value
+
+
 def validate_profile(preparation, recipe, protected):
     if set(preparation)!={'path','sha256','profile'}:raise ValueError('preparation fields')
     path=protected(preparation['path']);root=path.parent
     if path.name!='protected_preparation_v2.py' or sha(path)!=preparation['sha256']:raise ValueError('preparer identity')
     p=preparation['profile']
-    if set(p)!={'revision','modules','archive','toolchain','cargo_home','cargo_manifest','limits'} or p['revision']!=2 or set(p['modules'])!=MODULES:
+    fields={'revision','modules','archive','toolchain','cargo_home','cargo_manifest','limits'}
+    if set(p) not in (fields,fields|{'application_wire_revision'}) or p['revision']!=2 or set(p['modules'])!=MODULES:
         raise ValueError('fixed preparation profile/inventory')
+    application_wire(p)
     for name,expected in p['modules'].items():
         if not re.fullmatch('[0-9a-f]{64}',expected) or sha(protected(root/name))!=expected:raise ValueError('fixed preparation module changed: '+name)
     for name in ('fixed_build_launcher.py','candidate_launcher.py'):
@@ -328,7 +337,7 @@ def prepare(recipe, config, subject, candidate, work, execution, executable, pro
         if kind=='native':args+=['--native-endpoint','http://127.0.0.1:'+str(pp)+'/v1/responses']
         launches[name]=args
     rustc=Path(p['toolchain'])/'rustc'
-    journey={'binary':str(executable),'binary_sha256':subject['artifact']['binary_sha256'],'workspace':str(workspace),'launches':launches,'controller_port':cp,'peer_port':pp,'proxy_port':proxy,'gate_port':gp,'deadline_unix_ms':int(time.time()*1000)+3600000,'protocol_revision':8,'task_defaults':selected_limits['task_defaults'],'selected_limits_sha256':p['limits']['sha256'],'repository':{'registration':{'repository_id':'journey-source','registration_revision':'1'},'url':str(seed),'start_commit':start,'checkpoint_remote':str(remote)},'repository_registration':{'repository_id':'journey-source','registration_revision':'1','display_name':'Fixed journey source','source_endpoint':str(seed),'checkpoint_endpoint':str(remote),'source_store_key':'journey-source.git','checkpoint_store_key':'journey-checkpoints.git'},'acceptance':[[str(rustc),'--test','src/main.rs','-o','acceptance'],['./acceptance'],[str(rustc),'src/main.rs','-o','demo']],'git_sha256':package.READER_SHA['git_sha256'],'expected_test_source':SOURCE_TEXT}
+    journey={'binary':str(executable),'binary_sha256':subject['artifact']['binary_sha256'],'workspace':str(workspace),'launches':launches,'controller_port':cp,'peer_port':pp,'proxy_port':proxy,'gate_port':gp,'deadline_unix_ms':int(time.time()*1000)+3600000,'protocol_revision':application_wire(p),'task_defaults':selected_limits['task_defaults'],'selected_limits_sha256':p['limits']['sha256'],'repository':{'registration':{'repository_id':'journey-source','registration_revision':'1'},'url':str(remote),'start_commit':start,'checkpoint_remote':str(remote)},'repository_registration':{'repository_id':'journey-source','registration_revision':'1','display_name':'Fixed journey source','source_endpoint':str(remote),'checkpoint_endpoint':str(remote),'source_store_key':'journey-source.git','checkpoint_store_key':'journey-checkpoints.git'},'acceptance':[[str(rustc),'--test','src/main.rs','-o','acceptance'],['./acceptance'],[str(rustc),'src/main.rs','-o','demo']],'git_sha256':package.READER_SHA['git_sha256'],'expected_test_source':SOURCE_TEXT}
     journeypath=inputs/'journey.json';write(journeypath,journey)
     replacements={'{prepared_build}':str(buildpath),'{prepared_build_sha256}':sha(buildpath),'{prepared_journey}':str(journeypath),'{prepared_journey_sha256}':sha(journeypath)}
     steps=copy.deepcopy(recipe['steps'])

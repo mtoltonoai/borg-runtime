@@ -10,7 +10,7 @@ use tokio::{
 pub mod repository;
 
 pub const REVISION: u32 = 1;
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     Checker,
@@ -55,9 +55,21 @@ pub(crate) fn hash(v: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 impl Config {
+    pub(crate) fn producer(&self, uid: u32, command: &Command) -> Option<&Producer> {
+        let first = self.producers.iter().find(|p| p.uid == uid)?;
+        match command.producer_role() {
+            Some(role) => self.producers.iter().find(|p| p.uid == uid && p.role == role).or(Some(first)),
+            // These reads create no authority or receipts. An absent command role
+            // retains the existing permit refusal, including its exact receipt.
+            None => Some(first),
+        }
+    }
+
     pub fn validate(&self, limits: &InterfaceLimits) -> Result<(), String> {
         let ids: BTreeSet<_> = self.producers.iter().map(|p| &p.id).collect();
-        let uids: BTreeSet<_> = self.producers.iter().map(|p| p.uid).collect();
+        // An explicitly configured operator may hold distinct logical roles.
+        // A UID/role pair and each durable producer ID still have one meaning.
+        let roles: BTreeSet<_> = self.producers.iter().map(|p| (p.uid, &p.role)).collect();
         let checks: BTreeSet<_> = self.required_checks.iter().collect();
         if self.socket.as_os_str().len() > limits.protected_socket_path_bytes {
             return Err("invalid protected release configuration: interface.protected_socket_path_bytes".into());
@@ -73,7 +85,7 @@ impl Config {
             || self.producers.is_empty()
             || self.worker_uids.is_empty()
             || ids.len() != self.producers.len()
-            || uids.len() != self.producers.len()
+            || roles.len() != self.producers.len()
             || self
                 .producers
                 .iter()
@@ -208,6 +220,24 @@ pub enum Command {
         state: State,
         observation: String,
     },
+}
+impl Command {
+    fn producer_role(&self) -> Option<Role> {
+        Some(match self {
+            Self::Check(_) => Role::Checker,
+            Self::Grant { .. } => Role::Human,
+            Self::Prepare { kind: Kind::Rollout, .. }
+            | Self::StartRollout { .. }
+            | Self::ObserveRollout { .. } => Role::Rollout,
+            Self::Prepare { kind: Kind::Merge, .. }
+            | Self::ExecuteMerge { .. }
+            | Self::ReconcileMerge { .. }
+            | Self::ReconcileObservation { .. }
+            | Self::Start { .. }
+            | Self::Finish { .. } => Role::Repository,
+            Self::GetAction { .. } | Self::GetReceipt { .. } | Self::View { .. } => return None,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -348,6 +378,9 @@ fn validate_public_operation(req: &Request, limits: &InterfaceLimits) -> Result<
     }
     Ok(())
 }
+// Traceability scope: Protected same-host Unix IPC uses socket ownership/mode checks and the kernel peer UID; ordinary host trust is not hostile-user containment.
+//= spec/impl/v2/implementation.md#transport-and-access-controls-remain
+//# Same-host communication MAY rely on ordinary host access controls.
 async fn exchange(
     controller: &Controller,
     cfg: &Config,
@@ -552,7 +585,10 @@ mod tests {
     impl TestDirectory {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
+            let root = std::env::var_os("BORG_TEST_SOCKETS")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let path = root.join(format!(
                 "borg-protected-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -593,6 +629,25 @@ mod tests {
             installed_package_sha256: "b".repeat(64),
             max_records: 1_000_001,
         }
+    }
+
+    #[test]
+    fn configured_operator_roles_are_distinct_and_workers_remain_excluded() {
+        let limits = crate::limits::RuntimeLimits::seed().unwrap().interface;
+        let mut cfg = config();
+        assert!(cfg.validate(&limits).is_ok()); // Existing single-role config.
+        for (id, role) in [("repository", Role::Repository), ("human", Role::Human), ("rollout", Role::Rollout)] {
+            cfg.producers.push(Producer { id: id.into(), uid: 1002, role });
+        }
+        assert!(cfg.validate(&limits).is_ok());
+        let mut invalid = cfg.clone();
+        invalid.producers.push(Producer { id: "other-checker".into(), uid: 1002, role: Role::Checker });
+        assert!(invalid.validate(&limits).is_err());
+        let mut invalid = cfg.clone();
+        invalid.producers[1].id = "checker".into();
+        assert!(invalid.validate(&limits).is_err());
+        cfg.worker_uids.push(1002);
+        assert!(cfg.validate(&limits).is_err());
     }
 
     #[test]

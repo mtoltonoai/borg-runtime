@@ -1,6 +1,7 @@
 //! Admission is deliberately separate from JSON Schema validation. It bounds the
 //! work we ask the supplied validator to perform; it never returns a valid result.
 use crate::limits::NativeLimits;
+use super::format::{FormatIssue, SchemaRule};
 use serde_json::Value;
 use std::io::{self, Write};
 
@@ -101,6 +102,28 @@ impl Schema {
     //# The native executor MUST validate a result against that schema before accepting it.
     // Native component scope: actual bounded Draft202012 validator; a valid value is not controller acceptance or authority.
     pub(super) fn validate(&self, value: &Value, limit: usize, field: &str) -> Result<(), String> {
+        self.admit(value, limit, field)?;
+        if !self.validator.is_valid(value) {
+            return Err("native_output_schema_mismatch".into());
+        }
+        Ok(())
+    }
+
+    /// Classify one actual validator failure only after the identical admission
+    /// guards. Infrastructure failures are not repairable schema observations.
+    pub(super) fn final_issue(
+        &self, value: &Value, limit: usize, field: &str,
+    ) -> Result<Option<FormatIssue>, String> {
+        self.admit(value, limit, field)?;
+        match self.validator.validate(value) {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(FormatIssue::Schema {
+                rule: schema_rule(error.kind(), self.policy.validation_work)?,
+            })),
+        }
+    }
+
+    fn admit(&self, value: &Value, limit: usize, field: &str) -> Result<(), String> {
         let (bytes, nodes) = measure(value, limit, &self.policy, field)?;
         if bytes
             .checked_mul(nodes)
@@ -109,11 +132,84 @@ impl Schema {
         {
             return Err("native_validation_work_bound_native_validation_work".into());
         }
-        if !self.validator.is_valid(value) {
-            return Err("native_output_schema_mismatch".into());
-        }
         Ok(())
     }
+}
+
+/// Inspect compound failure causes without formatting any foreign error. An
+/// infrastructure failure nested under an applicator remains infrastructure.
+/// This traversal uses the same accepted validation-work budget, not a new cap.
+fn schema_rule(
+    kind: &jsonschema::error::ValidationErrorKind,
+    work_limit: usize,
+) -> Result<SchemaRule, String> {
+    use jsonschema::error::ValidationErrorKind as K;
+    let mut remaining = work_limit;
+    let mut pending = vec![kind];
+    while let Some(current) = pending.pop() {
+        remaining = remaining.checked_sub(1)
+            .ok_or("native_validation_work_bound_native_validation_work")?;
+        match current {
+            K::BacktrackLimitExceeded { .. } | K::RegexEngineFailure { .. }
+            | K::Referencing(_) | K::Custom { .. } => {
+                return Err("native_validation_infrastructure_failed".into());
+            }
+            K::AnyOf { context } | K::OneOfMultipleValid { context }
+            | K::OneOfNotValid { context } => {
+                for branch in context {
+                    for error in branch {
+                        if pending.len() >= remaining {
+                            return Err("native_validation_work_bound_native_validation_work".into());
+                        }
+                        pending.push(error.kind());
+                    }
+                }
+            }
+            K::PropertyNames { error } => {
+                if pending.len() >= remaining {
+                    return Err("native_validation_work_bound_native_validation_work".into());
+                }
+                pending.push(error.kind());
+            }
+            _ => {}
+        }
+    }
+    Ok(match kind {
+        K::AdditionalItems { .. } => SchemaRule::AdditionalItems,
+        K::AdditionalProperties { .. } => SchemaRule::AdditionalProperties,
+        K::AnyOf { .. } => SchemaRule::AnyOf,
+        K::Constant { .. } => SchemaRule::Const,
+        K::Contains => SchemaRule::Contains,
+        K::ContentEncoding { .. } | K::FromUtf8 { .. } => SchemaRule::ContentEncoding,
+        K::ContentMediaType { .. } => SchemaRule::ContentMediaType,
+        K::Enum { .. } => SchemaRule::Enum,
+        K::ExclusiveMaximum { .. } => SchemaRule::ExclusiveMaximum,
+        K::ExclusiveMinimum { .. } => SchemaRule::ExclusiveMinimum,
+        K::FalseSchema => SchemaRule::FalseSchema,
+        K::Format { .. } => SchemaRule::Format,
+        K::MaxItems { .. } => SchemaRule::MaxItems,
+        K::Maximum { .. } => SchemaRule::Maximum,
+        K::MaxLength { .. } => SchemaRule::MaxLength,
+        K::MaxProperties { .. } => SchemaRule::MaxProperties,
+        K::MinItems { .. } => SchemaRule::MinItems,
+        K::Minimum { .. } => SchemaRule::Minimum,
+        K::MinLength { .. } => SchemaRule::MinLength,
+        K::MinProperties { .. } => SchemaRule::MinProperties,
+        K::MultipleOf { .. } => SchemaRule::MultipleOf,
+        K::Not { .. } => SchemaRule::Not,
+        K::OneOfMultipleValid { .. } | K::OneOfNotValid { .. } => SchemaRule::OneOf,
+        K::Pattern { .. } => SchemaRule::Pattern,
+        K::PropertyNames { .. } => SchemaRule::PropertyNames,
+        K::Required { .. } => SchemaRule::Required,
+        K::Type { .. } => SchemaRule::Type,
+        K::UnevaluatedItems { .. } => SchemaRule::UnevaluatedItems,
+        K::UnevaluatedProperties { .. } => SchemaRule::UnevaluatedProperties,
+        K::UniqueItems => SchemaRule::UniqueItems,
+        K::BacktrackLimitExceeded { .. } | K::RegexEngineFailure { .. }
+        | K::Referencing(_) | K::Custom { .. } => {
+            return Err("native_validation_infrastructure_failed".into());
+        }
+    })
 }
 
 fn visit<'a>(
@@ -393,5 +489,204 @@ mod tests {
                 .unwrap_err(),
             "native_json_complexity_bound_native_json_nodes"
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_work_budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn accepted_profile() -> (Value, NativeLimits) {
+        let profile: Value = serde_json::from_str(include_str!(
+            "../../metadata/operational-diagnostic.json"
+        )).unwrap();
+        let policy = serde_json::from_value(
+            profile["definition"]["limit_overrides"]["native"].clone()
+        ).unwrap();
+        (profile["output_schema"].clone(), policy)
+    }
+
+    fn report() -> Value {
+        // Synthetic structurally complete report, not the unretained actual06
+        // provider response and not evidence of its claimed application.
+        json!({
+            "disposition": "applied_unmeasured",
+            "origin_task_id": "controlled-origin",
+            "target_agent_id": "controlled-target",
+            "reason": "A configured limit refused the completed original work.",
+            "change": {
+                "operation_id": "original-apply",
+                "controller_revision": 48,
+                "previous_revision": "old",
+                "selected_revision": "new",
+                "global_revision": "global",
+                "policy_revision": "policy",
+                "changed_fields": ["collaboration.complete_result_bytes"],
+                "classification": "widening",
+                "effective_for": "future_submissions"
+            },
+            "measurement": {
+                "status": "no_later_task",
+                "baseline": null,
+                "later": null,
+                "comparison": "not_comparable",
+                "causal_improvement_claim": false,
+                "limitations": ["No independent later work was observed."]
+            }
+        })
+    }
+
+    fn pad_reason_to(value: &mut Value, size: usize) {
+        let current = serde_json::to_vec(value).unwrap().len();
+        assert!(current <= size);
+        let reason = value["reason"].as_str().unwrap().to_owned();
+        value["reason"] = Value::String(reason + &"x".repeat(size - current));
+        assert_eq!(serde_json::to_vec(value).unwrap().len(), size);
+    }
+
+    #[test]
+    fn diagnostic_work_budget_rejects_valid_report_at_exact_existing_boundary() {
+        let (output_schema, mut policy) = accepted_profile();
+        // Historical actual06 accepted the previous 8Mi work score. Keep that
+        // frozen predecessor policy explicit while the current profile evolves.
+        policy.validation_work = 8_388_608;
+        let compiled = Schema::compile(&output_schema, &policy).unwrap();
+        assert_eq!(compiled.work, 97);
+        let mut value = report();
+        let (_, nodes) = measure(&value, 65_536, &policy, "task_output_bytes").unwrap();
+        assert_eq!(nodes, 24);
+        let boundary = policy.validation_work / nodes / compiled.work;
+        assert_eq!(boundary, 3_603);
+        pad_reason_to(&mut value, boundary);
+        compiled.validate(&value, 65_536, "task_output_bytes").unwrap();
+        pad_reason_to(&mut value, boundary + 1);
+        assert!(compiled.validator.is_valid(&value));
+        assert_eq!(compiled.validate(&value, 65_536, "task_output_bytes").unwrap_err(),
+                   "native_validation_work_bound_native_validation_work");
+        let mut sufficient = policy.clone();
+        sufficient.validation_work = (boundary + 1) * nodes * compiled.work;
+        let corrected = Schema::compile(&output_schema, &sufficient).unwrap();
+        corrected.validate(&value, 65_536, "task_output_bytes").unwrap();
+        value["change"] = Value::Null;
+        assert_eq!(corrected.validate(&value, 65_536, "task_output_bytes").unwrap_err(),
+                   "native_output_schema_mismatch");
+    }
+
+    #[test]
+    fn diagnostic_work_budget_exact_output_envelope_keeps_all_other_guards() {
+        let (output_schema, mut policy) = accepted_profile();
+        let initial = Schema::compile(&output_schema, &policy).unwrap();
+        assert_eq!(initial.work, 97);
+        assert_eq!(policy.json_nodes, 4_096);
+        let output_bytes = 65_536usize;
+        let exact_budget = output_bytes.checked_mul(policy.json_nodes)
+            .and_then(|v| v.checked_mul(initial.work)).unwrap();
+        assert_eq!(exact_budget, 26_038_239_232);
+        assert_eq!(policy.validation_work, exact_budget);
+        let mut value = report();
+        value["measurement"]["limitations"] = json!([]);
+        let (_, fixed_nodes) = measure(&value, output_bytes, &policy, "task_output_bytes").unwrap();
+        value["measurement"]["limitations"] = json!(vec![""; policy.json_nodes - fixed_nodes]);
+        pad_reason_to(&mut value, output_bytes);
+        assert_eq!(measure(&value, output_bytes, &policy, "task_output_bytes").unwrap(),
+                   (output_bytes, policy.json_nodes));
+        assert!(initial.validator.is_valid(&value));
+        policy.validation_work = exact_budget - 1;
+        let below = Schema::compile(&output_schema, &policy).unwrap();
+        assert_eq!(below.validate(&value, output_bytes, "task_output_bytes").unwrap_err(),
+                   "native_validation_work_bound_native_validation_work");
+        policy.validation_work = exact_budget;
+        policy.validate().unwrap();
+        let complete = Schema::compile(&output_schema, &policy).unwrap();
+        complete.validate(&value, output_bytes, "task_output_bytes").unwrap();
+        let mut excessive_bytes = value.clone();
+        pad_reason_to(&mut excessive_bytes, output_bytes + 1);
+        assert_eq!(complete.validate(&excessive_bytes, output_bytes, "task_output_bytes").unwrap_err(),
+                   "native_json_byte_bound_task_output_bytes");
+        let mut excessive_nodes = value.clone();
+        excessive_nodes["measurement"]["limitations"].as_array_mut().unwrap().push(json!(""));
+        assert_eq!(complete.validate(&excessive_nodes, output_bytes, "task_output_bytes").unwrap_err(),
+                   "native_json_complexity_bound_native_json_nodes");
+        let mut contradiction = value;
+        contradiction["change"] = Value::Null;
+        assert_eq!(complete.validate(&contradiction, output_bytes, "task_output_bytes").unwrap_err(),
+                   "native_output_schema_mismatch");
+    }
+}
+
+#[cfg(test)]
+mod final_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn policy() -> NativeLimits {
+        serde_json::from_str(include_str!("../../limits-native-seed.json")).unwrap()
+    }
+
+    #[test]
+    fn actual_schema_issues_are_specific_without_instance_or_schema_values() {
+        for (schema, value, rule) in [
+            (json!({"type":"integer"}), json!("private_instance"), SchemaRule::Type),
+            (json!({"required":["private_property"]}), json!({}), SchemaRule::Required),
+            (json!({"enum":["private_schema_value"]}), json!("private_instance"), SchemaRule::Enum),
+        ] {
+            let compiled = Schema::compile(&schema, &policy()).unwrap();
+            let issue = compiled.final_issue(&value, 1024, "task_output_bytes").unwrap().unwrap();
+            assert_eq!(issue, FormatIssue::Schema { rule });
+            assert_eq!(issue.stable_error(), "native_output_schema_mismatch");
+            assert_eq!(compiled.validate(&value, 1024, "task_output_bytes").unwrap_err(), issue.stable_error());
+            assert!(issue.feedback().contains(match rule {
+                SchemaRule::Type => "type", SchemaRule::Required => "required", SchemaRule::Enum => "enum",
+                _ => unreachable!(),
+            }));
+            let rendered = issue.feedback() + &serde_json::to_string(&issue).unwrap();
+            for secret in ["private_instance", "private_property", "private_schema_value"] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+        let compiled = Schema::compile(&json!({"type":"integer"}), &policy()).unwrap();
+        assert_eq!(compiled.final_issue(&json!(7), 1024, "task_output_bytes").unwrap(), None);
+        compiled.validate(&json!(7), 1024, "task_output_bytes").unwrap();
+    }
+
+    #[test]
+    fn final_schema_admission_precedes_mismatch_classification() {
+        let value = json!("private_instance");
+        let compiled = Schema::compile(&json!(false), &policy()).unwrap();
+        assert_eq!(compiled.final_issue(&value, 1, "task_output_bytes").unwrap_err(),
+            "native_json_byte_bound_task_output_bytes");
+        assert_eq!(compiled.validate(&value, 1, "task_output_bytes").unwrap_err(),
+            "native_json_byte_bound_task_output_bytes");
+        let mut p = policy(); p.validation_work = 8;
+        let compiled = Schema::compile(&json!(false), &p).unwrap();
+        assert_eq!(compiled.final_issue(&value, 1024, "task_output_bytes").unwrap_err(),
+            "native_validation_work_bound_native_validation_work");
+        assert_eq!(compiled.validate(&value, 1024, "task_output_bytes").unwrap_err(),
+            "native_validation_work_bound_native_validation_work");
+
+        let value = json!([[0]]);
+        for (nodes, depth, expected) in [
+            (2, 8, "native_json_complexity_bound_native_json_nodes"),
+            (8, 1, "native_json_complexity_bound_native_json_depth"),
+        ] {
+            let mut p = policy(); p.json_nodes = nodes; p.json_depth = depth;
+            let compiled = Schema::compile(&json!(false), &p).unwrap();
+            assert_eq!(compiled.final_issue(&value, 1024, "task_output_bytes").unwrap_err(), expected);
+            assert_eq!(compiled.validate(&value, 1024, "task_output_bytes").unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn nested_infrastructure_failures_are_never_schema_repair_observations() {
+        use jsonschema::error::ValidationErrorKind as K;
+        let limit = policy().validation_work;
+        let direct = K::RegexEngineFailure { message: "private_engine_message".into() };
+        assert_eq!(schema_rule(&direct, limit).unwrap_err(), "native_validation_infrastructure_failed");
+        let nested = K::AnyOf { context: vec![vec![jsonschema::ValidationError::custom("private_custom_message")]] };
+        assert_eq!(schema_rule(&nested, limit).unwrap_err(), "native_validation_infrastructure_failed");
+        let property = K::PropertyNames { error: Box::new(jsonschema::ValidationError::custom("private_property_message")) };
+        assert_eq!(schema_rule(&property, limit).unwrap_err(), "native_validation_infrastructure_failed");
+        assert_eq!(schema_rule(&K::Required { property: json!("private_property") }, limit).unwrap(), SchemaRule::Required);
     }
 }

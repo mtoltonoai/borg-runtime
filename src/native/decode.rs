@@ -1,6 +1,7 @@
 //! Enforce structural admission while building JSON, before an oversized tree
 //! exists. Serde remains the JSON syntax/number/string parser.
 use crate::limits::NativeLimits;
+use super::format::FormatIssue;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use std::{
@@ -139,11 +140,62 @@ pub(super) fn parse(
     policy: &NativeLimits,
     field: &str,
 ) -> Result<Value, String> {
+    parse_inner(bytes, limit, deadline, policy, field)
+        .map_err(|error| error.historical(malformed))
+}
+
+/// Only syntax/EOF and duplicate-key failures become format observations.
+/// Admission, clock and parser infrastructure errors never authorize repair.
+pub(super) fn parse_final(
+    bytes: &[u8],
+    limit: usize,
+    deadline: Instant,
+    policy: &NativeLimits,
+    field: &str,
+) -> Result<Result<Value, FormatIssue>, String> {
+    match parse_inner(bytes, limit, deadline, policy, field) {
+        Ok(value) => Ok(Ok(value)),
+        Err(ParseFailure::DuplicateKey) => Ok(Err(FormatIssue::DuplicateKey {})),
+        Err(ParseFailure::Json(error)) if matches!(
+            error.classify(), serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+        ) => {
+            let line = u64::try_from(error.line()).map_err(|_| "native_json_location_invalid")?;
+            let column = u64::try_from(error.column()).map_err(|_| "native_json_location_invalid")?;
+            Ok(Err(FormatIssue::InvalidJson { line, column }))
+        }
+        Err(error) => Err(error.historical("native_output_not_json")),
+    }
+}
+
+// The foreign error is held only long enough to read its category and numeric
+// location. It is never formatted, serialized or included in feedback.
+enum ParseFailure {
+    Policy(String),
+    DuplicateKey,
+    Json(serde_json::Error),
+}
+impl ParseFailure {
+    fn historical(self, malformed: &'static str) -> String {
+        match self {
+            Self::Policy(error) => error,
+            Self::DuplicateKey => "native_json_duplicate_key".into(),
+            Self::Json(_) => malformed.into(),
+        }
+    }
+}
+
+fn parse_inner(
+    bytes: &[u8],
+    limit: usize,
+    deadline: Instant,
+    policy: &NativeLimits,
+    field: &str,
+) -> Result<Value, ParseFailure> {
     if policy.decode_check_bytes == 0 {
-        return Err("native_json_configuration_invalid_native_decode_check_bytes".into());
+        return Err(ParseFailure::Policy("native_json_configuration_invalid_native_decode_check_bytes".into()));
     }
     if bytes.len() > limit {
-        return Err(format!("native_json_byte_bound_{field}"));
+        return Err(ParseFailure::Policy(format!("native_json_byte_bound_{field}")));
     }
     let mut work = Work {
         remaining: policy.json_nodes,
@@ -168,31 +220,42 @@ pub(super) fn parse(
         depth: 0,
     }
     .deserialize(&mut decoder);
-    let value = result.map_err(|_| {
+    let value = result.map_err(|error| {
         if Instant::now() >= deadline {
-            "native_deadline_exceeded".to_string()
-        } else if work.failure == Some("native_json_byte_bound") {
-            format!("native_json_byte_bound_{field}")
+            ParseFailure::Policy("native_deadline_exceeded".into())
         } else {
-            work.failure.unwrap_or(malformed).to_string()
+            match work.failure {
+                Some("native_json_byte_bound") => ParseFailure::Policy(format!("native_json_byte_bound_{field}")),
+                Some("native_json_duplicate_key") => ParseFailure::DuplicateKey,
+                Some(code) => ParseFailure::Policy(code.into()),
+                None => ParseFailure::Json(error),
+            }
         }
     })?;
-    end_checked(&mut decoder, deadline, malformed)?;
+    end_inner(&mut decoder, deadline)?;
     Ok(value)
 }
 
+fn end_inner<'de, R: serde_json::de::Read<'de>>(
+    decoder: &mut serde_json::Deserializer<R>,
+    deadline: Instant,
+) -> Result<(), ParseFailure> {
+    decoder.end().map_err(|error| {
+        if Instant::now() >= deadline {
+            ParseFailure::Policy("native_deadline_exceeded".into())
+        } else {
+            ParseFailure::Json(error)
+        }
+    })
+}
+
+#[cfg(test)]
 fn end_checked<'de, R: serde_json::de::Read<'de>>(
     decoder: &mut serde_json::Deserializer<R>,
     deadline: Instant,
     malformed: &'static str,
 ) -> Result<(), String> {
-    decoder.end().map_err(|_| {
-        if Instant::now() >= deadline {
-            "native_deadline_exceeded".to_string()
-        } else {
-            malformed.to_string()
-        }
-    })
+    end_inner(decoder, deadline).map_err(|error| error.historical(malformed))
 }
 
 struct DeadlineReader<'a> {
@@ -373,5 +436,67 @@ mod tests {
                 .as_deref(),
             Some("native_deadline_exceeded")
         );
+    }
+}
+
+#[cfg(test)]
+mod final_format_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn policy() -> NativeLimits {
+        serde_json::from_str(include_str!("../../limits-native-seed.json")).unwrap()
+    }
+    fn future() -> Instant { Instant::now() + Duration::from_secs(5) }
+
+    #[test]
+    fn final_syntax_and_duplicate_keys_are_typed_without_echoing_input() {
+        let p = policy();
+        let malformed = b"{\n  \"private_property\": }";
+        let issue = parse_final(malformed, malformed.len(), future(), &p, "task_output_bytes")
+            .unwrap().unwrap_err();
+        assert!(matches!(issue, FormatIssue::InvalidJson { line: 2, column } if column > 0));
+        assert_eq!(issue.stable_error(), "native_output_not_json");
+        assert!(!issue.feedback().contains("private_property"));
+        assert_eq!(parse(malformed, malformed.len(), future(), "old_malformed", &p, "task_output_bytes").unwrap_err(), "old_malformed");
+
+        let duplicate = br#"{"private_key":"private_value","private_key":0}"#;
+        let issue = parse_final(duplicate, duplicate.len(), future(), &p, "task_output_bytes")
+            .unwrap().unwrap_err();
+        assert_eq!(issue, FormatIssue::DuplicateKey {});
+        assert_eq!(issue.stable_error(), "native_json_duplicate_key");
+        assert!(!issue.feedback().contains("private_key"));
+        assert!(!issue.feedback().contains("private_value"));
+        assert_eq!(parse(duplicate, duplicate.len(), future(), "old_malformed", &p, "task_output_bytes").unwrap_err(), issue.stable_error());
+    }
+
+    #[test]
+    fn final_admission_failures_remain_outer_errors_with_original_codes() {
+        let bytes = b"[[0]]";
+        let check = |p: &NativeLimits, limit, deadline, expected: &str| {
+            assert_eq!(parse_final(bytes, limit, deadline, p, "task_output_bytes").unwrap_err(), expected);
+            assert_eq!(parse(bytes, limit, deadline, "old_malformed", p, "task_output_bytes").unwrap_err(), expected);
+        };
+        let p = policy();
+        check(&p, 2, future(), "native_json_byte_bound_task_output_bytes");
+        let mut nodes = p.clone(); nodes.json_nodes = 1;
+        check(&nodes, bytes.len(), future(), "native_json_complexity_bound_native_json_nodes");
+        let mut depth = p.clone(); depth.json_depth = 1;
+        check(&depth, bytes.len(), future(), "native_json_complexity_bound_native_json_depth");
+        check(&p, bytes.len(), Instant::now(), "native_deadline_exceeded");
+        let mut configuration = p; configuration.decode_check_bytes = 0;
+        check(&configuration, bytes.len(), future(), "native_json_configuration_invalid_native_decode_check_bytes");
+    }
+
+    #[test]
+    fn final_value_and_trailing_syntax_use_the_same_bounded_parser() {
+        let p = policy();
+        let bytes = br#"{"ok":[true,null]}"#;
+        assert_eq!(parse_final(bytes, bytes.len(), future(), &p, "task_output_bytes").unwrap().unwrap(),
+            parse(bytes, bytes.len(), future(), "old_malformed", &p, "task_output_bytes").unwrap());
+        let trailing = b"0 1";
+        assert!(matches!(parse_final(trailing, trailing.len(), future(), &p, "task_output_bytes").unwrap(),
+            Err(FormatIssue::InvalidJson { .. })));
+        assert_eq!(parse(trailing, trailing.len(), future(), "old_malformed", &p, "task_output_bytes").unwrap_err(), "old_malformed");
     }
 }

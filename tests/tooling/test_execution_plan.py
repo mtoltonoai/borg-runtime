@@ -1,6 +1,6 @@
 """Failure-oriented tests for declared milestone readiness, not runtime behavior."""
 import copy
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
@@ -430,6 +430,127 @@ class ExecutionPlanReadinessTests(unittest.TestCase):
                             for group in result["parallel_ready_sets"]))
         self.assertEqual(result, self.build(list(reversed(items))))
 
+    @staticmethod
+    def ownership(owner="worker-a", role="author", paths=None, evidence="artifacts/owner.json"):
+        return {"owner": owner, "role": role,
+                "paths": ["tools/adapter.py"] if paths is None else paths, "evidence": evidence}
+
+    def test_reported_ownership_supplies_boundary_without_rewriting_authored_scope(self):
+        record = self.ownership()
+        result = self.build([milestone(owns=[])], progress={"M1": {"ownership": [record]}})
+        view = self.view(result, "M1")
+        self.assertEqual(view["owns"], [])
+        self.assertEqual(view["ownership"], [record])
+        self.assertEqual(view["effective_owns"], record["paths"])
+        self.assertEqual(view["readiness_blockers"], [])
+        self.assertEqual(view["completion_blockers"], ["gate_missing:RECOVERY"])
+        self.assertFalse(view["complete"])
+        self.assertFalse(result["execution_authorized"])
+        self.assertFalse(result["promotion_allowed"])
+
+    def test_freeform_assignment_and_passed_gates_do_not_supply_ownership(self):
+        progress = {"M1": {"assignment": "worker-a owns tools/adapter.py",
+                            "gates": {"RECOVERY": self.receipt("pass")}}}
+        result = self.build([milestone(owns=[])], progress=progress)
+        view = self.view(result, "M1")
+        self.assertEqual(view["readiness_blockers"], ["ownership_boundary_missing"])
+        self.assertFalse(view["complete"])
+        self.assertNotIn("ownership", view)
+        self.assertNotIn("effective_owns", view)
+
+    def test_reported_and_authored_boundaries_both_prevent_parallel_overlap(self):
+        for authored in [False, True]:
+            items = [milestone("M1", owns=["tools"] if authored else []),
+                     milestone("M2", owns=[]), milestone("M3", owns=["docs"])]
+            progress = {"M2": {"ownership": [self.ownership()]}}
+            if not authored:
+                progress["M1"] = {"ownership": [self.ownership(paths=["tools"])]}
+            with self.subTest(authored=authored):
+                result = self.build(items, progress=progress)
+                self.assertEqual(result["ready"], ["M1", "M2", "M3"])
+                self.assertEqual(result["parallel_ready_sets"], [["M1", "M3"], ["M2"]])
+
+    def test_ledger_cannot_narrow_authored_paths_or_mutate_inputs(self):
+        items = [milestone("M1", owns=["tools"]),
+                 milestone("M2", owns=["tools/other.py"])]
+        progress = {"M1": {"ownership": [self.ownership(paths=["docs"])]}}
+        original = copy.deepcopy((items, progress))
+        result = self.build(items, progress=progress)
+        self.assertEqual(self.view(result, "M1")["owns"], ["tools"])
+        self.assertEqual(self.view(result, "M1")["effective_owns"], ["docs", "tools"])
+        self.assertEqual(result["parallel_ready_sets"], [["M1"], ["M2"]])
+        self.assertEqual((items, progress), original)
+
+    def test_contribution_roles_union_paths_and_normalize_without_exclusive_ownership(self):
+        records = [self.ownership(owner="worker-b", paths=["tools/b.py", "tools/a.py"]),
+                   self.ownership(role="integrator", paths=["tools/a.py"]),
+                   self.ownership(paths=["tools/a.py"])]
+        items = [milestone("M1", owns=[]), milestone("M2", owns=["tools/a.py"])]
+        first = self.build(items, progress={"M1": {"ownership": records}})
+        reordered = copy.deepcopy(list(reversed(records)))
+        reordered[-1]["paths"].reverse()
+        second = self.build(list(reversed(items)), progress={"M1": {"ownership": reordered}})
+        self.assertEqual(first, second)
+        self.assertEqual(self.view(first, "M1")["effective_owns"], ["tools/a.py", "tools/b.py"])
+        self.assertEqual(len(self.view(first, "M1")["ownership"]), 3)
+        self.assertEqual(first["parallel_ready_sets"], [["M1"], ["M2"]])
+
+    def test_reported_ownership_rejects_malformed_or_ambiguous_records(self):
+        invalid = [None, {}, "worker-a", [], [None], [self.ownership(), self.ownership()],
+                   [dict(self.ownership(), unexpected=True)]]
+        for missing in self.ownership():
+            record = self.ownership()
+            del record[missing]
+            invalid.append([record])
+        for key in ["owner", "evidence"]:
+            invalid += [[dict(self.ownership(), **{key: value})]
+                        for value in [None, [], True, "", " \t\n"]]
+        invalid += [[self.ownership(role=role)] for role in ["reviewer", "runner", "", None, []]]
+        invalid += [[dict(self.ownership(), paths=paths)]
+                    for paths in [None, "tools", {}, [], [None], ["tools", "tools"]]]
+        invalid += [[self.ownership(paths=[path])] for path in [
+            "", ".", "tools/*.py", "tools/?", "tools/[ab].py", "/tools/a.py",
+            "../tools/a.py", "tools/../a.py", "tools//a.py", "./tools/a.py", "tools\\a.py"]]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.build(progress={"M1": {"ownership": value}})
+        with self.assertRaises(ValueError):
+            self.build(progress={"UNKNOWN": {"ownership": [self.ownership()]}})
+
+    def test_ownership_does_not_approve_declarations_or_pass_failed_gates(self):
+        progress = {"M1": {"ownership": [self.ownership()],
+                            "gates": {"RECOVERY": self.receipt("fail")}}}
+        for unapproved in ["milestone", "capability", "stage", "draft", None]:
+            item, cap, st = milestone(owns=[]), capability(), stage()
+            if unapproved in {"milestone", "capability", "stage"}:
+                {"milestone": item, "capability": cap, "stage": st}[unapproved]["approval"] = "proposed"
+            with self.subTest(unapproved=unapproved):
+                result = self.build([item], [st], [cap], progress, draft=unapproved == "draft")
+                view = self.view(result, "M1")
+                self.assertNotIn("ownership_boundary_missing", view["readiness_blockers"])
+                self.assertEqual(view["completion_blockers"], ["gate_fail:RECOVERY"])
+                if unapproved:
+                    self.assertTrue(view["readiness_blockers"])
+                self.assertFalse(view["complete"])
+                self.assertFalse(result["execution_authorized"])
+                self.assertFalse(result["promotion_allowed"])
+
+    def test_recovery_ownership_and_gates_leave_unqualified_coding_journey_blocked(self):
+        items = [milestone("V2_E2E", owns=[], provides=["CODING_JOURNEY"]),
+                 milestone("V2_RECOVERY", owns=[], requires=["V2_E2E:CODING_JOURNEY"],
+                           gates=[{"id": name, "expectation": "Recorded check passes."}
+                                  for name in ["RECOVERY", "CANCEL"]])]
+        progress = {"V2_RECOVERY": {"ownership": [self.ownership()],
+                    "gates": {name: self.receipt("pass") for name in ["RECOVERY", "CANCEL"]}}}
+        result = self.build(items, progress=progress)
+        view = self.view(result, "V2_RECOVERY")
+        self.assertEqual(view["readiness_blockers"], ["prerequisite_not_ready:V2_E2E:CODING_JOURNEY"])
+        self.assertEqual(view["completion_blockers"], [])
+        self.assertFalse(view["ready"])
+        self.assertFalse(view["complete"])
+        self.assertFalse(result["execution_authorized"])
+        self.assertFalse(result["promotion_allowed"])
+
 
 class SpecificationSetRoutingTests(unittest.TestCase):
     def fixture(self, directory):
@@ -549,6 +670,72 @@ class SpecificationSetRoutingTests(unittest.TestCase):
                     native_report.assert_not_called()
                 self.assertIn("draft views do not accept progress overlays", errors.getvalue())
                 self.assertFalse(output.exists())
+
+    def test_ownership_overlay_is_spec_bound_pinned_and_rechecked_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            main, capabilities, _, _ = self.fixture(directory)
+            bundle = spec_set.load(main)
+            progress_path = Path(directory) / "progress.json"
+            output = Path(directory) / "generated"
+            overlay = {"schema_version": 1, "spec_set_digest": bundle["digest"],
+                       "milestones": {"M1": {"ownership": [ExecutionPlanReadinessTests.ownership()]}}}
+            arguments = ["execution_plan.py", "--main-spec", str(main),
+                         "--duvet-metrics", str(Path(directory) / "metrics.json"),
+                         "--output-dir", str(output), "--progress", str(progress_path)]
+            pins = {"spec_set_digest": bundle["digest"],
+                    "planning_source_sha256": plan.dag.digest(capabilities.read_bytes()),
+                    "proposal": False, "duvet_json_sha256": "fixture-native-report"}
+
+            def invoke(check=False):
+                stdout, stderr = StringIO(), StringIO()
+                with patch.object(plan.sys, "argv", arguments + (["--check"] if check else [])), \
+                        redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = plan.main()
+                return code, stdout.getvalue(), stderr.getvalue()
+
+            with ExitStack() as stack:
+                # Native report authentication is independently exercised by its tooling tests.
+                # Keep real overlay parsing, capture/recheck, rendering and stale-output behavior.
+                stack.enter_context(patch.object(plan.spec_set, "load_reviewed", return_value=bundle))
+                stack.enter_context(patch.object(plan.spec_set, "reviewed_declarations", return_value=(
+                    [capability()], [stage()], [milestone(owns=[])])))
+                stack.enter_context(patch.object(plan.dag, "load_duvet", return_value=({}, pins)))
+                stack.enter_context(patch.object(plan.dag.native, "planning_traceability", return_value={"metrics": {}}))
+
+                progress_path.write_text(json.dumps(dict(overlay, spec_set_digest="stale")))
+                self.assertEqual(invoke()[0], 2)
+                self.assertFalse(output.exists())
+                progress_path.write_text(json.dumps(overlay))
+                self.assertEqual(invoke()[0], 0)
+                generated = (output / "execution-plan.json").read_bytes()
+                value = json.loads(generated)
+                self.assertEqual(value["provenance"]["progress_sha256"], plan.dag.digest(progress_path.read_bytes()))
+                self.assertFalse(value["milestones"][0]["complete"])
+                self.assertEqual(json.loads(invoke(check=True)[1])["stale_outputs"], [])
+
+                for field, replacement in [("owner", "worker-b"), ("paths", ["docs"]),
+                                           ("evidence", "artifacts/other.json")]:
+                    changed = copy.deepcopy(overlay)
+                    changed["milestones"]["M1"]["ownership"][0][field] = replacement
+                    progress_path.write_text(json.dumps(changed))
+                    code, stdout, _ = invoke(check=True)
+                    self.assertEqual(code, 1)
+                    self.assertIn("execution-plan.json", json.loads(stdout)["stale_outputs"])
+                    self.assertEqual((output / "execution-plan.json").read_bytes(), generated)
+
+                progress_path.write_text(json.dumps(overlay))
+                original_build = plan.build_plan
+
+                def mutate_after_read(*args, **kwargs):
+                    result = original_build(*args, **kwargs)
+                    progress_path.write_text(json.dumps(changed))
+                    return result
+
+                with patch.object(plan, "build_plan", side_effect=mutate_after_read):
+                    code, _, stderr = invoke()
+                self.assertEqual(code, 2)
+                self.assertIn("input changed during generation", stderr)
+                self.assertEqual((output / "execution-plan.json").read_bytes(), generated)
 
 
 if __name__ == "__main__":

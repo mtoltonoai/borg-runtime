@@ -190,6 +190,7 @@ async fn workflow_child_default_uses_largest_applicable_reservation_without_over
         &fixture.controller,
         attempt,
         Observation::Usage {
+            native_diagnostic_reserved: false,
             model_requests: 1,
             input_tokens: None,
             output_tokens: None,

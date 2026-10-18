@@ -41,7 +41,7 @@ pub(super) struct Proof {
     completion: Completion,
 }
 
-// Traceability scope: Shared repository calls resolve only the accepted registered start or acknowledged checkpoint source; caller fields cannot select arbitrary material.
+// Traceability scope: Shared repository calls resolve only accepted registered sources or the acknowledged checkpoint; caller fields cannot select arbitrary material.
 //= spec/impl/v2/implementation.md#repository-reads-through-the-shared-tool-interface
 //# The shared agent interface MUST provide read-only repository access within the task's accepted repository scope.
 fn resolve(
@@ -51,6 +51,15 @@ fn resolve(
 ) -> database::Result<(Source, Option<Checkpoint>)> {
     let (binding, identity, commit, checkpoint, is_checkpoint) =
         match (task.input.definition.executor, selector) {
+            (ExecutorKind::Coding, Selector::Instructions) => {
+                if !crate::execution_profile::collaboration(&task.input) {
+                    return database::refuse("repository_read_unavailable", "instruction source requires the accepted collaboration profile");
+                }
+                let source = task.input.instruction_source.as_ref().ok_or_else(|| {
+                    Fault::Refused("repository_read_unavailable", "task has no accepted instruction source".into())
+                })?;
+                (source.registration.as_ref(), source.repository.clone(), source.start_commit.clone(), None, false)
+            }
             (ExecutorKind::Native, Selector::Start) => {
                 let source = task.input.repository_read.as_ref().ok_or_else(|| {
                     Fault::Refused(
@@ -125,7 +134,7 @@ fn resolve(
         .ok_or_else(|| Fault::Store("accepted repository policy absent".into()))?
         .global_metadata
         .as_ref();
-    let accepted_context = database::StoreContext::new(tx, accepted_policy);
+    let accepted_context = tx.with_limits(accepted_policy);
     let record = super::repositories::revision(&accepted_context, binding)?;
     let (endpoint, store_key) = if is_checkpoint {
         (record.checkpoint_endpoint, record.checkpoint_store_key)

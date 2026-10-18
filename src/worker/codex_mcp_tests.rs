@@ -28,6 +28,7 @@ enum Mode {
     Refused,
     LossAfter,
     LossBefore,
+    Uncommitted,
     Secret,
 }
 struct State {
@@ -73,8 +74,8 @@ fn result(call: &Invocation, mode: Mode) -> CallResult {
         requires_quiescence: false,
     }
 }
-impl Transport for Fake {
-    async fn call(&self, call: &Invocation) -> Result<CallResult, String> {
+impl Fake {
+    async fn call_typed(&self, call: &Invocation) -> Result<CallResult, mcp::CallFailure> {
         let bytes = read_private(
             &self.journal,
             self.journal_bytes,
@@ -92,17 +93,31 @@ impl Transport for Fake {
         let mut state = self.state.lock().unwrap();
         state.calls += 1;
         if matches!(state.mode, Mode::LossBefore) {
-            return Err("injected loss before commit".into());
+            return Err(mcp::CallFailure::Transport("MCP transport outcome unknown; reconcile original occurrence".into()));
+        }
+        if matches!(state.mode, Mode::Uncommitted) {
+            return Ok(CallResult {
+                reply: Reply::refused("fixture", "capacity", "known uncommitted refusal"),
+                requires_quiescence: false,
+            });
         }
         let receipt = result(call, state.mode);
         state
             .receipts
             .insert(call.operation_id.clone(), receipt.clone());
         if matches!(state.mode, Mode::LossAfter) {
-            Err("injected lost receipt".into())
+            Err(mcp::CallFailure::Transport("injected lost receipt".into()))
         } else {
             Ok(receipt)
         }
+    }
+}
+impl Transport for Fake {
+    async fn call(&self, call: &Invocation) -> Result<CallResult, String> {
+        self.call_typed(call).await.map_err(mcp::CallFailure::into_message)
+    }
+    async fn call_observed(&self, call: &Invocation) -> Result<CallResult, mcp::CallFailure> {
+        self.call_typed(call).await
     }
     async fn lookup(&self, call: &Invocation) -> Result<Option<CallResult>, String> {
         let mut state = self.state.lock().unwrap();
@@ -113,7 +128,8 @@ impl Transport for Fake {
 fn setup(mode: Mode) -> (Area, Config, Fake, Arc<AtomicBool>) {
     let area = Area::new();
     let runtime_limits = crate::worker::test_limits();
-    let config = Config {
+    let config = Config { instruction_source: None,
+        execution_profile: None,
         runtime_limits: (*runtime_limits).clone(),
         limits: runtime_limits.execution.collaboration.clone(),
         worker_limits: runtime_limits.worker.clone(),
@@ -391,7 +407,7 @@ async fn escaped_aggregate_and_worst_result_are_reserved_before_dispatch() {
             }
             Err(e) => {
                 assert_eq!(
-                    e,
+                    e.message(),
                     "collaboration journal admission bound (execution.collaboration.journal_bytes; reserves execution.collaboration.complete_result_bytes)"
                 );
                 break;
@@ -509,6 +525,7 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
         "collab_agents_list",
         "collab_agent_get",
         "collab_definition_get",
+        "collab_definition_update",
         "collab_memory_list",
         "collab_memory_get",
         "collab_memory_set",
@@ -707,16 +724,49 @@ async fn repository_write_and_coding_delegation_are_rejected_before_dispatch() {
             .invoke(name, json!({}), &meta(&format!("refused-{n}")))
             .await
             .unwrap_err();
-        assert_eq!(error, "collaboration tool not applicable to coding task");
+        assert_eq!(error.message(), "collaboration tool not applicable to coding task");
     }
     assert_eq!(fake.state.lock().unwrap().calls, 0);
     assert_eq!(fake.state.lock().unwrap().lookups, 0);
     assert!(bridge.journal.entries.is_empty());
 }
 
+fn workflow_config(mut cfg: Config) -> Config {
+    cfg.execution_profile=Some(ExecutionProfile::CollaborationV2 {web_search:None});
+    cfg.runtime_limits.workflow=Some(crate::limits::WorkflowLimits {
+        record_bytes:65_536,text_bytes:4096,options:8,records:128,revisions:1024,
+        page_items:8,page_bytes:65_536,waits_per_task:8,graph_scan_nodes:256,
+        events_per_mutation:16,event_bytes:16_384,notice_bytes:16_384,
+        pending_delivery_bytes:131_072,delivery_scan_rows:32,
+    });
+    cfg
+}
+
 #[tokio::test]
-async fn memory_boundary_holds_exact_retained_tool_result_until_matching_release() {
+async fn retired_memory_gate_does_not_hold_explicit_memory_tool_reply() {
+    let (_area,cfg,fake,cancel)=setup(Mode::Good);
+    enable_memory_gate(&cfg).unwrap();
+    let marker=cfg.directory().join("memory-gate.json");let before=std::fs::read(&marker).unwrap();
+    let mut bridge=Bridge::open(cfg.clone(),fake.clone(),vec![],cancel).unwrap();
+    let (wire,index)=bridge.invoke("collab_memory_set",args(),&meta("retired-gate")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1),bridge.hold_memory_boundary(index)).await.unwrap().unwrap();
+    assert!(!cfg.directory().join("memory-boundary.json").exists());
+    assert!(!cfg.directory().join("memory-release.json").exists());
+    assert_eq!(std::fs::read(&marker).unwrap(),before);
+    bridge.delivered(index).unwrap();
+    let (again,_)=bridge.invoke("collab_memory_set",args(),&meta("retired-gate")).await.unwrap();
+    assert_eq!(again,wire);assert_eq!(fake.state.lock().unwrap().calls,1);
+    assert!(!memory_gate_enabled(&cfg).unwrap());
+    let v2=workflow_config(cfg.clone());assert!(memory_gate_enabled(&v2).unwrap());
+    let mut no_policy=v2;no_policy.runtime_limits.workflow=None;
+    assert!(!memory_gate_enabled(&no_policy).unwrap());
+    assert_eq!(std::fs::read(marker).unwrap(),before);
+}
+
+#[tokio::test]
+async fn workflow_boundary_holds_exact_retained_tool_result_until_matching_release() {
     let (_area, cfg, fake, cancel) = setup(Mode::Good);
+    let cfg=workflow_config(cfg);
     let mut bridge = Bridge::open(cfg.clone(), fake.clone(), vec![], cancel).unwrap();
     enable_memory_gate(&cfg).unwrap();
     let (wire, index) = bridge
@@ -751,8 +801,9 @@ async fn memory_boundary_holds_exact_retained_tool_result_until_matching_release
 }
 
 #[tokio::test]
-async fn missing_memory_release_retains_unconsumed_tool_result_at_cancel() {
+async fn missing_workflow_release_retains_unconsumed_tool_result_at_cancel() {
     let (_area, cfg, fake, cancel) = setup(Mode::Good);
+    let cfg=workflow_config(cfg);
     let mut bridge = Bridge::open(cfg.clone(), fake.clone(), vec![], cancel.clone()).unwrap();
     enable_memory_gate(&cfg).unwrap();
     let (_, index) = bridge
@@ -802,7 +853,7 @@ async fn metadata_journal_reserve_refuses_before_dispatch_and_larger_policy_admi
         .await
         .unwrap_err();
     assert_eq!(
-        error,
+        error.message(),
         "collaboration journal admission bound (execution.collaboration.journal_bytes; reserves execution.collaboration.complete_result_bytes)"
     );
     assert!(bridge.journal.entries.is_empty());
@@ -1081,3 +1132,262 @@ async fn failed_result_save_requires_barrier_for_in_memory_and_reopened_codex_oc
         }
     }
 }
+
+
+#[tokio::test]
+async fn first_failure_diagnostic_distinguishes_transport_from_uncommitted_receipt() {
+    for (mode, expected) in [
+        (Mode::LossBefore, "mcp_transport"),
+        (Mode::Uncommitted, "mcp_uncommitted_reply"),
+    ] {
+        let (_area, mut cfg, fake, cancel) = setup(mode);
+        cfg.deadline_unix_ms = process::now_ms() + 1000;
+        let mut bridge = Bridge::open(cfg.clone(), fake.clone(), vec![], cancel).unwrap();
+        assert!(
+            diagnostic_reason(&cfg).unwrap().is_none(),
+            "historical absence is not a guessed cause"
+        );
+        assert!(
+            bridge
+                .invoke("collab_memory_set", args(), &meta("diagnosed"))
+                .await
+                .is_err()
+        );
+        assert_eq!(fake.state.lock().unwrap().calls, 1);
+        assert!(fake.state.lock().unwrap().lookups > 0);
+        assert_eq!(
+            outcome_disposition(&cfg).unwrap(),
+            OutcomeDisposition::Unresolved
+        );
+        assert_eq!(diagnostic_reason(&cfg).unwrap(), Some(expected));
+        assert!(bridge.journal.entries[0].outcome.is_none());
+        assert!(!bridge.journal.entries[0].delivered);
+        let before = std::fs::read(&bridge.path).unwrap();
+        bridge.remember_failure(
+            &bridge.journal.entries[0].invocation,
+            FailureStage::LookupAbsent,
+        );
+        assert_eq!(
+            diagnostic_reason(&cfg).unwrap(),
+            Some(expected),
+            "lookup absence must not erase first failure"
+        );
+        assert_eq!(std::fs::read(&bridge.path).unwrap(), before);
+    }
+}
+#[test]
+fn diagnostic_error_vocabulary_is_closed_and_never_retains_transport_content() {
+    let (_area, cfg, fake, cancel) = setup(Mode::Good);
+    let bridge = Bridge::open(cfg.clone(), fake, vec![], cancel).unwrap();
+    let call = Invocation {
+        operation_id: "diagnostic-only".into(),
+        logical_call_id: "logical".into(),
+        caller: cfg.caller.clone(),
+        tool: "collab_task_get".into(),
+        arguments: json!({"task_id":"missing"}),
+    };
+    let secret = "synthetic-private-value in an arbitrary unclassified transport message";
+    bridge.remember_failure(&call, FailureStage::from_error(secret));
+    let bytes = std::fs::read(cfg.directory().join("diagnostic.json")).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+    let diagnostic: FailureDiagnostic = decode(&bytes, cfg.limits.gate_bytes).unwrap();
+    assert_eq!(diagnostic.stage, FailureStage::Unclassified);
+    assert!(
+        diagnostic_reason(&cfg).is_err(),
+        "an unbound diagnostic is never projected onto a task"
+    );
+    for (error, expected) in [
+        (
+            "MCP HTTP outcome unavailable; reconcile original occurrence",
+            FailureStage::HttpStatus,
+        ),
+        (
+            "MCP response incomplete; reconcile original occurrence",
+            FailureStage::ResponseRead,
+        ),
+        (
+            "MCP response bound; reconcile original occurrence",
+            FailureStage::ResponseLimit,
+        ),
+        ("Invalid or duplicate JSON", FailureStage::ResponseSyntax),
+        (
+            "MCP response correlation differs",
+            FailureStage::ResponseCorrelation,
+        ),
+        (
+            "MCP method refused; reconcile original occurrence",
+            FailureStage::MethodRefused,
+        ),
+        ("invalid MCP tool result", FailureStage::ToolEnvelope),
+        (
+            "invalid controller tool reply",
+            FailureStage::ControllerReply,
+        ),
+    ] {
+        assert_eq!(FailureStage::from_error(error), expected);
+    }
+}
+
+#[test]
+fn historical_bridge_config_is_byte_equivalent_and_v2_catalogue_is_explicit() {
+    let (_area,mut config,_fake,_stop)=setup(Mode::Good);
+    let historical=serde_json::to_value(&config).unwrap();
+    assert!(historical.get("execution_profile").is_none());
+    let decoded:Config=serde_json::from_value(historical.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&decoded).unwrap(),historical);
+    assert!(!decoded.catalogue().iter().any(|tool|tool.name=="collab_task_wait"));
+    config.execution_profile=Some(ExecutionProfile::CollaborationV2{web_search:None});
+    config.runtime_limits.workflow=None;
+    config.validate().unwrap();
+    assert!(!config.catalogue().iter().any(|tool|tool.name=="collab_task_wait"));
+    config.runtime_limits.workflow=Some(crate::limits::WorkflowLimits {
+        record_bytes:65_536,text_bytes:4096,options:8,records:128,revisions:1024,
+        page_items:8,page_bytes:65_536,waits_per_task:8,graph_scan_nodes:256,
+        events_per_mutation:16,event_bytes:16_384,notice_bytes:16_384,
+        pending_delivery_bytes:131_072,delivery_scan_rows:32,
+    });
+    config.validate().unwrap();
+    assert!(config.catalogue().iter().any(|tool|tool.name=="collab_task_wait"));
+    let selected=server_config_for_profile(Path::new("/host/borg"),Path::new("/private/config"),
+        &config.runtime_limits,&config.limits,config.execution_profile.as_ref(),60);
+    assert!(selected["enabled_tools"].as_array().unwrap().contains(&json!("collab_task_wait")));
+    assert_eq!(selected["tools"]["collab_task_wait"],json!({"approval_mode":"approve"}));
+    assert!(selected["tools"].get("collab_task_delegate").is_none());
+    let legacy=server_config(Path::new("/host/borg"),Path::new("/private/config"),&config.runtime_limits,&config.limits,60);
+    assert!(!legacy["enabled_tools"].as_array().unwrap().contains(&json!("collab_task_wait")));
+    assert!(legacy["tools"].get("collab_task_wait").is_none());
+}
+
+#[path = "codex_mcp_read_recovery_tests.rs"]
+mod read_recovery;
+
+#[path = "codex_mcp_contract_tests.rs"]
+mod contract_recovery;
+
+#[path = "instruction_source_tests.rs"]
+mod instruction_source;
+// This component test crosses the former 1 MiB journal ceiling with valid,
+// individually bounded calls. Fake verifies real durable intent before each
+// dispatch; it does not claim a canonical controller or provider execution.
+#[tokio::test]
+async fn metadata_journal_above_former_byte_cap_reopens_exact_outcomes_without_repost() {
+    const FORMER_JOURNAL_BYTES: usize = 1_048_576;
+    const OCCURRENCES: usize = 9;
+    let (_area, mut cfg, mut fake, cancel) = setup(Mode::Good);
+    cfg.runtime_limits.execution.collaboration.journal_bytes = FORMER_JOURNAL_BYTES * 2;
+    cfg.limits = cfg.runtime_limits.execution.collaboration.clone();
+    cfg.validate().unwrap();
+    fake.journal_bytes = cfg.limits.journal_bytes;
+    let selected = cfg.clone();
+    let arguments = json!({
+        "key":"above-former-journal-cap",
+        "expected_revision":null,
+        "value":"\"".repeat(60 * 1024),
+    });
+    mcp::validate_arguments("collab_memory_set", &arguments, &cfg.runtime_limits).unwrap();
+    bounded_json_size(&arguments["value"], cfg.runtime_limits.controller.memory_value_bytes)
+        .unwrap();
+    let arguments_bytes = serde_json::to_vec(&arguments).unwrap().len();
+    assert!(arguments_bytes < cfg.runtime_limits.interface.mcp_call_bytes);
+    let mut bridge = Bridge::open(cfg, fake.clone(), vec![], cancel.clone()).unwrap();
+    let mut last_wire = None;
+    for index in 0..OCCURRENCES {
+        let logical = format!("above-former-journal-{index}");
+        let (wire, retained_index) = bridge
+            .invoke("collab_memory_set", arguments.clone(), &meta(&logical))
+            .await
+            .unwrap();
+        assert_eq!(retained_index, index);
+        assert_eq!(wire["isError"], false);
+        let entry = &bridge.journal.entries[index];
+        assert_eq!(entry.invocation.arguments, arguments);
+        assert_eq!(entry.invocation.logical_call_id, logical);
+        assert_eq!(entry.invocation.caller, selected.caller);
+        assert_eq!(entry.outcome, Some(result(&entry.invocation, Mode::Good)));
+        bridge.delivered(index).unwrap();
+        last_wire = Some(wire);
+    }
+    let retained = std::fs::read(&bridge.path).unwrap();
+    assert!(retained.len() > FORMER_JOURNAL_BYTES);
+    assert!(retained.len() < selected.limits.journal_bytes);
+    assert_eq!(fake.state.lock().unwrap().calls, OCCURRENCES);
+    assert_eq!(fake.state.lock().unwrap().lookups, 0);
+    let original = bridge.journal.clone();
+    drop(bridge);
+    let mut reopened = Bridge::open(selected.clone(), fake.clone(), vec![], cancel).unwrap();
+    assert_eq!(reopened.journal, original);
+    assert_eq!(std::fs::read(&reopened.path).unwrap(), retained);
+    let (replayed, index) = reopened
+        .invoke(
+            "collab_memory_set",
+            arguments.clone(),
+            &meta(&format!("above-former-journal-{}", OCCURRENCES - 1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(index, OCCURRENCES - 1);
+    assert_eq!(Some(replayed), last_wire);
+    assert_eq!(reopened.journal, original);
+    assert_eq!(std::fs::read(&reopened.path).unwrap(), retained);
+    assert_eq!(fake.state.lock().unwrap().calls, OCCURRENCES);
+    assert_eq!(fake.state.lock().unwrap().lookups, 0);
+
+    // A separately selected smaller policy must refuse before dispatch while
+    // leaving its already committed prefix byte-exact. No retained policy is
+    // rewritten to make the large journal fit a different bound.
+    let (_small_area, mut smaller, mut small_fake, small_cancel) = setup(Mode::Good);
+    smaller.runtime_limits = selected.runtime_limits.clone();
+    smaller.runtime_limits.execution.collaboration.journal_bytes = FORMER_JOURNAL_BYTES;
+    smaller.limits = smaller.runtime_limits.execution.collaboration.clone();
+    smaller.validate().unwrap();
+    small_fake.journal_bytes = smaller.limits.journal_bytes;
+    let mut small = Bridge::open(smaller, small_fake.clone(), vec![], small_cancel).unwrap();
+    small.save().unwrap();
+    let mut refused = None;
+    for index in 0..OCCURRENCES {
+        let before = std::fs::read(&small.path).unwrap();
+        let original_prefix = small.journal.clone();
+        match small
+            .invoke(
+                "collab_memory_set",
+                arguments.clone(),
+                &meta(&format!("above-former-journal-{index}")),
+            )
+            .await
+        {
+            Ok((wire, retained_index)) => {
+                assert_eq!(retained_index, index);
+                assert_eq!(wire["isError"], false);
+                small.delivered(index).unwrap();
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.message(),
+                    "collaboration journal admission bound (execution.collaboration.journal_bytes; reserves execution.collaboration.complete_result_bytes)"
+                );
+                assert_eq!(small.journal, original_prefix);
+                assert_eq!(std::fs::read(&small.path).unwrap(), before);
+                assert_eq!(small_fake.state.lock().unwrap().calls, index);
+                assert_eq!(small_fake.state.lock().unwrap().lookups, 0);
+                refused = Some((index, before.len()));
+                break;
+            }
+        }
+    }
+    let (accepted_prefix, smaller_retained_bytes) = refused.expect("smaller policy must refuse");
+    assert!(accepted_prefix > 0 && accepted_prefix < OCCURRENCES);
+    assert!(smaller_retained_bytes < FORMER_JOURNAL_BYTES);
+    println!(
+        "journal_byte_cap: former={FORMER_JOURNAL_BYTES} selected={} retained={} argument={} calls={} replay_extra_calls=0 replay_lookups=0 smaller_selected={} smaller_retained={} smaller_accepted={}",
+        selected.limits.journal_bytes,
+        retained.len(),
+        arguments_bytes,
+        OCCURRENCES,
+        small.config.limits.journal_bytes,
+        smaller_retained_bytes,
+        accepted_prefix,
+    );
+}
+
+#[path = "codex_mcp_admission_tests.rs"]
+mod admission_tests;

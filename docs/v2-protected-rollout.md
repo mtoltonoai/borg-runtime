@@ -35,7 +35,8 @@ verifier representation/profile rules remain unchanged.
 
 Top-level fields: `revision`, `deployment_target`, `target_revision`, `policy`,
 `producer`, `controller_config`, `python`, `transport_tools`, `sqlite_reader`,
-`state_root`, `limits`, `modules`, `formats`, `hosts`.
+`state_root`, `limits`, `modules`, `formats`, `hosts`. The optional
+`producer_transport` selects the fixed SSH join described below.
 
 * A file pin is exactly `{path, sha256}`. Use canonical absolute paths without
   symlinks, protected owners/modes and regular single-link files. The Python pin
@@ -49,10 +50,11 @@ Top-level fields: `revision`, `deployment_target`, `target_revision`, `policy`,
   the actual configuration named in the controller's unchanged unit. Policy,
   recipe, target, repository, installed digest and kernel UID role must agree.
 * `formats` contains `before`, `after` and `source_files`. Both format tuples
-  contain `wire`, `controller_schema`, `worker_format` and must be equal. The
-  package must contain the pinned `src/protocol.rs`,
-  `src/controller/database.rs`, `src/worker/handoff.rs`. A different deployed
-  format refuses: there is no reset, migration or compatibility fallback.
+  contain `wire`, `controller_schema`, `worker_format`. Without `forward`, they
+  must be equal and the source inventory is exactly `src/protocol.rs`,
+  `src/controller/database.rs`, `src/worker/handoff.rs`. The two explicit
+  forward transitions below have larger source inventories. Every other tuple
+  difference refuses; there is no version-range inference or reset fallback.
 * Exactly one controller and all intended workers are listed in `hosts`, with
   unique IDs. Each host has `id`, `role`, `transport`, `profile_path`,
   `state_root`, `service`, `unit`, `new_unit`, `release_root`, `package`,
@@ -91,6 +93,65 @@ a justified clock bound for real hosts; a profile value alone does not establish
 clock synchronization. Authorization checks subtract that uncertainty from the
 original absolute dispatch deadline.
 
+### Supported forward transitions
+
+The optional closed `formats.forward` object starts only from
+`{wire:11,controller_schema:12,worker_format:9}`. Each kind selects one exact
+destination; it is not a minimum version or permission to chain transitions.
+
+| `kind` | Exact destination |
+| --- | --- |
+| `validated-controller12-worker9-to-controller16-worker12/1` | `{wire:14,controller_schema:16,worker_format:12}` |
+| `validated-controller12-worker9-to-controller17-worker13/1` | `{wire:15,controller_schema:17,worker_format:13}` |
+
+The closed object's fields are:
+
+* `kind`: exactly one of the two values above.
+* `before_package_sha256` and `after_package_sha256`: distinct exact package
+  hashes matching every old host artifact and the full selected Subject.
+* `evidence`: exactly `controller`, `worker`, `retained_state`, each a file pin
+  for the reviewed qualification records. All three are bounded, protected
+  inputs checked before host effects. They are evidence selected by the profile;
+  they do not confer authority or replace actual state/readback guards.
+
+For the schema16 transition `source_files` contains exactly the three files above plus
+`src/controller/application_schema.rs`, `src/controller/workflow_schema.rs`,
+`src/controller/schema13-from12.sql`, `src/controller/schema14-from13.sql`, and
+`src/worker/mod.rs`. The schema17 transition requires those eight files plus
+`src/controller/schema17-from16.sql`, `src/charter.rs`,
+`src/controller/charters.rs`, `src/controller/charter_outputs.rs`,
+`src/worker/charter.rs`, `src/worker/charter_output.rs`, and
+`src/worker/mutations.rs`. Every digest must match the verified candidate package.
+Qualification records must cover the selected destination and its original
+state readers; earlier schema16/worker12 evidence is not evidence for the new
+output representation.
+The adapter does not execute these sources or migrate original state itself.
+The selected runtime performs its existing validated migration under its owner
+lock. Worker `format_file` must be the original state's `format.json`.
+
+The stopped controller comparison permits only the exact 25 empty tables from
+the two schema deltas, NULL `sessions.workflow_delivery` and
+`receipts.governance` columns on every original row, and the initial
+`workflow_revision=0` setting. Every original table, column and row remains
+equal. The schema17 transition additionally requires exactly one empty
+`charter_output_chunks` table with columns `request_id`, `chunk_index`,
+`operation_id`, `reference`, `body`. A populated table, an omitted table or a
+different column set refuses. The controller marker must become the selected
+16 or 17. Worker startup must produce the paired marker 12 or 13 and a
+fresh canonical registration. Only that marker's inode and contents may change
+in addition to the existing registration/await/owner files; its device,
+ownership and mode remain equal, and all other original history stays exact.
+The new runtime's bounded `charter-output` admission is part of its own startup;
+the adapter does not create, repair, truncate or translate output records.
+Uncertain original effects remain uncertain; completed command bookkeeping
+does not authorize replay.
+
+Migration commits are forward barriers. A crash, expired dispatch or lost
+acknowledgment after migration may leave newer state even when rollout is
+`UNKNOWN`. Retained original bytes are evidence, not an automatic restore or
+permission to run an old binary on newer state. Read-only reconciliation must
+prove the original phase completed; it cannot retry migration or host effects.
+
 ## Effects and retained evidence
 
 Before Start, each service must match its old package/unit/UID and compatible
@@ -121,8 +182,10 @@ two verified archive members, fsyncs files and parent directories, and replaces
 only the exact executable path in the unit, preserving its original owner, group
 and permissions (including a private 0600 unit). Existing release paths refuse.
 Runtime state bytes and preserved metadata must remain unchanged through install.
-The controller starts, answers canonical reads, stops for an exact logical-store
-comparison, then starts again before workers. This is one journaled host phase;
+The controller starts, answers canonical reads using the selected new wire,
+stops for the exact logical-store comparison (including only the declared
+additions for the supported transition), then starts again before workers.
+Preflight uses the old wire without fallback. This is one journaled host phase;
 an ambiguous acknowledgment never repeats it. Worker startup requires an actual
 canonical fresh registration and retains old history. Final readback compares all
 Task objects, original ordinary mutation receipts, installed binary/manifest/unit,
@@ -152,6 +215,16 @@ also distinguish lost Start before/after commit, original refusal, changed input
 current Applied/Unknown, partial progress, exact receipt bounds and read-only
 recovery of a lost final host acknowledgment.
 
+Forward-transition tests use the actual additive SQL files on scratch schema12
+stores and a controlled runtime-start seam. They discriminate rewritten
+original receipts, unexpected rows/columns, missing or changed qualification
+pins, incorrect format/package/source identity, wrong worker markers, and
+post-migration crash/expiry/lost-ACK handling. The schema17 cases also require
+the new chunk table to remain empty and distinguish the paired marker13 from
+the previous target's marker12. They do not claim execution of
+the runtime migrators or migration of any installed store; those are separate
+source-bound runtime and retained-state qualifications.
+
 `actual_rollout_adapter_original_receipts_and_no_effect_retry` additionally uses
 the actual Rust controller/SQLite/private Unix transport and then reopens that
 controller. Host systemd/SSH operations remain controlled, including a separate
@@ -161,6 +234,34 @@ accepted package supplied by BORG_TEST_PACKAGE and BORG_TEST_PACKAGE_DESCRIPTOR
 is a protocol fixture; its bytes are not reported as a newly built current runtime.
 
 An actual configured host qualification still requires the exact installation,
-roles, existing transport/access, same-format deployed baseline, finite metadata,
+roles, existing transport/access, the selected supported baseline, finite metadata,
 clock bound and a fresh approved Check/action/human grant. This source batch
 creates none of those prerequisites.
+
+## Optional remote producer on the existing controller host
+
+Without `producer_transport`, the existing same-host Unix producer path is
+unchanged. To use the already configured controller SSH route, add exactly:
+
+```
+"producer_transport": {
+  "kind": "ssh",
+  "host_id": "<existing controller host ID>",
+  "config_path": "/absolute/installed/producer.json"
+}
+```
+
+No independent alias, SSH options or executable may be added here. The host must
+be the profile's single controller and already use SSH transport. Its helper UID
+is the producer UID; that UID still needs an explicit rollout role and cannot be
+a worker. The remote config bytes must match the pinned local producer copy.
+The Python and producer-module locations and bytes are already selected by the
+profile. The fixed command uses the existing SSH configuration and sudo route,
+then the producer's bounded `exchange-stdio` operation. No route is provisioned.
+
+The controller's actual private-socket checks remain authoritative. Original
+StartRollout intent is synced locally before the exchange. A lost reply triggers
+only original receipt/action readback; reconciliation never resends StartRollout
+or resumes host installation. All exact-subject, fresh-check, human-grant and
+host-readback conditions remain unchanged. Pure transport tests are not evidence
+of a currently installed route or a completed rollout.

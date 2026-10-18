@@ -2,8 +2,34 @@
 use super::{ControllerConfig, database::*};
 use crate::protected_release::*;
 use super::database::StoreContext as Connection;
-use rusqlite::{ OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+
+pub(super) enum ProtectedResponse {
+    Reply(Reply),
+    StoreFailure(Box<ProtectedFailure>),
+}
+
+/// In-process ownership only. The original peer and full observation remain
+/// intact; normalized receipt input is not authority to repeat an external read.
+pub(super) struct ProtectedFailure {
+    pub(super) uid: u32,
+    pub(super) request: Request,
+    pub(super) cause: Fault,
+}
+impl ProtectedFailure {
+    pub(super) fn disposition(&self) -> super::checked_transaction::RetryDisposition {
+        match &self.cause {
+            Fault::Transaction(failure) => failure.retry_disposition(),
+            _ => super::checked_transaction::RetryDisposition::Ineligible,
+        }
+    }
+
+    pub(super) fn into_reply(self) -> Reply {
+        Reply::refused("store_unavailable_reconcile_original")
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Recorded {
     producer: Producer,
@@ -118,6 +144,10 @@ fn check(tx: &Connection, c: &Config, s: &Subject, id: &str, now: u64) -> Result
 //= spec/impl/v2/implementation.md#changes-can-be-prepared-without-per-change-human-approval
 //# Human authorization MUST NOT bypass applicable mandatory validation.
 // Grant lookup is separate from the mandatory check lookup at Prepare/Start.
+// Traceability scope: Only an original exact-subject Grant from a configured Human producer qualifies rollout; product outcomes cannot substitute for that receipt.
+//= spec/impl/v2/implementation.md#collaboration-surfaces-preserve-existing-authority
+//# A product question or review decision MUST NOT confer protected rollout authority.
+
 fn grant(tx: &Connection, c: &Config, s: &Subject, id: Option<&String>, now: u64) -> Result<()> {
     let Some(id) = id else {
         return refuse("human_authorization_required", "no rollout grant");
@@ -438,12 +468,44 @@ fn apply(tx: &Connection, c: &Config, p: &Producer, req: &Request, now: u64) -> 
 }
 impl Database {
     pub(super) fn protected(&mut self, uid: u32, req: Request) -> (Reply, bool) {
-    let limits = &self.config.limits;
-        let result = (|| -> Result<(Reply, bool)> {
+        match self.protected_observed(uid, req) {
+            (ProtectedResponse::Reply(reply), changed) => (reply, changed),
+            (ProtectedResponse::StoreFailure(failure), _) => (failure.into_reply(), false),
+        }
+    }
+
+    /// One SQL attempt. Retry policy and scheduling belong to the caller; no
+    /// repository/runtime callback is invoked or repeated at this boundary.
+    pub(super) fn protected_observed(&mut self, uid: u32, req: Request) -> (ProtectedResponse, bool) {
+        self.protected_attempt(uid, req, false)
+    }
+
+    /// A parked duplicate can only obtain its canonical receipt, never a fresh
+    /// dispatch grant. An absent receipt is not authority to execute the action.
+    pub(super) fn protected_replay_observed(&mut self, uid: u32, req: Request) -> (ProtectedResponse, bool) {
+        self.protected_attempt(uid, req, true)
+    }
+
+    fn protected_attempt(&mut self, uid: u32, req: Request, receipt_only: bool) -> (ProtectedResponse, bool) {
+        let result = self.protected_process(uid, &req, receipt_only);
+        match result {
+            Ok((reply, changed)) => (ProtectedResponse::Reply(reply), changed),
+            Err(Fault::Refused(code, message)) => (
+                ProtectedResponse::Reply(crate::protected_release::refusal_with_limit(code, &message)),
+                false,
+            ),
+            Err(cause) => (ProtectedResponse::StoreFailure(Box::new(ProtectedFailure {
+                uid, request: req, cause,
+            })), false),
+        }
+    }
+
+    fn protected_process(&mut self, uid: u32, req: &Request, receipt_only: bool) -> Result<(Reply, bool)> {
+            let limits = &self.config.limits;
             let Some(c) = &self.config.protected_release else {
                 return refuse("unconfigured", "no protected producers configured");
             };
-            let Some(p) = c.producers.iter().find(|p| p.uid == uid) else {
+            let Some(p) = c.producer(uid, &req.command) else {
                 return refuse("unauthenticated", "peer UID is not a configured producer");
             };
             if req.revision != REVISION || req.operation_id.is_empty() || req.operation_id.chars().any(char::is_control) {
@@ -466,14 +528,17 @@ impl Database {
             } else {
                 req.clone()
             };
-            let transaction = self
-                .conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let tx = Connection::new(&transaction, &self.config.limits);
+            super::checked_transaction::immediate(&mut self.conn, |sql| {
+            let tx = Connection::new(sql, &self.config.limits);
             let read_only = matches!(
                 req.command,
                 Command::GetAction { .. } | Command::GetReceipt { .. } | Command::View { .. }
             );
+            if receipt_only && read_only {
+                return Ok(super::checked_transaction::Completion::Rollback((
+                    Reply::refused("store_unavailable_reconcile_original"), false,
+                )));
+            }
             if !read_only {
                 let exists: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM protected_receipts WHERE id=?1)",
@@ -490,7 +555,19 @@ impl Database {
                     }
                     let mut reply = old.reply;
                     reply.replayed = true;
-                    return Ok((reply, false));
+                    return Ok(super::checked_transaction::Completion::Rollback((reply, false)));
+                }
+                if receipt_only {
+                    return Ok(super::checked_transaction::Completion::Rollback((
+                        Reply::refused("store_unavailable_reconcile_original"), false,
+                    )));
+                }
+                if self.maintenance_pending && !matches!(req.command,
+                    Command::Finish { .. } | Command::ReconcileObservation { .. }
+                    | Command::ObserveRollout { .. }) {
+                    return Ok(super::checked_transaction::Completion::Rollback((
+                        Reply::refused("store_unavailable_reconcile_original"), false,
+                    )));
                 }
                 let n: i64 =
                     tx.query_row("SELECT count(*) FROM protected_receipts", [], |r| r.get(0))?;
@@ -507,7 +584,7 @@ impl Database {
                 return refuse("response_bound", "protected view exceeds bound: interface.protected_reply_bytes");
             }
             if read_only {
-                return Ok((reply, false));
+                return Ok(super::checked_transaction::Completion::Rollback((reply, false)));
             }
             // An admitted original must itself remain retrievable through the
             // same bounded GetReceipt transport, not only fit its first reply.
@@ -547,17 +624,8 @@ impl Database {
             }
             let revision = super::metadata::advance(&tx)?;
             tx.execute("INSERT INTO protected_receipts(id,producer,request,reply,revision) VALUES(?1,?2,?3,?4,?5)",params![req.operation_id,encode(p)?,encode(&stored_req)?,encode(&reply)?,integer(revision)?])?;
-            transaction.commit()?;
-            Ok((reply, true))
-        })();
-        match result {
-            Ok(v) => v,
-            Err(Fault::Refused(code, message)) => (crate::protected_release::refusal_with_limit(code, &message), false),
-            Err(_) => (
-                Reply::refused("store_unavailable_reconcile_original"),
-                false,
-            ),
-        }
+            Ok(super::checked_transaction::Completion::Commit((reply, true)))
+            })
     }
 }
 pub(super) fn validate_existing(tx: &Connection, cfg: &ControllerConfig) -> Result<()> {
@@ -619,6 +687,10 @@ pub(super) fn validate_existing(tx: &Connection, cfg: &ControllerConfig) -> Resu
 }
 
 #[cfg(test)]
-#[path = "protected_tests.rs"]
-mod tests;
+mod tests {
+    include!("protected_tests.rs");
+    mod retry_tests {
+        include!("protected_retry_tests.rs");
+    }
+}
 

@@ -30,8 +30,17 @@ pub(super) fn fresh_id(kind: &str) -> Result<String, String> {
 fn identity(operation: &Operation) -> Result<&str, String> {
     match operation {
         Operation::CallCollaboration { call } => Ok(&call.operation_id),
-        Operation::PrepareAgentMemory { operation_id, .. }
+        Operation::EvaluateCompletion(input) => Ok(&input.operation_id),
+        Operation::BeginCompletionContinuation(input) => Ok(&input.operation_id),
+        Operation::AcknowledgeCompletionInput(input) => Ok(&input.operation_id),
+        Operation::AcquireNativeRequest { operation_id, .. }
+        | Operation::SettleNativeRequest { operation_id, .. }
+        | Operation::ObserveCharter { operation_id, .. }
+        | Operation::PrepareAgentMemory { operation_id, .. }
         | Operation::AcknowledgeAgentMemory { operation_id, .. }
+        | Operation::PrepareCollaborationDelivery { operation_id, .. }
+        | Operation::BeginCollaborationDelivery { operation_id, .. }
+        | Operation::AcknowledgeCollaborationDelivery { operation_id, .. }
         | Operation::RegisterWorker { operation_id, .. }
         | Operation::AwaitCommands { operation_id, .. } => Ok(operation_id),
         Operation::SettleOperation { settlement_id, .. } => Ok(settlement_id),
@@ -43,15 +52,33 @@ pub(super) fn read(
     path: &Path,
     limits: &crate::limits::RuntimeLimits,
 ) -> Result<Option<Journal>, String> {
+    let Some(bytes) = read_bytes(path, limits.worker.mutation_record_bytes)? else {
+        return Ok(None);
+    };
+    decode(&bytes, limits).map(Some)
+}
+
+fn read_bytes(path: &Path, bound: usize) -> Result<Option<Vec<u8>>, String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err("worker mutation journal unavailable".into()),
     };
     let mut bytes = Vec::new();
-    file.take(limits.worker.mutation_record_bytes as u64 + 1)
+    let read_bound = u64::try_from(bound)
+        .ok()
+        .and_then(|bound| bound.checked_add(1))
+        .ok_or("worker mutation journal bound exceeds reader representation")?;
+    file.take(read_bound)
         .read_to_end(&mut bytes)
         .map_err(|_| "worker mutation journal unreadable")?;
+    if bytes.len() > bound {
+        return Err("worker mutation journal exceeds bound (worker.mutation_record_bytes)".into());
+    }
+    Ok(Some(bytes))
+}
+
+fn decode(bytes: &[u8], limits: &crate::limits::RuntimeLimits) -> Result<Journal, String> {
     if bytes.len() > limits.worker.mutation_record_bytes {
         return Err("worker mutation journal exceeds bound (worker.mutation_record_bytes)".into());
     }
@@ -81,11 +108,16 @@ pub(super) fn read(
     if let (Some(outcome), Some(context)) = (&journal.outcome, &journal.outcome_context) {
         context.validate(&journal.request, outcome)?;
     }
-    Ok(Some(journal))
+    Ok(journal)
 }
 
-pub(super) fn create(
-    path: &Path,
+pub(super) fn create(path:&Path, request:Operation, recovery_epoch:u64, limits:&crate::limits::RuntimeLimits)->Result<Journal,String>{
+    let journal=prepare(request,recovery_epoch,limits)?;
+    atomic_json(path,&journal)?;
+    Ok(journal)
+}
+
+pub(super) fn prepare(
     request: Operation,
     recovery_epoch: u64,
     limits: &crate::limits::RuntimeLimits,
@@ -126,7 +158,6 @@ pub(super) fn create(
         .ok_or("mutation journal cannot reserve complete outcome/context (worker.mutation_record_bytes; reserves transport.body_bytes and committed context)")?;
     bounded_json_size(&journal, pending_bound)
         .map_err(|_| "mutation journal cannot reserve complete outcome/context (worker.mutation_record_bytes; reserves transport.body_bytes and committed context)")?;
-    atomic_json(path, &journal)?;
     Ok(journal)
 }
 
@@ -150,32 +181,83 @@ pub(super) fn consume(path: &Path, journal: &mut Journal) -> Result<(), String> 
     atomic_json(path, journal)
 }
 
+// AwaitCommands Pending is a validated, uncommitted long-poll result. It is
+// not a transport failure and must not consume or replace the original journal.
+pub(super) enum Resolution {
+    Recorded(Outcome),
+    Pending,
+    Unavailable,
+}
+
 pub(super) async fn resolve(
     client: &ApiClient,
     path: &Path,
     journal: &mut Journal,
 ) -> Result<Option<Outcome>, String> {
+    Ok(match resolve_status(client, path, journal).await? {
+        Resolution::Recorded(outcome) => Some(outcome),
+        Resolution::Pending | Resolution::Unavailable => None,
+    })
+}
+
+// Owning the journal keeps the actual request future alive across short cleanup
+// batches without borrowing the serving loop's replacement journal slot.
+pub(super) async fn resolve_await(
+    client: ApiClient,
+    path: PathBuf,
+    mut journal: Box<Journal>,
+) -> (Box<Journal>, Result<Resolution, String>) {
+    let result = if matches!(&journal.request, Operation::AwaitCommands { .. }) {
+        resolve_status(&client, &path, &mut journal).await
+    } else {
+        Err("unexpected wait journal operation".into())
+    };
+    (journal, result)
+}
+
+async fn resolve_status(
+    client: &ApiClient,
+    path: &Path,
+    journal: &mut Journal,
+) -> Result<Resolution, String> {
     if let Some(outcome) = &journal.outcome {
         persist(path, journal)?;
-        return Ok(Some(outcome.clone()));
+        return Ok(Resolution::Recorded(outcome.clone()));
     }
     let id = identity(&journal.request)?;
-    let observed = match acceptance::lookup(client, id, &journal.request).await? {
+    let acknowledgement = matches!(&journal.request, Operation::AcknowledgeCompletionInput(_));
+    let original = if acknowledgement {
+        acceptance::lookup_required(client, id, &journal.request).await?
+    } else {
+        acceptance::lookup(client, id, &journal.request).await?
+    };
+    let observed = match original {
         acceptance::Lookup::Recorded(outcome, context) => Some((outcome, context)),
-        acceptance::Lookup::Unavailable => return Ok(None),
+        acceptance::Lookup::Unavailable => return Ok(Resolution::Unavailable),
         acceptance::Lookup::Absent => {
             persist(path, journal)?;
             match tokio::time::timeout(
                 Duration::from_millis(journal.limits.worker.mutation_call_timeout_ms),
-                client.call(journal.request.clone()),
+                client.call_observed(journal.request.clone()),
             )
             .await
             {
                 Ok(Ok(reply)) => {
                     if let Some(context) = CommitContext::from_reply(&reply, &journal.request)? {
                         Some((reply.outcome, context))
+                    } else if matches!(
+                        (&journal.request, &reply.outcome),
+                        (Operation::AwaitCommands { operation_id: expected, .. },
+                         Outcome::Pending { operation_id }) if operation_id == expected
+                    ) {
+                        return Ok(Resolution::Pending);
                     } else if matches!(reply.outcome, Outcome::Refused { .. }) {
-                        match acceptance::lookup(client, id, &journal.request).await? {
+                        let original = if acknowledgement {
+                            acceptance::lookup_required(client, id, &journal.request).await?
+                        } else {
+                            acceptance::lookup(client, id, &journal.request).await?
+                        };
+                        match original {
                             acceptance::Lookup::Recorded(outcome, context) => {
                                 Some((outcome, context))
                             }
@@ -183,6 +265,15 @@ pub(super) async fn resolve(
                         }
                     } else {
                         None
+                    }
+                }
+                Ok(Err(crate::client::CallFailure::Contract(error))) if acknowledgement => return Err(error),
+                Ok(Err(crate::client::CallFailure::Unavailable(_))) | Err(_) if acknowledgement => {
+                    // The actual input proof is already durable. Recover only its
+                    // original ACK receipt, never another mutation or model turn.
+                    match acceptance::lookup_required(client, id, &journal.request).await? {
+                        acceptance::Lookup::Recorded(outcome, context) => Some((outcome, context)),
+                        acceptance::Lookup::Absent | acceptance::Lookup::Unavailable => None,
                     }
                 }
                 _ => None,
@@ -199,7 +290,10 @@ pub(super) async fn resolve(
             .map_err(|reason| format!("{reason} (worker.mutation_record_bytes)"))?;
         atomic_json(path, journal)?;
     }
-    Ok(observed.map(|(outcome, _)| outcome))
+    Ok(match observed {
+        Some((outcome, _)) => Resolution::Recorded(outcome),
+        None => Resolution::Unavailable,
+    })
 }
 
 pub(super) async fn recorded(
@@ -346,7 +440,12 @@ pub(super) async fn settle(
     }
 }
 
-pub(super) async fn recover_settlements(client: &ApiClient, state: &Path) -> Result<(), String> {
+pub(super) async fn recover_settlements(
+    client: &ApiClient,
+    state: &Path,
+    controller_url: &str,
+    worker_id: &str,
+) -> Result<(), String> {
     let mut paths = Vec::new();
     let mut count = 0usize;
     for entry in std::fs::read_dir(state.join("mutations/settlements"))
@@ -362,15 +461,67 @@ pub(super) async fn recover_settlements(client: &ApiClient, state: &Path) -> Res
         }
     }
     paths.sort();
-    for path in paths {
-        let mut journal = read(&path, client.limits())?.ok_or("settlement journal disappeared")?;
-        if !matches!(journal.request, Operation::SettleOperation { .. }) {
-            return Err("unexpected settlement journal operation".into());
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // The retained RunAttempt is the policy authority. A journal's policy is
+    // untrusted until the exact task/attempt/generation selects that command.
+    let commands = super::command_receipts(state, client.limits())?;
+    let mut original = Vec::new();
+    let mut read_bound = 0;
+    for (path, receipt) in &commands {
+        let WorkerCommand::RunAttempt { command_id, attempt, task, .. } = &receipt.command else {
+            continue;
+        };
+        task.execution_limits()?;
+        let limits = task.resolved_limits.as_ref().ok_or("settlement command limits missing")?.global_metadata.as_ref();
+        if path != &state.join("commands").join(format!("{}.json", component(command_id)))
+            || attempt.worker_id != worker_id
+            || attempt.worker_incarnation.is_empty()
+        {
+            return Err("settlement original command identity differs".into());
         }
+        read_bound = read_bound.max(limits.worker.mutation_record_bytes);
+        original.push((&receipt.command, attempt, limits));
+    }
+    if original.is_empty() {
+        return Err("settlement has no original run command".into());
+    }
+    for path in paths {
+        let bytes = read_bytes(&path, read_bound)?.ok_or("settlement journal disappeared")?;
+        // Decode only the selector first, with a finite bound derived above.
+        // Neither this value nor its saved limits can authorize recovery.
+        let selector: Journal = serde_json::from_slice(&bytes)
+            .map_err(|_| "corrupt worker mutation journal")?;
+        let Operation::SettleOperation {
+            settlement_id, operation_id, task_id, attempt_id, generation, ..
+        } = &selector.request else {
+            return Err("unexpected settlement journal operation".into());
+        };
+        let mut matching = original.iter().filter(|(_, attempt, _)| {
+            &attempt.task_id == task_id && &attempt.id == attempt_id && &attempt.generation == generation
+        });
+        let (command, _, limits) = matching.next().ok_or("settlement original command missing")?;
+        if matching.next().is_some() {
+            return Err("settlement original command is ambiguous".into());
+        }
+        let archived = state.join("mutations/settlements")
+            .join(format!("settled-{}.json", component(settlement_id)));
+        if operation_id.is_empty() || settlement_id.is_empty() || operation_id == settlement_id
+            || (path != settlement_path(state, operation_id) && path != archived)
+        {
+            return Err("settlement original operation identity differs".into());
+        }
+        // Validate the same bytes, including completed decisions, under the
+        // accepted policy. Do not migrate, rewrite or skip a consumed journal.
+        let mut journal = decode(&bytes, limits)?;
+        publication::validate_saved_settlement(state, command, &journal.request)?;
+        pull_request::validate_saved_settlement(state, command, &journal.request)?;
         if journal.consumed {
             continue;
         }
-        match resolve(client, &path, &mut journal).await? {
+        let original_client = ApiClient::new(controller_url, Arc::new((**limits).clone()))?;
+        match resolve(&original_client, &path, &mut journal).await? {
             Some(_) => consume(&path, &mut journal)?,
             None => return Err("external settlement awaits exact reconciliation".into()),
         }

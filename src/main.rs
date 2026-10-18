@@ -147,7 +147,29 @@ async fn run(
             if let Some(repositories) = repositories {
                 config.repository_read = repositories;
             }
-            let controller = Controller::open_with_config(db, config)?;
+            // Install the signal before starting the blocking database owner.
+            // Dropping a JoinHandle does not cancel that owner; cancellation
+            // wakes its retained SQL phase and we await actual startup exit.
+            let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|e| e.to_string())?;
+            let cancellation = borg_runtime::controller::StartupCancellation::default();
+            let startup_cancel = cancellation.clone();
+            let mut opening = tokio::task::spawn_blocking(move ||
+                Controller::open_with_config_cancellable(db, config, startup_cancel));
+            let controller = tokio::select! {
+                biased;
+                _ = shutdown.recv() => {
+                    cancellation.cancel();
+                    // A startup that committed concurrently is still closed by
+                    // dropping its returned Controller; no server is published.
+                    let result = opening.await.map_err(|e| e.to_string())?;
+                    drop(result);
+                    tokio::task::spawn_blocking(move || cancellation.wait_for_owners())
+                        .await.map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+                result = &mut opening => result.map_err(|e| e.to_string())??,
+            };
             let private = match protected {
                 Some(cfg) => {
                     let listener =
@@ -171,7 +193,7 @@ async fn run(
                     None => std::future::pending().await,
                 }
             };
-            tokio::select! {r=server::serve(controller,listener,origin)=>r,r=protected_server=>r,r=tokio::signal::ctrl_c()=>r.map_err(|e|e.to_string())}
+            tokio::select! {r=server::serve(controller,listener,origin)=>r,r=protected_server=>r,_=shutdown.recv()=>Ok(())}
         }
         "worker" => {
             let config = WorkerConfig {

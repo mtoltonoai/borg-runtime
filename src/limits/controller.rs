@@ -20,6 +20,8 @@ pub struct ControllerLimits {
     pub command_wait_ms: u64,
     pub validation_timeout_ms: u64,
     pub sqlite_busy_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_retry: Option<StoreRetryLimits>,
     pub max_task_input_bytes: usize,
     pub max_task_output_bytes: usize,
     pub max_task_result_bytes: usize,
@@ -69,8 +71,30 @@ pub struct ControllerLimits {
     pub mountinfo_fields: usize,
 }
 
+/// Current controller-service policy for one identified SQL phase. It neither
+/// alters an accepted task deadline nor authorizes replay of external work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRetryLimits {
+    pub backoff_ms: u64,
+    pub operation_timeout_ms: u64,
+}
+impl StoreRetryLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.backoff_ms == 0 || self.backoff_ms >= self.operation_timeout_ms {
+            return Err("controller.store_retry requires 0 < backoff_ms < operation_timeout_ms".into());
+        }
+        for n in [self.backoff_ms, self.operation_timeout_ms] {
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(n))
+                .ok_or("controller.store_retry exceeds clock representation")?;
+        }
+        Ok(())
+    }
+}
+
 impl ControllerLimits {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(retry) = &self.store_retry { retry.validate()?; }
         if self.history_kind_bytes == 0 { return Err("controller.history_kind_bytes must be positive".into()); }
         if self.queue_capacity == 0 { return Err("controller.queue_capacity must be positive".into()); }
         if self.max_tasks == 0 { return Err("controller.max_tasks must be positive".into()); }
@@ -160,5 +184,44 @@ impl ControllerLimits {
         }
         self.max_receipts.checked_add(self.max_cleanup_receipts).and_then(|v|v.checked_add(self.max_tasks)).and_then(|v|v.checked_mul(2)).and_then(|v|i64::try_from(v).ok()).ok_or("controller startup inventory bound overflow")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod store_retry_tests {
+    use super::*;
+
+    #[test]
+    fn absent_store_policy_round_trips_without_an_added_field() {
+        let limits = crate::limits::RuntimeLimits::seed().unwrap().controller;
+        assert!(limits.store_retry.is_none());
+        let bytes = serde_json::to_vec(&limits).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("store_retry").is_none());
+        let retained: ControllerLimits = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&retained).unwrap(), bytes);
+    }
+
+    #[test]
+    fn explicit_store_policy_is_closed_positive_and_clock_bounded() {
+        let policy = StoreRetryLimits { backoff_ms: 10, operation_timeout_ms: 100 };
+        policy.validate().unwrap();
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(value, serde_json::json!({"backoff_ms":10,"operation_timeout_ms":100}));
+        assert!(serde_json::from_value::<StoreRetryLimits>(serde_json::json!({
+            "backoff_ms":10,"operation_timeout_ms":100,"retry_count":3
+        })).is_err());
+        for (backoff_ms, operation_timeout_ms) in [(0,100),(10,0),(10,10),(100,10)] {
+            assert!(StoreRetryLimits { backoff_ms, operation_timeout_ms }.validate().is_err());
+        }
+        let largest = StoreRetryLimits { backoff_ms: 1, operation_timeout_ms: u64::MAX };
+        assert_eq!(largest.validate().is_ok(), std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(u64::MAX)).is_some());
+        let mut current = crate::limits::RuntimeLimits::seed().unwrap();
+        current.controller.store_retry = Some(policy.clone());
+        current.controller.validate().unwrap();
+        let restored: crate::limits::RuntimeLimits = serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(restored.controller.store_retry, Some(policy));
+        assert!(restored.native_retry.is_none(), "store scheduling does not require provider policy");
     }
 }

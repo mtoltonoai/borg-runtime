@@ -24,6 +24,10 @@ async fn query(c: &Controller, query: Query) -> QueryResult {
     }
 }
 #[tokio::test]
+// Traceability scope: Actual canonical worker capacity and attempt/history projections preserve the task and survive reopen; checkpoint/release projections are exercised by the companion case below.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//= type=test
+//# The collaboration tool interface MUST provide read-only views of worker capacity, task attempts, checkpoints and release-check records.
 async fn collaboration_queries_read_existing_records_without_mutating_revision() {
     let p = path();
     let c = Controller::open_with_config(&p, config()).unwrap();
@@ -43,19 +47,7 @@ async fn collaboration_queries_read_existing_records_without_mutating_revision()
         )
         .await,
     );
-    task(
-        report(
-            &c,
-            &a,
-            "query-usage",
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     for key in ["alpha", "omega"] {
         assert!(matches!(
             call(
@@ -221,6 +213,13 @@ async fn collaboration_queries_read_existing_records_without_mutating_revision()
     );
 }
 #[tokio::test]
+// Traceability scope: Actual checkpoint and empty release-check projections preserve the unqualified candidate and original task; reads do not manufacture release authority.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//= type=test
+//# The collaboration tool interface MUST provide read-only views of worker capacity, task attempts, checkpoints and release-check records.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//= type=test
+//# Operational queries MUST NOT grant authority to mutate worker controls or protected release state.
 async fn collaboration_queries_checkpoint_and_release_reads_do_not_create_authority() {
     let c = Controller::open_with_config(path(), config()).unwrap();
     let t = accepted_release_task(&c, "query-coding").await;

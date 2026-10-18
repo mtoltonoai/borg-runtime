@@ -8,6 +8,7 @@ use borg_runtime::{
 use std::{path::Path, process::Command};
 fn read_repository_registration() -> borg_runtime::repository_catalogue::Registration {
     borg_runtime::repository_catalogue::Registration {
+        pull_request_target: None,
         repository_id: "repository-read-fixture".into(),
         registration_revision: "revision-1".into(),
         display_name: "Local repository read fixture".into(),
@@ -221,7 +222,8 @@ async fn repository_calls_actual_http_all_five_exact_sources_and_closed_fields()
     let server = tokio::spawn(async move { borg_runtime::server::serve(cc, listener, bb).await });
     let client = mcp::Client::new(&base, actor.clone(), metadata()).unwrap();
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 33);
+    assert!(tools.iter().any(|tool| tool.name == "collab_definition_update"));
     assert!(tools.iter().any(|tool| tool.name == "collab_limits_get"));
     assert_eq!(tools, mcp::catalogue(c.limits()));
     // Both HTTP adapters enforce the complete frame using this selected policy.
@@ -296,6 +298,13 @@ async fn repository_calls_actual_http_all_five_exact_sources_and_closed_fields()
 //= spec/impl/v2/implementation.md#repository-reads-through-the-shared-tool-interface
 //= type=test
 //# The shared agent interface MUST provide read-only repository access within the task's accepted repository scope.
+// Traceability scope: Real controller/Git queries leave a working helper tripwire unexecuted and compare every repository file byte and mode after each query.
+//= spec/impl/v2/implementation.md#repository-reads-through-the-shared-tool-interface
+//= type=test
+//# An agent repository-read operation MUST NOT execute repository-supplied code.
+//= spec/impl/v2/implementation.md#repository-reads-through-the-shared-tool-interface
+//= type=test
+//# An agent repository-read operation MUST NOT modify repository content.
 #[tokio::test]
 async fn repository_calls_do_not_execute_repo_helpers_or_change_repository_files() {
     use std::collections::BTreeMap;
@@ -380,6 +389,7 @@ async fn repository_calls_do_not_execute_repo_helpers_or_change_repository_files
     let c = Controller::open_with_config(path(), f.config()).unwrap();
     let mut input = coding("inert-read");
     input.repository = Some(Repository {
+        pull_request_target: None,
         registration: Some(read_repository_registration().binding()),
         url: String::new(),
         start_commit: f.old.clone(),
@@ -524,6 +534,7 @@ async fn repository_calls_changed_checkpoint_cannot_retarget_result() {
     let c = Controller::open_with_config(path(), f.config()).unwrap();
     let mut input = coding("checkpoint-source");
     input.repository = Some(Repository {
+        pull_request_target: None,
         registration: Some(read_repository_registration().binding()),
         url: String::new(),
         start_commit: f.old.clone(),

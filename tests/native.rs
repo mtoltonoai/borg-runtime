@@ -63,7 +63,9 @@ fn require_send<F: std::future::Future + Send>(future: F) -> F {
     future
 }
 fn metadata() -> borg_runtime::limits::RuntimeLimits {
-    borg_runtime::limits::RuntimeLimits::seed().unwrap()
+    let mut p=borg_runtime::limits::RuntimeLimits::seed().unwrap();
+    p.execution.native.context_bytes=65_536;
+    p
 }
 // Direct executor fixtures emulate the controller acceptance boundary explicitly.
 fn bind(mut input: TaskInput) -> TaskInput {
@@ -126,10 +128,12 @@ fn helper_policy_frame() -> Vec<u8> {
 }
 
 fn task() -> TaskInput {
-    bind(TaskInput {
+    bind(TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         instruction: "Classify this synthetic input as good. Return JSON.".into(),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             inference: Some(borg_runtime::protocol::InferenceSettings::selected()),
             execution_profile: Some(borg_runtime::protocol::ExecutionProfile::CollaborationV1 {
@@ -431,7 +435,7 @@ async fn native_response_limits_and_errors_never_echo_provider_body() {
         .await;
         let r = execute(&task(), &config(f.endpoint.clone())).await;
         f.finish().await;
-        assert_eq!(r.err(), Some(format!("{error} status={status}")));
+        assert_eq!(r.err(), Some(format!("{error} status={status} error_body=invalid_json")));
     }
 }
 
@@ -439,31 +443,37 @@ async fn native_response_limits_and_errors_never_echo_provider_body() {
 // Native component scope: Fixed diagnostic labels survive HTTP refusal without
 // accepting output, completing provider accounting, or retaining response prose.
 async fn native_http_diagnostics_keep_status_and_known_labels_only() {
-    for (status, body, expected) in [
+    use borg_runtime::native::{ProviderRejection,RejectionKind,RetryAfter};
+    for (status, body, expected, expected_outcome) in [
         (
             400,
             json!({"error":{"message":"DO_NOT_COPY_PROVIDER_SECRET", "type":"invalid_request_error", "code":"invalid_json_schema", "param":"text.format.schema"}}),
-            "native_provider_request_refused status=400 type=invalid_request_error code=invalid_json_schema param=text.format.schema",
+            "native_provider_request_refused status=400 type=invalid_request_error code=invalid_json_schema param=text.format.schema error_body=complete provider_message_state=fingerprinted provider_message_bytes=27 provider_message_sha256=96974c22bb780499836231de2d5e15fa6293fee7d3e3ec0575cbb5706cc45e5e category=invalid_request".to_string(),
+            ProviderOutcome::Rejected(ProviderRejection{kind:RejectionKind::InvalidRequest,retry_after:RetryAfter::Absent}),
         ),
         (
             404,
             json!({"error":{"message":"DO_NOT_COPY_PROVIDER_SECRET", "type":"invalid_request_error", "code":"model_not_found", "param":"model"}}),
-            "native_provider_request_refused status=404 type=invalid_request_error code=model_not_found param=model",
+            "native_provider_request_refused status=404 type=invalid_request_error code=model_not_found param=model error_body=complete provider_message_state=fingerprinted provider_message_bytes=27 provider_message_sha256=96974c22bb780499836231de2d5e15fa6293fee7d3e3ec0575cbb5706cc45e5e category=invalid_request".to_string(),
+            ProviderOutcome::Rejected(ProviderRejection{kind:RejectionKind::InvalidRequest,retry_after:RetryAfter::Absent}),
         ),
         (
             400,
             json!({"error":{"message":std::env::var("HOME").unwrap(), "type":"private_project_123", "code":"DO_NOT_COPY_PROVIDER_SECRET", "param":"text.format.schema.properties.DO_NOT_COPY_PROVIDER_SECRET"}}),
-            "native_provider_request_refused status=400",
+            format!("native_provider_request_refused status=400 error_body=complete provider_message_state=redacted provider_message_bytes={}", std::env::var("HOME").unwrap().len()),
+            ProviderOutcome::Unknown,
         ),
         (
             400,
             json!({"error":{"type":17,"code":["invalid_json_schema"],"param":false}}),
-            "native_provider_request_refused status=400",
+            "native_provider_request_refused status=400 error_body=complete".to_string(),
+            ProviderOutcome::Unknown,
         ),
         (
             429,
             json!({"error":{"type":"insufficient_quota", "code":"project_spend_limit_exceeded", "param":null}}),
-            "native_provider_rate_limited status=429 type=insufficient_quota code=project_spend_limit_exceeded",
+            "native_provider_rate_limited status=429 type=insufficient_quota code=project_spend_limit_exceeded error_body=complete category=quota_exhausted".to_string(),
+            ProviderOutcome::Rejected(ProviderRejection{kind:RejectionKind::QuotaExhausted,retry_after:RetryAfter::Absent}),
         ),
     ] {
         let f = Fixture::start(
@@ -475,12 +485,12 @@ async fn native_http_diagnostics_keep_status_and_known_labels_only() {
         .await;
         let result = observed(&task(), &config(f.endpoint.clone())).await;
         f.finish().await;
-        assert_eq!(result.result.err().as_deref(), Some(expected));
+        assert_eq!(result.result.err().as_deref(), Some(expected.as_str()));
         assert_eq!(
             result.request_exposure,
             RequestExposure::HttpResponseReceived
         );
-        assert_eq!(result.provider_outcome, ProviderOutcome::Unknown);
+        assert_eq!(result.provider_outcome, expected_outcome);
         assert_eq!(result.usage, UsageObservation::Unknown);
     }
 }
@@ -491,16 +501,17 @@ async fn native_http_diagnostics_keep_status_and_known_labels_only() {
 async fn native_http_diagnostics_bound_body_before_retaining_labels() {
     let known =
         br#"{"error":{"code":"invalid_json_schema","param":"text.format.schema"}}"#.to_vec();
-    for (body, missing, declared) in [
-        (b"DO_NOT_COPY_PROVIDER_SECRET".to_vec(), 0, true),
+    for (body, missing, declared, capture) in [
+        (b"DO_NOT_COPY_PROVIDER_SECRET".to_vec(), 0, true, "invalid_json"),
         (
             br#"{"error":{"code":"invalid_json_schema","code":"model_not_found"}}"#.to_vec(),
             0,
             true,
+            "duplicate_key",
         ),
-        (known.clone(), 1, true),
-        ([known.clone(), vec![b' '; 8192]].concat(), 0, true),
-        ([known, vec![b' '; 8192]].concat(), 0, false),
+        (known.clone(), 1, true, "read_failed"),
+        ([known.clone(), vec![b' '; 8192]].concat(), 0, true, "advertised_bound_native_error_body_bytes"),
+        ([known, vec![b' '; 8192]].concat(), 0, false, "stream_bound_native_error_body_bytes"),
     ] {
         let f = Fixture::start_response(
             400,
@@ -515,8 +526,8 @@ async fn native_http_diagnostics_bound_body_before_retaining_labels() {
         let result = observed(&task(), &config(f.endpoint.clone())).await;
         f.finish().await;
         assert_eq!(
-            result.result.err().as_deref(),
-            Some("native_provider_request_refused status=400")
+            result.result.err(),
+            Some(format!("native_provider_request_refused status=400 error_body={capture}"))
         );
         assert_eq!(
             result.request_exposure,
@@ -555,7 +566,7 @@ async fn native_http_diagnostics_stop_waiting_for_stalled_error_body() {
         .unwrap();
     assert_eq!(
         result.result.err().as_deref(),
-        Some("native_provider_request_refused status=400")
+        Some("native_provider_request_refused status=400 error_body=timed_out_native_error_read_timeout_ms")
     );
     assert_eq!(
         result.request_exposure,
@@ -883,7 +894,7 @@ async fn native_received_post_never_retries_status_or_lost_response() {
             Some(if lost_response {
                 "native_transport_failed_outcome_unknown"
             } else {
-                "native_provider_unavailable status=503"
+                "native_provider_unavailable status=503 error_body=empty"
             })
         );
         assert_eq!(result.usage, UsageObservation::Unknown);
@@ -1139,7 +1150,7 @@ async fn native_helper_refuses_oversized_frames_before_payload_read() {
         .unwrap();
     let pid = child.id().unwrap();
     let mut header = Vec::from(&b"NV1\0"[..]);
-    header.extend_from_slice(&[6, 0]);
+    header.extend_from_slice(&[8, 0]);
     header.extend_from_slice(&1024u32.to_be_bytes());
     header.extend_from_slice(&(now_ms() + 5000).to_be_bytes());
     header.extend_from_slice(
@@ -1159,7 +1170,7 @@ async fn native_helper_refuses_oversized_frames_before_payload_read() {
         .unwrap();
     drop(input);
     assert!(child.wait().await.unwrap().success());
-    assert_eq!(&reply[..6], b"NVR\0\x06\x00");
+    assert_eq!(&reply[..6], b"NVR\0\x08\x00");
     assert!(reply[6..31].iter().all(|b| *b == 0));
     assert_eq!(reply[31], 1);
     assert_eq!(
@@ -1547,9 +1558,11 @@ async fn native_helper_revision_and_nonprovider_modes_preserve_usage_boundaries(
         (3, 0, Vec::new(), true),
         (4, 0, Vec::new(), true),
         (5, 0, Vec::new(), true),
-        (6, 0, Vec::new(), false),
+        (6, 0, Vec::new(), true),
+        (7, 0, Vec::new(), true),
+        (8, 0, Vec::new(), false),
         (
-            6,
+            8,
             3,
             br#"{"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"true"}]}],"usage":{"input_tokens":17,"output_tokens":9,"total_tokens":26}}"#.to_vec(),
             false,
@@ -1585,7 +1598,7 @@ async fn native_helper_revision_and_nonprovider_modes_preserve_usage_boundaries(
             .unwrap()
             .unwrap();
         assert!(child.wait().await.unwrap().success());
-        assert_eq!(&reply[..6], b"NVR\0\x06\x00");
+        assert_eq!(&reply[..6], b"NVR\0\x08\x00");
         assert!(reply[6..31].iter().all(|b| *b == 0));
         assert_eq!(reply[31], u8::from(error));
         assert_eq!(
@@ -1609,9 +1622,11 @@ fn workflow_task() -> TaskInput {
     input.limits.model_requests = 3;
     input.limits.max_delegation_depth = 1;
     input.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {
-        child: CodingTaskTemplate {
+        child: CodingTaskTemplate { instruction_source: None,
+            pull_request: None,
             instruction_prefix: "Work only on the configured synthetic repository".into(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(borg_runtime::protocol::InferenceSettings::selected()),
                 execution_profile: Some(
@@ -1622,6 +1637,7 @@ fn workflow_task() -> TaskInput {
                 executor: ExecutorKind::Coding,
             },
             repository: Repository {
+                pull_request_target: None,
                 registration: Some(borg_runtime::repository_catalogue::Revision {
                     repository_id: "fixture-repository".into(),
                     registration_revision: "1".into(),
@@ -2016,6 +2032,7 @@ async fn native_plain_json_is_inert_and_continuation_is_result_only_with_remaini
             status,
             result: if status == TaskStatus::Succeeded {
                 Some(AcceptedResult {
+                    pull_request: None,
                     attempt_id: "child-attempt-1".into(),
                     summary: "actual child result".into(),
                     checkpoint: None,
@@ -2084,6 +2101,7 @@ async fn native_continuation_refuses_invalid_or_oversized_outcome_before_post() 
                 task_id: "child".into(),
                 status: TaskStatus::Succeeded,
                 result: Some(AcceptedResult {
+                    pull_request: None,
                     attempt_id: "attempt".into(),
                     summary: "x".repeat(4096),
                     checkpoint: None,
@@ -2697,3 +2715,13 @@ async fn native_decision_response_bound_identifies_both_selected_metadata_fields
     assert_eq!(result.usage, reported());
     assert_eq!(result.provider_outcome, ProviderOutcome::Completed);
 }
+
+#[path = "native/charter.rs"]
+mod charter;
+#[path = "native/http_diagnostics.rs"]
+mod http_diagnostics;
+#[path = "native/diagnostic_carrier.rs"]
+mod diagnostic_carrier;
+
+#[path = "native/output_cap.rs"]
+mod output_cap;

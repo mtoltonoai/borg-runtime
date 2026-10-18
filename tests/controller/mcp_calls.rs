@@ -137,30 +137,27 @@ async fn call_fn(c: &Controller, op: Operation) -> Outcome {
 async fn mcp_calls_new_occurrence_same_arguments_can_succeed_after_old_refusal() {
     let c = Controller::open_with_config(path(), config()).unwrap();
     let (_, _, actor) = fixture(&c, "occurrence").await;
-    let target = submit(&c, "target", native("queued-agent")).await;
-    let mut newer=native("queued-agent");newer.definition.revision="later-selection".into();
-    submit(&c,"register-newer-selection",newer).await;
-    let first = invocation(
-        &actor,
-        "assign-one",
-        "collab_task_assign",
-        json!({"task_id":target.id,"expected_revision":target.revision,"agent_id":"queued-agent"}),
-    );
+    let first = invocation(&actor, "memory-before-create", "collab_memory_set",
+        json!({"key":"later", "expected_revision":1, "value":"updated"}));
     let refused = invoke(&c, &first).await;
-    assert_eq!(code(refused.outcome.clone()), "definition_conflict");
+    assert!(matches!(refused.outcome, Outcome::Refused { .. }));
     assert!(refused.commit.is_some());
-    submit(&c, "select-original-revision", native("queued-agent")).await;
+    let create = invocation(&actor, "create-memory", "collab_memory_set",
+        json!({"key":"later", "expected_revision":null, "value":"initial"}));
+    assert!(matches!(invoke(&c, &create).await.outcome, Outcome::Ok { data:Data::Memory(Some(_)) }));
     let replay = invoke(&c, &first).await;
     assert_eq!(refused.outcome, replay.outcome);
     assert_eq!(refused.commit, replay.commit);
     let mut second = first.clone();
-    second.operation_id = "assign-two".into();
+    second.operation_id = "memory-after-create".into();
     second.logical_call_id = "later-intent".into();
-    assert!(
-        matches!(invoke(&c,&second).await.outcome,Outcome::Ok{data:Data::Task(t)}if t.assigned_agent_id=="queued-agent")
-    );
+    assert!(matches!(invoke(&c, &second).await.outcome, Outcome::Ok { data:Data::Memory(Some(_)) }));
 }
 #[tokio::test]
+// Traceability scope: Actual controller calls reject stale generation/incarnation and expired progress without changing task output.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//= type=test
+//# The collaboration tool interface MUST validate its caller's current attempt before a new mutation.
 async fn mcp_calls_refuse_stale_worker_deadline_and_unconfigured_without_effect() {
     let clock = Arc::new(AtomicU64::new(future() - 300000));
     let mut cfg = config();
@@ -199,6 +196,10 @@ async fn mcp_calls_refuse_stale_worker_deadline_and_unconfigured_without_effect(
 
 }
 #[tokio::test]
+// Traceability scope: Unknown submission/protected-check tools and undeclared fields are refused by the closed collaboration catalogue; this does not qualify direct host/control-plane access.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//= type=test
+//# Operational queries MUST NOT grant authority to mutate worker controls or protected release state.
 async fn mcp_calls_closed_catalogue_bounded_paging_and_model_receipt_query() {
     let c = Controller::open_with_config(path(), config()).unwrap();
     let (t, _, actor) = fixture(&c, "closed").await;
@@ -290,13 +291,21 @@ async fn serve(c: Controller) -> (String, tokio::task::JoinHandle<Result<(), Str
     )
 }
 #[tokio::test]
+// Traceability scope: Actual HTTP/MCP memory mutation is reconciled from its original committed receipt; duplicate JSON is refused without creating a new call receipt.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//= type=test
+//# The collaboration tool interface MUST expose configured task-space mutations under their current operation rules.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//= type=test
+//# The collaboration tool interface MUST use the controller's canonical operation layer.
 async fn mcp_calls_actual_http_initialization_duplicate_refusal_and_discarded_ack() {
     let c = Controller::open_with_config(path(), config()).unwrap();
     let (_, _, actor) = fixture(&c, "http").await;
     let (base, server) = serve(c.clone()).await;
     let client = mcp::Client::new(&base, actor.clone(), metadata()).unwrap();
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 33);
+    assert!(tools.iter().any(|tool| tool.name == "collab_definition_update"));
     assert!(tools.iter().any(|tool|tool.name=="collab_limits_get"));
     assert!(serde_json::to_vec(&tools).unwrap().len() < metadata().execution.native.helper_value_bytes);
     let call = invocation(
@@ -343,19 +352,7 @@ async fn mcp_calls_actual_http_initialization_duplicate_refusal_and_discarded_ac
     assert!(server.await.unwrap_err().is_cancelled());
 }
 async fn reserve(c: &Controller, a: &Attempt, index: u32) {
-    task(
-        report(
-            c,
-            a,
-            &loop_ids::reservation_id(&a.id, index),
-            Observation::Usage {
-                model_requests: index,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(c, a, index, None, None).await;
 }
 #[tokio::test]
 async fn mcp_calls_native_completion_requires_exact_ordered_caller_receipts() {
@@ -397,6 +394,8 @@ async fn mcp_calls_native_completion_requires_exact_ordered_caller_receipts() {
             &a,
             &format!("bad-completion-{i}"),
             Observation::NativeLoopCompleted {
+                requests: Vec::new(),
+                final_response_index: None,
                 model_requests: 2,
                 calls,
             },
@@ -410,6 +409,8 @@ async fn mcp_calls_native_completion_requires_exact_ordered_caller_receipts() {
             &a,
             &loop_ids::completion_id(&a.id),
             Observation::NativeLoopCompleted {
+                requests: Vec::new(),
+                final_response_index: None,
                 model_requests: 2,
                 calls: vec![good],
             },
@@ -471,6 +472,8 @@ async fn mcp_calls_result_only_and_out_of_order_native_evidence_cannot_accept() 
                 &a,
                 &loop_ids::completion_id(&a.id),
                 Observation::NativeLoopCompleted {
+                    requests: Vec::new(),
+                    final_response_index: None,
                     model_requests: 2,
                     calls
                 }
@@ -523,7 +526,8 @@ async fn mcp_calls_configured_child_is_exact_and_requires_parent_quiescence() {
     child.limits.result_bytes = 2048;
     child.limits.deadline_unix_ms = input.limits.deadline_unix_ms;
     input.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {
-        child: CodingTaskTemplate {
+        child: CodingTaskTemplate { instruction_source: None,
+            pull_request: None,
             instruction_prefix: "fixed".into(),
             definition: child.definition,
             repository: child.repository.unwrap(),
@@ -667,7 +671,7 @@ async fn multiple_call_completion_requires_exact_serial_ordinals_and_all_receipt
         }
         // Every variant uses the required exact completion identity on its own
         // database, so a different report ID cannot mask an evidence defect.
-        let result=report(&c,&a,&loop_ids::completion_id(&a.id),Observation::NativeLoopCompleted{model_requests:2,calls}).await;
+        let result=report(&c,&a,&loop_ids::completion_id(&a.id),Observation::NativeLoopCompleted{requests: Vec::new(), final_response_index: None, model_requests:2,calls}).await;
         if variant=="valid" {assert_eq!(task(result).id,t.id)} else {assert_eq!(code(result),"source_mismatch", "{variant}")}
     }
 }
@@ -688,6 +692,7 @@ async fn accepted_new_calls_keep_memory_progress_and_page_policy_after_global_ch
         original.controller.max_list_tasks = if accepted_large { 100 } else { 1 };
         original.controller.collaboration_page_items = if accepted_large { 100 } else { 1 };
         original.product.page_items = if accepted_large { 100 } else { 1 };
+        original.workflow.as_mut().expect("fixture workflow policy").page_items = original.controller.collaboration_page_items;
         let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
         let (t, _, actor) = fixture(&c, "accepted-policy").await;
         let accepted_snapshot = t.input.resolved_limits.clone();
@@ -700,6 +705,7 @@ async fn accepted_new_calls_keep_memory_progress_and_page_policy_after_global_ch
         later.controller.max_list_tasks = if accepted_large { 1 } else { 100 };
         later.controller.collaboration_page_items = if accepted_large { 1 } else { 100 };
         later.product.page_items = if accepted_large { 1 } else { 100 };
+        later.workflow.as_mut().expect("fixture workflow policy").page_items = later.controller.collaboration_page_items;
         let c = Controller::open_with_config(&p, cfg).unwrap();
         let memory = invocation(&actor, "new-policy-memory", "collab_memory_set",
             json!({"key":"policy-value","expected_revision":null,"value":"x".repeat(2048)}));
@@ -962,3 +968,133 @@ async fn repository_catalogue_mcp_safe_projection_currentness_and_original_repla
         assert_eq!(code(invoke(&c, &fresh).await.outcome), "invalid_transition");
     }
 }
+
+// Local diagnostic reconstruction of installed self-delivery task123. Only the
+// new local controller's generated task/attempt/session identities are mapped.
+// Exact original input, selected limits, tool/argument/occurrence values remain
+// frozen artifact inputs. No executor, repository IO, model or remote runs.
+#[tokio::test]
+async fn self_delivery_missing_task_target_is_a_committed_http_refusal() {
+    let original: Operation = serde_json::from_str(include_str!("fixtures/self_delivery/original-request.json")).unwrap();
+    let Operation::SubmitTask { input, .. } = original else {
+        panic!("fixture operation")
+    };
+    let selected: borg_runtime::limits::RuntimeLimits = serde_json::from_str(include_str!("fixtures/self_delivery/original-limits.json")).unwrap();
+    let projection: serde_json::Value = serde_json::from_str(include_str!("fixtures/self_delivery/original-invocation-projection.json")).unwrap();
+    let original_call: Invocation =
+        serde_json::from_value(projection["entries"][0]["invocation"].clone()).unwrap();
+    assert_eq!(original_call.tool, "collab_task_get");
+    assert_eq!(
+        original_call.arguments,
+        json!({"task_id":"task-f2dc0f0ed413f702c9fe9516f4ef47ef"})
+    );
+    assert_ne!(
+        original_call.arguments["task_id"],
+        original_call.caller.task_id
+    );
+    assert!(serde_json::to_vec(&input).unwrap().len() > 70_000);
+    for small_complete_result in [false, true] {
+        let p = path();
+        let mut cfg = config();
+        let mut policy = selected.clone();
+        if small_complete_result {
+            policy.execution.collaboration.complete_result_bytes = 2048;
+        }
+        cfg.limits = Arc::new(policy.clone());
+        let now = input.limits.deadline_unix_ms - 1_800_000;
+        cfg.clock = Arc::new(move || now);
+        let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
+        register_repository_fixture(
+            &c,
+            &borg_runtime::repository_catalogue::Registration {
+                pull_request_target: None,
+                repository_id: "runtime".into(),
+                registration_revision: "1".into(),
+                display_name: "Local diagnostic runtime".into(),
+                source_endpoint: "git://127.0.0.1:19418/runtime.git".into(),
+                checkpoint_endpoint: "git://127.0.0.1:19418/runtime.git".into(),
+                source_store_key: "diagnostic-source".into(),
+                checkpoint_store_key: "diagnostic-checkpoint".into(),
+            },
+        )
+        .await;
+        let t = submit(&c, "isolated-original-input", input.clone()).await;
+        let w = worker(
+            &original_call.caller.worker_id,
+            &original_call.caller.incarnation,
+            0,
+            1,
+        );
+        register(&c, &w).await;
+        let a = run(&commands(&c, &w, vec![]).await);
+        task(
+            report(
+                &c,
+                &a,
+                "isolated-start",
+                Observation::Started {
+                    thread_id: Some("01a140bf-0e6a-7330-b800-fca150f10b66".into()),
+                    turn_id: Some("01a140bf-0f9c-7dc0-a1e2-90373aaf1075".into()),
+                },
+            )
+            .await,
+        );
+        let mut call = original_call.clone();
+        call.caller.task_id = t.id.clone();
+        call.caller.attempt_id = a.id.clone();
+        call.caller.generation = a.generation;
+        let (base, server) = serve(c.clone()).await;
+        let client = mcp::Client::new(&base, call.caller.clone(), policy).unwrap();
+        client.tools().await.unwrap();
+        let first = client.call(&call).await.unwrap();
+        assert!(
+            matches!(&first.reply.outcome, Outcome::Refused { code, message } if code == "not_found" && message == "task not found")
+        );
+        assert_eq!(
+            first.reply.commit.as_ref().unwrap().operation_id,
+            original_call.operation_id
+        );
+        assert!(!first.requires_quiescence);
+        assert_eq!(
+            client.get_call(&call).await.unwrap().unwrap().reply.commit,
+            first.reply.commit
+        );
+        let mut correct = call.clone();
+        correct.operation_id = "isolated-correct-target".into();
+        correct.logical_call_id = "isolated-correct-target".into();
+        correct.arguments = json!({"task_id":t.id});
+        let corrected = client.call(&correct).await.unwrap();
+        assert!(corrected.reply.commit.is_some());
+        if small_complete_result {
+            assert!(
+                matches!(&corrected.reply.outcome, Outcome::Refused { code, message } if code == "response_bound" && message.contains("execution.collaboration.complete_result_bytes"))
+            );
+        } else {
+            assert!(
+                matches!(&corrected.reply.outcome, Outcome::Ok { data: Data::Task(got) } if got.id == t.id && got.input.acceptance_commands == input.acceptance_commands)
+            );
+        }
+        assert_eq!(
+            client
+                .get_call(&correct)
+                .await
+                .unwrap()
+                .unwrap()
+                .reply
+                .outcome,
+            corrected.reply.outcome
+        );
+        server.abort();
+        let _ = server.await;
+        drop(client);
+        drop(c);
+        controller_owner_released(&p).await;
+        let reopened = Controller::open_with_config(&p, cfg).unwrap();
+        let retained = mcp::recovered(&call, lookup(&reopened, &call).await).unwrap();
+        assert_eq!(retained.reply.outcome, first.reply.outcome);
+        assert_eq!(retained.reply.commit, first.reply.commit);
+    }
+}
+
+// Closed configuration application uses this module's actual caller fixtures.
+include!("definition_updates.rs");

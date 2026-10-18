@@ -9,8 +9,18 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod client;
+pub(crate) mod documents_reviews;
+#[cfg(test)]
+mod instruction_source_tests;
+#[cfg(test)]
+mod profile_tests;
+pub(crate) mod questions;
 pub(crate) mod strict;
+pub(crate) mod work;
+pub(crate) use client::CallFailure;
 pub use client::Client;
+mod read_recovery;
+pub(crate) use read_recovery::retryable_read_tool;
 pub const VERSION: &str = "2025-06-18";
 pub const CALLER_HEADER: &str = "x-borg-caller";
 
@@ -82,7 +92,7 @@ pub fn catalogue(limits: &RuntimeLimits) -> Vec<Tool> {
             }
             if let Some((_, maximum)) = integer_limit(name, repository, limits) {
                 schema["maximum"] = json!(maximum);
-            } else if name == "expected_revision" {
+            } else if name == "expected_revision" && !string {
                 // Revisions are represented by SQLite signed integers. This
                 // numeric width is mechanism, not adjustable operator policy.
                 schema["maximum"] = json!(i64::MAX);
@@ -90,6 +100,101 @@ pub fn catalogue(limits: &RuntimeLimits) -> Vec<Tool> {
         }
     }
     tools
+}
+
+/// Exact accepted profile projection. The original catalogue remains V1; only
+/// an explicitly selected V2 plus configured workflow exposes added tools.
+/// Host delivery observation, preparation, begin and acknowledgment are absent.
+pub fn catalogue_for_profile(
+    limits: &RuntimeLimits,
+    profile: Option<&ExecutionProfile>,
+) -> Vec<Tool> {
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+    let mut tools = catalogue(limits);
+    if matches!(profile, ExecutionProfile::CollaborationV2 { .. }) && limits.workflow.is_some() {
+        // Append after the original flat-field metadata renderer. Each nested
+        // domain schema retains its own metadata field and structural validator.
+        tools.extend(questions::catalogue(limits));
+        tools.extend(documents_reviews::catalogue(limits));
+        tools.extend(work::catalogue(limits));
+    }
+    tools
+}
+
+/// An optional accepted Coding source changes only that task's repository
+/// selectors. The original profile-only projection remains byte-for-byte V1/V2.
+pub fn catalogue_for_task(
+    limits: &RuntimeLimits,
+    profile: Option<&ExecutionProfile>,
+    instruction_source: Option<&RepositoryReadSource>,
+) -> Vec<Tool> {
+    let mut tools = catalogue_for_profile(limits, profile);
+    if instruction_source.is_some() {
+        for tool in &mut tools {
+            if repository_query(&tool.name) {
+                for name in ["source", "base_source"] {
+                    if let Some(values) = tool
+                        .input_schema
+                        .get_mut("properties")
+                        .and_then(|properties| properties.get_mut(name))
+                        .and_then(|property| property.get_mut("enum"))
+                        .and_then(Value::as_array_mut)
+                    {
+                        values.push(json!("instructions"));
+                    }
+                }
+            }
+        }
+    }
+    tools
+}
+
+pub fn validate_arguments_for_task(
+    tool_name: &str,
+    arguments: &Value,
+    limits: &RuntimeLimits,
+    profile: Option<&ExecutionProfile>,
+    instruction_source: Option<&RepositoryReadSource>,
+) -> Result<(), String> {
+    if workflow_tool(tool_name) || instruction_source.is_none() {
+        return validate_arguments_for_profile(tool_name, arguments, limits, profile);
+    }
+    let tool = catalogue_for_task(limits, profile, instruction_source)
+        .into_iter()
+        .find(|tool| tool.name == tool_name)
+        .ok_or("tool is outside the collaboration catalogue")?;
+    validate_tool_arguments(tool_name, arguments, limits, &tool)
+}
+
+pub(crate) fn workflow_tool(name: &str) -> bool {
+    questions::handles(name) || documents_reviews::owns(name) || work::handles(name)
+}
+
+/// Structural admission is profile-bound; current actor and configured domain
+/// limits are still checked by the canonical controller receipt transaction.
+pub fn validate_arguments_for_profile(
+    tool_name: &str,
+    arguments: &Value,
+    limits: &RuntimeLimits,
+    profile: Option<&ExecutionProfile>,
+) -> Result<(), String> {
+    let profile = profile.ok_or("collaboration profile is not configured")?;
+    if workflow_tool(tool_name) {
+        if !matches!(profile, ExecutionProfile::CollaborationV2 { .. }) || limits.workflow.is_none()
+        {
+            return Err("collaboration workflow tools are not configured".into());
+        }
+        if questions::handles(tool_name) {
+            return questions::validate_arguments(tool_name, arguments, limits);
+        }
+        if documents_reviews::owns(tool_name) {
+            return documents_reviews::validate_arguments(tool_name, arguments, limits);
+        }
+        return work::validate_arguments(tool_name, arguments, limits);
+    }
+    validate_arguments(tool_name, arguments, limits)
 }
 
 fn repository_query(tool: &str) -> bool {
@@ -168,6 +273,14 @@ pub fn validate_arguments(
         .into_iter()
         .find(|t| t.name == tool_name)
         .ok_or("tool is outside the collaboration catalogue")?;
+    validate_tool_arguments(tool_name, arguments, limits, &tool)
+}
+fn validate_tool_arguments(
+    tool_name: &str,
+    arguments: &Value,
+    limits: &RuntimeLimits,
+    tool: &Tool,
+) -> Result<(), String> {
     let validator = jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .build(&tool.input_schema)
@@ -223,6 +336,9 @@ pub fn validate_arguments(
                     | "parent_task_id"
                     | "definition_id"
                     | "revision"
+                    | "expected_revision"
+                    | "expected_global_revision"
+                    | "expected_policy_revision"
                     | "key"
                     | "worker_id"
                     | "release_id"
@@ -274,11 +390,28 @@ impl Invocation {
         Operation::CallCollaboration { call: self.clone() }
     }
 }
+/// Exact original self-assignment only; coordinating another task does not stop
+/// this caller. A same-agent no-op has no pending assignment and is not a handoff.
+pub(crate) fn assignment_quiescence(call: &Invocation, outcome: &Outcome) -> bool {
+    matches!(outcome,Outcome::Ok{data:Data::Task(task)} if call.tool=="collab_task_assign"
+        &&task.id==call.caller.task_id
+        &&call.arguments.get("task_id").and_then(Value::as_str)==Some(task.id.as_str())
+        &&task.attempt.as_ref().is_some_and(|a|a.id==call.caller.attempt_id&&a.generation==call.caller.generation
+            &&a.worker_id==call.caller.worker_id&&a.worker_incarnation==call.caller.incarnation&&a.session_id==task.session_id)
+        &&task.pending_assignment.as_ref().is_some_and(|pending|pending.operation_id==call.operation_id
+            &&pending.from_session_id==task.session_id&&pending.session.task_id==task.id
+            &&pending.session.id!=task.session_id&&pending.session.agent_id==pending.session.definition.id
+            &&call.arguments.get("agent_id").and_then(Value::as_str)==Some(pending.session.agent_id.as_str())))
+}
+fn requires_quiescence(call: &Invocation, outcome: &Outcome) -> bool {
+    (call.tool == "collab_task_delegate" && matches!(outcome, Outcome::Ok { .. }))
+        || assignment_quiescence(call, outcome)
+        || work::requires_quiescence(call, outcome)
+}
 pub fn result(call: &Invocation, reply: Reply) -> Result<CallResult, String> {
     reply.validate_for(&call.operation())?;
     Ok(CallResult {
-        requires_quiescence: call.tool == "collab_task_delegate"
-            && matches!(reply.outcome, Outcome::Ok { .. }),
+        requires_quiescence: requires_quiescence(call, &reply.outcome),
         reply,
     })
 }
@@ -383,6 +516,52 @@ async fn caller_limits(
         _ => Err("accepted caller limits are unavailable".into()),
     }
 }
+/// Obtain the immutable accepted task profile, never a caller-supplied kind.
+/// This observation does not replace the call transaction's currentness checks.
+async fn caller_profile(
+    controller: &Controller,
+    caller: &Caller,
+) -> Result<(ExecutionProfile, Option<RepositoryReadSource>), String> {
+    let command = Operation::GetTask {
+        task_id: caller.task_id.clone(),
+    };
+    let reply = controller
+        .handle(Request {
+            protocol_revision: WIRE_REVISION,
+            request_id: "mcp-profile".into(),
+            command: command.clone(),
+        })
+        .await;
+    reply.validate_for(&command)?;
+    let Outcome::Ok {
+        data: Data::Task(task),
+    } = reply.outcome
+    else {
+        return Err("accepted caller profile is unavailable".into());
+    };
+    let attempt = task
+        .attempt
+        .as_ref()
+        .ok_or("accepted caller attempt is unavailable")?;
+    if task.id != caller.task_id
+        || attempt.id != caller.attempt_id
+        || attempt.generation != caller.generation
+        || attempt.worker_id != caller.worker_id
+        || attempt.worker_incarnation != caller.incarnation
+    {
+        return Err("accepted caller attempt differs".into());
+    }
+    let profile = task
+        .input
+        .definition
+        .execution_profile
+        .ok_or("collaboration profile is not configured")?;
+    let source = (task.input.definition.executor == ExecutorKind::Coding)
+        .then_some(task.input.instruction_source)
+        .flatten();
+    Ok((profile, source))
+}
+
 /// Existing HTTP adapter owns body/connection deadlines and host/origin checks.
 /// This function never retries a controller operation or starts provider work.
 pub async fn handle(
@@ -479,7 +658,14 @@ async fn exchange(
                 Ok(limits) => limits,
                 Err(_) => return fail(id, -32602, "Accepted caller limits are unavailable"),
             };
-            Some(success(id, json!({"tools":catalogue(&accepted)})))
+            let (profile, instruction_source) = match caller_profile(controller, &caller).await {
+                Ok(profile) => profile,
+                Err(_) => return fail(id, -32602, "Accepted caller profile is unavailable"),
+            };
+            Some(success(
+                id,
+                json!({"tools":catalogue_for_task(&accepted, Some(&profile), instruction_source.as_ref())}),
+            ))
         }
         "borg/calls/get" => {
             #[derive(Deserialize)]
@@ -548,8 +734,7 @@ async fn exchange(
             Some(tool_result(
                 id,
                 &CallResult {
-                    requires_quiescence: call.tool == "collab_task_delegate"
-                        && matches!(reply.outcome, Outcome::Ok { .. }),
+                    requires_quiescence: requires_quiescence(&call, &reply.outcome),
                     reply,
                 },
             ))
@@ -886,5 +1071,47 @@ mod metadata_tests {
         assert!(call.validate(&limits).is_ok());
         limits.interface.mcp_call_bytes = bytes - 1;
         assert!(call.validate(&limits).is_err());
+    }
+}
+
+#[cfg(test)]
+mod definition_update_schema_tests {
+    use super::*;
+    #[test]
+    fn definition_updates_schema_has_closed_positive_fields_and_string_revision() {
+        let limits = RuntimeLimits::seed().unwrap();
+        let args = json!({"agent_id":"a","expected_revision":"definition-1","expected_global_revision":limits.revision,"expected_policy_revision":"policy-1","changes":{"native.context_bytes":16777217}});
+        assert!(validate_arguments("collab_definition_update", &args, &limits).is_ok());
+        let tool = catalogue(&limits)
+            .into_iter()
+            .find(|x| x.name == "collab_definition_update")
+            .unwrap();
+        assert!(
+            tool.input_schema["properties"]["expected_revision"]
+                .get("maximum")
+                .is_none()
+        );
+        assert_eq!(tool.annotations["readOnlyHint"], false);
+        for changes in [
+            json!({}),
+            json!({"native.context_bytes":0}),
+            json!({"native.context_bytes":-1}),
+            json!({"native.context_bytes":1.5}),
+            json!({"worker.max_total_capacity":100}),
+            json!({"native.context_bytes":1,"model":"other"}),
+        ] {
+            let mut bad = args.clone();
+            bad["changes"] = changes;
+            assert!(validate_arguments("collab_definition_update", &bad, &limits).is_err());
+        }
+        for field in [
+            "expected_revision",
+            "expected_global_revision",
+            "expected_policy_revision",
+        ] {
+            let mut bad = args.clone();
+            bad[field] = json!("bad\nidentity");
+            assert!(validate_arguments("collab_definition_update", &bad, &limits).is_err());
+        }
     }
 }

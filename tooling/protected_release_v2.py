@@ -6,11 +6,11 @@ protected supervisor, separately configured execution identity and fixed oracles
 Missing mandatory results are never assumed and candidate output is not evidence.
 """
 from __future__ import annotations
-import argparse, hashlib, importlib.util, json, os, socket, stat, struct, sys, time
+import argparse, hashlib, importlib.util, json, os, select, socket, stat, struct, sys, time
 from pathlib import Path
 MAX=128*1024
-VERIFIER_SHA="1c0be524cf602bbe4649ade54672ae01f19775ce397643c26366f1690132041e"
-BEHAVIOR_SHA='f796870a16b26dd0d0f4ae21b76169117dfa8a3a049be865e7300e3d8047f43b'
+VERIFIER_SHA="8a687969b22b11dfbd73e5c45e2c1e516a8117408a857d34b03e9fd98bf16d4b"
+BEHAVIOR_SHA='7ed0df87efe47aff54e82ba22bae7861594c82b8c3ab7659fdb04c538c93a3db'
 def canonical(v):return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
 def strict(data):
     def pairs(xs):
@@ -31,6 +31,8 @@ def protected_file(path):
 def load_config(path):
     p=protected_file(path);raw=p.read_bytes()
     if len(raw)>MAX:raise ValueError("configuration bound")
+    return decode_config(raw)
+def decode_config(raw):
     c=strict(raw)
     if set(c)!={"socket","server_uid","producer_uid","policy","recipe_sha256","valid_for_ms"}:raise ValueError("configuration fields")
     if c['producer_uid']!=os.geteuid() or not 0<c['valid_for_ms']<=86400000:raise ValueError("producer identity/interval")
@@ -59,6 +61,50 @@ def exchange(c,request,*,max_bytes=MAX,timeout_ms=65000):
         n=struct.unpack('!I',read(4))[0]
         if n>max_bytes:raise ValueError("reply bound")
         return strict(read(n))
+OPERATOR_COMMANDS={'grant','prepare','execute_merge','reconcile_merge','start_rollout','observe_rollout','get_action','get_receipt','view'}
+def stream_bytes(fd,bound,end,data=None):
+    """One bounded stdin/stdout exchange under the original absolute deadline."""
+    original=os.get_blocking(fd);os.set_blocking(fd,False);out=bytearray();offset=0
+    try:
+        while data is None or offset<len(data):
+            left=end-time.monotonic()
+            if left<=0:raise TimeoutError('producer stdio deadline; reconcile original identity')
+            ready=select.select([fd] if data is None else [],[] if data is None else [fd],[],left)
+            if not any(ready):raise TimeoutError('producer stdio deadline; reconcile original identity')
+            try:
+                if data is None:
+                    block=os.read(fd,min(4096,bound+1-len(out)))
+                    if not block:return bytes(out)
+                    out.extend(block)
+                    if len(out)>bound:raise ValueError('producer stdio request bound')
+                else:
+                    written=os.write(fd,data[offset:offset+4096])
+                    if written<=0:raise ValueError('producer stdio reply lost; reconcile original identity')
+                    offset+=written
+            except BlockingIOError:continue
+        return None
+    finally:os.set_blocking(fd,original)
+def exchange_stdio(args,input_fd=0,output_fd=1):
+    if type(args.max_bytes) is not int or args.max_bytes<=0 or type(args.timeout_ms) is not int or args.timeout_ms<=0:raise ValueError('producer stdio bounds')
+    end=time.monotonic()+args.timeout_ms/1000
+    module=protected_file(Path(__file__).absolute())
+    if hashlib.sha256(module.read_bytes()).hexdigest()!=args.module_sha256:raise ValueError('remote producer module differs')
+    if hashlib.sha256(Path('/proc/self/exe').read_bytes()).hexdigest()!=args.python_sha256:raise ValueError('remote Python differs')
+    with protected_file(args.config).open('rb') as source:raw=source.read(MAX+1)
+    if len(raw)>MAX or hashlib.sha256(raw).hexdigest()!=args.config_sha256:raise ValueError('remote producer configuration differs')
+    config=decode_config(raw)
+    request=strict(stream_bytes(input_fd,args.max_bytes,end))
+    if not isinstance(request,dict) or set(request)!={'revision','operation_id','command'} or request['revision']!=1 or not isinstance(request['operation_id'],str) or not request['operation_id']:raise ValueError('producer stdio request schema')
+    command=request['command']
+    if not isinstance(command,dict) or command.get('operation') not in OPERATOR_COMMANDS:raise ValueError('unsupported producer command; checks are produced by the fixed checker')
+    remaining=int((end-time.monotonic())*1000)
+    if remaining<=0:raise TimeoutError('producer stdio deadline; reconcile original identity')
+    reply=exchange(config,request,max_bytes=args.max_bytes,timeout_ms=remaining)
+    raw=canonical(reply)
+    if len(raw)>args.max_bytes:raise ValueError('producer stdio reply bound')
+    stream_bytes(output_fd,args.max_bytes,end,raw)
+    return 0
+
 def private_create(path):
     return os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600),'wb')
 def sync_directory(path):
@@ -142,8 +188,7 @@ def run(args):
             else:command={'operation':'check','input':supervisor.behavior_check(c,value,args.package,args.recipe,out,args.operation_id)}
         else:
             command=value
-            allowed={'grant','prepare','execute_merge','reconcile_merge','start_rollout','observe_rollout','get_action','get_receipt','view'}
-            if command.get('operation') not in allowed:raise ValueError('unsupported producer command; checks are produced by the fixed checker')
+            if command.get('operation') not in OPERATOR_COMMANDS:raise ValueError('unsupported producer command; checks are produced by the fixed checker')
         request={'revision':1,'operation_id':args.operation_id,'command':command}
     p=out/'request.json'
     with private_create(p) as f:f.write(canonical(request));f.flush();os.fsync(f.fileno())
@@ -160,8 +205,10 @@ def run(args):
         sync_directory(out)
     return 0 if receipt['status']=='recorded' else 2
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('mode',choices=['check-package','check-behavior','check-prepared','recover-behavior','request','lookup','retry']);p.add_argument('--config',required=True);p.add_argument('--input');p.add_argument('--original-receipt');p.add_argument('--operation-id',required=True);p.add_argument('--receipt',required=True);p.add_argument('--package');p.add_argument('--recipe');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('mode',choices=['check-package','check-behavior','check-prepared','recover-behavior','request','lookup','retry','exchange-stdio']);p.add_argument('--config',required=True);p.add_argument('--input');p.add_argument('--original-receipt');p.add_argument('--operation-id');p.add_argument('--receipt');p.add_argument('--package');p.add_argument('--recipe');p.add_argument('--config-sha256');p.add_argument('--module-sha256');p.add_argument('--python-sha256');p.add_argument('--max-bytes',type=int);p.add_argument('--timeout-ms',type=int);a=p.parse_args()
     try:
+        if a.mode=='exchange-stdio':sys.exit(exchange_stdio(a))
+        if not a.operation_id or not a.receipt:raise ValueError('operation identity and receipt directory required')
         if a.mode in {'lookup','retry','recover-behavior'} and not a.original_receipt:raise ValueError('original receipt required')
         if a.mode in {'check-package','check-behavior','check-prepared','request'} and not a.input:raise ValueError('input required')
         if a.mode in {'check-package','check-behavior','check-prepared'} and not a.package:raise ValueError('package required')

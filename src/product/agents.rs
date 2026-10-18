@@ -46,7 +46,7 @@ pub(super) async fn get(controller: &Controller, route: &str, query: &str) -> Ui
                 if agents.is_empty() {
                     body.push_str("<p>No agents found.</p>");
                 } else {
-                    body.push_str("<table><caption>Agents</caption><thead><tr><th scope=\"col\">Agent</th><th scope=\"col\">Latest recorded definition</th><th scope=\"col\">Assigned tasks</th></tr></thead><tbody>");
+                    body.push_str("<table><caption>Agents</caption><thead><tr><th scope=\"col\">Agent</th><th scope=\"col\">Selected definition for new sessions</th><th scope=\"col\">Assigned tasks</th></tr></thead><tbody>");
                     for agent in &agents {
                         let _ = write!(
                             body,
@@ -116,18 +116,23 @@ pub(super) async fn get(controller: &Controller, route: &str, query: &str) -> Ui
         path(&id)
     );
     term(&mut body, "Agent", &agent.id);
+    term(&mut body, "Identity status", if agent.retired { "Retired" } else { "Active" });
     term(
         &mut body,
-        "Latest recorded definition",
+        "Selected definition for new sessions",
         &definition(&agent.definition),
     );
     body.push_str("</dl>");
+    if agent.retired {
+        let _ = write!(body, "<p>This identity is retired. Accepted work and historical records remain available.</p><p><a href=\"/sessions?agent_id={}\">All sessions</a></p>", encode(&id));
+    } else {
     let _ = write!(
         body,
         "<p>Sessions of this agent share its durable memory; each session keeps its own accepted revision and task context.</p><p><a href=\"/tasks/new?agent_id={}\">Start a new session</a> · <a href=\"/sessions?agent_id={}\">All sessions</a></p>",
         encode(&id),
         encode(&id)
     );
+    }
     let _ = write!(
         body,
         "<p><a href=\"/agents/{}/memory\">Shared agent memory</a> · <a href=\"/definitions/{}?revision={}\">Exact agent revision</a></p>",
@@ -135,6 +140,7 @@ pub(super) async fn get(controller: &Controller, route: &str, query: &str) -> Ui
         encode(&agent.definition.id),
         encode(&agent.definition.revision)
     );
+    if !agent.retired { let _ = write!(body, "<p><a href=\"{}/settings\">View and change execution settings</a></p>", path(&id)); }
     if tasks.is_empty() {
         body.push_str("<p>No tasks on this page.</p>");
     } else {

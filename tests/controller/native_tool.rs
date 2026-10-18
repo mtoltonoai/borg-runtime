@@ -16,7 +16,7 @@ async fn native_tool_fixed_workflow_refuses_new_profile_before_dispatch(){
 #[tokio::test]
 async fn native_tool_progress_marker_cannot_replace_current_loop_completion(){
  let (c,_,a)=setup().await;let v=projection(&c,&a).await;assert_eq!(code(report(&c,&a,&contract::report_id(&a.id),progress(&v)).await),"invalid_transition");
- for n in [1,2]{task(report(&c,&a,&borg_runtime::native_loop_contract::reservation_id(&a.id,n),Observation::Usage{model_requests:n,input_tokens:None,output_tokens:None}).await);}
+ for n in [1,2]{controlled_native_request(&c,&a,n,None,None).await;}
  task(report(&c,&a,"executor",Observation::ExecutorOutcome{success:true,summary:"controlled".into()}).await);task(report(&c,&a,"stopped",Observation::ProcessTreeStopped).await);
  let outcome=report(&c,&a,"candidate",Observation::ResultCandidate{checks_passed:true,summary:"must not accept fixed marker".into(),checkpoint:None,validation:vec![contract::evidence(&a.id)],output:Some(json!({"answer":1}))}).await;
  assert_eq!(code(outcome),"source_mismatch");assert!(get(&c,&a.task_id).await.result.is_none());

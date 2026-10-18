@@ -38,7 +38,7 @@ fn host() -> ValidationHost {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&path).unwrap();
-    let limits = borg_runtime::limits::RuntimeLimits::seed().unwrap();
+    let limits = metadata();
     ValidationHost::new(
         PathBuf::from(env!("CARGO_BIN_EXE_borg-runtime")),
         path,
@@ -173,6 +173,7 @@ async fn three_steps_preserve_exact_context_calls_results_and_schema() {
         NativeLoopStep::Complete {
             result,
             output_items,
+            ..
         } => {
             assert_eq!(result.output, json!({"result":"good"}));
             assert_eq!(result.requests, 1);
@@ -342,6 +343,7 @@ async fn hosted_search_is_opt_in_bounded_and_retains_annotations() {
         NativeLoopStep::Complete {
             result,
             output_items,
+            ..
         } => {
             assert_eq!(result.output, json!({"result":"good"}));
             assert_eq!(output_items, search_response()["output"]);
@@ -664,7 +666,7 @@ async fn loop_astra_selection_refuses_previous_model_before_network() {
 }
 
 #[tokio::test]
-async fn host_memory_notice_preserves_original_task_and_exact_tool_result() {
+async fn no_memory_notice_preserves_original_task_and_exact_tool_result() {
     use borg_runtime::native::execute_loop_step_with_notice;
     let input = input();
     let profile = profile();
@@ -672,7 +674,6 @@ async fn host_memory_notice_preserves_original_task_and_exact_tool_result() {
     let (first, _) = run(&input, &profile, None, call_response("before-memory")).await;
     let first = call(first);
     let result_text = "{\"key\":\"note\",\"revision\":1,\"value\":\"old observation\"}";
-    let notice = r#"{"batch_id":"batch-2","notices":[{"key":"note","revision":2}]}"#;
     let peer = Fixture::start(
         200,
         serde_json::to_vec(&call_response("after-memory")).unwrap(),
@@ -691,7 +692,7 @@ async fn host_memory_notice_preserves_original_task_and_exact_tool_result() {
                 output: result_text,
             },
         )),
-        Some(notice),
+        None,
         &host(),
         async { Ok(()) },
         std::future::pending(),
@@ -702,13 +703,10 @@ async fn host_memory_notice_preserves_original_task_and_exact_tool_result() {
     assert_eq!(request["input"][0]["content"], input.instruction);
     let items = request["input"].as_array().unwrap();
     assert_eq!(
-        items[items.len() - 2],
+        items[items.len() - 1],
         json!({"type":"function_call_output","call_id":"before-memory","output":result_text})
     );
-    assert_eq!(
-        items.last().unwrap(),
-        &json!({"role":"developer","content":notice})
-    );
+    assert!(items.iter().all(|item| item["role"] != "developer"));
     let second = call(value);
     // Same original TaskInput/profile still passes the next step association.
     let (done, next) = run(
@@ -732,12 +730,12 @@ async fn host_memory_notice_preserves_original_task_and_exact_tool_result() {
             .iter()
             .filter(|x| x["role"] == "developer")
             .count(),
-        1
+        0
     );
 }
 
 #[tokio::test]
-async fn oversized_memory_notice_refuses_before_reservation_or_http() {
+async fn retired_memory_notice_refuses_before_reservation_or_http() {
     use borg_runtime::native::execute_loop_step_with_notice;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let cfg = config(format!(
@@ -745,7 +743,7 @@ async fn oversized_memory_notice_refuses_before_reservation_or_http() {
         listener.local_addr().unwrap()
     ));
     let input = input();
-    let notice = "x".repeat(input.execution_limits().unwrap().native.memory_notice_bytes + 1);
+    for notice in ["old pending notice".to_owned(), "x".repeat(input.execution_limits().unwrap().native.memory_notice_bytes + 1)] {
     let out = execute_loop_step_with_notice(
         &input,
         &cfg,
@@ -759,7 +757,7 @@ async fn oversized_memory_notice_refuses_before_reservation_or_http() {
     .await;
     assert_eq!(
         out.result.err().as_deref(),
-        Some("native_memory_notice_bound_native_memory_notice_bytes")
+        Some("native_memory_notifications_disabled")
     );
     assert_eq!(out.request_exposure, RequestExposure::NotStarted);
     assert!(
@@ -767,6 +765,7 @@ async fn oversized_memory_notice_refuses_before_reservation_or_http() {
             .await
             .is_err()
     );
+    }
 }
 
 #[tokio::test]
@@ -871,6 +870,7 @@ async fn reasoning_content_survives_helper_and_exact_continuation_without_select
             NativeLoopStep::Complete {
                 result,
                 output_items,
+                ..
             } => {
                 assert_eq!(output_items, final_items);
                 assert_eq!(result.output, json!({"result":"good"}));
@@ -910,4 +910,146 @@ async fn malformed_reasoning_content_helper_preserves_usage_and_hides_text() {
         assert_eq!(observed.provider_outcome, ProviderOutcome::Unknown);
         assert_eq!(observed.usage, reported());
     }
+}
+
+// Controlled provider fixture: actual final context + recorded host feedback,
+// not controller policy qualification or an unknown provider replay.
+#[tokio::test]
+async fn completion_continuation_appends_actual_final_items_and_feedback_without_fake_call() {
+    let input=input(); let profile=profile(); let envelope=final_response();
+    let (first,_)=run(&input,&profile,None,envelope.clone()).await;
+    let NativeLoopStep::Complete {continuation,..}=first.result.unwrap() else {panic!("final expected")};
+    assert_eq!(continuation.request_index(),1);
+    let peer=Fixture::start(200,serde_json::to_vec(&final_response()).unwrap(),Duration::ZERO,"").await;
+    let feedback="Recorded completion refusal: remaining child task child-7";
+    let response=borg_runtime::native::execute_loop_step_after_completion(
+        &input,&config(peer.endpoint.clone()),&profile,&continuation,feedback,None,None,&host(),
+        async {Ok(())},std::future::pending(),
+    ).await;
+    assert!(matches!(response.result,Ok(NativeLoopStep::Complete {..})));
+    let request=peer.received.await.unwrap();
+    let items=request["input"].as_array().unwrap();
+    assert_eq!(items[0],json!({"role":"user","content":input.instruction}));
+    let original=envelope["output"].as_array().unwrap();
+    assert_eq!(&items[1..1+original.len()],original.as_slice());
+    assert_eq!(items.last().unwrap(),&json!({"role":"developer","content":feedback}));
+    assert!(items.iter().all(|item|item["type"]!="function_call" && item["type"]!="function_call_output"));
+}
+
+#[tokio::test]
+async fn completion_continuation_binds_task_and_refuses_exhausted_or_changed_input_before_post() {
+    let mut input=input(); input.limits.model_requests=1; let input=bind(input);
+    let profile=profile();
+    let (first,_)=run(&input,&profile,None,final_response()).await;
+    let NativeLoopStep::Complete {continuation,..}=first.result.unwrap() else {panic!("final expected")};
+    for changed in [false,true] {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg=config(format!("http://{}/v1/responses",listener.local_addr().unwrap()));
+        let mut candidate=input.clone(); if changed {candidate.instruction.push('!');}
+        let candidate=bind(candidate);
+        let response=borg_runtime::native::execute_loop_step_after_completion(
+            &candidate,&cfg,&profile,&continuation,"recorded reason",None,None,&host(),
+            async {Ok(())},std::future::pending(),
+        ).await;
+        assert_eq!(response.request_exposure,RequestExposure::NotStarted);
+        assert!(response.result.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn final_compaction_keeps_original_response_index_and_accounts_for_separate_request() {
+    let input=input(); let profile=profile();
+    let (first,_)=run(&input,&profile,None,final_response()).await;
+    let NativeLoopStep::Complete {continuation,..}=first.result.unwrap() else {panic!("final expected")};
+    assert!(continuation.after_compaction(3,Some("summary")).is_err());
+    let compacted=continuation.after_compaction(2,Some("canonical current-source summary")).unwrap();
+    assert_eq!(compacted.request_index(),1);
+    assert_eq!(compacted.next_request_index().unwrap(),3);
+    let context=compacted.compaction_input().unwrap();
+    assert_eq!(context.as_array().unwrap().len(),2);
+    assert!(context[1]["content"].as_str().unwrap().contains("canonical current-source summary"));
+    assert!(context.as_array().unwrap().iter().all(|item|item["type"]!="function_call_output"));
+}
+
+#[tokio::test]
+async fn successor_initial_request_carries_original_instruction_and_recorded_reason_once() {
+    let input=input();let profile=profile();
+    let peer=Fixture::start(200,serde_json::to_vec(&final_response()).unwrap(),Duration::ZERO,"").await;
+    let response=borg_runtime::native::execute_loop_step_with_completion_input(
+        &input,&config(peer.endpoint.clone()),&profile,"Recorded stopped completion decision: remaining-child",
+        None,None,&host(),async {Ok(())},std::future::pending(),
+    ).await;
+    let NativeLoopStep::Complete {continuation,..}=response.result.unwrap() else {panic!("final expected")};
+    assert_eq!(continuation.request_index(),1);
+    let request=peer.received.await.unwrap();let items=request["input"].as_array().unwrap();
+    assert_eq!(items[0],json!({"role":"user","content":input.instruction}));
+    assert_eq!(items[1],json!({"role":"developer","content":"Recorded stopped completion decision: remaining-child"}));
+    assert_eq!(items.len(),2);
+}
+
+
+// Source-only primitive fixtures: the worker/controller own original rejection
+// receipts and retry admission; these verify exact real request bytes at the API.
+#[tokio::test]
+async fn completion_retry_advances_physical_index_with_identical_actual_input() {
+    for initial in [false,true] {
+        let input=input();let profile=profile();let base=host();
+        let previous=if initial {None} else {
+            let (first,_)=run(&input,&profile,None,final_response()).await;
+            let NativeLoopStep::Complete {continuation,..}=first.result.unwrap() else {panic!("final expected")};
+            Some(continuation)
+        };
+        let first=if initial {1}else{2};
+        let reason="Original recorded completion refusal: child-7 remains";
+        let rejected=Fixture::start(429,serde_json::to_vec(&json!({"error":{"code":"rate_limit_exceeded","type":"rate_limit_error"}})).unwrap(),Duration::ZERO,"").await;
+        let request_host=base.for_request(None);
+        let response=if let Some(prior)=previous.as_ref() {
+            borg_runtime::native::execute_loop_step_after_completion_at(&input,&config(rejected.endpoint.clone()),&profile,
+                prior,reason,None,None,Some(first),&request_host,async {Ok(())},std::future::pending()).await
+        } else {
+            borg_runtime::native::execute_loop_step_with_completion_input_at(&input,&config(rejected.endpoint.clone()),&profile,
+                reason,None,None,Some(first),&request_host,async {Ok(())},std::future::pending()).await
+        };
+        assert!(matches!(response.provider_outcome,ProviderOutcome::Rejected(_)));
+        assert!(response.result.is_err());
+        let original=request_host.request_binding().unwrap().unwrap();
+        let original_body=rejected.received.await.unwrap();
+        let peer=Fixture::start(200,serde_json::to_vec(&final_response()).unwrap(),Duration::ZERO,"").await;
+        let retry_host=base.for_request(Some(original.clone()));
+        let response=if let Some(prior)=previous.as_ref() {
+            borg_runtime::native::execute_loop_step_after_completion_at(&input,&config(peer.endpoint.clone()),&profile,
+                prior,reason,None,None,Some(first+1),&retry_host,async {Ok(())},std::future::pending()).await
+        } else {
+            borg_runtime::native::execute_loop_step_with_completion_input_at(&input,&config(peer.endpoint.clone()),&profile,
+                reason,None,None,Some(first+1),&retry_host,async {Ok(())},std::future::pending()).await
+        };
+        assert_eq!(response.provider_outcome,ProviderOutcome::Completed);
+        let NativeLoopStep::Complete {continuation,..}=response.result.unwrap() else {panic!("final expected")};
+        assert_eq!(continuation.request_index(),first+1);
+        assert_eq!(retry_host.request_binding().unwrap(),Some(original));
+        assert_eq!(peer.received.await.unwrap(),original_body);
+    }
+}
+
+#[tokio::test]
+async fn completion_retry_changed_reason_is_rejected_before_post() {
+    let input=input();let profile=profile();let base=host();
+    let rejected=Fixture::start(429,serde_json::to_vec(&json!({"error":{"code":"rate_limit_exceeded"}})).unwrap(),Duration::ZERO,"").await;
+    let first=base.for_request(None);
+    let response=borg_runtime::native::execute_loop_step_with_completion_input_at(&input,&config(rejected.endpoint.clone()),&profile,
+        "original reason",None,None,Some(1),&first,async {Ok(())},std::future::pending()).await;
+    assert!(matches!(response.provider_outcome,ProviderOutcome::Rejected(_)));
+    let original=first.request_binding().unwrap().unwrap();
+    let _=rejected.received.await.unwrap();
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cfg=config(format!("http://{}/v1/responses",listener.local_addr().unwrap()));
+    let retry=base.for_request(Some(original));
+    let response=borg_runtime::native::execute_loop_step_with_completion_input_at(&input,&cfg,&profile,
+        "changed reason",None,None,Some(2),&retry,async {Ok(())},std::future::pending()).await;
+    assert_eq!(response.provider_outcome,ProviderOutcome::NotStarted);
+    assert_eq!(response.request_exposure,RequestExposure::NotStarted);
+    assert_eq!(response.result.err().as_deref(),Some("native_retry_original_input_changed_no_post"));
+    assert!(retry.request_binding().unwrap().is_none());
+    assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
 }

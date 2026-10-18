@@ -1,6 +1,7 @@
 //! Task-scoped stdio MCP adapter. This is host correlation, not a new auth boundary.
 //! The sole bridge owner retains an immutable occurrence before HTTP; lost replies
-//! are lookup-only. No unresolved result is returned to the supplied executor.
+//! are reconciled by original identity. Only closed read adapters can redispatch
+//! after validated absence. No unresolved result reaches the supplied executor.
 use super::process;
 use crate::limits::{CollaborationLimits, RuntimeLimits, WorkerLimits};
 use crate::{
@@ -25,6 +26,12 @@ const REVISION: u32 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Exact optional source from the accepted RunAttempt, never model supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_source: Option<crate::protocol::RepositoryReadSource>,
+    /// Host-derived V2 capability projection. Historical absence is exact V1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<ExecutionProfile>,
     pub runtime_limits: RuntimeLimits,
     pub limits: CollaborationLimits,
     pub worker_limits: WorkerLimits,
@@ -37,6 +44,13 @@ pub struct Config {
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.runtime_limits.validate()?;
+        if let Some(source) = &self.instruction_source {
+            source.validate_instruction_binding(&self.runtime_limits)?;
+        }
+        if self.execution_profile.as_ref().is_some_and(|profile|
+            !matches!(profile,ExecutionProfile::CollaborationV2{..})) {
+            return Err("bridge workflow capability differs from selected metadata".into());
+        }
         self.caller.validate(&self.runtime_limits.transport)?;
         self.limits.validate()?;
         self.worker_limits.validate()?;
@@ -46,12 +60,18 @@ impl Config {
         {
             return Err("invalid collaboration bridge configuration".into());
         }
-        Client::new(
-            &self.controller_url,
-            self.caller.clone(),
-            self.runtime_limits.clone(),
-        )?;
+        self.client()?;
         Ok(())
+    }
+    fn profile(&self) -> ExecutionProfile {
+        self.execution_profile.clone().unwrap_or(ExecutionProfile::CollaborationV1 { web_search: None })
+    }
+    fn client(&self) -> Result<Client,String> {
+        Client::new_for_task(&self.controller_url, self.caller.clone(), self.runtime_limits.clone(),
+            self.profile(), self.instruction_source.clone())
+    }
+    fn catalogue(&self) -> Vec<mcp::Tool> {
+        mcp::catalogue_for_task(&self.runtime_limits, Some(&self.profile()), self.instruction_source.as_ref())
     }
     pub fn directory(&self) -> PathBuf {
         self.state.join("collaboration-codex")
@@ -96,6 +116,13 @@ pub(super) fn enable_memory_gate(config: &Config) -> Result<(), String> {
     )
 }
 fn memory_gate_enabled(config: &Config) -> Result<bool, String> {
+    // The retained filename predates workflow delivery. A memory-only legacy
+    // gate must never hold a tool result after automatic memory notices retire.
+    if !matches!(config.execution_profile, Some(ExecutionProfile::CollaborationV2 { .. }))
+        || config.runtime_limits.workflow.is_none()
+    {
+        return Ok(false);
+    }
     let Some(bytes) = read_private(
         &config.directory().join("memory-gate.json"),
         config.limits.gate_bytes,
@@ -148,6 +175,7 @@ fn read_memory_boundary(config: &Config) -> Result<Option<MemoryBoundary>, Strin
         || journal.runtime_limits != config.runtime_limits
         || journal.limits != config.limits
         || journal.worker_limits != config.worker_limits
+        || journal.instruction_source != config.instruction_source
     {
         return Err("memory boundary journal binding differs".into());
     }
@@ -220,6 +248,8 @@ struct Entry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Journal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instruction_source: Option<crate::protocol::RepositoryReadSource>,
     runtime_limits: RuntimeLimits,
     limits: CollaborationLimits,
     worker_limits: WorkerLimits,
@@ -296,9 +326,165 @@ fn safe_value(
     }
 }
 
+
+// Diagnostic-only record: never an outcome, delivery acknowledgement, or
+// authority to retry. One first-failure frame per occurrence uses the existing
+// private gate byte limit and never records transport text or response bodies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FailureStage {
+    Transport,
+    HttpStatus,
+    ResponseRead,
+    ResponseLimit,
+    ResponseSyntax,
+    ResponseCorrelation,
+    MethodRefused,
+    ToolEnvelope,
+    ControllerReply,
+    UncommittedReply,
+    ResultLimit,
+    ReceiptContract,
+    LookupAbsent,
+    Unclassified,
+}
+impl FailureStage {
+    fn from_error(error: &str) -> Self {
+        match error {
+            "MCP transport outcome unknown; reconcile original occurrence" => Self::Transport,
+            "MCP HTTP outcome unavailable; reconcile original occurrence" => Self::HttpStatus,
+            "MCP response incomplete; reconcile original occurrence" => Self::ResponseRead,
+            "MCP response bound; reconcile original occurrence" => Self::ResponseLimit,
+            "Invalid or duplicate JSON" => Self::ResponseSyntax,
+            "MCP response correlation differs" => Self::ResponseCorrelation,
+            "MCP method refused; reconcile original occurrence" => Self::MethodRefused,
+            "invalid MCP tool result" | "invalid MCP content" => Self::ToolEnvelope,
+            "invalid controller tool reply" | "MCP outcome discriminator differs" => {
+                Self::ControllerReply
+            }
+            _ => Self::Unclassified,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Transport => "mcp_transport",
+            Self::HttpStatus => "mcp_http_status",
+            Self::ResponseRead => "mcp_response_read",
+            Self::ResponseLimit => "mcp_response_limit",
+            Self::ResponseSyntax => "mcp_response_syntax",
+            Self::ResponseCorrelation => "mcp_response_correlation",
+            Self::MethodRefused => "mcp_method_refused",
+            Self::ToolEnvelope => "mcp_tool_envelope",
+            Self::ControllerReply => "mcp_controller_reply",
+            Self::UncommittedReply => "mcp_uncommitted_reply",
+            Self::ResultLimit => "mcp_complete_result_limit",
+            Self::ReceiptContract => "mcp_receipt_contract",
+            Self::LookupAbsent => "mcp_lookup_no_committed_receipt",
+            Self::Unclassified => "mcp_unclassified_failure",
+        }
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailureDiagnostic {
+    revision: u32,
+    caller: Caller,
+    operation_id: String,
+    logical_call_id: String,
+    stage: FailureStage,
+}
+
+const JOURNAL_ADMISSION_MESSAGE: &str = "collaboration journal admission bound (execution.collaboration.journal_bytes; reserves execution.collaboration.complete_result_bytes)";
+
+// This record is diagnostic evidence of a call that was never admitted or sent,
+// not a controller receipt, a journal entry, or authority to retry another call.
+// Keep it separate from diagnostics for dispatched, unresolved occurrences.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AdmissionDisposition {
+    NotSent,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionRefusal {
+    revision: u32,
+    dispatch: AdmissionDisposition,
+    caller: Caller,
+    operation_id: String,
+    logical_call_id: String,
+    thread_id: String,
+    session_id: String,
+    journal_bytes: usize,
+    complete_result_bytes: usize,
+}
+
+#[derive(Debug)]
+enum InvokeError {
+    JournalAdmission(AdmissionRefusal),
+    Quiesce(String),
+}
+impl From<String> for InvokeError {
+    fn from(reason: String) -> Self {
+        Self::Quiesce(reason)
+    }
+}
+impl From<&str> for InvokeError {
+    fn from(reason: &str) -> Self {
+        Self::Quiesce(reason.into())
+    }
+}
+impl InvokeError {
+    #[cfg(test)]
+    fn message(&self) -> &str {
+        match self {
+            Self::JournalAdmission(_) => JOURNAL_ADMISSION_MESSAGE,
+            Self::Quiesce(reason) => reason,
+        }
+    }
+}
+
+pub(super) fn diagnostic_reason(config: &Config) -> Result<Option<&'static str>, String> {
+    let Some(bytes) = read_private(
+        &config.directory().join("diagnostic.json"),
+        config.limits.gate_bytes,
+        "execution.collaboration.gate_bytes",
+    )?
+    else {
+        return Ok(None);
+    };
+    let diagnostic: FailureDiagnostic = decode(&bytes, config.limits.gate_bytes)?;
+    if diagnostic.revision != 1 || diagnostic.caller != config.caller {
+        return Err("collaboration diagnostic binding differs".into());
+    }
+    let bytes = read_private(
+        &config.directory().join("calls.json"),
+        config.limits.journal_bytes,
+        "execution.collaboration.journal_bytes",
+    )?
+    .ok_or("collaboration diagnostic journal absent")?;
+    let journal: Journal = decode(&bytes, config.limits.journal_bytes)?;
+    if !journal.entries.iter().any(|entry| {
+        entry.invocation.caller == diagnostic.caller
+            && entry.invocation.operation_id == diagnostic.operation_id
+            && entry.invocation.logical_call_id == diagnostic.logical_call_id
+            && entry.outcome.is_none()
+            && !entry.delivered
+    }) {
+        return Err("collaboration diagnostic occurrence differs".into());
+    }
+    Ok(Some(diagnostic.stage.label()))
+}
 trait Transport {
     async fn call(&self, call: &Invocation) -> Result<CallResult, String>;
     async fn lookup(&self, call: &Invocation) -> Result<Option<CallResult>, String>;
+    // An unclassified String error is never evidence of transport loss.
+    async fn call_observed(&self, call: &Invocation) -> Result<CallResult, mcp::CallFailure> {
+        self.call(call).await.map_err(mcp::CallFailure::Contract)
+    }
+    async fn lookup_observed(&self, call: &Invocation) -> Result<Option<CallResult>, mcp::CallFailure> {
+        self.lookup(call).await.map_err(mcp::CallFailure::Contract)
+    }
 }
 impl Transport for Client {
     async fn call(&self, call: &Invocation) -> Result<CallResult, String> {
@@ -306,6 +492,12 @@ impl Transport for Client {
     }
     async fn lookup(&self, call: &Invocation) -> Result<Option<CallResult>, String> {
         Client::get_call(self, call).await
+    }
+    async fn call_observed(&self, call: &Invocation) -> Result<CallResult, mcp::CallFailure> {
+        Client::call_observed(self, call).await
+    }
+    async fn lookup_observed(&self, call: &Invocation) -> Result<Option<CallResult>, mcp::CallFailure> {
+        Client::get_call_observed(self, call).await
     }
 }
 struct Bridge<T> {
@@ -360,6 +552,7 @@ impl<T: Transport> Bridge<T> {
         )? {
             Some(bytes) => decode::<Journal>(&bytes, config.limits.journal_bytes)?,
             None => Journal {
+                instruction_source: config.instruction_source.clone(),
                 runtime_limits: config.runtime_limits.clone(),
                 limits: config.limits.clone(),
                 worker_limits: config.worker_limits.clone(),
@@ -373,6 +566,7 @@ impl<T: Transport> Bridge<T> {
         if journal.runtime_limits != config.runtime_limits
             || journal.limits != config.limits
             || journal.worker_limits != config.worker_limits
+        || journal.instruction_source != config.instruction_source
             || journal.revision != REVISION
             || journal.caller != config.caller
             || journal.deadline_unix_ms != config.deadline_unix_ms
@@ -463,6 +657,58 @@ impl<T: Transport> Bridge<T> {
             "execution.collaboration.journal_bytes",
         )
     }
+    fn remember_failure(&self, call: &Invocation, stage: FailureStage) {
+        let path = self.config.directory().join("diagnostic.json");
+        // Best effort only: failed diagnostic IO cannot change reconciliation.
+        let _ = (|| -> Result<(), String> {
+            if let Some(bytes) = read_private(
+                &path,
+                self.config.limits.gate_bytes,
+                "execution.collaboration.gate_bytes",
+            )? {
+                let saved: FailureDiagnostic = decode(&bytes, self.config.limits.gate_bytes)?;
+                if saved.revision == 1
+                    && saved.caller == call.caller
+                    && saved.operation_id == call.operation_id
+                    && saved.logical_call_id == call.logical_call_id
+                {
+                    return Ok(());
+                }
+            }
+            bounded_save(
+                &path,
+                &FailureDiagnostic {
+                    revision: 1,
+                    caller: call.caller.clone(),
+                    operation_id: call.operation_id.clone(),
+                    logical_call_id: call.logical_call_id.clone(),
+                    stage,
+                },
+                self.config.limits.gate_bytes,
+                "execution.collaboration.gate_bytes",
+            )
+        })();
+    }
+    fn rejected_result_stage(&self, call: &Invocation, result: &CallResult) -> FailureStage {
+        let Ok(checked) = mcp::result(call, result.reply.clone()) else {
+            return FailureStage::ReceiptContract;
+        };
+        if checked.requires_quiescence != result.requires_quiescence {
+            return FailureStage::ReceiptContract;
+        }
+        if result.reply.commit.is_none() {
+            FailureStage::UncommittedReply
+        } else if !matches!(
+            result.reply.outcome,
+            Outcome::Ok { .. } | Outcome::Refused { .. }
+        ) {
+            FailureStage::ReceiptContract
+        } else if bounded_json_size(result, self.config.limits.complete_result_bytes).is_err() {
+            FailureStage::ResultLimit
+        } else {
+            FailureStage::ReceiptContract
+        }
+    }
     fn check_result(
         call: &Invocation,
         result: &CallResult,
@@ -493,6 +739,10 @@ impl<T: Transport> Bridge<T> {
             tokio::select! {r=&mut f=>return r,_=tokio::time::sleep(Duration::from_millis(self.config.limits.liveness_interval_ms))=>self.live()?}
         }
     }
+    async fn until_observed<F, R>(&self, f: F) -> Result<R, mcp::CallFailure>
+    where F: std::future::Future<Output = Result<R, mcp::CallFailure>> {
+        self.until(async { Ok(f.await) }).await.map_err(mcp::CallFailure::Contract)?
+    }
     fn association(&self, thread: &str) -> Result<(), String> {
         let bytes = read_private(
             &self.config.state.join("borg-thread.json"),
@@ -516,7 +766,7 @@ impl<T: Transport> Bridge<T> {
         name: &str,
         args: Value,
         meta: &Value,
-    ) -> Result<(Value, usize), String> {
+    ) -> Result<(Value, usize), InvokeError> {
         self.live()?;
         let logical = meta
             .get("callId")
@@ -534,7 +784,7 @@ impl<T: Transport> Bridge<T> {
             .filter(|x| mcp::valid_identity(x, self.config.runtime_limits.transport.identity_bytes))
             .ok_or("MCP session absent")?;
         self.association(thread)?;
-        if !mcp::catalogue(&self.config.runtime_limits)
+        if !self.config.catalogue()
             .iter()
             .any(|t| t.name == name)
             || name == "collab_task_delegate"
@@ -592,19 +842,41 @@ impl<T: Transport> Bridge<T> {
             )
             .is_err()
             {
-                self.journal.entries.pop();
-                return Err("collaboration journal admission bound (execution.collaboration.journal_bytes; reserves execution.collaboration.complete_result_bytes)".into());
+                let unsent = self.journal.entries.pop()
+                    .ok_or("fresh collaboration intent missing")?;
+                return Err(InvokeError::JournalAdmission(AdmissionRefusal {
+                    revision: 1,
+                    dispatch: AdmissionDisposition::NotSent,
+                    caller: unsent.invocation.caller,
+                    operation_id: unsent.invocation.operation_id,
+                    logical_call_id: unsent.invocation.logical_call_id,
+                    thread_id: unsent.thread_id,
+                    session_id: unsent.session_id,
+                    journal_bytes: self.config.limits.journal_bytes,
+                    complete_result_bytes: self.config.limits.complete_result_bytes,
+                }));
             }
             self.save()?;
             self.journal.entries.len() - 1
         };
         let call = self.journal.entries[index].invocation.clone();
         if self.journal.entries[index].outcome.is_none() {
-            // New durable intent sends at most once. A recovered intent is
-            // lookup-only: absence after a crash is not proof no send occurred.
+            // Mutations stay lookup-only after their first send. Closed read
+            // adapters may repeat only this exact occurrence after absence.
             let first = existing.is_none();
+            let mut read_retry = mcp::retryable_read_tool(&call.tool);
+            let mut retry_ready = false;
             let mut observed = if first {
-                self.until(self.transport.call(&call)).await.ok()
+                match self.until_observed(self.transport.call_observed(&call)).await {
+                    Ok(result) => Some(result),
+                    Err(error) => {
+                        self.remember_failure(&call, FailureStage::from_error(error.message()));
+                        if matches!(&error, mcp::CallFailure::Contract(_)) {
+                            return Err(error.into_message().into());
+                        }
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -618,13 +890,51 @@ impl<T: Transport> Bridge<T> {
                         self.save()?;
                         break;
                     }
+                    self.remember_failure(&call, self.rejected_result_stage(&call, &result));
+                    // A malformed/uncommitted CallResult is not transport retry
+                    // authority. Continue original lookup without redispatch.
+                    read_retry = false;
                 }
                 self.live()?;
-                observed = self
-                    .until(self.transport.lookup(&call))
-                    .await
-                    .ok()
-                    .flatten();
+                let mut redispatched = false;
+                observed = match self.until_observed(self.transport.lookup_observed(&call)).await {
+                    Ok(Some(result)) => Some(result),
+                    Ok(None) => {
+                        self.remember_failure(&call, FailureStage::LookupAbsent);
+                        if read_retry && retry_ready {
+                            // The lookup above happened after the configured
+                            // wait. Preserve exact durable intent before send.
+                            self.save()?;
+                            self.live()?;
+                            retry_ready = false;
+                            redispatched = true;
+                            match self.until_observed(self.transport.call_observed(&call)).await {
+                                Ok(result) => Some(result),
+                                Err(error) => {
+                                    self.remember_failure(&call, FailureStage::from_error(error.message()));
+                                    if matches!(&error, mcp::CallFailure::Contract(_)) {
+                                        return Err(error.into_message().into());
+                                    }
+                                    None
+                                },
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(error) => {
+                        self.remember_failure(&call, FailureStage::from_error(error.message()));
+                        if matches!(&error, mcp::CallFailure::Contract(_)) {
+                            return Err(error.into_message().into());
+                        }
+                        None
+                    }
+                };
+                if redispatched && observed.is_none() {
+                    // Resolve a lost reply immediately; only a later fresh
+                    // absent lookup after backoff can authorize another send.
+                    continue;
+                }
                 if observed.as_ref().is_none_or(|result| {
                     Self::check_result(&call, result, self.config.limits.complete_result_bytes)
                         .is_err()
@@ -637,6 +947,7 @@ impl<T: Transport> Bridge<T> {
                         Ok(())
                     })
                     .await?;
+                    retry_ready = true;
                 }
             }
         }
@@ -658,9 +969,51 @@ impl<T: Transport> Bridge<T> {
         )?;
         Ok((value, index))
     }
-    // Traceability scope: The coding tool boundary is exposed only after an original tool outcome is retained, so notice delivery cannot preempt that tool.
-    //= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-    //# Memory-change notification delivery MUST NOT interrupt a tool that has begun execution.
+
+    // Only the typed pre-save/pre-dispatch branch may return an ordinary MCP
+    // tool error. Text from a transport, failed save or recovered occurrence
+    // cannot acquire known-unsent status by resembling this message.
+    //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+    //# An operation refused by a configured limit MUST identify the limiting metadata field.
+    async fn invoke_for_stdio(
+        &mut self,
+        name: &str,
+        args: Value,
+        meta: &Value,
+    ) -> Result<(Value, Option<usize>), String> {
+        match self.invoke(name, args, meta).await {
+            Ok((body, index)) => {
+                self.hold_memory_boundary(index).await?;
+                Ok((body, Some(index)))
+            }
+            Err(InvokeError::JournalAdmission(refusal)) => {
+                // Diagnostic IO is best effort, as for dispatched failures. It
+                // cannot change the proven lack of dispatch or hide a pending
+                // outcome: prior-undelivered checks run before this branch.
+                let _ = bounded_save(
+                    &self.config.directory().join("admission.json"),
+                    &refusal,
+                    self.config.limits.gate_bytes,
+                    "execution.collaboration.gate_bytes",
+                );
+                self.live()?;
+                let text = serde_json::to_string(&json!({
+                    "code": "collaboration_journal_admission",
+                    "dispatch": "not_sent",
+                    "message": JOURNAL_ADMISSION_MESSAGE,
+                    "journal_bytes": refusal.journal_bytes,
+                    "complete_result_bytes": refusal.complete_result_bytes,
+                })).map_err(|_| "collaboration admission refusal encoding failed")?;
+                let body = json!({"content":[{"type":"text","text":text}],"isError":true});
+                bounded_json_size(&body, self.config.limits.frame_bytes)
+                    .map_err(|_| "collaboration admission refusal exceeds execution.collaboration.frame_bytes")?;
+                Ok((body, None))
+            }
+            Err(InvokeError::Quiesce(reason)) => Err(reason),
+        }
+    }
+    // Workflow delivery uses this retained-result boundary; the legacy on-disk
+    // names are preserved, but memory-only profiles never activate it.
     async fn hold_memory_boundary(&self, index: usize) -> Result<(), String> {
         if !memory_gate_enabled(&self.config)? {
             return Ok(());
@@ -718,7 +1071,27 @@ pub enum OutcomeDisposition {
     Unresolved,
 }
 pub fn outcome_disposition(config: &Config) -> Result<OutcomeDisposition, String> {
+    inspect_retained_outcomes(config, false)
+}
+
+/// Historical outer markers must not silently adopt newly typed Task fields.
+/// Uses the same private bounded reader, identity joins and result validation as
+/// recovery; this function neither rewrites a record nor resolves an outcome.
+pub(super) fn admit_worker18_outcomes(config: &Config) -> Result<(), String> {
+    inspect_retained_outcomes(config, true).map(|_| ())
+}
+
+fn inspect_retained_outcomes(config: &Config, historical_marker: bool) -> Result<OutcomeDisposition, String> {
     config.validate()?;
+    // The host reconstructs this scope from the original RunAttempt. A retained
+    // bridge configuration cannot silently substitute or drop that source.
+    if let Some(bytes) = read_private(&config.state.join("borg-collaboration-config.json"),
+        config.limits.config_bytes, "execution.collaboration.config_bytes")? {
+        let retained: Config = decode(&bytes, config.limits.config_bytes)?;
+        if retained.instruction_source != config.instruction_source {
+            return Err("retained instruction source differs from accepted command".into());
+        }
+    }
     let Some(bytes) = read_private(
         &config.directory().join("calls.json"),
         config.limits.journal_bytes,
@@ -731,6 +1104,7 @@ pub fn outcome_disposition(config: &Config) -> Result<OutcomeDisposition, String
     if journal.runtime_limits != config.runtime_limits
         || journal.limits != config.limits
         || journal.worker_limits != config.worker_limits
+        || journal.instruction_source != config.instruction_source
         || journal.revision != REVISION
         || journal.caller != config.caller
         || journal.deadline_unix_ms != config.deadline_unix_ms
@@ -759,11 +1133,12 @@ pub fn outcome_disposition(config: &Config) -> Result<OutcomeDisposition, String
             return Err("collaboration journal binding differs".into());
         }
         match &entry.outcome {
-            Some(outcome) => Bridge::<Client>::check_result(
-                &entry.invocation,
-                outcome,
-                config.limits.complete_result_bytes,
-            )?,
+            Some(outcome) => {
+                Bridge::<Client>::check_result(&entry.invocation, outcome, config.limits.complete_result_bytes)?;
+                if historical_marker && super::outcome_requires_worker18(&outcome.reply.outcome) {
+                    return Err("pending_assignment or reassignment in retained Coding outcome requires worker18".into());
+                }
+            }
             None => unresolved = true,
         }
     }
@@ -785,8 +1160,18 @@ pub fn server_config(
     limits: &CollaborationLimits,
     timeout_seconds: u64,
 ) -> Value {
-    let enabled = mcp::catalogue(runtime_limits)
-        .into_iter()
+    server_config_for_profile(binary,config_path,runtime_limits,limits,None,timeout_seconds)
+}
+
+pub fn server_config_for_profile(
+    binary: &Path, config_path: &Path, runtime_limits: &RuntimeLimits,
+    limits: &CollaborationLimits, profile: Option<&ExecutionProfile>, timeout_seconds: u64,
+) -> Value {
+    let selected=match profile {
+        Some(profile)=>mcp::catalogue_for_profile(runtime_limits,Some(profile)),
+        None=>mcp::catalogue(runtime_limits),
+    };
+    let enabled = selected.iter().cloned()
         .filter(|t| t.name != "collab_task_delegate")
         .map(|t| t.name)
         .collect::<Vec<_>>();
@@ -799,6 +1184,13 @@ pub fn server_config(
         "collab_task_retry",
     ] {
         tools.insert(name.into(), json!({"approval_mode":"approve"}));
+    }
+    if matches!(profile,Some(ExecutionProfile::CollaborationV2{..})) {
+        for tool in &selected {
+            if tool.name!="collab_task_delegate" && tool.annotations.get("readOnlyHint")==Some(&json!(false)) {
+                tools.insert(tool.name.clone(),json!({"approval_mode":"approve"}));
+            }
+        }
     }
     json!({"command":binary,"args":["__collaboration_mcp","--config",config_path,"--config-bytes",limits.config_bytes.to_string()],"env_vars":["OPENAI_API_KEY"],"required":true,"startup_timeout_sec":(limits.startup_timeout_ms as f64 / 1000.0),"tool_timeout_sec":timeout_seconds,"enabled_tools":enabled,"tools":tools})
 }
@@ -839,11 +1231,7 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
     config.validate()?;
     let credentials = super::configured_credentials(&config.runtime_limits)?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    let client = Client::new(
-        &config.controller_url,
-        config.caller.clone(),
-        config.runtime_limits.clone(),
-    )?;
+    let client = config.client()?;
     let frame_bytes = config.limits.frame_bytes;
     let channel_items = config.limits.channel_items;
     let mut bridge = Bridge::open(config, client, credentials, cancelled.clone())?;
@@ -961,7 +1349,8 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                     let tools = runtime
                         .block_on(bridge.until(bridge.transport.tools()))?
                         .into_iter()
-                        .filter(|t| t.name != "collab_task_delegate")
+                        .filter(|t| t.name != "collab_task_delegate"
+                            && bridge.config.catalogue().iter().any(|selected|selected.name==t.name))
                         .collect::<Vec<_>>();
                     (json!({"tools":tools}), None)
                 }
@@ -976,10 +1365,7 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                     }
                     let call: Call = serde_json::from_value(params)
                         .map_err(|_| "invalid MCP tool parameters")?;
-                    let (body, index) =
-                        runtime.block_on(bridge.invoke(&call.name, call.arguments, &call.meta))?;
-                    runtime.block_on(bridge.hold_memory_boundary(index))?;
-                    (body, Some(index))
+                    runtime.block_on(bridge.invoke_for_stdio(&call.name, call.arguments, &call.meta))?
                 }
                 "ping" => (json!({}), None),
                 _ => return Err("unsupported MCP method".into()),

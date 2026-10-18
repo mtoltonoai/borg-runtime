@@ -9,6 +9,8 @@ use super::*;
 // Traceability scope: Positive browser root-result navigation is a separate test gap; validation strings are not protected-check proof. The load oracle asserts exact selected checkpoint and three returned check outcomes; it does not provide protected checker provenance.
 //= spec/impl/v2/implementation.md#observable-end-to-end-result
 //# The initial system MUST return references to the source changes and validation results produced by a successful task.
+//= spec/impl/v2/implementation.md#platform-owned-model-retries
+//# Every transition into a retry-related blocked state MUST publish its reason as a durable event.
 pub(super) fn observe(
     tx: &Connection,
     r: &Report,
@@ -19,6 +21,11 @@ pub(super) fn observe(
     let limits = tx.limits;
     if !valid_id(limits, &r.worker_id) || !valid_id(limits, &r.incarnation) || !valid_id(limits, &r.attempt_id) {
         return refuse("invalid_input", "invalid report identity");
+    }
+    if matches!(r.observation, Observation::NativeRequestDiagnostic { .. }) {
+        // The immutable charge supplies authority. A late observation cannot
+        // change current task ownership, health, usage or retry permission.
+        return super::super::native_request_diagnostics::observe(tx, r);
     }
     let mut t = owned(tx, &r.task_id, &r.attempt_id, r.generation, false)?;
     let a = t
@@ -47,14 +54,23 @@ pub(super) fn observe(
     }
     super::task_tool::progress(tx, &t.task, r, now)?;
     match &r.observation {
+        Observation::NativeRequestDiagnostic { .. } =>
+            return super::super::native_request_diagnostics::observe(tx, r),
+        Observation::NativeOutputCapped { .. } => super::native_output_cap::validate_report(tx, &t.task, r)?,
+        Observation::NativeFormatFailure { .. } => super::native_format::validate_report(tx, &t.task, r)?,
+        Observation::NativeRequestRejected { .. } => super::native_retry::validate_report(tx, &t.task, r)?,
+        Observation::NativeRetryBlocked { .. } => super::native_retry::block(tx, &mut t, r, now)?,
         Observation::NativeLoopCompleted {
             model_requests,
             calls,
+            requests,
+            final_response_index,
         } => {
-            super::native_loop::completed(tx, &t.task, r, *model_requests, calls, now)?;
+            super::native_loop::completed(tx, &t.task, r, *model_requests, calls, requests, *final_response_index, now)?;
         }
         Observation::Started { thread_id, turn_id } => {
-            if terminal(t.task.status) || a.stopped || a.phase == AttemptPhase::StopRequested {
+            if terminal(t.task.status) || t.task.status == TaskStatus::Blocked
+                || t.task.native_retry_block.is_some() || a.stopped || a.phase == AttemptPhase::StopRequested {
                 return refuse("invalid_transition", "cannot start this attempt");
             }
             if thread_id.as_ref().is_some_and(|x| !valid_id(limits, x))
@@ -127,6 +143,9 @@ pub(super) fn observe(
         //= spec/impl/v2/implementation.md#cancellation-commits-intent-before-interruption
         //# A cancellation acknowledgment MUST distinguish requested cancellation from verified execution termination.
         Observation::ProcessTreeStopped => {
+            // Capture actual pre-stop eligibility in this original receipt.
+            // Typed unavailable preserves the physical stop and blocks later success.
+            super::super::governance_completion::capture_before_stop(tx, &t, r, now)?;
             tx.execute(
                 "UPDATE commands SET acknowledged=1 WHERE attempt_id=?1",
                 [&r.attempt_id],
@@ -143,10 +162,12 @@ pub(super) fn observe(
             a.phase = AttemptPhase::Stopped;
             a.uncertain = uncertain;
             let settled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM waits WHERE parent=?1 AND parent_attempt=?2 AND state='settled')",params![t.task.id,r.attempt_id],|row|row.get(0))?;
-            if !terminal(t.task.status) && t.task.waiting_child_id.is_none() && settled {
+            if !terminal(t.task.status) && t.task.status != TaskStatus::Blocked
+                && t.task.native_retry_block.is_none() && t.task.waiting_child_id.is_none() && settled {
                 t.task.status = TaskStatus::Queued;
                 t.task.blocked_reason = Some("child_outcome_ready".into());
             }
+            super::super::governance_completion::mark_stopped_hold(&mut t);
         }
         Observation::ExecutionUncertain { message } => {
             if message.len() > limits.controller.max_progress_bytes {
@@ -155,7 +176,7 @@ pub(super) fn observe(
             t.unresolved_execution = true;
             t.task.attempt.as_mut().unwrap().uncertain = true;
             if !terminal(t.task.status) {
-                t.task.status = TaskStatus::Failed;
+                t.task.status = if t.task.pending_assignment.is_some() {TaskStatus::Blocked} else {TaskStatus::Failed};
                 t.task.blocked_reason = Some("execution_uncertain".into());
                 stop(tx, &mut t)?;
             }
@@ -167,6 +188,7 @@ pub(super) fn observe(
             model_requests,
             input_tokens,
             output_tokens,
+            ..
         } => {
             let stored: (u32, Option<i64>, Option<i64>) = tx.query_row(
                 "SELECT model_requests,input_tokens,output_tokens FROM attempts WHERE id=?1",
@@ -189,6 +211,7 @@ pub(super) fn observe(
             }
             let input = input_tokens.map(integer).transpose()?;
             let output = output_tokens.map(integer).transpose()?;
+            super::super::native_request_diagnostics::reserve(tx, &t.task, r, old.0, cfg)?;
             tx.execute("UPDATE attempts SET model_requests=?2,input_tokens=?3,output_tokens=?4 WHERE id=?1",params![r.attempt_id,model_requests,input,output])?;
             if used_model_requests(tx, &t.task.id)? + u64::from(t.delegated_model_requests)
                 > u64::from(t.task.input.limits.model_requests)
@@ -254,7 +277,11 @@ pub(super) fn observe(
             }
             //= spec/impl/v2/implementation.md#observable-end-to-end-result
             //# A task MUST NOT be reported successful solely because its executor exited successfully.
+            let pull_request = if success {
+                super::super::pull_request::accepted_reference(tx, &t.task)?
+            } else { None };
             let accepted = success.then(|| AcceptedResult {
+                pull_request,
                 attempt_id: r.attempt_id.clone(),
                 summary: summary.clone(),
                 checkpoint: checkpoint.clone(),
@@ -270,6 +297,19 @@ pub(super) fn observe(
                 );
             }
             if success {
+                // The schema helper validates this exact small candidate outside
+                // the transaction. Obtain its one-use proof before scanning the
+                // potentially large original provider output: the first pass
+                // rolls back for this ticket and must not repeat that scan.
+                // Final dispatch still checks every occurrence below in its own
+                // transaction, with all owner/input and final clock guards.
+                if t.task.input.definition.executor == ExecutorKind::Native || (t.task.input.output_schema.is_some() && super::super::sessions::is_successor(tx,&t.task.session_id)?) {
+                    let output = output.as_ref().ok_or_else(|| {
+                        Fault::Refused("invalid_input", "candidate lacks its original required output".into())
+                    })?;
+                    validated.require(&t.task.input, Some(output), Some(&t), now)?;
+                    if t.task.input.definition.executor==ExecutorKind::Native { super::super::native_request_diagnostics::require_attempt_terminals(tx, &t.task)?; }
+                }
                 super::task_tool::acceptance(tx, &t.task, validation)?;
                 super::native_loop::acceptance(tx, &t.task, validation)?;
                 match t.task.input.definition.executor {
@@ -287,10 +327,6 @@ pub(super) fn observe(
                         }
                     }
                     ExecutorKind::Native => {
-                        let output = output.as_ref().ok_or_else(|| {
-                            Fault::Refused("invalid_input", "native candidate has no output".into())
-                        })?;
-                        validated.require(&t.task.input, Some(output), Some(&t), now)?;
                         let requests: u32 = tx.query_row(
                             "SELECT model_requests FROM attempts WHERE id=?1",
                             [&r.attempt_id],
@@ -318,8 +354,13 @@ pub(super) fn observe(
                     "result validation crossed the original deadline",
                 );
             }
+            // All original result, usage, acceptance and final-clock guards above
+            // remain mandatory. Historical reconciliation cannot mint a new decision.
+            super::super::governance_completion::before_result(tx, &t, r, *checks_passed, final_now)?;
             t.task.status = if success {
                 TaskStatus::Succeeded
+            } else if t.task.pending_assignment.is_some() {
+                TaskStatus::Blocked
             } else {
                 TaskStatus::Failed
             };

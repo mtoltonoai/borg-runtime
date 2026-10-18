@@ -158,6 +158,7 @@ async fn real_coding_checkpoint_and_controller_restart() {
         .unwrap()
         .as_millis() as u64;
     let registration = borg_runtime::repository_catalogue::Registration {
+        pull_request_target: None,
         repository_id: "e2e-repository".into(),
         registration_revision: "1".into(),
         display_name: "Explicit E2E fixture".into(),
@@ -179,7 +180,7 @@ async fn real_coding_checkpoint_and_controller_restart() {
             data: Data::RepositoryRegistration(_)
         }
     ));
-    let input=TaskInput{resolved_limits:None,repository_read:None,instruction:"Change answer() in src/main.rs to return the literal after. Preserve the test. Make only that source correction.".into(),definition:Definition{limit_overrides:None, inference: Some(InferenceSettings::selected()), execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),id:"agent-e2e".into(),revision:"fixture-1".into(),executor:ExecutorKind::Coding},repository:Some(Repository{registration:Some(registration.binding()),url:String::new(),start_commit:start.clone(),checkpoint_remote:String::new()}),acceptance_commands:vec![vec![rustc.clone(),"--test".into(),"src/main.rs".into(),"-o".into(),"acceptance".into()],vec!["./acceptance".into()],vec![rustc,"src/main.rs".into(),"-o".into(),"demo".into()]],output_schema:None,limits:Limits{deadline_unix_ms:now+300_000,model_requests:4,output_bytes:65536,result_bytes:limits.task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None};
+    let input=TaskInput{ instruction_source: None, pull_request: None, resolved_limits:None,repository_read:None,instruction:"Change answer() in src/main.rs to return the literal after. Preserve the test. Make only that source correction.".into(),definition:Definition{charter: None, limit_overrides:None, inference: Some(InferenceSettings::selected()), execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),id:"agent-e2e".into(),revision:"fixture-1".into(),executor:ExecutorKind::Coding},repository:Some(Repository{ pull_request_target: None, registration:Some(registration.binding()),url:String::new(),start_commit:start.clone(),checkpoint_remote:String::new()}),acceptance_commands:vec![vec![rustc.clone(),"--test".into(),"src/main.rs".into(),"-o".into(),"acceptance".into()],vec!["./acceptance".into()],vec![rustc,"src/main.rs".into(),"-o".into(),"demo".into()]],output_schema:None,limits:Limits{deadline_unix_ms:now+300_000,model_requests:4,output_bytes:65536,result_bytes:limits.task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None};
     let submitted = task(
         client
             .call(Operation::SubmitTask {

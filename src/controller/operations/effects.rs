@@ -21,7 +21,7 @@ pub(super) fn apply(
             if now >= t.task.input.limits.deadline_unix_ms {
                 return refuse("deadline", "attempt deadline expired");
             }
-            if !matches!(kind.as_str(), "checkpoint" | "pull_request" | "merge") {
+            if !matches!(kind.as_str(), "checkpoint" | "pull_request_head" | "pull_request" | "merge") {
                 return refuse("invalid_input", "unsupported external operation kind");
             }
             if !intended.is_object() {
@@ -56,6 +56,7 @@ pub(super) fn apply(
                 state: "pending".into(),
                 outcome: None,
             };
+            super::super::pull_request::prepare(tx, &t.task, &record)?;
             final_deadline(&t.task, cfg, now)?;
             if !cleanup_available(tx, cfg, 1)? {
                 return refuse("capacity", "no final settlement reservation available");
@@ -140,6 +141,7 @@ pub(super) fn apply(
                 save(tx, &mut t, "external_uncertain", operation_id)?;
                 return Ok((Data::Operation(record), true));
             }
+            super::super::pull_request::settle(tx, &t.task, &record, outcome)?;
             if record.kind == "checkpoint" {
                 if let Some(cp) = checkpoint {
                     if cp != &intended_checkpoint(operation_id, &record.intended)? {
@@ -228,8 +230,8 @@ pub(super) fn apply(
         //# A memory MUST be keyed by agent identity rather than by session.
         //= spec/impl/v2/implementation.md#definitions-select-execution
         //# An agent's memories MUST persist across every session of that agent identity.
-        //= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-        //# A committed memory update MUST make its changed key and committed revision available to other active sessions of the same agent.
+        // The memory_recorded audit is retained independently of retired
+        // automatic cross-session memory notifications.
         Operation::SetMemory {
             operation_id,
             task_id,

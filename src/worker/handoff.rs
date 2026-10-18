@@ -63,6 +63,22 @@ fn load(path: &Path, attempt: &Attempt, input: &TaskInput) -> Result<Saved, Stri
     Ok(saved)
 }
 
+// The original command inventory bounds this scan; load validates the saved
+// operation, accepted input and committed outcome before marker admission.
+pub(super) fn admit_retained_outcomes(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
+    for (_, receipt) in command_receipts(state, limits)? {
+        let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { continue; };
+        let path = path(state, attempt);
+        if path.exists() {
+            let saved = load(&path, attempt, task)?;
+            if saved.outcome.as_ref().is_some_and(super::outcome_requires_worker18) {
+                return Err("pending_assignment or reassignment in retained delegation outcome requires worker18".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn record(
     state: &Path,
     attempt: &Attempt,
@@ -372,6 +388,72 @@ struct Format {
     format_revision: u32,
 }
 
+// Outer revision 15 adds accepted PR request/target and original publication
+// phases. Historical absent optional fields keep their original serialization.
+// Outer revision 14 adds original-request diagnostic outbox records. Revisions
+// 9 through 14 keep their existing readers: admission never rewrites records.
+// Outer revision 15 adds explicit requested PR targets and original PR phases.
+// Outer16 adds accepted secondary instruction sources to task/bridge records.
+// Original absent fields retain exact serialization; no new state namespace.
+// Outer17 fences supplied public outer-turn journals and output manifests.
+// Outer18 carries optional default-assignment metadata in accepted snapshots.
+const CURRENT_STATE_FORMAT: u32 = 18;
+const SUPPLIED_STATE_FORMAT: u32 = 17;
+const INSTRUCTION_SOURCE_STATE_FORMAT: u32 = 16;
+const PULL_REQUEST_STATE_FORMAT: u32 = 15;
+const DIAGNOSTIC_STATE_FORMAT: u32 = 14;
+const OUTPUT_RETENTION_STATE_FORMAT: u32 = 13;
+const OUTPUT_CAP_STATE_FORMAT:u32=12;
+const PREVIOUS_STATE_FORMAT: u32 = 11;
+const EARLIER_STATE_FORMAT: u32 = 10;
+const INSTALLED_STATE_FORMAT: u32 = 9;
+
+fn read_state_format(state: &Path, limits: &WorkerLimits) -> Result<Format, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x800)
+        .open(state.join("format.json"))
+        .map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("unsupported worker state format".into());
+    }
+    if metadata.len() > limits.state_format_bytes as u64 {
+        return Err("unsupported worker state format (worker.state_format_bytes)".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(limits.state_format_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > limits.state_format_bytes {
+        return Err("unsupported worker state format (worker.state_format_bytes)".into());
+    }
+    let format: Format =
+        serde_json::from_slice(&bytes).map_err(|_| "unsupported worker state format")?;
+    if !matches!(format.format_revision, INSTALLED_STATE_FORMAT | EARLIER_STATE_FORMAT | PREVIOUS_STATE_FORMAT | OUTPUT_CAP_STATE_FORMAT | OUTPUT_RETENTION_STATE_FORMAT | DIAGNOSTIC_STATE_FORMAT | PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT) {
+        return Err("unsupported worker state format; no migration performed".into());
+    }
+    Ok(format)
+}
+
+pub(super) fn admits_instruction_sources(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(matches!(read_state_format(state, limits)?.format_revision, INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT))
+}
+
+pub(super) fn admits_supplied_turn_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(matches!(read_state_format(state, limits)?.format_revision, SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT))
+}
+
+pub(super) fn admits_default_assignment(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(read_state_format(state, limits)?.format_revision == CURRENT_STATE_FORMAT)
+}
+
+pub(super) fn admits_pull_request_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(matches!(read_state_format(state, limits)?.format_revision, PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT))
+}
+
 pub(super) fn initialize_state(state: &Path, limits: &WorkerLimits) -> Result<(), String> {
     if state.exists() {
         if !std::fs::symlink_metadata(state)
@@ -381,34 +463,10 @@ pub(super) fn initialize_state(state: &Path, limits: &WorkerLimits) -> Result<()
         {
             return Err("worker state is not a directory".into());
         }
-        let marker = state.join("format.json");
-        if marker.exists() {
-            use std::io::Read;
-            use std::os::unix::fs::OpenOptionsExt;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(0x20000 | 0x800)
-                .open(&marker)
-                .map_err(|e| e.to_string())?;
-            let metadata = file.metadata().map_err(|e| e.to_string())?;
-            if !metadata.is_file() {
-                return Err("unsupported worker state format".into());
-            }
-            if metadata.len() > limits.state_format_bytes as u64 {
-                return Err("unsupported worker state format (worker.state_format_bytes)".into());
-            }
-            let mut bytes = Vec::new();
-            file.take(limits.state_format_bytes as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            if bytes.len() > limits.state_format_bytes {
-                return Err("unsupported worker state format (worker.state_format_bytes)".into());
-            }
-            let format: Format =
-                serde_json::from_slice(&bytes).map_err(|_| "unsupported worker state format")?;
-            if format.format_revision != 9 {
-                return Err("unsupported worker state format; no migration performed".into());
-            }
+        if state.join("format.json").exists() {
+            // Compatibility inspection happens before ownership. Retained 9-17
+            // markers remain byte-exact until the owned admission boundary.
+            read_state_format(state, limits)?;
             return Ok(());
         }
         if std::fs::read_dir(state)
@@ -420,9 +478,32 @@ pub(super) fn initialize_state(state: &Path, limits: &WorkerLimits) -> Result<()
         }
     }
     process::private_directory(state)?;
-    let format = Format { format_revision: 9 };
-    bounded_json_size(&format, limits.state_format_bytes).map_err(|reason| format!("{reason} (worker.state_format_bytes)"))?;
+    write_current_state_format(state, limits)
+}
+
+fn write_current_state_format(state: &Path, limits: &WorkerLimits) -> Result<(), String> {
+    let format = Format { format_revision: CURRENT_STATE_FORMAT };
+    bounded_json_size(&format, limits.state_format_bytes)
+        .map_err(|reason| format!("{reason} (worker.state_format_bytes)"))?;
     atomic_json(&state.join("format.json"), &format)
+}
+
+/// Call only after the existing local retained-policy, command, resource and
+/// stopped-journal admission checks, with this state's owner lease held, before
+/// any report replay or recovery request. Inner records keep their own readers
+/// and recovery gates; this is only the explicit outer 9-17 -> 18 migration.
+/// A failure must exit before the ordinary shutdown report-flushing path.
+pub(super) fn finish_state_upgrade(
+    state: &Path,
+    limits: &RuntimeLimits,
+    _lease: &process::WorkerLease,
+) -> Result<(), String> {
+    read_state_format(state, &limits.worker)?;
+    crate::worker::admit_default_assignment(state, limits)?;
+    // Also re-persist an observed 18: a prior rename may have succeeded before
+    // its directory sync failed. Visibility alone is not a durable barrier.
+    write_current_state_format(state, &limits.worker)
+        .map_err(|error| format!("worker state format upgrade failed: {error}"))
 }
 
 #[cfg(test)]
@@ -534,6 +615,7 @@ mod tests {
     }
     fn task(id: &str, input: TaskInput, attempt: Option<Attempt>) -> Task {
         Task {
+            pending_assignment: None,
             session_id: format!("session-{id}"),
             id: id.into(),
             assigned_agent_id: input.definition.id.clone(),
@@ -547,7 +629,7 @@ mod tests {
             attempt,
             selected_checkpoint: None,
             result: None,
-            blocked_reason: None,
+            blocked_reason: None, native_retry_block: None,
             progress: String::new(),
             recent_output: String::new(),
             output_truncated: false,
@@ -563,11 +645,13 @@ mod tests {
             std::fs::create_dir(state.join(d)).unwrap();
         }
         let deadline = process::now_ms() + 60_000;
-        let mut input = TaskInput {
+        let mut input = TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             repository_read: None,
             instruction: "parent original instruction".into(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 execution_profile: Some(crate::protocol::ExecutionProfile::CollaborationV1 {
                     web_search: None,
@@ -589,9 +673,11 @@ mod tests {
             },
             dependencies: vec![],
             native_workflow: Some(Box::new(NativeWorkflow::CodingThenContinue {
-                child: CodingTaskTemplate {
+                child: CodingTaskTemplate { instruction_source: None,
+                    pull_request: None,
                     instruction_prefix: "fixed prefix".into(),
                     definition: Definition {
+                        charter: None,
                         limit_overrides: None,
                         execution_profile: Some(
                             crate::protocol::ExecutionProfile::CollaborationV1 { web_search: None },
@@ -602,6 +688,7 @@ mod tests {
                         executor: ExecutorKind::Coding,
                     },
                     repository: Repository {
+                        pull_request_target: None,
                         registration: Some(crate::repository_catalogue::Revision {
                             repository_id: "fixture-repository".into(),
                             registration_revision: "fixture-revision".into(),
@@ -890,6 +977,7 @@ mod tests {
                 task: input.clone(),
                 checkpoint: None,
                 continuation: None,
+                workflow_continuation: None, completion_continuation: None,
             },
         )
         .unwrap();
@@ -1346,8 +1434,280 @@ mod tests {
         let saved: Receipt = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         assert!(saved.completed);
     }
+    fn historical_limits() -> Arc<RuntimeLimits> {
+        let mut limits = (*test_limits()).clone();
+        limits.task_defaults.agent_id = None;
+        Arc::new(limits)
+    }
+    fn historical_state(label: &str, revision: u32) -> (PathBuf, Vec<u8>) {
+        assert!(matches!(revision, 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17));
+        let state = area(label);
+        process::private_directory(&state.join("commands")).unwrap();
+        process::private_directory(&state.join("mutations")).unwrap();
+        let marker = format!("{{\n  \"format_revision\": {revision}\n}}\n").into_bytes();
+        std::fs::write(state.join("format.json"), &marker).unwrap();
+        (state, marker)
+    }
+
+    #[tokio::test]
+    async fn instruction_sources_require16_in_original_commands_and_pending_await() {
+        let f = fixture(Mode::Normal).await;
+        let p = f.state.join("commands").join(format!("{}.json", component("launch")));
+        let mut receipt = crate::worker::read_receipt(&p, &test_limits()).unwrap();
+        let WorkerCommand::RunAttempt { task, .. } = &mut receipt.command else { unreachable!() };
+        let Some(NativeWorkflow::CodingThenContinue { child }) = task.native_workflow.as_deref_mut() else { unreachable!() };
+        child.instruction_source = Some(RepositoryReadSource {
+            registration: Some(crate::repository_catalogue::Revision { repository_id: "spec".into(), registration_revision: "r1".into() }),
+            repository: "/provisioned/spec.git".into(), start_commit: "a".repeat(40),
+        });
+        atomic_json(&p, &receipt).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        atomic_json(&f.state.join("format.json"), &json!({"format_revision":15})).unwrap();
+        let marker = std::fs::read(f.state.join("format.json")).unwrap();
+        assert!(crate::worker::admit_instruction_sources(&f.state, &test_limits()).unwrap_err().contains("worker16"));
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        assert_eq!(std::fs::read(f.state.join("format.json")).unwrap(), marker);
+        process::private_directory(&f.state.join("mutations")).unwrap();
+        let mut journal = mutations::prepare(Operation::AwaitCommands { operation_id: "original-await".into(), worker_id: "worker".into(), incarnation: "old".into(), acknowledged: vec![] }, 0, &test_limits()).unwrap();
+        journal.outcome = Some(Outcome::Ok { data: Data::Commands(vec![receipt.command]) });
+        journal.outcome_context = Some(CommitContext { commit: MutationCommit { operation_id: "original-await".into(), controller_revision: 1 }, observed_controller_revision: 1 });
+        let jp = f.state.join("mutations/await.json"); mutations::persist(&jp, &journal).unwrap();
+        let jb = std::fs::read(&jp).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        assert!(crate::worker::admit_instruction_sources(&f.state, &test_limits()).unwrap_err().contains("worker16"));
+        assert_eq!(std::fs::read(&jp).unwrap(), jb);
+        atomic_json(&f.state.join("format.json"), &json!({"format_revision":16})).unwrap();
+        crate::worker::admit_instruction_sources(&f.state, &test_limits()).unwrap();
+        assert_eq!(std::fs::read(&jp).unwrap(), jb);
+    }
+
     #[test]
-    fn worker_format_nine_refuses_unmarked_or_old_state_without_rewrite() {
+    fn supplied_records_require17_after_owned16_upgrade_without_record_rewrite() {
+        let (state, marker)=historical_state("supplied16-upgrade",16);let limits=historical_limits();
+        process::private_directory(&state.join("commands")).unwrap();
+        let command=WorkerCommand::StopAttempt{command_id:"old-command".into(),task_id:"task".into(),attempt_id:"attempt".into(),generation:1,incarnation:"old".into()};
+        let path=state.join("commands/original.json");record_launch(&path,&command).unwrap();
+        let bytes=std::fs::read(&path).unwrap();initialize_state(&state).unwrap();
+        assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);
+        assert!(admits_instruction_sources(&state,&limits.worker).unwrap());
+        assert!(!admits_supplied_turn_records(&state,&limits.worker).unwrap());
+        let lease=process::WorkerLease::claim(&state.join("worker-owner.json"),&limits.worker).unwrap();
+        crate::worker::read_receipt(&path,&limits).unwrap();
+        finish_state_upgrade(&state,&limits,&lease).unwrap();
+        assert!(admits_supplied_turn_records(&state,&limits.worker).unwrap());
+        assert!(admits_instruction_sources(&state,&limits.worker).unwrap());
+        assert_eq!(read_state_format(&state,&limits.worker).unwrap().format_revision,CURRENT_STATE_FORMAT);
+        assert_eq!(std::fs::read(&path).unwrap(),bytes);
+        initialize_state(&state).unwrap();finish_state_upgrade(&state,&limits,&lease).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(),bytes);
+        assert!(matches!(crate::worker::read_receipt(&path,&limits).unwrap().command,WorkerCommand::StopAttempt{command_id,..} if command_id=="old-command"));
+    }
+
+    #[test]
+    fn historical_format_inspection_is_read_only_and_owned_upgrade_preserves_records() {
+        for revision in [9, 10, 11, 12, 13, 14, 15, 16, 17] {
+            let (state, original_marker) = historical_state(&format!("format-{revision}-upgrade"), revision);
+            let limits = historical_limits();
+            process::private_directory(&state.join("commands")).unwrap();
+            let command = WorkerCommand::StopAttempt {
+                command_id: "retained-stop".into(),
+                task_id: "task".into(),
+                attempt_id: "attempt".into(),
+                generation: 1,
+                incarnation: "prior".into(),
+            };
+            let command_path = state.join("commands/retained.json");
+            record_launch(&command_path, &command).unwrap();
+            atomic_json(&state.join("limits.json"), &*limits).unwrap();
+            let original_command = std::fs::read(&command_path).unwrap();
+            let original_limits = std::fs::read(state.join("limits.json")).unwrap();
+            initialize_state(&state).unwrap();
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(), original_marker);
+            let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &limits.worker).unwrap();
+            // The actual command reader, not the marker, establishes this fixture's
+            // retained command shape before the explicit outer-format migration.
+            let before = crate::worker::read_receipt(&command_path, &limits).unwrap();
+            assert!(!before.completed);
+            assert!(!before.effects_started);
+            for _ in 0..2 {
+                finish_state_upgrade(&state, &limits, &lease).unwrap();
+                assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, CURRENT_STATE_FORMAT);
+                assert_eq!(std::fs::read(&command_path).unwrap(), original_command);
+                assert_eq!(std::fs::read(state.join("limits.json")).unwrap(), original_limits);
+                let after = crate::worker::read_receipt(&command_path, &limits).unwrap();
+                assert!(!after.completed);
+                assert!(!after.effects_started);
+                assert_eq!(serde_json::to_value(after.command).unwrap(), serde_json::to_value(&command).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_or_unowned_state_cannot_cross_the_upgrade_boundary() {
+        let (state, original_marker) = historical_state("format-lock", 10);
+        let mut limits = test_limits().worker.clone();
+        limits.owner_lock_timeout_ms = 1;
+        let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &limits).unwrap();
+        assert!(process::WorkerLease::claim(&state.join("worker-owner.json"), &limits).is_err());
+        assert_eq!(std::fs::read(state.join("format.json")).unwrap(), original_marker);
+        drop(lease);
+        for (i, bytes) in [
+            b"{".to_vec(),
+            b"{\"format_revision\":10,\"extra\":true}".to_vec(),
+            b"{\"format_revision\":10,\"format_revision\":10}".to_vec(),
+            b"{\"format_revision\":8}".to_vec(),
+            b"{\"format_revision\":19}".to_vec(),
+            vec![b' '; limits.state_format_bytes + 1],
+        ].into_iter().enumerate() {
+            let state = area(&format!("invalid-format-{i}"));
+            std::fs::write(state.join("format.json"), &bytes).unwrap();
+            let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &limits).unwrap();
+            assert!(initialize_state(&state).is_err());
+            let mut metadata = (*historical_limits()).clone();
+            metadata.worker = limits.clone();
+            assert!(finish_state_upgrade(&state, &metadata, &lease).is_err());
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(), bytes);
+            assert!(!state.join("format.pending").exists());
+        }
+        let state = area("format-symlink");
+        let target = state.join("original-marker");
+        std::fs::write(&target, &original_marker).unwrap();
+        std::os::unix::fs::symlink(&target, state.join("format.json")).unwrap();
+        assert!(initialize_state(&state).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), original_marker);
+    }
+
+    #[test]
+    fn state_upgrade_faults_do_not_claim_durability_and_visible_fourteen_is_resynced() {
+        use crate::worker::process::storage_tests::{Point, inject};
+        for revision in [9, 10, 11, 12, 13, 14, 15, 16, 17] {
+            for point in [Point::Create, Point::Write, Point::FileSync, Point::Rename, Point::DirectorySync] {
+                let (state, original) = historical_state(&format!("format-{revision}-upgrade-{point:?}"), revision);
+                let marker = state.join("format.json");
+                let metadata = historical_limits();
+                let limits = metadata.worker.clone();
+                let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &limits).unwrap();
+                let cut = inject(&marker, point, 28, if point == Point::Write { 4 } else { 0 });
+                assert!(finish_state_upgrade(&state, &metadata, &lease).is_err());
+                assert_eq!(cut.hits(), 1);
+                if point != Point::DirectorySync {
+                    assert_eq!(std::fs::read(&marker).unwrap(), original);
+                } else {
+                    assert_eq!(read_state_format(&state, &limits).unwrap().format_revision, CURRENT_STATE_FORMAT);
+                    // A visible current marker must still traverse the real atomic-json barrier.
+                    let second = inject(&marker, Point::DirectorySync, 28, 0);
+                    assert!(finish_state_upgrade(&state, &metadata, &lease).is_err());
+                    assert_eq!(second.hits(), 1);
+                }
+                finish_state_upgrade(&state, &metadata, &lease).unwrap();
+                assert_eq!(read_state_format(&state, &limits).unwrap().format_revision, CURRENT_STATE_FORMAT);
+                assert!(!state.join("format.pending").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_marker_upgrade_exits_without_outbox_replay_or_registration() {
+        use crate::worker::process::storage_tests::{Point, inject};
+        for point in [Point::Rename, Point::DirectorySync] {
+            let root = area(&format!("format-no-replay-{point:?}"));
+            let workspace = root.join("workspace");
+            let state = workspace.join(".borg-worker").join(component("worker"));
+            process::private_directory(&state).unwrap();
+            atomic_json(&state.join("format.json"), &json!({"format_revision":9})).unwrap();
+            let original_marker = std::fs::read(state.join("format.json")).unwrap();
+            let limits = historical_limits();
+            atomic_json(&state.join("limits.json"), &*limits).unwrap();
+            process::private_directory(&state.join("outbox")).unwrap();
+            let report = Report {
+                report_id: "retained-before-upgrade".into(), worker_id: "worker".into(),
+                incarnation: "prior".into(), task_id: "task".into(), attempt_id: "attempt".into(),
+                generation: 1, observation: Observation::ProcessTreeStopped,
+            };
+            let report_path = state.join("outbox").join(format!("{}.json", component(&report.report_id)));
+            atomic_json(&report_path, &report).unwrap();
+            let original_report = std::fs::read(&report_path).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let marker = state.join("format.json");
+            let cut = inject(&marker, point, 28, 0);
+            let result = tokio::time::timeout(Duration::from_secs(5), crate::worker::run(WorkerConfig {
+                limits: limits.clone(), resource_profile: None,
+                controller_url: format!("http://{}", listener.local_addr().unwrap()),
+                id: "worker".into(), incarnation: "new".into(), workspace_root: workspace,
+                codex_path: PathBuf::from("/must-not-launch"),
+                coding_capacity: limits.worker.coding_capacity, native_capacity: limits.worker.native_capacity,
+                native_endpoint: "http://127.0.0.1:1/no-provider".into(),
+                validation_executable: PathBuf::from("/must-not-launch"),
+            })).await.expect("migration error must exit, not enter recovery backoff");
+            assert!(result.unwrap_err().contains("worker state format upgrade failed"));
+            assert_eq!(cut.hits(), 1);
+            assert!(tokio::time::timeout(Duration::from_millis(25), listener.accept()).await.is_err(),
+                "neither normal replay nor shutdown may bypass the failed marker barrier");
+            assert_eq!(std::fs::read(&report_path).unwrap(), original_report);
+            assert!(!state.join("worker-owner.json").exists());
+            if point == Point::Rename {
+                assert_eq!(std::fs::read(&marker).unwrap(), original_marker);
+            } else {
+                assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, CURRENT_STATE_FORMAT);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn state9_failed_local_admission_preserves_marker_records_and_no_controller_send() {
+        for fault in ["resource", "policy", "command"] {
+            let root = area(&format!("state9-admission-{fault}"));
+            let workspace = root.join("workspace");
+            let state = workspace.join(".borg-worker").join(component("worker"));
+            process::private_directory(&state).unwrap();
+            atomic_json(&state.join("format.json"), &json!({"format_revision":9})).unwrap();
+            let marker = std::fs::read(state.join("format.json")).unwrap();
+            let limits = historical_limits();
+            atomic_json(&state.join("limits.json"), &*limits).unwrap();
+            let retained_limits = std::fs::read(state.join("limits.json")).unwrap();
+            process::private_directory(&state.join("outbox")).unwrap();
+            let report = Report {
+                report_id: "state9-retained-stop".into(), worker_id: "worker".into(),
+                incarnation: "prior".into(), task_id: "task".into(), attempt_id: "attempt".into(),
+                generation: 1, observation: Observation::ProcessTreeStopped,
+            };
+            let report_path = state.join("outbox").join(format!("{}.json", component(&report.report_id)));
+            atomic_json(&report_path, &report).unwrap();
+            let retained_report = std::fs::read(&report_path).unwrap();
+            let mut selected = (*limits).clone();
+            let resource_profile = if fault == "resource" {
+                let path = root.join("invalid-resource.json");
+                std::fs::write(&path, b"{}").unwrap();
+                Some(path)
+            } else { None };
+            if fault == "policy" { selected.revision.push_str("-changed"); }
+            if fault == "command" {
+                process::private_directory(&state.join("commands")).unwrap();
+                std::fs::write(state.join("commands/invalid.json"), b"{}").unwrap();
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), Box::pin(crate::worker::run(WorkerConfig {
+                limits: Arc::new(selected), resource_profile,
+                controller_url: format!("http://{}", listener.local_addr().unwrap()),
+                id: "worker".into(), incarnation: "replacement".into(), workspace_root: workspace,
+                codex_path: PathBuf::from("/must-not-launch"),
+                coding_capacity: limits.worker.coding_capacity, native_capacity: limits.worker.native_capacity,
+                native_endpoint: "http://127.0.0.1:1/no-provider".into(),
+                validation_executable: PathBuf::from("/must-not-launch"),
+            }))).await.expect("local admission refusal must close without recovery");
+            assert!(result.is_err(), "{fault} unexpectedly admitted");
+            assert!(tokio::time::timeout(Duration::from_millis(25), listener.accept()).await.is_err(),
+                "failed local admission cannot replay retained reports during shutdown");
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+            assert_eq!(std::fs::read(state.join("limits.json")).unwrap(), retained_limits);
+            assert_eq!(std::fs::read(report_path).unwrap(), retained_report);
+            if fault == "command" { assert_eq!(std::fs::read(state.join("commands/invalid.json")).unwrap(), b"{}"); }
+            assert!(!state.join("worker-owner.json").exists());
+        }
+    }
+
+    #[test]
+    fn worker_format_twelve_refuses_unmarked_or_unsupported_state_without_rewrite() {
         let root = area("formats");
         let old = root.join("old");
         std::fs::create_dir(&old).unwrap();
@@ -1398,7 +1758,7 @@ mod tests {
             std::fs::read(format_five.join("format.json")).unwrap(),
             original
         );
-        for revision in [6, 7, 8] {
+        for revision in [6, 7, 8, 19] {
             let previous = root.join(format!("format-{revision}"));
             std::fs::create_dir(&previous).unwrap();
             let bytes = serde_json::to_vec(&json!({"format_revision":revision})).unwrap();
@@ -1419,7 +1779,315 @@ mod tests {
                 &std::fs::read(fresh.join("format.json")).unwrap()
             )
             .unwrap(),
-            json!({"format_revision":9})
+            json!({"format_revision":CURRENT_STATE_FORMAT})
         );
     }
+
+    fn default_assignment_command(metadata: &RuntimeLimits) -> WorkerCommand {
+        let mut input = TaskInput {
+            instruction_source: None, pull_request: None, resolved_limits: None,
+            repository_read: None,
+            // A user spelling the metadata key is not a typed selector carrier.
+            instruction: "Explain task_defaults.agent_id without changing it".into(),
+            definition: Definition {
+                charter: None, limit_overrides: None,
+                id: "format-native-agent".into(), revision: "r1".into(), executor: ExecutorKind::Native,
+                inference: Some(InferenceSettings::selected()),
+                execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
+            },
+            repository: None, acceptance_commands: vec![],
+            output_schema: Some(json!({"type":"object","description":"task_defaults.agent_id"})),
+            limits: metadata.task_defaults.at(process::now_ms()).unwrap(),
+            dependencies: vec![], native_workflow: None,
+        };
+        input.resolved_limits = Some(metadata.resolve_task(&input).unwrap());
+        let attempt = Attempt {
+            id: "format-attempt".into(), session_id: "format-session".into(), task_id: "format-task".into(),
+            generation: 1, worker_id: "worker".into(), worker_incarnation: "prior".into(),
+            phase: AttemptPhase::Assigned, deadline_unix_ms: input.limits.deadline_unix_ms,
+            stopped: false, uncertain: false,
+        };
+        WorkerCommand::RunAttempt {
+            command_id: "format-command".into(),
+            session: Session { id: attempt.session_id.clone(), agent_id: input.definition.id.clone(),
+                definition: input.definition.clone(), task_id: attempt.task_id.clone() },
+            attempt, task: input, checkpoint: None, continuation: None,
+            workflow_continuation: None, completion_continuation: None,
+        }
+    }
+    fn default_assignment_await(state: &Path, metadata: &RuntimeLimits, command: WorkerCommand) -> PathBuf {
+        let mut journal = mutations::prepare(Operation::AwaitCommands {
+            operation_id: "format-await".into(), worker_id: "worker".into(), incarnation: "prior".into(), acknowledged: vec![],
+        }, 0, metadata).unwrap();
+        journal.outcome = Some(Outcome::Ok { data: Data::Commands(vec![command]) });
+        journal.outcome_context = Some(CommitContext {
+            commit: MutationCommit { operation_id: "format-await".into(), controller_revision: 1 },
+            observed_controller_revision: 1,
+        });
+        let path = state.join("mutations/await.json");
+        mutations::persist(&path, &journal).unwrap();
+        path
+    }
+
+    #[test]
+    // Traceability scope: Typed retained metadata and command carriers only; no worker, provider or controller is launched.
+    //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+    //= type=test
+    //# A retained operation MUST NOT be discarded solely because a later limit configuration is lower.
+    fn default_assignment_worker17_upgrade_preserves_missing_selector_carriers() {
+        let (state, original_marker) = historical_state("default-assignment-old17", SUPPLIED_STATE_FORMAT);
+        let limits = historical_limits();
+        let policy_path = state.join("limits.json");
+        atomic_json(&policy_path, &*limits).unwrap();
+        let command = default_assignment_command(&limits);
+        let command_path = state.join("commands/original.json");
+        record_launch(&command_path, &command).unwrap();
+        let await_path = default_assignment_await(&state, &limits, command.clone());
+        let originals: Vec<_> = [policy_path, command_path.clone(), await_path.clone()].into_iter()
+            .map(|path| { let bytes = std::fs::read(&path).unwrap(); (path, bytes) }).collect();
+        assert!(admits_supplied_turn_records(&state, &limits.worker).unwrap(), "17 keeps its supplied-journal meaning");
+        assert!(!admits_default_assignment(&state, &limits.worker).unwrap());
+        initialize_state(&state).unwrap();
+        assert_eq!(std::fs::read(state.join("format.json")).unwrap(), original_marker);
+        let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &limits.worker).unwrap();
+        let retained = crate::worker::retained_worker_limits(&state, &limits).unwrap();
+        assert!(retained.task_defaults.agent_id.is_none());
+        assert!(crate::worker::same_execution_policy(&retained, &limits));
+        assert_eq!(crate::worker::read_receipt(&command_path, &retained).unwrap().command, command);
+        assert!(mutations::read(&await_path, &retained).unwrap().unwrap().outcome.is_some());
+        finish_state_upgrade(&state, &retained, &lease).unwrap();
+        assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, 18);
+        assert!(admits_supplied_turn_records(&state, &limits.worker).unwrap());
+        assert!(admits_default_assignment(&state, &limits.worker).unwrap());
+        for (path, bytes) in originals { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+    }
+
+    #[test]
+    fn default_assignment_selector_in_each_historical_carrier_refuses_without_rewrite() {
+        for carrier in ["limits", "command", "await"] {
+            let (state, marker) = historical_state(&format!("default-assignment-{carrier}"), SUPPLIED_STATE_FORMAT);
+            let old = historical_limits();
+            let mut selected = (*old).clone(); selected.task_defaults.agent_id = Some("triage".into());
+            let selected = Arc::new(selected);
+            let retained = if carrier == "limits" { selected.clone() } else { old.clone() };
+            let policy_path = state.join("limits.json"); atomic_json(&policy_path, &*retained).unwrap();
+            let command = default_assignment_command(if carrier == "command" || carrier == "await" { &selected } else { &old });
+            let carrier_path = if carrier == "await" {
+                default_assignment_await(&state, &retained, command)
+            } else {
+                let path = state.join("commands/original.json"); record_launch(&path, &command).unwrap(); path
+            };
+            let policy_bytes = std::fs::read(&policy_path).unwrap();
+            let carrier_bytes = std::fs::read(&carrier_path).unwrap();
+            let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &old.worker).unwrap();
+            let actual = crate::worker::retained_worker_limits(&state, &retained).unwrap();
+            let reason = finish_state_upgrade(&state, &actual, &lease).unwrap_err();
+            assert!(reason.contains("task_defaults.agent_id") && reason.contains("worker18"), "{carrier}: {reason}");
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+            assert_eq!(std::fs::read(&policy_path).unwrap(), policy_bytes);
+            assert_eq!(std::fs::read(&carrier_path).unwrap(), carrier_bytes);
+            assert!(!state.join("format.pending").exists());
+            // The identical typed carrier is current vocabulary under18; this
+            // deliberate fixture marker replacement is not a migration result.
+            atomic_json(&state.join("format.json"), &json!({"format_revision":18})).unwrap();
+            crate::worker::command_receipts(&state, &actual).unwrap();
+            mutations::read(&state.join("mutations/await.json"), &actual).unwrap();
+            finish_state_upgrade(&state, &actual, &lease).unwrap();
+            assert_eq!(std::fs::read(&policy_path).unwrap(), policy_bytes);
+            assert_eq!(std::fs::read(&carrier_path).unwrap(), carrier_bytes);
+        }
+    }
+
+    #[test]
+    fn historical_empty_root_cannot_persist_new_selector_before_marker_upgrade() {
+        let (state, marker) = historical_state("default-assignment-empty17", SUPPLIED_STATE_FORMAT);
+        for name in ["outbox", "processes", "codex", "mutations/settlements", "native-tracking", "publications", "pull-requests"] {
+            process::private_directory(&state.join(name)).unwrap();
+        }
+        let mut metadata = (*historical_limits()).clone();
+        metadata.task_defaults.agent_id = Some("triage".into());
+        let metadata = Arc::new(metadata);
+        let _lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &metadata.worker).unwrap();
+        let reason = crate::worker::retained_worker_limits(&state, &metadata).unwrap_err();
+        assert!(reason.contains("task_defaults.agent_id") && reason.contains("worker18"), "{reason}");
+        assert!(!state.join("limits.json").exists());
+        assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+    }
+
+    #[test]
+    // Traceability scope: Original marker and carrier bytes remain unchanged on refusal; current18 accepts the same typed retained carriers, with no executor launched.
+    //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+    //= type=test
+    //# A task reassignment MUST retain the task's prior session and execution-input history.
+    fn reassignment_in_historical_commands_and_await_refuses_without_default_selector() {
+        for carrier in ["command", "await"] {
+            let (state, marker) = historical_state(&format!("reassignment-{carrier}"), SUPPLIED_STATE_FORMAT);
+            let metadata = historical_limits();
+            assert!(metadata.task_defaults.agent_id.is_none());
+            let policy = state.join("limits.json"); atomic_json(&policy, &*metadata).unwrap();
+            let mut command = default_assignment_command(&metadata);
+            let WorkerCommand::RunAttempt { task, .. } = &mut command else { unreachable!() };
+            let mut definition = task.definition.clone(); definition.executor = ExecutorKind::Coding; definition.id = "coding".into();
+            task.native_workflow = Some(Box::new(NativeWorkflow::Reassign { target: CodingTaskTemplate {
+                instruction_source: None, pull_request: None, instruction_prefix: String::new(), definition,
+                repository: Repository { registration: None, url: "file:///repo".into(), start_commit: "a".repeat(40),
+                    checkpoint_remote: "origin".into(), pull_request_target: None },
+                acceptance_commands: vec![vec!["check".into()]], dependencies: task.dependencies.clone(), limits: task.limits.clone(),
+            }}));
+            let path = if carrier == "await" { default_assignment_await(&state, &metadata, command) }
+                else { let path = state.join("commands/original.json"); record_launch(&path, &command).unwrap(); path };
+            let policy_bytes = std::fs::read(&policy).unwrap(); let bytes = std::fs::read(&path).unwrap();
+            let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &metadata.worker).unwrap();
+            let reason = finish_state_upgrade(&state, &metadata, &lease).unwrap_err();
+            assert!(reason.contains("reassign") && reason.contains("worker18"), "{reason}");
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+            assert_eq!(std::fs::read(&policy).unwrap(), policy_bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(!state.join("format.pending").exists());
+            atomic_json(&state.join("format.json"), &json!({"format_revision":CURRENT_STATE_FORMAT})).unwrap();
+            crate::worker::command_receipts(&state, &metadata).unwrap();
+            mutations::read(&state.join("mutations/await.json"), &metadata).unwrap();
+            finish_state_upgrade(&state, &metadata, &lease).unwrap();
+            assert_eq!(std::fs::read(&policy).unwrap(), policy_bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    // Traceability scope: A typed saved delegation outcome is the only new carrier; marker and all original records remain byte-exact on refusal.
+    //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+    //= type=test
+    //# A task reassignment MUST retain the task's prior session and execution-input history.
+    fn pending_assignment_in_saved_outcome_requires_worker18_without_selector_or_reassign() {
+        let (state, marker) = historical_state("pending-assignment-saved", SUPPLIED_STATE_FORMAT);
+        let metadata = historical_limits();
+        assert!(metadata.task_defaults.agent_id.is_none());
+        process::private_directory(&state.join("delegations")).unwrap();
+        let mut command = default_assignment_command(&metadata);
+        let WorkerCommand::RunAttempt { attempt, task: input, .. } = &mut command else { unreachable!() };
+        let mut definition = input.definition.clone();
+        definition.id = "coding-child".into(); definition.executor = ExecutorKind::Coding;
+        input.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue { child: CodingTaskTemplate {
+            instruction_source: None, pull_request: None, instruction_prefix: String::new(), definition,
+            repository: Repository { registration: None, url: "file:///repo".into(), start_commit: "a".repeat(40),
+                checkpoint_remote: "origin".into(), pull_request_target: None },
+            acceptance_commands: vec![], dependencies: vec![], limits: input.limits.clone(),
+        }}));
+        assert!(crate::delegation::handoff_template(input).is_none());
+        let path = record(&state, attempt, input, "original decision").unwrap();
+        let mut saved = load(&path, attempt, input).unwrap();
+        let Operation::DelegateTask { child, .. } = &saved.request else { unreachable!() };
+        let mut retained = task("child", child.clone(), None);
+        retained.parent_task_id = Some(attempt.task_id.clone());
+        retained.pending_assignment = Some(PendingAssignment {
+            operation_id: "retained-handoff".into(), from_session_id: retained.session_id.clone(),
+            session: Session { id: "next-session".into(), task_id: retained.id.clone(),
+                agent_id: retained.input.definition.id.clone(), definition: retained.input.definition.clone() },
+        });
+        saved.outcome = Some(Outcome::Ok { data: Data::Task(Box::new(retained)) });
+        saved.outcome_context = Some(CommitContext {
+            commit: MutationCommit { operation_id: saved.request.mutation_id().unwrap().to_owned(), controller_revision: 1 },
+            observed_controller_revision: 1,
+        });
+        atomic_json(&path, &saved).unwrap();
+        load(&path, attempt, input).unwrap();
+        let command_path = state.join("commands/original.json"); record_launch(&command_path, &command).unwrap();
+        let policy = state.join("limits.json"); atomic_json(&policy, &*metadata).unwrap();
+        let originals: Vec<_> = [&path, &command_path, &policy].into_iter()
+            .map(|p| (p.clone(), std::fs::read(p).unwrap())).collect();
+        let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &metadata.worker).unwrap();
+        let reason = finish_state_upgrade(&state, &metadata, &lease).unwrap_err();
+        assert!(reason.contains("pending_assignment") && reason.contains("worker18"), "{reason}");
+        assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+        assert!(!state.join("format.pending").exists());
+        for (path, bytes) in &originals { assert_eq!(&std::fs::read(path).unwrap(), bytes); }
+        atomic_json(&state.join("format.json"), &json!({"format_revision":CURRENT_STATE_FORMAT})).unwrap();
+        finish_state_upgrade(&state, &metadata, &lease).unwrap();
+        for (path, bytes) in originals { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+    }
+
+    #[test]
+    // Traceability scope: Real bounded native and Coding journal readers at pre-upgrade admission, using only local synthetic committed records and no transport or executor.
+    //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+    //= type=test
+    //# A task reassignment MUST retain the task's prior session and execution-input history.
+    fn pending_assignment_in_native_and_coding_journals_refuses_old_marker_without_rewrite() {
+        for coding in [false, true] {
+            let (state, marker) = historical_state(if coding {"pending-coding-journal"} else {"pending-native-journal"}, SUPPLIED_STATE_FORMAT);
+            let metadata = historical_limits();
+            let mut command = default_assignment_command(&metadata);
+            if coding {
+                let WorkerCommand::RunAttempt { task, session, .. } = &mut command else { unreachable!() };
+                task.definition.executor = ExecutorKind::Coding;
+                task.resolved_limits = Some(metadata.resolve_task(task).unwrap());
+                session.definition = task.definition.clone();
+            }
+            let WorkerCommand::RunAttempt { attempt, task: input, .. } = &command else { unreachable!() };
+            assert!(input.native_workflow.is_none() && metadata.task_defaults.agent_id.is_none());
+            let command_path = state.join("commands/original.json"); record_launch(&command_path, &command).unwrap();
+            let policy = state.join("limits.json"); atomic_json(&policy, &*metadata).unwrap();
+            let config = WorkerConfig {
+                limits: metadata.clone(), resource_profile: None, controller_url: "http://127.0.0.1:9".into(),
+                id: attempt.worker_id.clone(), incarnation: attempt.worker_incarnation.clone(), workspace_root: state.clone(),
+                codex_path: PathBuf::from("/must-not-launch"), coding_capacity: metadata.worker.coding_capacity,
+                native_capacity: metadata.worker.native_capacity, native_endpoint: "http://127.0.0.1:9/no-provider".into(),
+                validation_executable: PathBuf::from("/must-not-launch"),
+            };
+            let call = crate::mcp::Invocation {
+                operation_id: "retained-task-read".into(), logical_call_id: "retained-logical-read".into(),
+                caller: crate::worker::collaboration_caller(attempt), tool: "collab_task_get".into(),
+                arguments: json!({"task_id":attempt.task_id}),
+            };
+            let directory = if coding {
+                codex::state_path(&state.join("codex"), &attempt.id).join("collaboration-codex")
+            } else { state.join("collaboration").join(component(&attempt.id)) };
+            process::private_directory(&directory).unwrap();
+            let path = directory.join(if coding {"calls.json"} else {"0000000001.json"});
+            let mut retained = task(&attempt.task_id, input.clone(), Some(attempt.clone()));
+            retained.session_id = attempt.session_id.clone();
+            let persist = |retained: &Task| {
+                let outcome = Outcome::Ok { data: Data::Task(Box::new(retained.clone())) };
+                let context = CommitContext { commit: MutationCommit { operation_id: call.operation_id.clone(), controller_revision: 1 }, observed_controller_revision: 1 };
+                if coding {
+                    let reply = Reply { request_id: "retained-read".into(), outcome,
+                        commit: Some(context.commit), observed_controller_revision: Some(1) };
+                    let result = crate::mcp::result(&call, reply).unwrap();
+                    atomic_json(&path, &json!({"instruction_source":null,"runtime_limits":&*metadata,
+                        "limits":input.execution_limits().unwrap().collaboration,"worker_limits":metadata.worker,
+                        "revision":2,"caller":call.caller,"deadline_unix_ms":attempt.deadline_unix_ms.min(input.limits.deadline_unix_ms),
+                        "controller_url":config.controller_url,"entries":[{"thread_id":"thread-original","session_id":"session-original",
+                        "invocation":call,"outcome":result,"delivered":true}]})).unwrap();
+                } else {
+                    let mut journal = mutations::prepare(Operation::CallCollaboration { call: call.clone() }, 0, &metadata).unwrap();
+                    journal.outcome = Some(outcome); journal.outcome_context = Some(context); journal.consumed = true;
+                    mutations::persist(&path, &journal).unwrap();
+                }
+            };
+            persist(&retained);
+            // Absence preserves the old vocabulary and is not synthesized.
+            let original = std::fs::read(&path).unwrap();
+            assert!(!String::from_utf8_lossy(&original).contains("pending_assignment"));
+            crate::worker::admit_default_assignment(&state, &metadata).unwrap();
+            if coding { assert!(crate::worker::coding_collaboration_closed(&config, input, attempt, &state).unwrap()); }
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            retained.pending_assignment = Some(PendingAssignment { operation_id: "pending-handoff".into(),
+                from_session_id: retained.session_id.clone(), session: Session { id: "next-session".into(),
+                    task_id: retained.id.clone(), agent_id: retained.input.definition.id.clone(), definition: retained.input.definition.clone() } });
+            persist(&retained);
+            let originals: Vec<_> = [&path, &command_path, &policy].into_iter()
+                .map(|p| (p.clone(), std::fs::read(p).unwrap())).collect();
+            let lease = process::WorkerLease::claim(&state.join("worker-owner.json"), &metadata.worker).unwrap();
+            let reason = if coding { crate::worker::coding_collaboration_closed(&config, input, attempt, &state).unwrap_err() }
+                else { finish_state_upgrade(&state, &metadata, &lease).unwrap_err() };
+            assert!(reason.contains("pending_assignment") && reason.contains("worker18"), "{reason}");
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(), marker);
+            assert!(!state.join("format.pending").exists());
+            for (path, bytes) in &originals { assert_eq!(&std::fs::read(path).unwrap(), bytes); }
+            atomic_json(&state.join("format.json"), &json!({"format_revision":CURRENT_STATE_FORMAT})).unwrap();
+            finish_state_upgrade(&state, &metadata, &lease).unwrap();
+            if coding { assert!(crate::worker::coding_collaboration_closed(&config, input, attempt, &state).unwrap()); }
+            for (path, bytes) in originals { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+        }
+    }
+
 }

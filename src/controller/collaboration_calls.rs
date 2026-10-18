@@ -83,6 +83,8 @@ enum ToolArgs {
     },
     #[serde(rename = "collab_agent_get")]
     Agent { agent_id: String },
+    #[serde(rename = "collab_definition_update")]
+    DefinitionUpdate(crate::protocol::DefinitionUpdate),
     #[serde(rename = "collab_definition_get")]
     Definition {
         definition_id: String,
@@ -155,11 +157,14 @@ enum ToolArgs {
         limit: usize,
     },
 }
-fn parse(limits: &crate::limits::RuntimeLimits, call: &Invocation) -> Result<ToolArgs> {
+fn parse(limits: &crate::limits::RuntimeLimits, call: &Invocation, input: Option<&TaskInput>) -> Result<ToolArgs> {
     call.validate(limits)
         .map_err(|_| Fault::Refused("invalid_input", "invalid collaboration invocation".into()))?;
-    crate::mcp::validate_arguments(&call.tool, &call.arguments, limits)
-        .map_err(|reason| Fault::Refused("invalid_input", reason))?;
+    match input {
+        Some(input) => crate::mcp::validate_arguments_for_task(&call.tool, &call.arguments, limits,
+            input.definition.execution_profile.as_ref(), input.instruction_source.as_ref()),
+        None => crate::mcp::validate_arguments(&call.tool, &call.arguments, limits),
+    }.map_err(|reason| Fault::Refused("invalid_input", reason))?;
     serde_json::from_value(json!({"tool":call.tool,"arguments":call.arguments})).map_err(|_| {
         Fault::Refused(
             "invalid_input",
@@ -168,7 +173,7 @@ fn parse(limits: &crate::limits::RuntimeLimits, call: &Invocation) -> Result<Too
     })
 }
 pub(super) fn cancel_operation(limits: &crate::limits::RuntimeLimits, call: &Invocation) -> Option<Operation> {
-    match parse(limits, call).ok()? {
+    match parse(limits, call, None).ok()? {
         ToolArgs::Cancel {
             task_id,
             expected_revision,
@@ -180,6 +185,9 @@ pub(super) fn cancel_operation(limits: &crate::limits::RuntimeLimits, call: &Inv
         _ => None,
     }
 }
+// Traceability scope: New occurrences validate current task/attempt/generation, worker incarnation, uncertainty and deadline before dispatch; retained exact replay is handled separately.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//# The collaboration tool interface MUST validate its caller's current attempt before a new mutation.
 pub(super) fn caller(tx: &Connection, actor: &Caller, now: u64) -> Result<StoredTask> {
     actor
         .validate(&tx.limits.transport)
@@ -266,6 +274,13 @@ pub(super) fn lookup(tx: &Connection, actor: &Caller, id: &str) -> Result<(Data,
 //# Changing default metadata MUST NOT silently change the limits of an already accepted task.
 //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
 //# The shared agent interface MUST expose the effective limits applicable to its caller.
+//= spec/impl/v2/implementation.md#operational-feedback-applies-supported-configuration
+//# The shared agent interface MUST expose supported definition-limit changes through the canonical controller operation layer.
+// Traceability scope: The closed catalogue dispatches supported mutations through existing canonical handlers and their receipt transaction; this is not arbitrary worker or protected control access.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//# The collaboration tool interface MUST expose configured task-space mutations under their current operation rules.
+//= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+//# The collaboration tool interface MUST use the controller's canonical operation layer.
 pub(super) fn apply(
     tx: &Connection,
     call: &Invocation,
@@ -277,7 +292,7 @@ pub(super) fn apply(
     original.task.input.execution_limits().map_err(|reason| Fault::Store(reason))?;
     let selected = original.task.input.resolved_limits.as_ref().ok_or_else(|| Fault::Store("accepted caller limits absent".into()))?;
     let limits = selected.global_metadata.as_ref();
-    let bound_tx = Connection::new(tx, limits);
+    let bound_tx = tx.with_limits(limits);
     let bound_validation = Context { issuer:validation.issuer, request:validation.request, proof:validation.proof, repository:validation.repository, limits };
     let result = apply_inner(&bound_tx, call, cfg, now, &bound_validation)?;
     let observed = (cfg.clock)();
@@ -303,7 +318,10 @@ fn apply_inner(
     let original = caller(tx, &call.caller, now)?;
     let actor = &call.caller;
     let id = call.operation_id.clone();
-    let args = parse(limits, call)?;
+    if crate::mcp::workflow_tool(&call.tool) {
+        return super::collaboration_routing::agent(tx, call, now);
+    }
+    let args = parse(limits, call, Some(&original.task.input))?;
     let query = |q| -> Result<(Data, bool)> {
         Ok((
             Data::Collaboration(super::collaboration_queries::apply(tx, &q, cfg)?),
@@ -418,6 +436,19 @@ fn apply_inner(
         } => return list(tx, "releases", &json!(task_id), cursor, limit, cfg, now),
         ToolArgs::Task { task_id } => Operation::GetTask { task_id },
         ToolArgs::Agent { agent_id } => Operation::GetAgent { agent_id },
+        ToolArgs::DefinitionUpdate(input) => {
+            // The already validated current caller supplies provenance, never
+            // an argument of the closed twelve-field configuration payload.
+            let recorded_actor = crate::collaboration::workflow::RecordedActor {
+                principal: crate::collaboration::workflow::PrincipalRef::Agent { agent_id: original.task.assigned_agent_id.clone() },
+                provenance: crate::collaboration::workflow::ActorProvenance::BoundAgentSession {
+                    agent_id: original.task.assigned_agent_id.clone(), session_id: original.task.session_id.clone(),
+                    task_id: call.caller.task_id.clone(), attempt_id: call.caller.attempt_id.clone(),
+                    generation: call.caller.generation, worker_id: call.caller.worker_id.clone(), incarnation: call.caller.incarnation.clone(),
+                },
+            };
+            return super::definition_updates::apply(tx, &input, cfg, &call.operation_id, &recorded_actor);
+        }
         ToolArgs::Definition {
             definition_id,
             revision,
@@ -579,7 +610,10 @@ fn apply_inner(
     }
     bounded(limits, result)
 }
-fn bounded(limits: &crate::limits::RuntimeLimits, value: (Data, bool)) -> Result<(Data, bool)> {
+fn bounded(limits: &crate::limits::RuntimeLimits, mut value: (Data, bool)) -> Result<(Data, bool)> {
+    // The original public receipt is projected before commit. Canonical worker
+    // GetTask/RunAttempt inputs keep their immutable provider target unchanged.
+    value.0 = crate::pull_request_view::data(value.0).map_err(Fault::Store)?;
     crate::protocol::bounded_json_size(&value.0, limits.interface.mcp_data_bytes).map_err(|_| {
         Fault::Refused(
             "response_bound",
@@ -587,10 +621,18 @@ fn bounded(limits: &crate::limits::RuntimeLimits, value: (Data, bool)) -> Result
         )
     })?;
     // Known repository operands cannot expose credential-bearing identities.
+    //= spec/impl/v2/implementation.md#shared-collaboration-tool-interface
+    //# Collaboration tool responses MUST exclude credential values.
     let safe = match &value.0 {
         Data::Task(t) => !super::credential_admission::rejected(&Operation::SubmitTask {
             operation_id: "read-projection".into(),
             input: t.input.clone(),
+        }),
+        Data::WorkMutation(result) => !super::credential_admission::rejected(&Operation::SubmitTask {
+            operation_id: "read-projection".into(), input: result.view.task.input.clone(),
+        }),
+        Data::WorkQuery(crate::collaboration::work::WorkQueryResult::Task(view)) => !super::credential_admission::rejected(&Operation::SubmitTask {
+            operation_id: "read-projection".into(), input: view.task.input.clone(),
         }),
         Data::Release(r) => {
             !crate::credential::repository_contains_credentials(&r.checkpoint.repository)
@@ -708,7 +750,7 @@ fn list(
         }
     } else if kind == "agents" {
         let mut q =
-            tx.prepare("SELECT id FROM agents WHERE id>?1 ORDER BY id COLLATE BINARY LIMIT ?2")?;
+            tx.prepare("SELECT id FROM agents WHERE id>?1 AND NOT EXISTS(SELECT 1 FROM agent_retirements r WHERE r.id=agents.id) ORDER BY id COLLATE BINARY LIMIT ?2")?;
         let rows = q
             .query_map(params![start, (limit + 1) as i64], |r| {
                 r.get::<_, String>(0)
@@ -789,3 +831,7 @@ fn list(
     page.next_cursor = if more { last } else { None };
     bounded(limits, (Data::CollaborationPage(page), false))
 }
+
+#[cfg(test)]
+#[path = "collaboration_calls/workflow_projection_tests.rs"]
+mod workflow_projection_tests;

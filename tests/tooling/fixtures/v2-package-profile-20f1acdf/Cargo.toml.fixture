@@ -1,0 +1,31 @@
+[package]
+name = "borg-runtime"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.99"
+
+[dependencies]
+rusqlite = { version = "=0.40.2", default-features = false, features = ["modern_sqlite", "limits", "hooks"] }
+libsqlite3-sys = { version = "=0.38.2", default-features = false }
+tokio = { version = "=1.53.2", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util", "process", "signal", "macros"] }
+hyper = { version = "=1.11.1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio", "server", "server-graceful", "http1"] }
+http-body-util = { version = "=0.1.3", default-features = false }
+httpdate = "=1.0.3"
+bytes = "=1.12.1"
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2"] }
+aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["aws-lc-sys"] }
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std", "raw_value", "float_roundtrip"] }
+jsonschema = { version = "=0.50.1", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dev-dependencies]
+bach = { git = "https://github.com/camshaft/bach", rev = "8bddd1958ff66460ea7d0e060bf07b999262aadb", default-features = false, features = ["net"] }
+bolero = { git = "https://github.com/camshaft/bolero", rev = "71e5de0eceb043f3eda2f62ccd02d2be2b398c44", default-features = false, features = ["std"] }
+
+[patch.crates-io]
+bolero-generator = { git = "https://github.com/camshaft/bolero", rev = "71e5de0eceb043f3eda2f62ccd02d2be2b398c44" }
+bolero-generator-derive = { git = "https://github.com/camshaft/bolero", rev = "71e5de0eceb043f3eda2f62ccd02d2be2b398c44" }

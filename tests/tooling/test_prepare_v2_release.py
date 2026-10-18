@@ -4,6 +4,7 @@ fixture. No Rust build, actual controller acceptance, protected checker or provi
 import copy
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from unittest.mock import patch
 
 import package_v2 as package
 import prepare_v2_release as prepare
+from selected_package_fixture import selected_build_files
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -148,7 +150,7 @@ class PrepareReleaseTests(unittest.TestCase):
         binary.write_bytes(data)
         binary.chmod(0o755)
         files = {}
-        for name, value in {"Cargo.toml":(ROOT/"Cargo.toml").read_bytes(), "Cargo.lock":(ROOT/"Cargo.lock").read_bytes(),
+        for name, value in {**selected_build_files(),
                             "src/main.rs":b"fn main() {}\n", "src/lib.rs":b"// controlled fixture\n"}.items():
             files[name] = {"mode":"100644", "git_blob":hashlib.sha1(b"blob "+str(len(value)).encode()+b"\0"+value).hexdigest(),
                            "size":len(value),"sha256":hashlib.sha256(value).hexdigest()}
@@ -198,11 +200,477 @@ class PrepareReleaseTests(unittest.TestCase):
 
     def test_current_wire_and_protocol_source_pin_match_selected_rust_source(self):
         protocol = (ROOT / "src/protocol.rs").read_bytes()
-        self.assertIn(b"pub const WIRE_REVISION: u32 = 8;", protocol)
-        self.assertEqual(prepare.WIRE_REVISION, 8)
+        self.assertIn(b"pub const WIRE_REVISION: u32 = 23;", protocol)
+        self.assertEqual(prepare.WIRE_REVISION, 23)
         self.assertEqual(hashlib.sha256(protocol).hexdigest(), prepare.PROTOCOL_SOURCE_SHA)
         self.run_prepare()
-        self.assertTrue(all(req["protocol_revision"] == 8 for _, req in self.peer.requests))
+        self.assertTrue(all(req["protocol_revision"] == 23 for _, req in self.peer.requests))
+
+    def test_historical_wire_target_and_original_retry_are_preserved(self):
+        prepare.execute("prepare", self.peer.origin, self.root/"wire8", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=8)
+        original=(self.root/"wire8/prepare-request.json").read_bytes()
+        self.assertTrue(all(req["protocol_revision"]==8 for _,req in self.peer.requests))
+        prepare.execute("retry", self.peer.origin, self.root/"retry8", self.digest, self.commit,
+                        previous=self.root/"wire8")
+        self.assertEqual((self.root/"retry8/prepare-request.json").read_bytes(),original)
+        self.assertEqual(self.peer.requests[-1][0],original)
+        count=len(self.peer.requests)
+        with self.assertRaisesRegex(ValueError,"cannot rewrite"):
+            prepare.execute("retry", self.peer.origin, self.root/"retry9", self.digest, self.commit,
+                            previous=self.root/"wire8",wire_revision=9)
+        self.assertEqual(len(self.peer.requests),count)
+
+    def test_wire9_original_retry_stays_wire9_after_wire10_default(self):
+        prepare.execute("prepare", self.peer.origin, self.root/"wire9", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=9)
+        original=(self.root/"wire9/prepare-request.json").read_bytes()
+        self.assertTrue(all(req["protocol_revision"]==9 for _,req in self.peer.requests))
+        prepare.execute("retry", self.peer.origin, self.root/"retry9", self.digest, self.commit,
+                        previous=self.root/"wire9")
+        self.assertEqual((self.root/"retry9/prepare-request.json").read_bytes(),original)
+        self.assertEqual(self.peer.requests[-1][0],original)
+        count=len(self.peer.requests)
+        with self.assertRaisesRegex(ValueError,"cannot rewrite"):
+            prepare.execute("retry", self.peer.origin, self.root/"retry10", self.digest, self.commit,
+                            previous=self.root/"wire9",wire_revision=10)
+        self.assertEqual(len(self.peer.requests),count)
+
+    def test_wire10_retry_and_lookup_preserve_original_under_wire11_default(self):
+        prepare.execute("prepare", self.peer.origin, self.root/"wire10", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=10)
+        original=(self.root/"wire10/prepare-request.json").read_bytes()
+        prepare.execute("retry", self.peer.origin, self.root/"retry10", self.digest, self.commit,
+                        previous=self.root/"wire10")
+        self.assertEqual(self.peer.requests[-1][0],original)
+        count=len(self.peer.requests)
+        result=prepare.execute("reconcile", self.peer.origin, self.root/"lookup11", self.digest, self.commit,
+                               previous=self.root/"wire10", wire_revision=11)
+        self.assertEqual(result["original_protocol_revision"],10)
+        self.assertEqual(result["target_protocol_revision"],11)
+        self.assertTrue(all(r["operation"]=="get_operation" and r["protocol_revision"]==11
+                            for _,r in self.peer.requests[count:]))
+        self.assertEqual((self.root/"wire10/prepare-request.json").read_bytes(),original)
+        count=len(self.peer.requests)
+        with self.assertRaisesRegex(ValueError,"cannot rewrite"):
+            prepare.execute("retry", self.peer.origin, self.root/"rewrite11", self.digest, self.commit,
+                            previous=self.root/"wire10",wire_revision=11)
+        self.assertEqual(len(self.peer.requests),count)
+
+    def test_wire11_retry_and_wire12_lookup_keep_original_bytes(self):
+        prepare.execute("prepare", self.peer.origin, self.root/"wire11", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=11)
+        original=(self.root/"wire11/prepare-request.json").read_bytes()
+        prepare.execute("retry", self.peer.origin, self.root/"retry11", self.digest, self.commit,
+                        previous=self.root/"wire11")
+        self.assertEqual(self.peer.requests[-1][0],original)
+        self.assertEqual((self.root/"retry11/prepare-request.json").read_bytes(),original)
+        count=len(self.peer.requests)
+        result=prepare.execute("reconcile", self.peer.origin, self.root/"lookup12",self.digest,self.commit,
+                               previous=self.root/"wire11",wire_revision=12)
+        self.assertEqual(result["status"],"prepared")
+        self.assertEqual(result["original_protocol_revision"],11)
+        self.assertEqual(result["target_protocol_revision"],12)
+        self.assertEqual(len(self.peer.requests),count+1)
+        self.assertEqual(self.peer.requests[-1][1]["operation"],"get_operation")
+        self.assertEqual(self.peer.requests[-1][1]["protocol_revision"],12)
+        self.assertEqual((self.root/"lookup12/prepare-request.json").read_bytes(),original)
+        count=len(self.peer.requests)
+        with self.assertRaisesRegex(ValueError,"cannot rewrite"):
+            prepare.execute("retry", self.peer.origin, self.root/"rewrite12",self.digest,self.commit,
+                            previous=self.root/"wire11",wire_revision=12)
+        self.assertEqual(len(self.peer.requests),count)
+        self.assertEqual((self.root/"wire11/prepare-request.json").read_bytes(),original)
+
+    def test_unselected_verifier_refuses_before_controller_contact(self):
+        with patch.object(prepare,"VERIFIER_SHA","f"*64):
+            with self.assertRaisesRegex(ValueError,"package verifier differs"):
+                self.run_prepare()
+        self.assertEqual(self.peer.requests,[])
+        receipt=json.loads((self.root/"prepared/receipt.json").read_bytes())
+        self.assertFalse(receipt["mutation_attempted"])
+        self.assertNotIn("candidate",receipt)
+
+    def test_wire12_retry_and_wire13_lookup_keep_original_bytes(self):
+        prepare.execute("prepare", self.peer.origin, self.root/"wire12", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=12)
+        original=(self.root/"wire12/prepare-request.json").read_bytes()
+        prepare.execute("retry", self.peer.origin, self.root/"retry12", self.digest, self.commit,
+                        previous=self.root/"wire12")
+        self.assertEqual(self.peer.requests[-1][0],original)
+        self.assertEqual((self.root/"retry12/prepare-request.json").read_bytes(),original)
+        count=len(self.peer.requests)
+        result=prepare.execute("reconcile", self.peer.origin, self.root/"lookup13",self.digest,self.commit,
+                               previous=self.root/"wire12",wire_revision=13)
+        self.assertEqual(result["status"],"prepared")
+        self.assertEqual(result["original_protocol_revision"],12)
+        self.assertEqual(result["target_protocol_revision"],13)
+        self.assertEqual(len(self.peer.requests),count+1)
+        self.assertEqual(self.peer.requests[-1][1]["operation"],"get_operation")
+        self.assertEqual(self.peer.requests[-1][1]["protocol_revision"],13)
+        self.assertEqual((self.root/"lookup13/prepare-request.json").read_bytes(),original)
+        count=len(self.peer.requests)
+        with self.assertRaisesRegex(ValueError,"cannot rewrite"):
+            prepare.execute("retry", self.peer.origin, self.root/"rewrite13",self.digest,self.commit,
+                            previous=self.root/"wire12",wire_revision=13)
+        self.assertEqual(len(self.peer.requests),count)
+        self.assertEqual((self.root/"wire12/prepare-request.json").read_bytes(),original)
+
+    def test_wire13_retry_and_wire14_lookup_keep_original_bytes(self):
+        prepare.execute("prepare", self.peer.origin, self.root/"wire13", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=13)
+        original=(self.root/"wire13/prepare-request.json").read_bytes()
+        prepare.execute("retry", self.peer.origin, self.root/"retry13", self.digest, self.commit,
+                        previous=self.root/"wire13")
+        self.assertEqual(self.peer.requests[-1][0],original)
+        self.assertEqual((self.root/"retry13/prepare-request.json").read_bytes(),original)
+        count=len(self.peer.requests)
+        result=prepare.execute("reconcile", self.peer.origin, self.root/"lookup14",self.digest,self.commit,
+                               previous=self.root/"wire13",wire_revision=14)
+        self.assertEqual(result["status"],"prepared")
+        self.assertEqual(result["original_protocol_revision"],13)
+        self.assertEqual(result["target_protocol_revision"],14)
+        self.assertEqual(len(self.peer.requests),count+1)
+        self.assertEqual(self.peer.requests[-1][1]["operation"],"get_operation")
+        self.assertEqual(self.peer.requests[-1][1]["protocol_revision"],14)
+        self.assertEqual((self.root/"lookup14/prepare-request.json").read_bytes(),original)
+        count=len(self.peer.requests)
+        with self.assertRaisesRegex(ValueError,"cannot rewrite"):
+            prepare.execute("retry", self.peer.origin, self.root/"rewrite14",self.digest,self.commit,
+                            previous=self.root/"wire13",wire_revision=14)
+        self.assertEqual(len(self.peer.requests),count)
+        self.assertEqual((self.root/"wire13/prepare-request.json").read_bytes(),original)
+
+    def test_cli_wire_selection_matches_supported_revision_set(self):
+        for action in ("prepare", "reconcile", "retry"):
+            args=["prepare_v2_release.py",action,"--controller",self.peer.origin,
+                  "--output",str(self.root/"cli"),"--expect-sha256",self.digest,
+                  "--expect-commit",self.commit]
+            if action == "prepare":
+                args += ["--package",str(self.package),"--task-id","task-1","--operation-id","cli"]
+            else:
+                args += ["--original-receipt",str(self.root/"original")]
+            for wire in (None,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23):
+                argv=args + ([] if wire is None else ["--protocol-revision",str(wire)])
+                with self.subTest(action=action,wire=wire),patch.object(prepare.sys,"argv",argv), \
+                        patch.object(prepare.sys,"stdout",io.StringIO()), \
+                        patch.object(prepare,"execute",return_value={"status":"prepared","operation_id":"cli"}) as execute:
+                    self.assertEqual(prepare.main(),0)
+                    self.assertEqual(execute.call_args.args[-1],wire)
+                    execute.assert_called_once()
+            with self.subTest(action=action,wire=24), \
+                    patch.object(prepare.sys,"argv",args+["--protocol-revision","24"]), \
+                    patch.object(prepare.sys,"stderr",io.StringIO()), \
+                    patch.object(prepare,"execute") as execute:
+                with self.assertRaises(SystemExit) as error:
+                    prepare.main()
+                self.assertEqual(error.exception.code,2)
+                execute.assert_not_called()
+        self.assertEqual(self.peer.requests,[])
+
+    def test_new_wire_lookup_preserves_old_original_without_resending_it(self):
+        prepare.execute("prepare", self.peer.origin, self.root/"wire8", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=8)
+        original=(self.root/"wire8/prepare-request.json").read_bytes();count=len(self.peer.requests)
+        result=prepare.execute("reconcile", self.peer.origin, self.root/"lookup9",self.digest,self.commit,
+                               previous=self.root/"wire8",wire_revision=9)
+        self.assertEqual(result["status"],"prepared")
+        self.assertEqual(result["original_protocol_revision"],8)
+        self.assertEqual(result["target_protocol_revision"],9)
+        self.assertEqual((self.root/"lookup9/prepare-request.json").read_bytes(),original)
+        self.assertEqual(len(self.peer.requests),count+1)
+        self.assertEqual(self.peer.requests[-1][1]["operation"],"get_operation")
+        self.assertEqual(self.peer.requests[-1][1]["protocol_revision"],9)
+
+    def test_historical_wire8_through14_lookup_on15_preserves_original_operation(self):
+        for original_wire in range(8, 15):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup15-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=15)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 15)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 15))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite15-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=15)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through15_lookup_on16_preserves_original_operation(self):
+        for original_wire in range(8, 16):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup16-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=16)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 16)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 16))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite16-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=16)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through16_lookup_on17_preserves_original_operation(self):
+        for original_wire in range(8, 17):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup17-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=17)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 17)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 17))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite17-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=17)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through17_lookup_on18_preserves_original_operation(self):
+        for original_wire in range(8, 18):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup18-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=18)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 18)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 18))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite18-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=18)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through18_lookup_on19_preserves_original_operation(self):
+        for original_wire in range(8, 19):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup19-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=19)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 19)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 19))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite19-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=19)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through19_lookup_on20_preserves_original_operation(self):
+        for original_wire in range(8, 20):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                retried = self.root / ("retry-original-" + str(original_wire))
+                prepare.execute("retry", self.peer.origin, retried, self.digest, self.commit, previous=origin)
+                self.assertEqual((retried / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[-1][0], original)
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup20-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=20)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 20)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 20))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite20-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=20)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through20_lookup_on21_preserves_original_operation(self):
+        for original_wire in range(8, 21):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                retried = self.root / ("retry-original-" + str(original_wire))
+                prepare.execute("retry", self.peer.origin, retried, self.digest, self.commit, previous=origin)
+                self.assertEqual((retried / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[-1][0], original)
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup21-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=21)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 21)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 21))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite21-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=21)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through21_lookup_on22_preserves_original_operation(self):
+        for original_wire in range(8, 22):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                retried = self.root / ("retry-original-" + str(original_wire))
+                prepare.execute("retry", self.peer.origin, retried, self.digest, self.commit, previous=origin)
+                self.assertEqual((retried / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[-1][0], original)
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup22-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=22)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 22)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 22))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite22-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=22)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_historical_wire8_through22_lookup_on23_preserves_original_operation(self):
+        for original_wire in range(8, 23):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                retried = self.root / ("retry-original-" + str(original_wire))
+                prepare.execute("retry", self.peer.origin, retried, self.digest, self.commit, previous=origin)
+                self.assertEqual((retried / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[-1][0], original)
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup23-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=23)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 23)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 23))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite23-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=23)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
+    def test_wire15_lookup_does_not_accept_changed_original_or_unknown_target(self):
+        prepare.execute("prepare", self.peer.origin, self.root / "wire14", self.digest, self.commit,
+                        self.package, "task-1", "stable-prepare-operation", wire_revision=14)
+        original = (self.root / "wire14/prepare-request.json").read_bytes()
+        count = len(self.peer.requests)
+        with self.assertRaisesRegex(ValueError, "application wire revision"):
+            prepare.execute("reconcile", self.peer.origin, self.root / "lookup24", self.digest, self.commit,
+                            previous=self.root / "wire14", wire_revision=24)
+        self.assertEqual(len(self.peer.requests), count)
+        self.peer.mode = "wrong_original"
+        with self.assertRaisesRegex(ValueError, "differs from original request"):
+            prepare.execute("reconcile", self.peer.origin, self.root / "foreign15", self.digest, self.commit,
+                            previous=self.root / "wire14", wire_revision=15)
+        self.assertEqual(len(self.peer.requests), count + 1)
+        self.assertEqual(self.peer.requests[-1][1]["operation"], "get_operation")
+        self.assertEqual(self.peer.requests[-1][1]["protocol_revision"], 15)
+        self.assertEqual((self.root / "wire14/prepare-request.json").read_bytes(), original)
+        record = json.loads((self.root / "foreign15/receipt.json").read_bytes())
+        self.assertFalse(record["mutation_attempted"])
+        self.assertNotIn("candidate", record)
+
+    def test_wire_selection_rejects_invalid_types_before_network(self):
+        for i,value in enumerate((True,False,None,"20",20.0,7,24)):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                prepare.request("get_task",{"task_id":"task-1"},"wire",value)
+        for i,value in enumerate((True,False,"20",20.0,7,24)):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                prepare.execute("prepare",self.peer.origin,self.root/("invalid-wire-"+str(i)),self.digest,self.commit,
+                                self.package,"task-1","wire",wire_revision=value)
+        self.assertEqual(self.peer.requests,[])
 
     def test_exact_registration_and_distinct_destination_are_retained(self):
         result = self.run_prepare()
@@ -387,12 +855,12 @@ class PrepareReleaseTests(unittest.TestCase):
         self.assertEqual(recovered["status"], "prepared")
         self.assertEqual(self.peer.requests[-1][1]["operation"], "get_operation")
 
-    def test_previous_wire_preparation_is_refused_without_network_or_rewrite(self):
+    def test_unsupported_wire_preparation_is_refused_without_network_or_rewrite(self):
         self.run_prepare()
         saved = self.root / "prepared/prepare-request.json"
         receipt = self.root / "prepared/receipt.json"
         body = json.loads(saved.read_text())
-        self.assertEqual(body["protocol_revision"], 8)
+        self.assertEqual(body["protocol_revision"], 23)
         body["protocol_revision"] = 7
         saved.write_bytes(prepare.canonical(body))
         record = json.loads(receipt.read_text())
@@ -400,7 +868,7 @@ class PrepareReleaseTests(unittest.TestCase):
         receipt.write_bytes(prepare.canonical(record))
         original = (saved.read_bytes(), receipt.read_bytes())
         calls = len(self.peer.requests)
-        with self.assertRaisesRegex(ValueError, "original request"):
+        with self.assertRaisesRegex(ValueError, "application wire revision"):
             self.follow("retry")
         self.assertEqual(len(self.peer.requests), calls)
         self.assertEqual((saved.read_bytes(), receipt.read_bytes()), original)

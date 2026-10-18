@@ -30,7 +30,7 @@ fn host() -> ValidationHost {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&root).unwrap();
-    let limits = borg_runtime::limits::RuntimeLimits::seed().unwrap();
+    let limits = metadata(); // Same explicit small policy that bind(input) accepted.
     ValidationHost::new(
         PathBuf::from(env!("CARGO_BIN_EXE_borg-runtime")),
         root,

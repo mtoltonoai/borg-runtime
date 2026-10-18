@@ -129,7 +129,7 @@
   },
   {
     "name": "collab_agent_get",
-    "description": "AgentSummary; identity and stored Definition only",
+    "description": "AgentSummary; identity, stored Definition and retired status; historical identities remain readable",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -944,6 +944,99 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "collab_definition_update",
+    "description": "Apply allowed execution-limit changes as a new selected immutable agent definition for future tasks; compare current definition/global/policy revisions. Existing tasks remain pinned. No model, executor, tool, host or protected authority changes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_global_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_policy_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "changes": {
+          "type": "object",
+          "minProperties": 1,
+          "properties": {
+            "native.context_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "native.output_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "native.result_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "native.max_output_tokens": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "coding.command_output_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "coding.summary_chars": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "coding.summary_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "collaboration.complete_result_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "native.request_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "native.helper_value_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "native.response_wire_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "coding.model_context_window": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "agent_id",
+        "expected_revision",
+        "expected_global_revision",
+        "expected_policy_revision",
+        "changes"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "idempotentHint": true,
       "openWorldHint": false
     }
   }

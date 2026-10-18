@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn fresh_schema_eleven_preserves_credit_columns_and_reopens() {
+async fn fresh_current_schema_preserves_credit_columns_and_reopens() {
     let p = path();
     let c = Controller::open_with_config(&p, config())
         .expect("fresh schema must satisfy its startup validator");
@@ -14,7 +14,7 @@ async fn fresh_schema_eleven_preserves_credit_columns_and_reopens() {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            12
+            21
         );
         for (query, expected) in [
             (
@@ -82,7 +82,8 @@ fn command_ids(outcome: &Outcome) -> Vec<String> {
             .iter()
             .map(|c| match c {
                 WorkerCommand::RunAttempt { command_id, .. }
-                | WorkerCommand::StopAttempt { command_id, .. } => command_id.clone(),
+                | WorkerCommand::StopAttempt { command_id, .. }
+                    | WorkerCommand::CollaborationReady { command_id, .. } => command_id.clone(),
             })
             .collect(),
         other => panic!("expected recorded command response: {other:?}"),

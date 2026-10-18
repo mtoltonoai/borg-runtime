@@ -76,6 +76,7 @@ fn registration(
     checkpoint: &str,
 ) -> Registration {
     Registration {
+        pull_request_target: None,
         repository_id: repository_id.into(),
         registration_revision: revision.into(),
         display_name: format!("Repository {repository_id}"),
@@ -105,9 +106,12 @@ fn input(binding: Revision, commit: &str, coding: bool) -> TaskInput {
         .as_millis() as u64
         + 600_000;
     TaskInput {
+        instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         instruction: "Inspect the configured repository".into(),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
             inference: Some(InferenceSettings::selected()),
@@ -121,6 +125,7 @@ fn input(binding: Revision, commit: &str, coding: bool) -> TaskInput {
         },
         repository: if coding {
             Some(Repository {
+                pull_request_target: None,
                 registration: Some(binding.clone()),
                 url: String::new(),
                 start_commit: commit.into(),
@@ -666,6 +671,8 @@ async fn configured_child_keeps_parent_admission_revision_after_revise_and_disab
     parent.limits.model_requests = 4;
     parent.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {
         child: CodingTaskTemplate {
+            instruction_source: None,
+            pull_request: None,
             instruction_prefix: "Implement".into(),
             definition: child.definition.clone(),
             repository: child.repository.unwrap(),
@@ -1012,4 +1019,131 @@ async fn registration_preserves_denied_local_repository_access_and_permissions()
     drop(c);
     fs::remove_dir_all(&material_root).unwrap();
     assert!(!material_root.exists());
+}
+
+#[path = "repository_catalogue/instruction_sources.rs"]
+mod instruction_sources;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_repository_revisions_commit_one_head_and_replay_both_original_outcomes() {
+    async fn original(c: &Controller, request: &Operation, receipt: &Reply) -> Reply {
+        let operation_id = request.mutation_id().unwrap();
+        let lookup = Operation::GetOperation { operation_id: operation_id.into() };
+        let found = raw(c, lookup.clone()).await;
+        found.validate_for(&lookup).unwrap();
+        let Outcome::Ok { data: Data::Operation(record) } = &found.outcome else {
+            panic!("original mutation receipt expected: {found:?}");
+        };
+        assert_eq!(record.id, operation_id);
+        assert_eq!(record.kind, "application_mutation");
+        assert_eq!(record.state, "settled");
+        assert_eq!(record.intended, serde_json::to_value(request).unwrap());
+        assert_eq!(record.outcome, Some(serde_json::to_value(&receipt.outcome).unwrap()));
+        assert_eq!(found.commit, receipt.commit);
+        let commit = found.commit.as_ref().unwrap();
+        assert_eq!(commit.operation_id, operation_id);
+        assert!(commit.controller_revision > 0);
+        assert!(commit.controller_revision <= found.observed_controller_revision.unwrap());
+        found
+    }
+    async fn retained(c: &Controller, first: &Registration, winner: &Registration, loser: &Registration) {
+        let head = entry(raw(c, Operation::GetRepository {
+            repository_id: first.repository_id.clone(), registration_revision: None,
+        }).await);
+        assert_eq!(head.current_revision, winner.registration_revision);
+        assert_eq!(head.registration_revision, winner.registration_revision);
+        assert_eq!(head.generation, 2);
+        assert!(head.enabled_for_new_tasks);
+        for expected in [first, winner] {
+            let stored = entry(raw(c, Operation::GetRepository {
+                repository_id: expected.repository_id.clone(),
+                registration_revision: Some(expected.registration_revision.clone()),
+            }).await);
+            assert_eq!(stored.repository_id, expected.repository_id);
+            assert_eq!(stored.registration_revision, expected.registration_revision);
+            assert_eq!(stored.display_name, expected.display_name);
+            assert_eq!(stored.source_endpoint, expected.source_endpoint);
+            assert_eq!(stored.checkpoint_endpoint, expected.checkpoint_endpoint);
+            assert_eq!(stored.current_revision, winner.registration_revision);
+            assert_eq!(stored.generation, 2);
+        }
+        refused(raw(c, Operation::GetRepository {
+            repository_id: loser.repository_id.clone(),
+            registration_revision: Some(loser.registration_revision.clone()),
+        }).await, "repository_not_found");
+    }
+
+    let directory = root();
+    let db = directory.join("task.db");
+    let cfg = config();
+    let c = Controller::open_with_config(&db, cfg.clone()).unwrap();
+    let first = registration("concurrent-cas", "r1", "initial.git", "checkpoint.git");
+    assert_eq!(register(&c, &first).await.generation, 1);
+    let candidates = [
+        registration("concurrent-cas", "left-r2", "left.git", "left-checkpoint.git"),
+        registration("concurrent-cas", "right-r2", "right.git", "right-checkpoint.git"),
+    ];
+    let operations = [
+        Operation::ReviseRepository { operation_id: "concurrent-left".into(), expected_generation: 1, registration: candidates[0].clone() },
+        Operation::ReviseRepository { operation_id: "concurrent-right".into(), expected_generation: 1, registration: candidates[1].clone() },
+    ];
+    // Both original requests are live behind the same barrier before either
+    // caller awaits a result. The real owner transaction chooses the winner.
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let mut calls = Vec::new();
+    for operation in &operations {
+        let owner = c.clone();
+        let request = operation.clone();
+        let start = start.clone();
+        calls.push(tokio::spawn(async move {
+            start.wait().await;
+            let reply = raw(&owner, request.clone()).await;
+            reply.validate_for(&request).unwrap();
+            reply
+        }));
+    }
+    let right_call = calls.pop().unwrap();
+    let left_call = calls.pop().unwrap();
+    let (left, right) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(left_call, right_call)
+    }).await.unwrap();
+    let receipts = [left.unwrap(), right.unwrap()];
+    let successful: Vec<usize> = receipts.iter().enumerate().filter_map(|(index, reply)| {
+        matches!(reply.outcome, Outcome::Ok { data: Data::RepositoryRegistration(_) }).then_some(index)
+    }).collect();
+    assert_eq!(successful.len(), 1, "one concurrent CAS must win: {receipts:?}");
+    let winner = successful[0];
+    let loser = 1 - winner;
+    refused(receipts[loser].clone(), "revision_conflict");
+    assert_eq!(entry(receipts[winner].clone()).generation, 2);
+    assert_ne!(receipts[0].commit, receipts[1].commit);
+    retained(&c, &first, &candidates[winner], &candidates[loser]).await;
+
+    let mut originals = Vec::new();
+    for (request, receipt) in operations.iter().zip(&receipts) {
+        originals.push(original(&c, request, receipt).await);
+        let replay = raw(&c, request.clone()).await;
+        assert_eq!(replay.outcome, receipt.outcome);
+        assert_eq!(replay.commit, receipt.commit);
+        let mut changed = request.clone();
+        let Operation::ReviseRepository { registration, .. } = &mut changed else { unreachable!() };
+        registration.display_name.push_str(" changed body");
+        refused(raw(&c, changed).await, "operation_conflict");
+        let unchanged = original(&c, request, receipt).await;
+        assert_eq!(unchanged.outcome, originals.last().unwrap().outcome);
+        assert_eq!(unchanged.commit, originals.last().unwrap().commit);
+    }
+    retained(&c, &first, &candidates[winner], &candidates[loser]).await;
+    drop(c);
+    let c = reopen(&db, cfg).await;
+    retained(&c, &first, &candidates[winner], &candidates[loser]).await;
+    for ((request, receipt), before) in operations.iter().zip(&receipts).zip(&originals) {
+        let after = original(&c, request, receipt).await;
+        assert_eq!(after.outcome, before.outcome);
+        assert_eq!(after.commit, before.commit);
+        let replay = raw(&c, request.clone()).await;
+        assert_eq!(replay.outcome, receipt.outcome);
+        assert_eq!(replay.commit, receipt.commit);
+    }
+    retained(&c, &first, &candidates[winner], &candidates[loser]).await;
 }

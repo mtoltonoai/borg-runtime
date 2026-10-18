@@ -72,6 +72,7 @@ fn repository(root: &Path) -> Repository {
         ],
     );
     Repository {
+        pull_request_target: None,
         registration: Some(borg_runtime::repository_catalogue::Revision {
             repository_id: "fixture-repository".into(),
             registration_revision: "fixture-revision".into(),
@@ -443,6 +444,10 @@ async fn cache_identity_and_external_ownership_fail_closed_without_overwrite() {
     assert_eq!(run(&original, &["rev-parse", "HEAD"]), repo.start_commit);
 }
 
+// Traceability scope: Real Git reconstructs the exact acknowledged commit from a separate checkpoint repository after the original source becomes unavailable.
+//= spec/impl/v2/implementation.md#work-starts-from-a-durable-source
+//= type=test
+//# A workspace's starting revision MUST resolve to an immutable source revision available outside the worker.
 #[tokio::test]
 async fn replacement_cache_can_recover_only_from_acknowledged_checkpoint_destination() {
     let root = area("checkpoint-only-recovery");

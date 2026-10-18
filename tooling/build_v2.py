@@ -143,6 +143,40 @@ def environment(build: Path, tools: dict) -> dict:
             "RUSTC": tools["paths"]["rustc"], "RUSTDOC": tools["paths"]["rustdoc"]}
 
 
+PATH_NORMALIZATION = "borg-v2-build-paths/1"
+
+
+def reproducible_environment(root: Path, build: Path, tools: dict, selected: dict) -> dict:
+    """Normalize compiler source locations, not executable runtime paths.
+
+    All physical paths remain in the invocation/receipt. Only compiler-emitted
+    source locations use stable role prefixes, including dependency C sources.
+    External compiler overrides are still rejected before this is called.
+    """
+    if any(selected.get(name) for name in BUILD_OVERRIDES):
+        raise ValueError("reproducible paths cannot accept compiler overrides")
+    if not selected.get("CARGO_HOME") or not selected.get("CARGO_TARGET_DIR"):
+        raise ValueError("reproducible paths require explicit Cargo home and target")
+    roles = {
+        "source": checked_path(root),
+        "sqlite": checked_path(build),
+        "cargo": checked_path(Path(selected["CARGO_HOME"])),
+        "target": checked_path(Path(selected["CARGO_TARGET_DIR"])),
+        "toolchain": checked_path(Path(tools["paths"]["rustc"]).parent.parent),
+    }
+    if len(set(roles.values())) != len(roles):
+        raise ValueError("reproducible path roles overlap exactly")
+    # rustc uses the last matching prefix. More specific paths must win when
+    # an explicitly selected target or Cargo home is inside another role.
+    pairs = sorted(((str(path), "/borg-build/" + role) for role, path in roles.items()),
+                   key=lambda pair: (len(pair[0]), pair[0]))
+    return {
+        "CARGO_ENCODED_RUSTFLAGS": "\x1f".join("--remap-path-prefix=" + a + "=" + b for a, b in pairs),
+        "CFLAGS": " ".join("-ffile-prefix-map=" + a + "=" + b for a, b in pairs),
+        "CXXFLAGS": " ".join("-ffile-prefix-map=" + a + "=" + b for a, b in pairs),
+    }
+
+
 PROBE = r'''#include "sqlite3.h"
 #include <stdio.h>
 int main(void) {
@@ -232,6 +266,7 @@ def main() -> int:
     parser.add_argument("--offline", action="store_true", help="never download; also pass --offline to optional Cargo")
     parser.add_argument("--cargo", choices=("build", "check", "test"), help="optional ordinary whole-package Cargo command")
     parser.add_argument("--release", action="store_true", help="use Cargo's release profile")
+    parser.add_argument("--reproducible-paths", action="store_true", help="normalize selected release compiler source paths")
     args = parser.parse_args()
     try:
         root = checked_path(args.root)
@@ -240,6 +275,11 @@ def main() -> int:
         if any(os.environ.get(name) for name in BUILD_OVERRIDES):
             raise ValueError("unreviewed compiler/linker environment override; use a clean build shell")
         tools = inspect_tools(args.toolchain_dir.absolute())
+        path_environment = None
+        if args.reproducible_paths:
+            if args.cargo != "build" or not args.release or not args.offline:
+                raise ValueError("reproducible paths require an offline release build")
+            path_environment = reproducible_environment(root, build, tools, os.environ)
         acquisition = acquire(archive, args.offline)
         receipt = prepare(build, archive, tools, acquisition)
         print("SQLite build receipt:", build / "build-receipt.json", flush=True)
@@ -261,6 +301,10 @@ def main() -> int:
             cargo_receipt = {"sqlite_receipt_sha256": digest(build / "build-receipt.json"), "manifest_sha256": manifest_before, "lock_sha256": lock_before, "source_sha256": source_before, "commands": commands}
             env = os.environ.copy()
             env.update(environment(build, tools))
+            if path_environment is not None:
+                env.update(path_environment)
+                cargo_receipt["path_normalization"] = PATH_NORMALIZATION
+                cargo_receipt["path_environment"] = path_environment
             try:
                 run(command, root, env, output / "command.log", commands)
                 if digest(root / "Cargo.toml") != manifest_before or digest(root / "Cargo.lock") != lock_before:

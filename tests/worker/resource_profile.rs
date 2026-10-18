@@ -20,15 +20,16 @@ async fn invalid_resource_profile_reaps_owned_process_and_retains_reports_withou
     process::atomic_json(&state.join("limits.json"), &*selected_policy).unwrap();
     process::atomic_json(
         &state.join("format.json"),
-        &serde_json::json!({"format_revision":9}),
+        &serde_json::json!({"format_revision":16}),
     )
     .unwrap();
     for name in ["outbox", "mutations", "delegations"] {
         std::fs::create_dir_all(state.join(name)).unwrap();
     }
-    // Pending work journals are deliberately not executable test inputs. If
-    // resource refusal falls through to recovery it will fail/retry instead of
-    // returning the profile error; their exact bytes must stay untouched.
+    // The current format marker bypasses legacy instruction-source inspection.
+    // These sentinels isolate resource refusal before recovery or report replay;
+    // their exact bytes must stay untouched. Legacy journal validation is not
+    // part of this fixture's resource-profile error precedence assertion.
     let await_bytes = b"pending original await must not be read or sent";
     let handoff_bytes = b"pending child creation must not be replayed";
     std::fs::write(state.join("mutations/await.json"), await_bytes).unwrap();
@@ -118,7 +119,11 @@ async fn invalid_resource_profile_reaps_owned_process_and_retains_reports_withou
         .unwrap();
     peer.abort();
     let _ = peer.await;
-    assert!(result.unwrap_err().contains("resource profile unavailable"));
+    let error = result.unwrap_err();
+    assert!(
+        error.contains("resource profile unavailable"),
+        "unexpected worker refusal: {error}"
+    );
     assert!(
         stopped_by_worker,
         "worker itself must terminate the original child"
@@ -132,8 +137,8 @@ async fn invalid_resource_profile_reaps_owned_process_and_retains_reports_withou
     assert_eq!(process_records(&registry), 0);
     let operations = observed.lock().unwrap();
     assert!(
-        !operations.is_empty(),
-        "bounded retained-report cleanup still attempted"
+        operations.is_empty(),
+        "profile refusal before state-format admission must not replay retained reports"
     );
     assert!(
         operations.iter().all(|op| match op {

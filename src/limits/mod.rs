@@ -1,10 +1,25 @@
 //! Versioned operational policy. Values are data, never hidden consumer defaults.
+/// Selected gpt-6-astra context window: input, output and reasoning tokens together.
+/// Source: https://developers.openai.com/api/docs/models/gpt-6-astra (2026-10-15).
+pub const SELECTED_MODEL_CONTEXT_TOKENS: usize = 1_050_000;
+mod charter;
+pub use charter::CharterLimits;
 mod controller;
 mod interface;
 mod native;
+mod native_retry;
+pub use native_retry::{NativeRetryLimits, NativeCircuitLimits};
 mod product;
 mod worker;
-pub use controller::ControllerLimits;
+mod definition_updates;
+mod retention;
+mod workflow;
+mod governance;
+pub use governance::GovernanceLimits;
+pub use workflow::WorkflowLimits;
+pub use retention::{RetentionLimits, WorkerRetentionLimits};
+pub use definition_updates::{DefinitionLimitField, DefinitionUpdatePolicy};
+pub use controller::{ControllerLimits, StoreRetryLimits};
 pub use interface::InterfaceLimits;
 pub use native::NativeLimits;
 pub use product::{ProductLimits, RepositoryLimits};
@@ -72,6 +87,9 @@ impl TransportLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskDefaults {
+    /// Root routing only; accepted tasks retain the selected explicit definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub deadline_ms: u64,
     pub model_requests: u32,
     pub output_bytes: usize,
@@ -123,6 +141,24 @@ pub struct ExecutionLimitOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLimits {
+    /// Historical absence neither selects nor enforces governance rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<GovernanceLimits>,
+    /// Historical absence does not enable charter operations or synthesize a source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charter: Option<CharterLimits>,
+    /// Future accepted tasks only; historical absence enables no provider retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_retry: Option<NativeRetryLimits>,
+    /// Historical absence enables no new collaboration workflow operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowLimits>,
+    /// Historical absence grants no automatic deletion authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionLimits>,
+    /// Absent in historical metadata: no configuration writes are enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_updates: Option<DefinitionUpdatePolicy>,
     pub runtime: RuntimeThreadLimits,
     pub constraints: RepresentationConstraints,
     pub schema_version: u32,
@@ -148,6 +184,9 @@ pub struct LimitSnapshot {
 }
 impl RuntimeLimits {
     /// Explicit shipped seed data. Maintained startup loads the selected metadata file.
+    // Traceability scope: Selected byte framing and model-token defaults; actual load qualification is separate.
+    //= spec/impl/v2/implementation.md#maximum-context-defaults
+    //# Default context limits MUST use the maximum supported by the selected model and executor.
     pub fn seed() -> Result<Self, String> {
         Self::parse(include_bytes!("../../metadata/limits.json"))
     }
@@ -179,11 +218,20 @@ impl RuntimeLimits {
         }
         Self::parse(&bytes)
     }
+    //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+    //# An invalid or inconsistent limit configuration MUST be reported without silently clamping its values.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1 {
             return Err("unsupported limits metadata schema".into());
         }
         self.transport.validate()?;
+        if let Some(charter) = &self.charter {
+            charter.validate(self)?;
+        }
+        if let Some(retry) = &self.native_retry { retry.validate()?; }
+        if let Some(retention) = &self.retention {
+            retention.validate()?;
+        }
         self.runtime.validate()?;
         self.constraints.validate()?;
         if self.transport.http_header_bytes < self.constraints.http1_minimum_buffer_bytes {
@@ -197,12 +245,22 @@ impl RuntimeLimits {
         {
             return Err("invalid limits metadata revision".into());
         }
+        if let Some(policy) = &self.definition_updates {
+            policy.validate(&self.transport)?;
+        }
         self.controller.validate()?;
         self.worker.validate()?;
         self.product.validate()?;
+        self.product.validate_response(&self.transport)?;
         self.repository.validate()?;
         self.interface.validate()?;
         self.execution.validate()?;
+        if let Some(workflow) = &self.workflow {
+            workflow.validate(self)?;
+        }
+        if let Some(governance) = &self.governance {
+            governance.validate(self)?;
+        }
         self.validate_execution_transport(&self.execution)?;
         if self.product.page_items > self.controller.max_list_tasks
             || self.product.page_items > self.controller.collaboration_page_items
@@ -214,6 +272,10 @@ impl RuntimeLimits {
             || self.interface.mcp_caller_header_bytes > self.transport.http_header_bytes
         {
             return Err("interface limits cannot fit the transport limits".into());
+        }
+        if self.task_defaults.agent_id.as_ref().is_some_and(|id| id.is_empty()
+            || id.len() > self.transport.identity_bytes || id.chars().any(char::is_control)) {
+            return Err("invalid task_defaults.agent_id: transport.identity_bytes".into());
         }
         if self.task_defaults.deadline_ms == 0
             || self.task_defaults.model_requests == 0
@@ -239,8 +301,12 @@ impl RuntimeLimits {
     //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
     //# Global metadata MUST provide explicit defaults for limits without a more specific configured value.
     fn effective(&self, input: &crate::protocol::TaskInput) -> Result<ExecutionLimits, String> {
+        self.resolve_definition(&input.definition)
+    }
+    /// Complete validation for a future definition without inventing a task.
+    pub fn resolve_definition(&self, definition: &crate::protocol::Definition) -> Result<ExecutionLimits, String> {
         let mut v = self.execution.clone();
-        if let Some(o) = &input.definition.limit_overrides {
+        if let Some(o) = &definition.limit_overrides {
             if let Some(x) = &o.native {
                 v.native = x.clone();
             }
@@ -367,11 +433,13 @@ mod tests {
     use super::*;
     fn task() -> crate::protocol::TaskInput {
         let p = RuntimeLimits::seed().unwrap();
-        crate::protocol::TaskInput {
+        crate::protocol::TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             repository_read: None,
             instruction: "inspect".into(),
             definition: crate::protocol::Definition {
+                charter: None,
                 limit_overrides: None,
                 execution_profile: None,
                 inference: Some(crate::protocol::InferenceSettings::selected()),
@@ -454,13 +522,13 @@ mod tests {
         assert!(p.validate().unwrap_err().contains("http_header_bytes"));
     }
     #[test]
-    // Traceability scope: Checks unknown provider and executor-internal limits remain None; does not establish their external values.
+    // Traceability scope: Checks the selected provider context fact separately from still-unknown request and executor-inner quotas; no byte/token conversion.
     //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
     //= type=test
     //# The runtime MUST distinguish configured policy limits from non-configurable representation and external-service constraints.
     fn unknown_external_limits_stay_explicitly_unknown() {
         let p = RuntimeLimits::seed().unwrap();
-        assert!(p.constraints.provider_model_context_tokens.is_none());
+        assert_eq!(p.constraints.provider_model_context_tokens, Some(SELECTED_MODEL_CONTEXT_TOKENS as u64));
         assert!(p.constraints.provider_requests_per_minute.is_none());
         assert!(p.constraints.codex_inner_tool_calls.is_none());
     }
@@ -491,10 +559,11 @@ mod tests {
     #[test]
     fn browser_page_size_must_fit_both_controller_projections() {
         let mut p = RuntimeLimits::seed().unwrap();
-        p.product.page_items = p.controller.max_list_tasks + 1;
+        p.controller.max_list_tasks = p.product.page_items - 1;
         assert!(p.validate().unwrap_err().contains("product.page_items"));
         let mut p = RuntimeLimits::seed().unwrap();
-        p.controller.collaboration_page_items = p.product.page_items - 1;
+        p.product.page_items = p.controller.collaboration_page_items + 1;
+        p.controller.max_list_tasks = p.product.page_items;
         assert!(p.validate().unwrap_err().contains("product.page_items"));
     }
     #[test]
@@ -576,5 +645,47 @@ mod tests {
         assert_eq!(decoded, input);
         assert_eq!(std::mem::size_of::<Option<Box<LimitSnapshot>>>(), std::mem::size_of::<usize>());
         assert_eq!(std::mem::size_of::<Option<Box<ExecutionLimitOverrides>>>(), std::mem::size_of::<usize>());
+    }
+}
+
+
+#[cfg(test)]
+mod maximum_context_tests {
+    use super::*;
+    //= spec/impl/v2/implementation.md#maximum-context-defaults
+    //= type=test
+    //# Default context limits MUST use the maximum supported by the selected model and executor.
+    #[test]
+    fn maximum_context_defaults_use_framing_and_model_units_separately() {
+        let p=RuntimeLimits::seed().unwrap();
+        p.validate().unwrap();
+        let n=&p.execution.native;
+        assert_eq!([n.context_bytes,n.request_bytes,n.helper_value_bytes,n.response_wire_bytes],[u32::MAX as usize;4]);
+        assert_eq!(p.execution.coding.model_context_window,Some(SELECTED_MODEL_CONTEXT_TOKENS));
+        assert_eq!(p.constraints.provider_model_context_tokens,Some(SELECTED_MODEL_CONTEXT_TOKENS as u64));
+        assert_eq!(n.max_output_tokens,16_384);
+        let mut wrong=n.clone();wrong.context_bytes=u32::MAX as usize+1;
+        assert!(wrong.validate().unwrap_err().contains("context_bytes"));
+        let mut coding=p.execution.coding.clone();coding.model_context_window=Some(SELECTED_MODEL_CONTEXT_TOKENS+1);
+        assert!(coding.validate().unwrap_err().contains("model_context_window"));
+        coding.model_context_window=Some(0);assert!(coding.validate().is_err());
+    }
+    #[test]
+    fn absent_historical_coding_window_roundtrips_without_acquiring_default() {
+        let p=RuntimeLimits::seed().unwrap();
+        let mut prior=serde_json::to_value(&p.execution.coding).unwrap();
+        prior.as_object_mut().unwrap().remove("model_context_window");
+        let encoded=serde_json::to_vec(&prior).unwrap();
+        let decoded:CodingLimits=serde_json::from_slice(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.model_context_window,None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(),prior);
+        assert_eq!(serde_json::to_vec(&serde_json::to_value(&decoded).unwrap()).unwrap(),encoded);
+        let retained=include_str!("../../tests/fixtures/definition-update-old-worker-limits.json");
+        let value:serde_json::Value=serde_json::from_str(retained).unwrap();
+        let metadata:RuntimeLimits=serde_json::from_str(retained).unwrap();
+        metadata.validate().unwrap();
+        assert_eq!(metadata.execution.coding.model_context_window,None);
+        assert_eq!(serde_json::to_value(&metadata).unwrap(),value);
     }
 }

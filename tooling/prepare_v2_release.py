@@ -19,9 +19,9 @@ import time
 import urllib.parse
 
 MAX_BODY = 1_048_576
-WIRE_REVISION = 8
-VERIFIER_SHA = "1c0be524cf602bbe4649ade54672ae01f19775ce397643c26366f1690132041e"
-PROTOCOL_SOURCE_SHA = "9afd1f1c913e4d011fc2537e3d1894acbf7d3fc42e842283fdd581914d189a06"
+WIRE_REVISION = 23
+VERIFIER_SHA = "8a687969b22b11dfbd73e5c45e2c1e516a8117408a857d34b03e9fd98bf16d4b"
+PROTOCOL_SOURCE_SHA = "8ac0c2fe1a18781886cc283e5972f1356670a526769a67969bb0699262dffe3c"
 QUALIFICATION = {"artifact": "claimed", "repository_submission": "unconfigured",
                  "checks": "unconfigured", "human_rollout": "unconfigured"}
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -175,8 +175,14 @@ def endpoint(value: str) -> tuple[str, int]:
     return str(ip), port
 
 
-def request(operation: str, value: dict, stable_id: str) -> dict:
-    return {"protocol_revision": WIRE_REVISION, "request_id": operation + "-" + sha(stable_id.encode()), "operation": operation, "input": value}
+def selected_wire(value: int) -> int:
+    if type(value) is not int or value not in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23):
+        raise ValueError("explicit application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 or 23")
+    return value
+
+
+def request(operation: str, value: dict, stable_id: str, wire_revision: int = WIRE_REVISION) -> dict:
+    return {"protocol_revision": selected_wire(wire_revision), "request_id": operation + "-" + sha(stable_id.encode()), "operation": operation, "input": value}
 
 
 class Client:
@@ -325,9 +331,10 @@ def outcome(reply: dict, prepared: dict, accepted_attempt: str) -> tuple[str, di
 def original_input(path: Path, expected_sha: str, commit: str) -> tuple[dict, dict, dict]:
     old = read_json(path / "receipt.json")
     saved = read_json(path / "prepare-request.json")
+    original_wire = selected_wire(saved.get("protocol_revision"))
     if (old.get("expected_package_sha256") != expected_sha or old.get("expected_commit") != commit
             or old.get("prepare_request_sha256") != sha(canonical(saved))
-            or saved.get("operation") != "prepare_release" or saved.get("protocol_revision") != WIRE_REVISION):
+            or saved.get("operation") != "prepare_release"):
         raise ValueError("original request/external identity mismatch")
     supplied = saved.get("input")
     if not isinstance(supplied, dict) or set(supplied) != {"operation_id", "task_id", "expected_task_revision", "checkpoint", "artifact"}:
@@ -336,7 +343,7 @@ def original_input(path: Path, expected_sha: str, commit: str) -> tuple[dict, di
     identifier(supplied["task_id"])
     number(supplied["expected_task_revision"])
     checkpoint(supplied["checkpoint"], commit)
-    if saved != request("prepare_release", supplied, supplied["operation_id"]):
+    if saved != request("prepare_release", supplied, supplied["operation_id"], original_wire):
         raise ValueError("original request identity mismatch")
     identifier(old.get("accepted_attempt_id"))
     accepted_task = read_json(path / "accepted-task.json")
@@ -349,7 +356,8 @@ def original_input(path: Path, expected_sha: str, commit: str) -> tuple[dict, di
 
 def execute(action: str, controller: str, output: Path, expected_sha: str, commit: str,
             package_path: Path | None = None, task_id: str | None = None,
-            operation_id: str | None = None, previous: Path | None = None) -> dict:
+            operation_id: str | None = None, previous: Path | None = None,
+            wire_revision: int | None = None) -> dict:
     output = path_input(output)
     output.mkdir(mode=0o700)
     receipt = {"format": "borg-release-preparation/1", "action": action, "status": "failed", "controller": controller,
@@ -359,19 +367,26 @@ def execute(action: str, controller: str, output: Path, expected_sha: str, commi
     try:
         client = Client(controller, output, receipt)  # Validates origin but opens no socket.
         if action == "prepare":
+            target_wire = selected_wire(WIRE_REVISION if wire_revision is None else wire_revision)
+            receipt["target_protocol_revision"] = target_wire
             identifier(task_id)
             identifier(operation_id)
             package_path = path_input(package_path)
             art, manifest = artifact(package_path, expected_sha, commit)
             receipt["package"] = str(package_path)
             write_bytes(output / "verified-manifest.json", verifier().canonical(manifest))
-            current = data(client.call(request("get_task", {"task_id": task_id}, operation_id), "get-task"), "task")
+            current = data(client.call(request("get_task", {"task_id": task_id}, operation_id, target_wire), "get-task"), "task")
             revision, cp, accepted = task_binding(current, task_id, commit)
             prepared = {"operation_id": operation_id, "task_id": task_id, "expected_task_revision": revision, "checkpoint": cp, "artifact": art}
-            saved = request("prepare_release", prepared, operation_id)
+            saved = request("prepare_release", prepared, operation_id, target_wire)
         elif action in ("reconcile", "retry"):
             previous = path_input(previous)
             old, saved, current = original_input(previous, expected_sha, commit)
+            original_wire = saved["protocol_revision"]
+            target_wire = selected_wire(original_wire if wire_revision is None else wire_revision)
+            if action == "retry" and target_wire != original_wire:
+                raise ValueError("retry cannot rewrite the original mutation wire revision")
+            receipt["target_protocol_revision"] = target_wire
             package_path = path_input(Path(old["package"]))
             art, manifest = artifact(package_path, expected_sha, commit)
             if art != saved["input"]["artifact"]:
@@ -381,13 +396,13 @@ def execute(action: str, controller: str, output: Path, expected_sha: str, commi
             prepared, accepted = saved["input"], old["accepted_attempt_id"]
         else:
             raise ValueError("unsupported adapter action")
-        receipt.update(accepted_attempt_id=accepted, prepare_request_sha256=sha(canonical(saved)), operation_id=prepared["operation_id"],
+        receipt.update(original_protocol_revision=saved["protocol_revision"], accepted_attempt_id=accepted, prepare_request_sha256=sha(canonical(saved)), operation_id=prepared["operation_id"],
                        accepted_task_sha256=sha(canonical(current)))
         write_bytes(output / "accepted-task.json", canonical(current))
         write_bytes(output / "prepare-request.json", canonical(saved))
         save_receipt(output, receipt)  # Durable exact operation before any mutation.
         if action == "reconcile":
-            reply = client.call(request("get_operation", {"operation_id": prepared["operation_id"]}, prepared["operation_id"]), "lookup")
+            reply = client.call(request("get_operation", {"operation_id": prepared["operation_id"]}, prepared["operation_id"], target_wire), "lookup")
             if reply.get("status") == "refused" and reply.get("code") == "not_found":
                 if set(reply) != REPLY_CONTEXT | {"status", "code", "message"} or not isinstance(reply["message"], str):
                     raise ValueError("invalid lookup refusal")
@@ -435,6 +450,7 @@ def main() -> int:
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--expect-sha256", required=True)
         p.add_argument("--expect-commit", required=True)
+        p.add_argument("--protocol-revision", type=int, choices=(8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23), help="explicit target application wire; reconcile may use a newer wire without rewriting the original mutation")
         if action == "prepare":
             p.add_argument("--package", type=Path, required=True)
             p.add_argument("--task-id", required=True)
@@ -444,7 +460,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         result = execute(args.action, args.controller, args.output, args.expect_sha256, args.expect_commit,
-                         getattr(args, "package", None), getattr(args, "task_id", None), getattr(args, "operation_id", None), getattr(args, "original_receipt", None))
+                         getattr(args, "package", None), getattr(args, "task_id", None), getattr(args, "operation_id", None), getattr(args, "original_receipt", None), args.protocol_revision)
         print(json.dumps({"status": result["status"], "operation_id": result["operation_id"], "receipt": str(args.output / "receipt.json")}, sort_keys=True))
         return 0 if result["status"] == "prepared" else 2
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as error:

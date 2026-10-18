@@ -384,6 +384,9 @@ pub fn qualification_pause_next_blob(
     qualification::arm(repo)
 }
 
+// Traceability scope: The closed Git reader disables repository hooks, external helpers, text conversion and lazy fetch; this is not hostile same-UID containment.
+//= spec/impl/v2/implementation.md#repository-reads-through-the-shared-tool-interface
+//# An agent repository-read operation MUST NOT execute repository-supplied code.
 async fn git(
     repo: &Path,
     limits: &RepositoryLimits,
@@ -551,6 +554,9 @@ async fn tree(
     result.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(result)
 }
+// Traceability scope: The five query branches read exact objects without checkout or writes; optional Git locks and lazy fetch are disabled by the shared launcher.
+//= spec/impl/v2/implementation.md#repository-reads-through-the-shared-tool-interface
+//# An agent repository-read operation MUST NOT modify repository content.
 pub async fn read(
     config: &Config,
     limits: &RepositoryLimits,

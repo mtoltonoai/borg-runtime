@@ -13,9 +13,63 @@ import unittest
 from unittest.mock import patch
 
 import package_v2 as package
+import build_v2 as builder
+from selected_package_fixture import historical_build_files, selected_build_files
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class ReproduciblePathTests(unittest.TestCase):
+    def settings(self, prefix):
+        return builder.reproducible_environment(
+            Path(prefix) / "source", Path(prefix) / "sqlite",
+            {"paths": {"rustc": prefix + "/toolchain/bin/rustc"}},
+            {"CARGO_HOME": prefix + "/cargo", "CARGO_TARGET_DIR": prefix + "/target"})
+
+    def test_distinct_roots_map_all_compiler_roles_to_the_same_paths(self):
+        # This tests flag construction, not binary reproducibility. The real
+        # paired offline package build is a separately retained qualification.
+        for role in ("source", "sqlite", "cargo", "target", "toolchain"):
+            results = []
+            for prefix in ("/tmp/borg-short", "/tmp/borg-longer-separate-root"):
+                values = self.settings(prefix)
+                physical = prefix + "/" + role + "/nested/original.rs"
+                rust = values["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+                c = values["CFLAGS"].split()
+                for flags, kind in ((rust, "--remap-path-prefix="), (c, "-ffile-prefix-map=")):
+                    matches = [flag.removeprefix(kind).split("=", 1) for flag in flags
+                               if physical.startswith(flag.removeprefix(kind).split("=", 1)[0])]
+                    self.assertTrue(matches)
+                    source, target = matches[-1]
+                    results.append(target + physical[len(source):])
+                self.assertEqual(values["CFLAGS"], values["CXXFLAGS"])
+            self.assertEqual(results, ["/borg-build/" + role + "/nested/original.rs"] * 4)
+
+    def test_missing_or_ambiguous_roles_and_external_overrides_refuse(self):
+        tools = {"paths": {"rustc": "/tmp/selected/toolchain/bin/rustc"}}
+        selected = {"CARGO_HOME": "/tmp/selected/cargo", "CARGO_TARGET_DIR": "/tmp/selected/target"}
+        for key in selected:
+            with self.subTest(missing=key), self.assertRaisesRegex(ValueError, "explicit Cargo"):
+                builder.reproducible_environment(Path("/tmp/selected/source"), Path("/tmp/selected/sqlite"),
+                                                tools, {k: v for k, v in selected.items() if k != key})
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            builder.reproducible_environment(Path(selected["CARGO_HOME"]), Path("/tmp/selected/sqlite"), tools, selected)
+        for name in builder.BUILD_OVERRIDES:
+            with self.subTest(override=name), self.assertRaisesRegex(ValueError, "overrides"):
+                builder.reproducible_environment(Path("/tmp/selected/source"), Path("/tmp/selected/sqlite"),
+                                                tools, {**selected, name: "unselected"})
+
+    def test_package_pins_the_selected_normalization_and_builder(self):
+        self.assertEqual(package.ENV_PROFILE["path_normalization"], builder.PATH_NORMALIZATION)
+        self.assertEqual(package.BUILDER_SHA, package.digest(ROOT / "tooling/build_v2.py"))
+
+    def test_both_release_consumers_pin_the_selected_verifier(self):
+        import prepare_v2_release
+        import protected_release_v2
+        selected = package.digest(ROOT / "tooling/package_v2.py")
+        self.assertEqual(prepare_v2_release.VERIFIER_SHA, selected)
+        self.assertEqual(protected_release_v2.VERIFIER_SHA, selected)
 
 
 def fake_elf():
@@ -36,8 +90,10 @@ class PackageTests(unittest.TestCase):
         self.git("init", "--quiet")
         self.git("config", "user.email", "package-test@example.invalid")
         self.git("config", "user.name", "Package fixture")
-        for name in ("Cargo.toml", "Cargo.lock"):
-            (self.repo / name).write_bytes((ROOT / name).read_bytes())
+        for name, raw in selected_build_files().items():
+            (self.repo / name).write_bytes(raw)
+        # Compilation remains mocked. Exact selected Cargo bytes make the
+        # fixture usable by a separately loaded, unmodified package verifier.
         (self.repo / "src").mkdir()
         (self.repo / "src/main.rs").write_text("fn main() {}\n")
         (self.repo / "src/lib.rs").write_text("// private unit fixture\n")
@@ -126,6 +182,57 @@ class PackageTests(unittest.TestCase):
                 builder.assert_not_called()
                 self.assertEqual(json.loads((out / "receipt.json").read_text())["status"], "failed")
             (self.repo / name).write_bytes(original)
+
+    def test_selected_profile_matches_exact_current_cargo_inputs(self):
+        actual = {name: (ROOT / name).read_bytes() for name in ("Cargo.toml", "Cargo.lock")}
+        self.assertEqual(actual, selected_build_files())
+        self.assertEqual(package.PROFILE["cargo_manifest_sha256"], hashlib.sha256(actual["Cargo.toml"]).hexdigest())
+        self.assertEqual(package.PROFILE["cargo_lock_sha256"], hashlib.sha256(actual["Cargo.lock"]).hexdigest())
+
+    def test_historical_profile_is_not_silently_admitted_by_current_reader(self):
+        # Historical artifacts retain their original reader/recipe; selecting
+        # current exact Cargo inputs must not turn this reader into a fallback.
+        historical = historical_build_files()
+        self.assertNotEqual(historical, selected_build_files())
+        for name, raw in historical.items():
+            (self.repo / name).write_bytes(raw)
+        self.commit = self.commit_all()
+        out = self.root / "unselected-historical-profile"
+        with patch.object(package, "verify_archive"), patch.object(package, "verify_tool_files"), patch.object(package, "run_builder") as run:
+            with self.assertRaisesRegex(ValueError, "manifest/lock"):
+                package.build(self.repo, self.commit, out, self.archive, self.tools, self.cache)
+            run.assert_not_called()
+        self.assertEqual(json.loads((out / "receipt.json").read_text())["status"], "failed")
+        self.assertFalse((out / "borg-runtime.tar").exists())
+
+    def test_unselected_feature_change_refuses_before_builder(self):
+        path = self.repo / "Cargo.toml"
+        original = path.read_text()
+        self.assertEqual(original.count('features = ["rustls", "http2"]'), 1)
+        path.write_text(original.replace('features = ["rustls", "http2"]',
+                                         'features = ["rustls", "http2", "gzip"]'))
+        self.commit = self.commit_all()
+        out = self.root / "unselected-feature"
+        with patch.object(package, "verify_archive"), patch.object(package, "verify_tool_files"), patch.object(package, "run_builder") as run:
+            with self.assertRaisesRegex(ValueError, "manifest/lock"):
+                package.build(self.repo, self.commit, out, self.archive, self.tools, self.cache)
+            run.assert_not_called()
+        self.assertFalse((out / "borg-runtime.tar").exists())
+
+    def test_current_reader_refuses_historical_profile_in_canonical_package(self):
+        result = self.build(self.root / "good-current")
+        manifest = package.verify(self.root / "good-current/borg-runtime.tar", result["package_sha256"], self.commit)
+        historical = historical_build_files()
+        for name, raw in historical.items():
+            entry = manifest["source"]["files"][name]
+            entry.update(size=len(raw), sha256=hashlib.sha256(raw).hexdigest(),
+                         git_blob=hashlib.sha1(b"blob "+str(len(raw)).encode()+b"\0"+raw).hexdigest())
+        manifest["profile"]["cargo_manifest_sha256"] = hashlib.sha256(historical["Cargo.toml"]).hexdigest()
+        manifest["profile"]["cargo_lock_sha256"] = hashlib.sha256(historical["Cargo.lock"]).hexdigest()
+        out = self.root / "historical-profile.tar"
+        package.package_tar(out, self.root / "good-current/target/release/borg-runtime", manifest)
+        with self.assertRaisesRegex(ValueError, "manifest profile"):
+            package.verify(out, package.digest(out), self.commit)
 
     def test_symlinks_submodules_and_config_inputs_refuse(self):
         (self.repo / "link").symlink_to("src/main.rs")
@@ -240,8 +347,8 @@ class PackageTests(unittest.TestCase):
         self.git("init", "--quiet", "--object-format=sha256")
         self.git("config", "user.email", "package-test@example.invalid")
         self.git("config", "user.name", "Package fixture")
-        for name in ("Cargo.toml", "Cargo.lock"):
-            (self.repo / name).write_bytes((ROOT / name).read_bytes())
+        for name, raw in selected_build_files().items():
+            (self.repo / name).write_bytes(raw)
         (self.repo / "src").mkdir()
         (self.repo / "src/main.rs").write_text("fn main() {}\n")
         (self.repo / "src/lib.rs").write_text("// sha256 fixture\n")

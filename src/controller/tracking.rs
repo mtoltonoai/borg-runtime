@@ -219,6 +219,11 @@ fn canonical_location(path: &Path) -> Result<PathBuf, String> {
 
 impl Tracking {
     pub fn acquire(path: &Path, limits: &ControllerLimits) -> Result<Self, String> {
+        Self::acquire_cancellable(path, limits, &super::StartupCancellation::default())
+    }
+    pub(super) fn acquire_cancellable(path: &Path, limits: &ControllerLimits,
+        cancellation: &super::StartupCancellation) -> Result<Self, String> {
+        cancellation.check()?;
         let path = canonical_location(path)?;
         let storage = super::local_storage::LocalStorage::admit(&path, limits)?;
         let lock_path = suffixed(&path, ".controller-lock");
@@ -244,6 +249,7 @@ impl Tracking {
         storage.check_file(&lock)?;
         let until = Instant::now() + Duration::from_millis(limits.owner_lock_wait_ms);
         loop {
+            cancellation.check()?;
             // Only our already-owned ManagedProcess handles are observed here.
             // Reading another controller's on-disk registry is forbidden until
             // the exclusive owner and its durable association are established.
@@ -251,7 +257,8 @@ impl Tracking {
             match lock.try_lock() {
                 Ok(()) => break,
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < until => {
-                    std::thread::sleep(Duration::from_millis(limits.owner_lock_retry_ms))
+                    cancellation.wait(Duration::from_millis(limits.owner_lock_retry_ms)
+                        .min(until.saturating_duration_since(Instant::now())))?
                 }
                 Err(std::fs::TryLockError::WouldBlock) => return Err("controller owner lock unavailable: controller.owner_lock_wait_ms".into()),
                 Err(e) => return Err(format!("controller owner lock unavailable: {e}")),

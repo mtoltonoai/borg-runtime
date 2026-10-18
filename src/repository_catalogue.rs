@@ -12,6 +12,9 @@ pub struct Revision {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Registration {
+    /// Optional operator-owned provider target; immutable with this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_target: Option<crate::pull_request::Target>,
     pub repository_id: String,
     pub registration_revision: String,
     pub display_name: String,
@@ -36,6 +39,9 @@ impl Registration {
 //= spec/impl/v2/implementation.md#repository-associations-are-versioned-metadata
 //# A model-visible repository projection MUST NOT expose controller storage keys.
 pub struct Entry {
+    /// Capability only; private provider routing and credential selector stay hidden.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pull_request_available: bool,
     pub repository_id: String,
     pub registration_revision: String,
     pub display_name: String,
@@ -45,3 +51,5 @@ pub struct Entry {
     pub generation: u64,
     pub enabled_for_new_tasks: bool,
 }
+
+fn is_false(value: &bool) -> bool { !*value }

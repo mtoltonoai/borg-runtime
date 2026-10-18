@@ -1,5 +1,10 @@
 //! Read projections over the existing collaboration/controller store.
 //! These values are observations, never a grant, launch command or protected check.
+pub mod workflow;
+pub mod notifications;
+pub mod questions;
+pub mod documents;
+pub mod work;
 use crate::{protected_release::Check, protocol::*};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +31,7 @@ pub enum Query {
     Session {
         session_id: String,
     },
+    SessionInput { session_id: String },
     Sessions {
         agent_id: Option<String>,
         after: Option<String>,
@@ -166,6 +172,7 @@ pub enum QueryResult {
         execution: Option<Box<crate::limits::LimitSnapshot>>,
     },
     Session(Session),
+    SessionInput { session: Session, input: Box<TaskInput>, current: bool },
     Sessions(Page<Session>),
     Activity(ActivityPage),
     Tasks(crate::mcp::ListPage),

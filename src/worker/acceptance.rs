@@ -45,7 +45,29 @@ pub(super) async fn lookup(
     let Some(reply) = call(client, query.clone()).await else {
         return Ok(Lookup::Unavailable);
     };
-    let context = CommitContext::from_reply(&reply, &query)?;
+    lookup_reply(reply, &query, id, intended)
+}
+
+// Required native report recovery may wait for unavailable transport, but a
+// complete invalid response is never an availability retry signal.
+pub(super) async fn lookup_required(client: &ApiClient, id: &str, intended: &Operation) -> Result<Lookup, String> {
+    let query = Operation::GetOperation { operation_id: id.into() };
+    let reply = match tokio::time::timeout(
+        Duration::from_millis(client.limits().worker.acceptance_call_timeout_ms),
+        client.call_observed(query.clone()),
+    ).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(crate::client::CallFailure::Contract(error))) => return Err(error),
+        Ok(Err(crate::client::CallFailure::Unavailable(_))) | Err(_) => return Ok(Lookup::Unavailable),
+    };
+    if matches!(&reply.outcome, Outcome::Ok { data } if !matches!(data, Data::Operation(_))) {
+        return Err("required report lookup response kind differs".into());
+    }
+    lookup_reply(reply, &query, id, intended)
+}
+
+fn lookup_reply(reply: Reply, query: &Operation, id: &str, intended: &Operation) -> Result<Lookup, String> {
+    let context = CommitContext::from_reply(&reply, query)?;
     match reply.outcome {
         Outcome::Ok {
             data: Data::Operation(record),
@@ -263,6 +285,16 @@ pub(super) fn pending(
     limits: &crate::limits::RuntimeLimits,
 ) -> Result<bool, String> {
     Ok(!entries(outbox, false, limits)?.is_empty())
+}
+
+// Exact local attempt association, with all journal/context parsing retained.
+pub(super) fn pending_for(outbox: &Path, attempt: &Attempt, limits: &crate::limits::RuntimeLimits) -> Result<bool, String> {
+    for path in entries(outbox, false, limits)? {
+        let journal = read(&path, limits)?;
+        let report = &journal.original;
+        if report.task_id == attempt.task_id || report.attempt_id == attempt.id { return Ok(true); }
+    }
+    Ok(false)
 }
 
 pub(super) fn completed_decision(

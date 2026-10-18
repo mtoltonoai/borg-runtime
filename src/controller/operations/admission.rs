@@ -20,7 +20,9 @@ fn common_reason(
 ) -> Result<Option<String>> {
     //= spec/impl/v2/implementation.md#cancellation-commits-intent-before-interruption
     //# An automatic retry MUST wait until prior execution is known unable to continue.
-    let reason = if now >= t.task.input.limits.deadline_unix_ms {
+    let reason = if t.task.status == TaskStatus::Blocked || t.task.native_retry_block.is_some() {
+        Some("native_retry_blocked")
+    } else if now >= t.task.input.limits.deadline_unix_ms {
         Some("execution_deadline")
     } else if t.task.waiting_child_id.is_some() {
         Some("waiting_child")
@@ -31,6 +33,25 @@ fn common_reason(
     };
     if let Some(r) = reason {
         return Ok(Some(r.into()));
+    }
+    if let Some(reason) = super::super::governance_control::admission_reason(tx, &t.task.id, now)? {
+        return Ok(Some(reason));
+    }
+
+    // Traceability scope: Ordinary admission checks explicit open waits; collaboration adds no unconditional human-approval gate.
+    //= spec/impl/v2/implementation.md#collaboration-surfaces-preserve-existing-authority
+    //# The collaboration expansion MUST NOT require human approval of ordinary work that has no explicitly requested product wait.
+    //= spec/impl/v2/implementation.md#collaboration-waits-are-separate-from-execution-prerequisites
+    //# A task with an open collaboration wait MUST be ineligible for a new execution attempt.
+
+    if super::super::collaboration_work::admission_blocked(tx, &t.task.id)? {
+        return Ok(Some("workflow_wait".into()));
+    }
+    if super::super::collaboration_notifications::delivery_blocks_admission(tx, &t.task)? {
+        return Ok(Some("workflow_delivery_unresolved".into()));
+    }
+    if super::super::governance_completion::admission_blocked(tx, t, now)? {
+        return Ok(Some("governance_completion_blocked".into()));
     }
     if let Err(reason) = t.task.input.definition.required_inference() {
         return Ok(Some(reason.into()));
@@ -54,6 +75,12 @@ fn common_reason(
     }
     //= spec/impl/v2/implementation.md#cancellation-commits-intent-before-interruption
     //# An automatic retry MUST wait until relevant uncertain external effects are reconciled.
+    // Traceability scope: The selected provider interface has no outcome lookup for an unknown request; unresolved execution or effects therefore block admission instead of authorizing a resend.
+    //= spec/impl/v2/implementation.md#platform-owned-model-retries
+    //# A platform-owned retry of an uncertain provider effect MUST use the receiving interface's supported outcome reconciliation or deduplication before resending that effect.
+    // Traceability scope: This executor-independent uncertainty fence also prevents a supplied-executor successor admission from creating a session or repeating an uncertain start merely for a provider retry.
+    //= spec/impl/v2/implementation.md#platform-owned-model-retries
+    //# Platform recovery of a supplied executor MUST NOT create another session or repeat an uncertain start merely to implement a provider retry.
     if t.unresolved_execution
         || t.task.attempt.as_ref().is_some_and(|a| a.uncertain)
         || pending_effects(tx, &t.task.id)? > 0
@@ -103,6 +130,9 @@ fn remaining(tx: &Connection, t: &StoredTask) -> Result<u32> {
     Ok(u64::from(t.task.input.limits.model_requests)
         .saturating_sub(used.saturating_add(u64::from(t.delegated_model_requests))) as u32)
 }
+// Traceability scope: Executor-specific active attempts are compared with the registered worker capacity before a RunAttempt can be committed; this does not install host resource controls.
+//= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
+//# Admission MUST enforce configured queue and resource bounds.
 fn worker_room(tx: &Connection, worker: &Worker, kind: ExecutorKind) -> Result<bool> {
     let capacity = match kind {
         ExecutorKind::Coding => worker.coding_capacity,
@@ -119,7 +149,7 @@ fn worker_room(tx: &Connection, worker: &Worker, kind: ExecutorKind) -> Result<b
 // Traceability scope: Allocates a successor attempt/generation for the same task.
 //= spec/impl/v2/implementation.md#interrupted-work-is-reconciled
 //# Recovery that cannot resume available saved executor history MUST create a new attempt.
-fn proposal(tx: &Connection, t: &StoredTask, worker: &Worker, remaining: u32) -> Result<Decision> {
+fn proposal(tx: &Connection, t: &StoredTask, worker: &Worker, remaining: u32, now: u64) -> Result<Decision> {
     if crate::task_tool::enabled(&t.task.input) && remaining < 2 {
         return Ok(Decision::BudgetExhausted);
     }
@@ -163,6 +193,25 @@ fn proposal(tx: &Connection, t: &StoredTask, worker: &Worker, remaining: u32) ->
     session
         .validate_for(&attempt, &input)
         .map_err(|_| Fault::Store("session launch binding mismatch".into()))?;
+
+    // Traceability scope: Resolved wait references join the ordinary durable RunAttempt command for the same task and session.
+    //= spec/impl/v2/implementation.md#committed-resolutions-reach-their-consumers
+    //# A committed resolution that makes a waiting task eligible MUST wake it through the existing platform command mechanism.
+
+    let workflow_continuation = if let Some(limits) = tx.limits.workflow.as_ref() {
+        let resolved_waits = super::super::collaboration_work::pending_resolution_refs(tx, &t.task.id, limits)?;
+        if resolved_waits.is_empty() { None } else {
+            if !matches!(t.task.input.definition.execution_profile, Some(ExecutionProfile::CollaborationV2 { .. }))
+                || t.task.input.resolved_limits.as_ref().is_none_or(|accepted| accepted.global_metadata.workflow.is_none()) {
+                return Ok(Decision::Blocked("workflow_delivery_profile_unavailable".into()));
+            }
+            Some(crate::collaboration::workflow::WorkflowContinuation {
+                task_id: t.task.id.clone(), session_id: t.task.session_id.clone(), resolved_waits,
+            })
+        }
+    } else { None };
+    // Read the old stopped owner before await_commands replaces its attempt.
+    let completion_continuation = super::super::governance_completion::resume_for_admission(tx, t, now)?;
     let command = WorkerCommand::RunAttempt {
         session,
         command_id: format!("run-{}", attempt.id),
@@ -173,6 +222,8 @@ fn proposal(tx: &Connection, t: &StoredTask, worker: &Worker, remaining: u32) ->
         //# A recorded executor conversation identifier MUST NOT be treated as a durable checkpoint by itself.
         checkpoint: t.task.selected_checkpoint.clone(),
         continuation: t.task.completed_child.clone(),
+        workflow_continuation,
+        completion_continuation,
     };
     if bounded_json_size(&command, tx.limits.controller.run_command_bytes).is_err() {
         return Ok(Decision::Blocked(
@@ -199,7 +250,7 @@ pub(super) fn check(
     if !worker_room(tx, worker, t.task.input.definition.executor)? {
         return Ok(Decision::Blocked("executor_capacity".into()));
     }
-    proposal(tx, t, worker, remaining(tx, t)?)
+    proposal(tx, t, worker, remaining(tx, t)?, now)
 }
 
 //= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
@@ -229,7 +280,7 @@ pub(super) fn current_reason(
             continue;
         }
         capacity = true;
-        match proposal(tx, t, &worker, remaining)? {
+        match proposal(tx, t, &worker, remaining, now)? {
             Decision::Ready { command, .. } => {
                 let existing =
                     super::delivery_snapshot(tx, &worker.id, &worker.incarnation, cfg, true)?;

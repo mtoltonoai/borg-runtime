@@ -100,7 +100,9 @@ def load_recipe(path,config,subject):
     roles=cc.get('producers');workers=cc.get('worker_uids');checks=cc.get('required_checks')
     if not isinstance(roles,list) or not 1<=len(roles)<=1024 or not all(isinstance(x,dict) and set(x)=={'id','uid','role'} and integer(x['uid'],0,2**32-1) and x['role'] in {'checker','repository','human','rollout'} for x in roles):raise ValueError('controller producer inventory')
     ids=[x['uid'] for x in roles]
-    if len(set(ids))!=len(ids) or not isinstance(workers,list) or not all(integer(x,0,2**32-1) for x in workers) or any(x in workers for x in ids):raise ValueError('controller worker/producer identities overlap')
+    role_ids=[(x['uid'],x['role']) for x in roles]
+    names=[x['id'] for x in roles]
+    if not all(isinstance(x,str) and x for x in names) or len(set(names))!=len(names) or len(set(role_ids))!=len(role_ids) or not isinstance(workers,list) or not all(integer(x,0,2**32-1) for x in workers) or any(x in workers for x in ids):raise ValueError('controller worker/producer identities overlap')
     if r['execution_uid'] not in workers or r['execution_uid'] in ids:raise ValueError('execution identity is not an unprivileged configured worker')
     if not any(x['uid']==config['producer_uid'] and x['role']=='checker' for x in roles):raise ValueError('producer is not the configured checker')
     if not isinstance(checks,list) or not checks or len(set(checks))!=len(checks) or set(checks)!=(set(required)|{'package_integrity'}):raise ValueError('mandatory checks differ from controller configuration')

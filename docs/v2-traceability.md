@@ -1,5 +1,16 @@
 # v2 Requirement Audit
 
+The memory-notification retirement on 2026-10-16 removes seven v2 requirements;
+the other 419 exact requirements remain. Automatic memory delivery is no longer
+an open qualification requirement. Explicit memory operations, resolution and
+charter delivery keep their own requirements. The reports and notification tests
+below remain historical, bound to their original source and requirement counts.
+Current retirement reporting is recorded separately under
+`artifacts/v2/memory-notification-removal-wkfepzjc`; planning associations do not
+establish executed acceptance or installed activation.
+
+## Historical Reports
+
 The latest [native association report](../artifacts/v2/build-60156282/repository-current-implementation-report-09/completion.json) captures maintained source at 2026-10-15 13:07:26 UTC against 240 exact v2 main requirements. It records 165 implementation associations (68.75%), 154 test associations (64.17%) and 154 paired associations (64.17%), with zero partial, unmatched or stale references. Normal/strict exits are 0/1 because coverage remains incomplete. All original 223 identities remain; 17 metadata-driven repository clauses were added earlier. The [preceding exact delta](../artifacts/v2/build-60156282/repository-current-implementation-report-08/association-delta.json) added 20 implementation and 17 test associations. The [current exact delta](../artifacts/v2/build-60156282/repository-current-implementation-report-09/association-delta.json) adds two TEST associations from executed native boundary discriminators, retaining all requirements, implementation links and prior test links. The 75 requirements without implementation links are not a count of missing features.
 
 The [current rollout integration](../artifacts/v2/build-60156282/metadata-limits-v41pfogc/protected-rollout-integration-01/run-03/receipt.json) passes 26 affected Python cases and 17 actual controller cases, including all three original-receipt/lost-acknowledgment scenarios. Production guards and the historical package remain unchanged; a verified private package copy corrects the fixture-only failure. Controlled service seams do not qualify installed host roles, SSH, cgroups or actual rollout. The [current memory sizing run](../artifacts/v2/build-60156282/metadata-limits-v41pfogc/memory-batch-identity-sizing-01/run-01/receipt.json) passes 27 affected cases; the old-source rejection and its separate wrapper-classification correction remain retained. Report09 binds all 135 native inputs and separately seven unchanged supplemental Python producer/test inputs. The earlier rollout and memory executions retain their original source bindings; they were not all rerun for the annotation-only production change. The [one affected native memory case](../artifacts/v2/build-60156282/metadata-limits-v41pfogc/checkpoint-26/test-01/receipt.json) passed on checkpoint26 source and proves no session creation in that controlled notice journey; the same case also passes in checkpoint27's full 15-case native target. Supplemental input binding is not native coverage.

@@ -1,6 +1,9 @@
 //! Real controller and two worker processes, faulted loopback transport, local
 //! Git, and a controlled Codex-protocol peer. This is not real Codex/provider
 //! qualification. Every subprocess executes a retained copy of the same binary.
+#[path = "support/retained_images.rs"]
+mod retained_images;
+
 use borg_runtime::{client::ApiClient, limits::RuntimeLimits, protocol::*};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -32,6 +35,7 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const TIMEOUT: Duration = Duration::from_secs(30);
 fn selected_definition(id: &str, executor: ExecutorKind) -> Definition {
     Definition {
+        charter: None,
         limit_overrides: None,
         id: id.into(),
         revision: "1".into(),
@@ -154,6 +158,8 @@ enum Fault {
     RefusePrepare,
     ObserveMissingTask,
     DuplicateLaunch,
+    StaleIncarnationLaunch,
+    WrongWorkerLaunch,
     DropDelegation,
 }
 struct FaultState {
@@ -162,6 +168,11 @@ struct FaultState {
     duplicates: usize,
     settlements: usize,
     missing_task_lookups: usize,
+    launch_original: Option<(Request, Reply)>,
+    launch_barrier_seen: bool,
+    launch_current_released: bool,
+    launch_gate: tokio::sync::watch::Sender<bool>,
+    initial_start_reports: usize,
 }
 struct FaultEvent {
     original: Request,
@@ -184,6 +195,11 @@ impl Proxy {
             duplicates: 0,
             settlements: 0,
             missing_task_lookups: 0,
+            launch_original: None,
+            launch_barrier_seen: false,
+            launch_current_released: false,
+            launch_gate: tokio::sync::watch::channel(false).0,
+            initial_start_reports: 0,
         }));
         let (send, events) = mpsc::channel(8);
         let shared = state.clone();
@@ -255,6 +271,36 @@ impl Proxy {
                                     }
                                     assert_eq!(path,"/api/operations");
                                     let original:Request=serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                                    // The next distinct poll is reached only after processing the
+                                    // injected batch. Hold it BEFORE upstream long polling. Every
+                                    // retransmission shares this gate, so a lost transport cannot
+                                    // accidentally release the genuine command during inspection.
+                                    let launch_barrier = {
+                                        let mut state=state.lock().unwrap();
+                                        if matches!(state.fault,Fault::StaleIncarnationLaunch|Fault::WrongWorkerLaunch) {
+                                            if matches!(&original.command,Operation::ObserveWorker{report}
+                                                if report.report_id.ends_with("-initial-start")) {
+                                                state.initial_start_reports+=1;
+                                                save(evidence.join(format!("launch-initial-start-{}.json",state.initial_start_reports)),&original);
+                                            }
+                                            if matches!(&original.command,Operation::AwaitCommands{..})
+                                                && !state.launch_current_released {
+                                                state.launch_original.clone().map(|(prior,reply)| {
+                                                    assert_ne!(original.command.mutation_id(),prior.command.mutation_id(),"barrier must be the next command occurrence");
+                                                    let first=!state.launch_barrier_seen;
+                                                    state.launch_barrier_seen=true;
+                                                    (first,reply,state.launch_gate.subscribe())
+                                                })
+                                            } else {None}
+                                        } else {None}
+                                    };
+                                    if let Some((first,prior_reply,mut gate))=launch_barrier {
+                                        if first {
+                                            save(evidence.join("launch-processing-barrier.json"),&json!({"next_request":original,"prior_reply":prior_reply,"forwarded":false}));
+                                            send.send(FaultEvent{original:original.clone(),reply:prior_reply,release:None}).await.map_err(io::Error::other)?;
+                                        }
+                                        while !*gate.borrow_and_update() {gate.changed().await.map_err(io::Error::other)?;}
+                                    }
                                     let withheld = {
                                         let mut state = state.lock().unwrap();
                                         if matches!(original.command, Operation::SettleOperation {..}) { state.settlements += 1; }
@@ -282,6 +328,35 @@ impl Proxy {
                                     let response=client.post(format!("{upstream}/api/operations")).header("content-type","application/json").body(bytes.to_vec()).send().await.map_err(io::Error::other)?;
                                     let bytes=response.bytes().await.map_err(io::Error::other)?;
                                     let mut reply:Reply=serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                                    {
+                                        let mut state=state.lock().unwrap();
+                                        if matches!(state.fault,Fault::StaleIncarnationLaunch|Fault::WrongWorkerLaunch) {
+                                            let genuine=reply.clone();
+                                            if let Outcome::Ok{data:Data::Commands(commands)}=&mut reply.outcome {
+                                                if state.launch_original.is_none() && commands.iter().any(|c|matches!(c,WorkerCommand::RunAttempt{..})) {
+                                                    assert_eq!(commands.len(),1,"one genuine launch isolates this guard");
+                                                    let mut injected=commands[0].clone();
+                                                    let WorkerCommand::RunAttempt{session,attempt,task,..}=&mut injected else {unreachable!()};
+                                                    session.validate_for(attempt,task).unwrap();
+                                                    if matches!(state.fault,Fault::StaleIncarnationLaunch) {
+                                                        attempt.worker_incarnation="earlier-incarnation".into();
+                                                    } else {attempt.worker_id="other-worker".into();}
+                                                    session.validate_for(attempt,task).unwrap();
+                                                    commands[0]=injected;
+                                                    state.launch_original=Some((original.clone(),genuine.clone()));
+                                                    save(evidence.join("launch-original-and-injected.json"),&json!({"request":original,"original_reply":genuine,"injected_reply":reply}));
+                                                } else if state.launch_barrier_seen && !state.launch_current_released {
+                                                    let (_,prior)=state.launch_original.as_ref().unwrap();
+                                                    let Outcome::Ok{data:Data::Commands(first)}=&prior.outcome else {unreachable!()};
+                                                    assert_eq!(commands.as_slice(),first.as_slice(),"controller must redeliver the unacknowledged original command");
+                                                    commands.extend(first.clone());
+                                                    state.duplicates+=1;
+                                                    state.launch_current_released=true;
+                                                    save(evidence.join("launch-current-and-duplicate.json"),&json!({"request":original,"reply":reply}));
+                                                }
+                                            }
+                                        }
+                                    }
                                     let missing_observed = {
                                         let mut state = state.lock().unwrap();
                                         if matches!(state.fault, Fault::ObserveMissingTask)
@@ -371,8 +446,10 @@ struct Lab {
 }
 impl Lab {
     async fn new(label: &str) -> Self {
-        let base =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v2/build-60156282/recovery/runs");
+        Self::new_with_private_image(label, false).await
+    }
+    async fn new_with_private_image(label: &str, private: bool) -> Self {
+        let base = retained_images::artifact_root().join("recovery/runs");
         fs::create_dir_all(&base).unwrap();
         // PIDs are reused by sandbox namespaces. Allocate the case directory
         // exclusively BEFORE writing any subject/evidence, even on a clock tie.
@@ -408,7 +485,7 @@ impl Lab {
         let input = std::env::var_os("BORG_RECOVERY_BINARY")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_borg-runtime")));
-        fs::copy(input, &image).unwrap();
+        retained_images::materialize(&input, &image, private);
         let mut pins = vec![
             image.clone(),
             limits_path,
@@ -416,6 +493,7 @@ impl Lab {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
             Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/recovery.rs"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/retained_images.rs"),
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/recovery/fixtures/codex_protocol.py"),
         ];
         for folder in ["src", "tests/recovery"] {
@@ -449,6 +527,7 @@ impl Lab {
             ],
         );
         let repository = Repository {
+            pull_request_target: None,
             registration: Some(borg_runtime::repository_catalogue::Revision {
                 repository_id: "recovery-repository".into(), registration_revision: "initial".into(),
             }),
@@ -493,6 +572,7 @@ impl Lab {
         let registered = lab.client.call(Operation::RegisterRepository {
             operation_id: "register-recovery-repository".into(),
             registration: borg_runtime::repository_catalogue::Registration {
+                pull_request_target: None,
                 repository_id: binding.repository_id.clone(),
                 registration_revision: binding.registration_revision.clone(),
                 display_name: "Recovery fixture repository".into(),
@@ -644,10 +724,12 @@ impl Lab {
         selected
     }
     fn input(&self, agent: &str) -> TaskInput {
-        TaskInput {
+        TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             instruction: "Set answer.txt to after, preserving only the intended source.".into(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(InferenceSettings::selected()),
                 execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -813,6 +895,66 @@ fn stale_report(a: &Attempt, id: &str) -> Operation {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acknowledged_coding_turn_eof_retains_uncertainty_and_refuses_retry() {
+    let mut lab = Lab::new("coding-ack-eof").await;
+    let original = lab.submit("coding-ack-eof-submit", "coding-ack-eof-agent").await;
+    let origin = lab.origin.clone();
+    lab.start_worker("coding-ack-eof-worker", "initial", &origin);
+    let mut gate = lab.gate().await;
+    // The existing peer sends the exact turn/start ACK before this barrier.
+    // Anything except G makes it exit without any turn terminal notification.
+    let observed = gate.observed.clone();
+    let running = lab.until(&original.id, "initial turn association", |task| {
+        task.attempt.as_ref().is_some_and(|attempt| attempt.phase == AttemptPhase::Running)
+    }).await;
+    let attempt = running.attempt.as_ref().unwrap().clone();
+    let state = lab.root.join("coding-ack-eof-worker/.borg-worker")
+        .join(borg_runtime::worker::process::component("coding-ack-eof-worker"));
+    let thread = state.join("codex")
+        .join(borg_runtime::worker::process::component(&attempt.id)).join("borg-thread.json");
+    let until = Instant::now() + TIMEOUT;
+    let (association_bytes, association) = loop {
+        let bytes = fs::read(&thread).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        if value["turn_id"] == observed["turn"] { break (bytes, value); }
+        assert!(Instant::now() < until, "original turn ACK was not retained");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(association["thread_id"], observed["thread"]);
+    assert_eq!(association["turn_id"], observed["turn"]);
+    gate.stream.write_all(b"E").await.unwrap();
+    drop(gate);
+    let stopped = lab.until(&original.id, "acknowledged turn EOF and actual stop", |task| {
+        task.status == TaskStatus::Failed && task.attempt.as_ref().is_some_and(|attempt| attempt.stopped)
+    }).await;
+    assert_eq!(stopped.input, original.input);
+    assert_eq!(stopped.attempt.as_ref().unwrap().id, attempt.id);
+    assert!(stopped.result.is_none());
+    assert_eq!(fs::read(&thread).unwrap(), association_bytes);
+    let bridge: borg_runtime::worker::codex_mcp::Config = serde_json::from_slice(
+        &fs::read(thread.parent().unwrap().join("borg-collaboration-config.json")).unwrap()).unwrap();
+    assert_eq!(borg_runtime::worker::codex_mcp::outcome_disposition(&bridge).unwrap(),
+        borg_runtime::worker::codex_mcp::OutcomeDisposition::NoCalls);
+    let retried = lab.client.call(Operation::RetryTask {
+        operation_id: "coding-ack-eof-retry".into(), task_id: original.id.clone(),
+        expected_revision: stopped.revision,
+    }).await.unwrap();
+    save(lab.root.join("coding-ack-eof-observation.json"),
+        &json!({"task":stopped,"retry":retried,"association":association,"executor_start":observed}));
+    assert!(matches!(&retried.outcome, Outcome::Refused {code,..} if code == "reconciliation_required"),
+        "an acknowledged turn without a terminal event is unresolved: {retried:?}");
+    assert!(stopped.attempt.as_ref().unwrap().uncertain);
+    assert!(tokio::time::timeout(Duration::from_millis(200), lab.gate.accept()).await.is_err(),
+        "unknown original turn was dispatched again");
+    lab.restart_controller().await;
+    let reopened = lab.get(&original.id).await;
+    assert!(reopened.attempt.as_ref().unwrap().uncertain);
+    assert_eq!(reopened.attempt.as_ref().unwrap().id, attempt.id);
+    assert_eq!(lab.starts.len(), 1);
+    lab.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 //= spec/impl/v2/implementation.md#accepted-state-has-one-durable-owner
 //# An accepted task MUST have a durable input record.
 //= spec/impl/v2/implementation.md#accepted-state-has-one-durable-owner
@@ -891,6 +1033,108 @@ async fn lost_submission_reply_restart_and_duplicate_launch_execute_once() {
     assert_eq!(lab.get(&a.id).await.result, a.result);
     assert_eq!(lab.get(&b.id).await.result, b.result);
     lab.close();
+}
+
+fn assert_launch_path_absent(path: &Path) {
+    assert!(matches!(fs::symlink_metadata(path),Err(error) if error.kind()==io::ErrorKind::NotFound),
+        "unexpected local launch record or unreadable path: {}",path.display());
+}
+
+async fn rejected_launch_then_current_and_duplicate(fault: Fault, label: &str) {
+    let mut lab=Lab::new(label).await;
+    let accepted=lab.submit("launch-owner-submission","launch-owner-agent").await;
+    let mut proxy=Proxy::new(lab.origin.clone(),fault,lab.root.clone(),lab.limits.transport.body_bytes).await;
+    let worker=lab.start_worker("worker-a","current-incarnation",&proxy.url);
+    let barrier=proxy.event().await;
+    let (first_request,first_reply)=proxy.state.lock().unwrap().launch_original.clone().unwrap();
+    assert_ne!(first_request.command.mutation_id(),barrier.original.command.mutation_id());
+    assert!(matches!(&barrier.original.command,Operation::AwaitCommands{worker_id,incarnation,acknowledged,..}
+        if worker_id=="worker-a"&&incarnation=="current-incarnation"&&acknowledged.is_empty()));
+    let Outcome::Ok{data:Data::Commands(commands)}=&first_reply.outcome else {panic!("genuine controller launch missing")};
+    assert_eq!(commands.len(),1);
+    let genuine=commands[0].clone();
+    let WorkerCommand::RunAttempt{command_id,session,attempt,task,..}=&genuine else {panic!("expected RunAttempt")};
+    assert_eq!(attempt.task_id,accepted.id);assert_eq!(attempt.worker_id,"worker-a");
+    assert_eq!(attempt.worker_incarnation,"current-incarnation");
+    session.validate_for(attempt,task).unwrap();
+    let injected:Value=serde_json::from_slice(&fs::read(lab.root.join("launch-original-and-injected.json")).unwrap()).unwrap();
+    let injected_reply:Reply=serde_json::from_value(injected["injected_reply"].clone()).unwrap();
+    let Outcome::Ok{data:Data::Commands(altered)}=injected_reply.outcome else {unreachable!()};
+    let mut expected=genuine.clone();
+    let WorkerCommand::RunAttempt{attempt:changed,..}=&mut expected else {unreachable!()};
+    match fault {Fault::StaleIncarnationLaunch=>changed.worker_incarnation="earlier-incarnation".into(),
+        Fault::WrongWorkerLaunch=>changed.worker_id="other-worker".into(),_=>unreachable!()}
+    assert_eq!(altered,vec![expected]);
+    let WorkerCommand::RunAttempt{session,attempt:altered_attempt,task,..}=&altered[0] else {unreachable!()};
+    session.validate_for(altered_attempt,task).unwrap();
+
+    // The receipt is written synchronously before the later controller admission
+    // gate. Its absence discriminates the early guard even if a broken guard
+    // would subsequently be refused before creating a workspace or executor.
+    let component=borg_runtime::worker::process::component;
+    let workspace=lab.root.join("worker-a");
+    let state=workspace.join(".borg-worker").join(component("worker-a"));
+    let receipt=state.join("commands").join(format!("{}.json",component(command_id)));
+    let initial=format!("{}-initial-start",attempt.id);
+    assert_launch_path_absent(&receipt);
+    for extension in ["json","refused","outcome"] {
+        assert_launch_path_absent(&state.join("outbox").join(format!("{}.{}",component(&initial),extension)));
+    }
+    assert_eq!(proxy.state.lock().unwrap().initial_start_reports,0);
+    assert!(matches!(lab.client.call(Operation::GetOperation{operation_id:initial.clone()}).await.unwrap().outcome,
+        Outcome::Refused{code,..} if code=="not_found"));
+    assert_launch_path_absent(&workspace.join("workspaces").join(component(&attempt.id)));
+    assert_launch_path_absent(&state.join("processes").join(component(&attempt.id)));
+    assert!(lab.workers[worker].child.try_wait().unwrap().is_none(),"stale command must not terminate worker");
+    assert!(lab.starts.is_empty());
+    assert!(tokio::time::timeout(Duration::from_millis(100),lab.gate.accept()).await.is_err(),
+        "rejected command unexpectedly launched the supplied executor");
+    save(lab.root.join("launch-refusal-oracles.json"),&json!({"command_id":command_id,"attempt":attempt,
+        "command_receipt_absent":true,"initial_start_absent":true,"workspace_absent":true,"process_registry_absent":true,
+        "worker_alive":true,"next_await_operation":barrier.original.command.mutation_id()}));
+
+    proxy.state.lock().unwrap().launch_gate.send(true).unwrap();
+    let gate=lab.gate().await;
+    assert_eq!(gate.observed["cwd"],workspace.join("workspaces").join(component(&attempt.id)).to_string_lossy().as_ref());
+    let recorded:Value=serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(recorded["command"],serde_json::to_value(&genuine).unwrap());
+    assert_eq!(recorded["effects_started"],true);
+    gate.release().await;
+    let completed=lab.successful(&accepted.id).await;
+    let current=completed.attempt.as_ref().unwrap();
+    assert_eq!(current.id,attempt.id);assert_eq!(current.worker_id,"worker-a");
+    assert_eq!(current.worker_incarnation,"current-incarnation");
+    assert_eq!(completed.input,accepted.input);
+    assert_eq!(lab.starts.len(),1);
+    assert_eq!(proxy.state.lock().unwrap().duplicates,1);
+    assert_eq!(proxy.state.lock().unwrap().initial_start_reports,1);
+    let recorded:Value=serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(recorded["command"],serde_json::to_value(&genuine).unwrap());
+    let reply=lab.client.call(Operation::GetOperation{operation_id:initial}).await.unwrap();
+    let Outcome::Ok{data:Data::Operation(record)}=reply.outcome else {panic!("original current start receipt missing")};
+    let Operation::ObserveWorker{report}=serde_json::from_value(record.intended).unwrap() else {unreachable!()};
+    assert_eq!(report.worker_id,attempt.worker_id);assert_eq!(report.incarnation,attempt.worker_incarnation);
+    assert_eq!(report.attempt_id,attempt.id);assert_eq!(report.task_id,attempt.task_id);
+    assert!(matches!(report.observation,Observation::Started{thread_id:None,turn_id:None}));
+    assert!(matches!(serde_json::from_value::<Outcome>(record.outcome.unwrap()).unwrap(),Outcome::Ok{..}));
+    assert!(tokio::time::timeout(Duration::from_millis(100),lab.gate.accept()).await.is_err(),"exact duplicate launched twice");
+    lab.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+//= spec/impl/v2/implementation.md#worker-commands-do-not-create-duplicate-execution
+//# A worker MUST reject a launch addressed to an earlier incarnation.
+// Scope: genuine controller command with only incarnation altered; next-poll
+// processing barrier proves no local receipt/start/workspace before exact retry.
+async fn stale_incarnation_launch_has_no_receipt_and_current_duplicate_executes_once() {
+    Box::pin(rejected_launch_then_current_and_duplicate(Fault::StaleIncarnationLaunch,"stale-launch")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Scope: foreign worker dispatch is refused before a local command receipt or
+// workspace; this is not a claim about every possible workspace mutation path.
+async fn wrong_worker_launch_has_no_receipt_and_current_duplicate_executes_once() {
+    Box::pin(rejected_launch_then_current_and_duplicate(Fault::WrongWorkerLaunch,"foreign-launch")).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1424,6 +1668,10 @@ async fn registration_and_command_ack_loss_reconcile_before_fresh_incarnation() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Traceability scope: Pending/refused original preparation leaves the exact Git ref absent; the accepted preparation publishes it. Controlled local Git and executor boundary.
+//= spec/impl/v2/implementation.md#checkpoint-publication-is-reconciled
+//= type=test
+//# A checkpoint publication MUST have a durable operation record before it is sent.
 async fn checkpoint_publication_waits_for_durable_prepare_before_git_push() {
     for (label, mode) in [
         ("prepare-pending", Fault::PendingPrepare),
@@ -1698,17 +1946,19 @@ async fn native_coding_continuation_survives_lost_delegation_reply_and_fresh_pro
     )
     .await;
     let deadline = now() + 120_000;
-    let input = TaskInput {
+    let input = TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         instruction: "Use the configured coding task to correct the source, then report its accepted outcome.".into(),
-        definition: Definition { limit_overrides: None, inference:Some(InferenceSettings::selected()), execution_profile:Some(ExecutionProfile::CollaborationV1 { web_search:None }), id: "native-parent".into(), revision: "1".into(), executor: ExecutorKind::Native }, repository: None, repository_read: None, acceptance_commands: vec![],
+        definition: Definition { charter: None, limit_overrides: None, inference:Some(InferenceSettings::selected()), execution_profile:Some(ExecutionProfile::CollaborationV1 { web_search:None }), id: "native-parent".into(), revision: "1".into(), executor: ExecutorKind::Native }, repository: None, repository_read: None, acceptance_commands: vec![],
         output_schema: Some(json!({"type":"object","required":["answer"],"properties":{"answer":{"type":"string"}},"additionalProperties":false})),
         limits: Limits { deadline_unix_ms: deadline, model_requests: 3, output_bytes: 4096, result_bytes: lab.limits.task_defaults.result_bytes, max_delegation_depth: 2 },
         dependencies: vec![],
         native_workflow: Some(Box::new(NativeWorkflow::CodingThenContinue {
-            child: CodingTaskTemplate {
+            child: CodingTaskTemplate { instruction_source: None,
+                pull_request: None,
                 instruction_prefix: "Only the configured source and checks are in this task.".into(),
-                definition: Definition { limit_overrides: None, inference:Some(InferenceSettings::selected()), execution_profile:Some(ExecutionProfile::CollaborationV1 { web_search:None }), id: "coding-child".into(), revision: "1".into(), executor: ExecutorKind::Coding }, repository: lab.repository_selector(), dependencies: vec![],
+                definition: Definition { charter: None, limit_overrides: None, inference:Some(InferenceSettings::selected()), execution_profile:Some(ExecutionProfile::CollaborationV1 { web_search:None }), id: "coding-child".into(), revision: "1".into(), executor: ExecutorKind::Coding }, repository: lab.repository_selector(), dependencies: vec![],
                 acceptance_commands: vec![vec![rustc.clone(), "--test".into(), "src/main.rs".into(), "-o".into(), "acceptance".into()], vec!["./acceptance".into()], vec![rustc, "src/main.rs".into(), "-o".into(), "demo".into()]],
                 limits: Limits { deadline_unix_ms: deadline, model_requests: 1, output_bytes: 4096, result_bytes: 8192, max_delegation_depth: 0 },
             },
@@ -1962,13 +2212,16 @@ async fn native_helper_hard_loss_reconciles_before_new_work() {
     //# A restarted worker MUST account for surviving prior-incarnation processes before accepting new work.
     // Exact scope: owned native validation process after hard worker loss; this
     // does not settle a remote request, enforce all host resources or prove scale.
-    let mut lab = Lab::new("native-helper-hard-loss").await;
+    // The ignored helper binds its validation hold to this private case path.
+    let mut lab = Lab::new_with_private_image("native-helper-hard-loss", true).await;
     let peer =
         SimpleNativePeer::start(lab.root.clone(), lab.limits.execution.native.request_bytes).await;
-    let input = |agent: &str| TaskInput {
+    let input = |agent: &str| TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         instruction: "Return the integer seven.".into(),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             inference: Some(InferenceSettings::selected()),
             execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -2630,3 +2883,25 @@ mod git_publication;
 
 #[path = "recovery/checkpoint_crash.rs"]
 mod checkpoint_crash;
+
+#[path = "recovery/supplied_executor_evidence.rs"]
+mod supplied_executor_evidence;
+
+#[path = "recovery/catalogue_recovery.rs"]
+mod catalogue_recovery;
+
+#[path = "recovery/governance_controls.rs"]
+mod governance_controls;
+#[path = "recovery/cleanup_recovery.rs"]
+mod cleanup_recovery;
+
+#[path = "recovery/controller_restart_live.rs"]
+mod controller_restart_live;
+
+#[path = "recovery/git_transport_ack.rs"]
+mod git_transport_ack;
+#[path = "recovery/pull_request_publication.rs"]
+mod pull_request_publication;
+
+#[path = "recovery/instruction_source.rs"]
+mod instruction_source;

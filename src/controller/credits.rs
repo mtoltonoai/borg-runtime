@@ -150,6 +150,10 @@ pub(super) fn validate_existing(tx: &Connection, cfg: &ControllerConfig) -> Resu
                     && *g == generation
                     && incarnation == &inc
             }
+            // Reserved wake hints are not produced by the current controller.
+            // Refuse an injected durable command rather than treating it as
+            // an execution or cancellation credit.
+            WorkerCommand::CollaborationReady { .. } => false,
         };
         if !valid {
             return Err(Fault::Store("command body/index differs".into()));

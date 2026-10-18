@@ -3,6 +3,12 @@ use super::process::{Control, command, component};
 use crate::protocol::{Checkpoint, Repository};
 use crate::repository_catalogue::Revision;
 use std::path::{Path, PathBuf};
+#[path = "git_cleanup.rs"]
+pub(super) mod cleanup;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheUse { format_revision: u32, used_unix_ms: u64, use_revision: u64 }
 
 pub fn valid_commit(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -66,7 +72,7 @@ fn cache_name(identity: &CacheIdentity) -> String {
     format!("repository-{:016x}", hash.finish())
 }
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct CacheIdentity {
     version: u32,
@@ -153,6 +159,7 @@ async fn cache_guard(path: &Path, control: &Control) -> Result<CacheGuard, Strin
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(0x20000 | 0x800) // Linux O_NOFOLLOW | O_NONBLOCK; reject before create side effects.
         .open(path)
         .map_err(|e| e.to_string())?;
     let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
@@ -235,6 +242,9 @@ async fn prepare_cache(
     registry: &Path,
     control: &Control,
 ) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(cache_root.join(format!("{}.cleanup.json", cache_name(identity)))).is_ok() {
+        return Err("repository cache cleanup requires reconciliation".into());
+    }
     if std::fs::symlink_metadata(cache).is_ok() {
         return verify_cache(cache, identity, registry, control).await;
     }
@@ -320,6 +330,9 @@ pub async fn checkout(
     .await
 }
 
+// Traceability scope: An exact commit is fetched from the accepted source or acknowledged checkpoint destination and verified before detached checkout; the local cache is disposable.
+//= spec/impl/v2/implementation.md#work-starts-from-a-durable-source
+//# A workspace's starting revision MUST resolve to an immutable source revision available outside the worker.
 pub async fn checkout_cached(
     cache_root: &Path,
     root: &Path,
@@ -371,6 +384,12 @@ pub async fn checkout_cached(
         control,
     )
     .await?;
+    // A recorded use under the same stable cache lock, never directory mtime.
+    let use_path = bare.parent().ok_or("repository cache parent missing")?.join("last-use.json");
+    let previous: Option<CacheUse> = cleanup::read_use(&use_path, control)?;
+    let use_revision = previous.map_or(Some(1), |p| p.use_revision.checked_add(1)).ok_or("repository cache use revision exhausted")?;
+    super::process::atomic_json(&use_path, &CacheUse { format_revision: 1, used_unix_ms: super::process::now_ms(), use_revision })?;
+
     // Never infer a replacement from dirty files or a local detached commit.
     //= spec/impl/v2/implementation.md#interrupted-work-is-reconciled
     //# Recovery MUST NOT assume that uncheckpointed workspace content survived worker loss.

@@ -1,3 +1,6 @@
+#[path = "support/retained_images.rs"]
+mod retained_images;
+
 use borg_runtime::{
     protocol::*,
     worker::{
@@ -22,8 +25,7 @@ fn write_limits(root: &Path, policy: &borg_runtime::limits::RuntimeLimits) -> Pa
 }
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 fn area(label: &str) -> PathBuf {
-    let base =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v2/build-60156282/worker/tests");
+    let base = retained_images::artifact_root().join("worker/tests");
     std::fs::create_dir_all(&base).unwrap();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,6 +105,7 @@ fn repository(root: &Path) -> Repository {
         ],
     );
     Repository {
+        pull_request_target: None,
         registration: Some(borg_runtime::repository_catalogue::Revision {
             repository_id: "fixture-repository".into(),
             registration_revision: "fixture-revision".into(),
@@ -204,6 +207,7 @@ fn worker_owner_prevents_two_local_incarnations() {
 
 fn launch() -> WorkerCommand {
     let definition = Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(borg_runtime::protocol::InferenceSettings::selected()),
                 execution_profile: Some(borg_runtime::protocol::ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -226,7 +230,8 @@ fn launch() -> WorkerCommand {
             stopped: false,
             uncertain: false,
         },
-        task: TaskInput {
+        task: TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             instruction: "edit the source".into(),
             definition: definition.clone(),
@@ -246,6 +251,7 @@ fn launch() -> WorkerCommand {
         },
         checkpoint: None,
         continuation: None,
+                workflow_continuation: None, completion_continuation: None,
     };
     if let WorkerCommand::RunAttempt { task, .. } = &mut command {
         task.resolved_limits = Some(limits().resolve_task(task).unwrap());
@@ -481,6 +487,15 @@ async fn actual_pinned_codex_handshake_without_a_model_turn() {
     .unwrap();
     let initialized = session.initialize(&c).await.unwrap();
     assert!(initialized.is_object());
+    // No model turn: inspect only selected context settings from the actual
+    // pinned executor. A null compaction setting is not a claimed threshold.
+    let context_config = session
+        .request(
+            "config/read",
+            serde_json::json!({"cwd":root,"includeLayers":false}),
+            &c,
+        )
+        .await;
     use std::os::unix::fs::PermissionsExt;
     assert!(root.join("processes/home/code").is_dir());
     assert_eq!(
@@ -534,6 +549,33 @@ async fn actual_pinned_codex_handshake_without_a_model_turn() {
     session.shutdown().await.unwrap();
     assert_eq!(process_records(&root.join("processes")), 0);
     command.unwrap();
+    let context_config = context_config.unwrap();
+    let observed = &context_config["config"];
+    let selected_window = limits().execution.coding.model_context_window;
+    assert!(selected_window.is_some());
+    assert_eq!(
+        observed["model_context_window"],
+        serde_json::json!(selected_window)
+    );
+    let selected_inference = borg_runtime::protocol::InferenceSettings::selected();
+    assert_eq!(observed["model"], selected_inference.model);
+    assert_eq!(observed["model_reasoning_effort"], selected_inference.reasoning_effort);
+    let compact = observed.get("model_auto_compact_token_limit").cloned();
+    assert!(compact.as_ref().is_none_or(|value| {
+        value.is_null() || value.as_i64().is_some_and(|n| n > 0)
+    }));
+    std::fs::write(
+        root.join("resolved-context.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "model":observed["model"],
+            "reasoning_effort":observed["model_reasoning_effort"],
+            "model_context_window":observed["model_context_window"],
+            "model_auto_compact_token_limit":compact,
+            "model_auto_compact_token_limit_scope":observed.get("model_auto_compact_token_limit_scope"),
+            "internal_default_compaction_threshold_known":false,
+            "model_turns_started":0
+        })).unwrap(),
+    ).unwrap();
     let thread = thread.unwrap();
     let cwd_write = cwd_write.unwrap();
     std::fs::write(
@@ -1492,12 +1534,15 @@ mod task_recovery {
     }
     impl Lab {
         fn new(label: &str) -> Self {
+            Self::new_with_private_images(label, false)
+        }
+        fn new_with_private_images(label: &str, private: bool) -> Self {
             let root = area(label);
             write_limits(&root, &recovery_limits());
             let controller_image = root.join("controller-runtime");
             let worker_image = root.join("worker-runtime");
             for image in [&controller_image, &worker_image] {
-                std::fs::copy(env!("CARGO_BIN_EXE_borg-runtime"), image).unwrap();
+                retained_images::materialize(Path::new(env!("CARGO_BIN_EXE_borg-runtime")), image, private);
             }
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap().to_string();
@@ -1634,10 +1679,12 @@ mod task_recovery {
         }
     }
     async fn submit(api: &ApiClient) -> Task {
-        let input = TaskInput {
+        let input = TaskInput { instruction_source: None,
+            pull_request: None,
             resolved_limits: None,
             instruction: "Return integer seven".into(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 inference: Some(borg_runtime::protocol::InferenceSettings::selected()),
                 execution_profile: Some(borg_runtime::protocol::ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -1799,7 +1846,8 @@ mod task_recovery {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn task_recovery_completed_result_revalidates_original_after_worker_controller_restart() {
-        let lab = Lab::new("result-acceptance-recovery");
+        // This case intentionally hides/restores only the controller validator.
+        let lab = Lab::new_with_private_images("result-acceptance-recovery", true);
         let mut controller = lab.controller("controller-one").await;
         let peer = Peer::start(2).await;
         let proxy = Proxy::start(lab.origin.clone(), Some(lab.controller_image.clone())).await;
@@ -1874,6 +1922,357 @@ mod task_recovery {
         controller.stop().await;
         assert_eq!(lab.usage(&original.attempt_id), (1, Some(5), Some(1)));
     }
+
+    // The old executor is a controlled report producer only. No Codex is run.
+    // The replacement is the actual worker process and completes one unrelated
+    // native task against the existing controlled HTTP peer.
+    async fn stopped_coding_unknown(case: &str) {
+        let lab = Lab::new(&format!("coding-unknown-{case}"));
+        let mut controller = lab.controller("controller").await;
+        let proxy = Proxy::start(lab.origin.clone(), None).await;
+        let api = ApiClient::new(&lab.origin, recovery_limits()).unwrap();
+        let registration = borg_runtime::repository_catalogue::Registration {
+            pull_request_target: None,
+            repository_id: "unknown-fixture".into(),
+            registration_revision: "1".into(),
+            display_name: "Controlled stopped coding fixture".into(),
+            source_endpoint: "https://example.invalid/fixture.git".into(),
+            checkpoint_endpoint: "https://example.invalid/fixture.git".into(),
+            source_store_key: "unknown-source".into(),
+            checkpoint_store_key: "unknown-checkpoint".into(),
+        };
+        assert!(matches!(
+            api.call(Operation::RegisterRepository {
+                operation_id: "unknown-register-repository".into(),
+                registration: registration.clone()
+            })
+            .await
+            .unwrap()
+            .outcome,
+            Outcome::Ok { .. }
+        ));
+        let input = TaskInput { instruction_source: None,
+            pull_request: None,
+            resolved_limits: None,
+            instruction: "Controlled historical coding attempt".into(),
+            definition: Definition {
+                charter: None,
+                limit_overrides: None,
+                inference: Some(InferenceSettings::selected()),
+                execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
+                id: "unknown-coding".into(),
+                revision: "one".into(),
+                executor: ExecutorKind::Coding,
+            },
+            repository: Some(Repository {
+                pull_request_target: None,
+                registration: Some(registration.binding()),
+                url: String::new(),
+                checkpoint_remote: String::new(),
+                start_commit: "a".repeat(40),
+            }),
+            repository_read: None,
+            acceptance_commands: vec![vec!["/usr/bin/false".into()]],
+            output_schema: None,
+            limits: Limits {
+                deadline_unix_ms: process::now_ms() + 120_000,
+                model_requests: 2,
+                output_bytes: 4096,
+                result_bytes: 8192,
+                max_delegation_depth: 0,
+            },
+            dependencies: vec![],
+            native_workflow: None,
+        };
+        let Outcome::Ok {
+            data: Data::Task(original),
+        } = api
+            .call(Operation::SubmitTask {
+                operation_id: "old-coding-submit".into(),
+                input,
+            })
+            .await
+            .unwrap()
+            .outcome
+        else {
+            panic!("submit")
+        };
+        assert!(matches!(
+            api.call(Operation::RegisterWorker {
+                operation_id: "old-register".into(),
+                worker: Worker {
+                    id: "recovery-worker".into(),
+                    incarnation: "old-incarnation".into(),
+                    native_capacity: 0,
+                    coding_capacity: 1
+                }
+            })
+            .await
+            .unwrap()
+            .outcome,
+            Outcome::Ok { .. }
+        ));
+        let Outcome::Ok {
+            data: Data::Commands(commands),
+        } = api
+            .call(Operation::AwaitCommands {
+                operation_id: "old-command".into(),
+                worker_id: "recovery-worker".into(),
+                incarnation: "old-incarnation".into(),
+                acknowledged: vec![],
+            })
+            .await
+            .unwrap()
+            .outcome
+        else {
+            panic!("command")
+        };
+        let mut command = commands
+            .into_iter()
+            .find(|c| matches!(c, WorkerCommand::RunAttempt { .. }))
+            .unwrap();
+        let WorkerCommand::RunAttempt {
+            attempt: prior,
+            task: accepted,
+            ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        let prior = prior.clone();
+        let accepted = accepted.clone();
+        let mut observations = vec![Observation::Started {
+            thread_id: Some("old-thread".into()),
+            turn_id: Some("old-turn".into()),
+        }];
+        if case != "unacknowledged" {
+            observations.push(Observation::ExecutionUncertain {
+                message: "original collaboration call unresolved".into(),
+            });
+        }
+        observations.push(Observation::ExecutorOutcome {
+            success: false,
+            summary: "original outcome unresolved".into(),
+        });
+        if !matches!(case, "active" | "completed-active" | "unstarted-active") {
+            observations.push(Observation::ProcessTreeStopped);
+        }
+        for (i, observation) in observations.into_iter().enumerate() {
+            assert!(matches!(
+                api.call(Operation::ObserveWorker {
+                    report: Report {
+                        report_id: format!("old-report-{i}"),
+                        worker_id: prior.worker_id.clone(),
+                        incarnation: prior.worker_incarnation.clone(),
+                        task_id: prior.task_id.clone(),
+                        attempt_id: prior.id.clone(),
+                        generation: prior.generation,
+                        observation
+                    }
+                })
+                .await
+                .unwrap()
+                .outcome,
+                Outcome::Ok { .. }
+            ));
+        }
+        if case == "unacknowledged" {
+            let current = get(&api, &original.id).await;
+            assert!(matches!(
+                api.call(Operation::CancelTask {
+                    operation_id: "old-cancel-without-uncertainty".into(),
+                    task_id: original.id.clone(),
+                    expected_revision: current.revision
+                })
+                .await
+                .unwrap()
+                .outcome,
+                Outcome::Ok { .. }
+            ));
+        }
+        let before = get(&api, &original.id).await;
+        let mut journal_prior = prior.clone();
+        if case == "changed-input" {
+            let WorkerCommand::RunAttempt { task, .. } = &mut command else {
+                unreachable!()
+            };
+            task.instruction.push_str(" changed");
+        }
+        if case == "missing-task" {
+            let WorkerCommand::RunAttempt {
+                attempt, session, ..
+            } = &mut command
+            else {
+                unreachable!()
+            };
+            attempt.task_id = "missing-old-task".into();
+            session.task_id = attempt.task_id.clone();
+            journal_prior = attempt.clone();
+        }
+        let state = lab.state();
+        process::private_directory(&state).unwrap();
+        process::atomic_json(&state.join("format.json"), &json!({"format_revision":10})).unwrap();
+        process::atomic_json(&state.join("limits.json"), &*recovery_limits()).unwrap();
+        process::private_directory(&state.join("commands")).unwrap();
+        process::atomic_json(
+            &state.join("commands/old.json"),
+            &json!({"command":command,"completed":case=="completed-active","effects_started":case!="unstarted-active"}),
+        )
+        .unwrap();
+        let codex_state = codex::state_path(&state.join("codex"), &prior.id);
+        let directory = codex_state.join("collaboration-codex");
+        process::private_directory(&directory).unwrap();
+        let caller = borg_runtime::mcp::Caller {
+            task_id: journal_prior.task_id.clone(),
+            attempt_id: journal_prior.id.clone(),
+            generation: journal_prior.generation,
+            worker_id: journal_prior.worker_id.clone(),
+            incarnation: journal_prior.worker_incarnation.clone(),
+        };
+        let operation_id = "original-unresolved-read";
+        let journal = directory.join("calls.json");
+        process::atomic_json(&journal,&json!({"revision":2,"runtime_limits":accepted.resolved_limits.as_ref().unwrap().global_metadata,"limits":accepted.execution_limits().unwrap().collaboration,"worker_limits":recovery_limits().worker,"caller":caller,"deadline_unix_ms":prior.deadline_unix_ms,"controller_url":proxy.url,"entries":[{"thread_id":"old-thread","session_id":"old-thread","invocation":{"operation_id":operation_id,"logical_call_id":"old-call","caller":caller,"tool":"collab_task_get","arguments":{"task_id":"missing-target"}},"outcome":null,"delivered":false}]})).unwrap();
+        if case == "corrupt" {
+            std::fs::write(&journal, b"{").unwrap();
+        }
+        let withheld_report = state.join("outbox").join(format!(
+            "{}.json",
+            process::component("corrupt-journal-report")
+        ));
+        if case == "corrupt" {
+            process::private_directory(&state.join("outbox")).unwrap();
+            process::atomic_json(
+                &withheld_report,
+                &Report {
+                    report_id: "corrupt-journal-report".into(),
+                    worker_id: prior.worker_id.clone(),
+                    incarnation: prior.worker_incarnation.clone(),
+                    task_id: prior.task_id.clone(),
+                    attempt_id: prior.id.clone(),
+                    generation: prior.generation,
+                    observation: Observation::ExecutionUncertain {
+                        message: "must remain withheld".into(),
+                    },
+                },
+            )
+            .unwrap();
+        }
+        let withheld_bytes = std::fs::read(&withheld_report).ok();
+        let journal_before = std::fs::read(&journal).unwrap();
+        let peer = Peer::start(2).await;
+        let mut replacement = lab.worker(&proxy.url, &peer.endpoint, "new-incarnation");
+        let mut expected = before.clone();
+        if matches!(case, "allowed" | "active") {
+            until(|| proxy.registered("new-incarnation")).await;
+            if case == "active" {
+                // Uncertainty was acknowledged before the old process stopped.
+                // Recovery must finish the stop report, not discard the journal
+                // or refuse unrelated capacity forever.
+                assert!(before.attempt.as_ref().unwrap().uncertain);
+                assert!(!before.attempt.as_ref().unwrap().stopped);
+                expected = get(&api, &original.id).await;
+                assert_eq!(expected.input, before.input);
+                assert_eq!(expected.id, before.id);
+                assert_eq!(expected.session_id, before.session_id);
+                assert_eq!(expected.status, TaskStatus::Failed);
+                assert_eq!(expected.result, before.result);
+                let old = before.attempt.as_ref().unwrap();
+                let now = expected.attempt.as_ref().unwrap();
+                assert_eq!(now.id, old.id);
+                assert_eq!(now.worker_incarnation, old.worker_incarnation);
+                assert!(now.stopped && now.uncertain);
+                assert_eq!(now.phase, AttemptPhase::Stopped);
+            } else {
+                assert_eq!(get(&api, &original.id).await, before);
+            }
+            let retry = api
+                .call(Operation::RetryTask {
+                    operation_id: "forbidden-old-retry".into(),
+                    task_id: original.id.clone(),
+                    expected_revision: expected.revision,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(retry.outcome,Outcome::Refused { ref code,.. } if code=="reconciliation_required")
+            );
+            let unrelated = submit(&api).await;
+            let completed = wait_task(&api, &unrelated.id, |t| t.status == TaskStatus::Succeeded).await;
+            assert_eq!(completed.result.unwrap().output, Some(json!(7)));
+            assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
+            replacement.stop().await;
+        } else {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(
+                    replacement.child.try_wait().unwrap().is_none(),
+                    "worker exited before controlled recovery refusal"
+                );
+                let log = std::fs::read_to_string(lab.root.join("new-incarnation.log")).unwrap();
+                if log.contains("Worker recovery admission refused:") {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "unsafe fixture did not refuse registration"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!proxy.registered("new-incarnation"));
+            assert_eq!(peer.posts.load(Ordering::SeqCst), 0);
+            replacement.stop().await;
+        }
+        assert_eq!(std::fs::read(journal).unwrap(), journal_before);
+        if case == "corrupt" {
+            // Includes orderly shutdown: its final flush must not bypass the
+            // startup validation that refused this corrupt journal.
+            assert_eq!(std::fs::read(&withheld_report).ok(), withheld_bytes);
+            assert!(proxy.uncertainty.lock().unwrap().is_empty());
+            let reply = api
+                .call(Operation::GetOperation {
+                    operation_id: "corrupt-journal-report".into(),
+                })
+                .await
+                .unwrap();
+            assert!(reply.commit.is_none());
+            assert!(matches!(reply.outcome, Outcome::Refused { ref code, .. } if code == "not_found"));
+        }
+        assert_eq!(get(&api, &original.id).await, expected);
+        let lookup = api
+            .call(Operation::GetOperation {
+                operation_id: operation_id.into(),
+            })
+            .await
+            .unwrap();
+        assert!(lookup.commit.is_none());
+        assert!(
+            matches!(lookup.outcome,Outcome::Refused { ref code,.. } if code=="not_found"),
+            "original call was never resent or settled"
+        );
+        controller.stop().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stopped_uncertain_coding_does_not_block_unrelated_worker_capacity() {
+        stopped_coding_unknown("allowed").await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acknowledged_coding_uncertainty_finishes_interrupted_stop_before_registration() {
+        stopped_coding_unknown("active").await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unresolved_coding_startup_refuses_unproven_stop_binding_or_uncertainty() {
+        for case in [
+            "completed-active",
+            "unstarted-active",
+            "unacknowledged",
+            "changed-input",
+            "missing-task",
+            "corrupt",
+        ] {
+            stopped_coding_unknown(case).await;
+        }
+    }
+
 }
 
 #[tokio::test]
@@ -1881,6 +2280,7 @@ async fn credential_repository_identities_refuse_before_git_or_workspace_effects
     let root = area("credential-git-boundary");
     let (control, _cancel) = control();
     let clean = Repository {
+        pull_request_target: None,
         registration: Some(borg_runtime::repository_catalogue::Revision {
             repository_id: "fixture-repository".into(),
             registration_revision: "fixture-revision".into(),
@@ -1946,3 +2346,9 @@ async fn credential_repository_identities_refuse_before_git_or_workspace_effects
 
 #[path = "worker/resource_profile.rs"]
 mod resource_profile;
+
+#[path = "worker/automatic_cleanup.rs"]
+mod automatic_cleanup;
+
+#[path = "worker/native_retry.rs"]
+mod native_retry;

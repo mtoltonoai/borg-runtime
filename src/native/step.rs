@@ -16,6 +16,7 @@ pub struct NativeStepObservation {
     pub request_exposure: RequestExposure,
     pub usage: UsageObservation,
     pub provider_outcome: ProviderOutcome,
+    pub diagnostic: Option<super::ProviderFailureDiagnostic>,
 }
 impl NativeStepObservation {
     pub(super) fn not_started(code: impl Into<String>) -> Self {
@@ -24,6 +25,7 @@ impl NativeStepObservation {
             request_exposure: RequestExposure::NotStarted,
             usage: UsageObservation::Unknown,
             provider_outcome: ProviderOutcome::NotStarted,
+            diagnostic: Some(super::ProviderFailureDiagnostic::new(super::ProviderFailureClass::LocalAdmission)),
         }
     }
 }
@@ -47,7 +49,10 @@ pub(super) fn plan(
     if continuation.is_none() {
         delegation::validate_workflow(input)?;
     }
-    let decision = input.native_workflow.is_some() && continuation.is_none();
+    // Traceability scope: Native planning keeps the current accepted instruction and result schema for Reassign; no child decision or continuation replaces that input.
+    //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+    //# A task reassignment MUST retain the task's prior session and execution-input history.
+    let decision = delegation::template(input).is_some() && continuation.is_none();
     let instruction = if let Some(child) = continuation {
         // The worker supplies the exact committed outcome; this function does
         // not infer it from model output or claim a commit from public fields.
@@ -116,5 +121,46 @@ pub(super) fn decode_decision(value: Value, output_bound: usize) -> Result<Decis
             _ => Err("native_delegation_instruction_bound".into()),
         },
         _ => Err("native_decision_shape".into()),
+    }
+}
+
+#[cfg(test)]
+mod reassignment_tests {
+    use super::*;
+    use crate::protocol::*;
+
+    #[test]
+    // Traceability scope: Planner-only discriminator for original instruction/schema and absence of a child continuation; durable lineage is tested by controller cases.
+    //= spec/impl/v2/implementation.md#task-reassignment-creates-a-new-session
+    //= type=test
+    //# A task reassignment MUST retain the task's prior session and execution-input history.
+    fn reassignment_uses_original_result_schema_and_never_decision_or_child_continuation() {
+        let metadata = crate::limits::RuntimeLimits::seed().unwrap();
+        let mut input = TaskInput {
+            instruction_source: None, pull_request: None, resolved_limits: None, repository_read: None,
+            instruction: "Return the original result".into(),
+            definition: Definition { charter: None, id: "triage".into(), revision: "r1".into(),
+                executor: ExecutorKind::Native, inference: Some(InferenceSettings::selected()),
+                execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }), limit_overrides: None },
+            repository: None, acceptance_commands: vec![], output_schema: Some(json!({"type":"string"})),
+            limits: metadata.task_defaults.at(0).unwrap(), dependencies: vec![], native_workflow: None,
+        };
+        let mut coding = input.definition.clone(); coding.id = "coding".into(); coding.executor = ExecutorKind::Coding;
+        input.native_workflow = Some(Box::new(NativeWorkflow::Reassign { target: CodingTaskTemplate {
+            instruction_source: None, pull_request: None, instruction_prefix: String::new(), definition: coding,
+            repository: Repository { registration: None, url: "file:///repo".into(), start_commit: "a".repeat(40),
+                checkpoint_remote: "origin".into(), pull_request_target: None },
+            acceptance_commands: vec![vec!["check".into()]], dependencies: input.dependencies.clone(), limits: input.limits.clone(),
+        }}));
+        input.resolved_limits = Some(metadata.resolve_task(&input).unwrap());
+        let plan = plan(&input, input.output_schema.as_ref().unwrap(), None).unwrap();
+        assert!(!plan.decision);
+        assert_eq!(plan.instruction, input.instruction);
+        assert_eq!(plan.response_schema, *input.output_schema.as_ref().unwrap());
+        assert_eq!(plan.response_bound, input.limits.output_bytes);
+        let child = ChildOutcome { task_id: "unrelated-child".into(), status: TaskStatus::Failed,
+            result: None, summary: "No child belongs to reassignment".into() };
+        assert_eq!(super::plan(&input, input.output_schema.as_ref().unwrap(), Some(&child)).err().unwrap(),
+            "native_reassignment_has_no_child_continuation");
     }
 }

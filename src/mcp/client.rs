@@ -3,17 +3,58 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+/// Retry eligibility is established at the actual transport boundary, never by
+/// parsing diagnostic text. Complete protocol/receipt errors are held failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallFailure {
+    Transport(String),
+    Contract(String),
+}
+impl CallFailure {
+    pub(crate) fn message(&self) -> &str {
+        match self { Self::Transport(value) | Self::Contract(value) => value }
+    }
+    pub(crate) fn into_message(self) -> String {
+        match self { Self::Transport(value) | Self::Contract(value) => value }
+    }
+}
+impl From<String> for CallFailure {
+    fn from(value: String) -> Self { Self::Contract(value) }
+}
+impl From<&str> for CallFailure {
+    fn from(value: &str) -> Self { Self::Contract(value.into()) }
+}
+
 #[derive(Clone)]
 pub struct Client {
     base: String,
     caller: Caller,
     http: reqwest::Client,
     limits: RuntimeLimits,
+    profile: ExecutionProfile,
+    instruction_source: Option<RepositoryReadSource>,
     sequence: Arc<AtomicU64>,
 }
 impl Client {
     pub fn new(base: &str, caller: Caller, limits: RuntimeLimits) -> Result<Self, String> {
+        Self::new_for_profile(base, caller, limits, ExecutionProfile::CollaborationV1 { web_search: None })
+    }
+    /// The accepted task selects this profile; a server response cannot widen it.
+    pub fn new_for_profile(
+        base: &str,
+        caller: Caller,
+        limits: RuntimeLimits,
+        profile: ExecutionProfile,
+    ) -> Result<Self, String> {
+        Self::new_for_task(base, caller, limits, profile, None)
+    }
+    /// Host-derived accepted scope, never selected by an MCP response.
+    pub fn new_for_task(
+        base: &str, caller: Caller, limits: RuntimeLimits, profile: ExecutionProfile,
+        instruction_source: Option<RepositoryReadSource>,
+    ) -> Result<Self, String> {
         limits.validate()?;
+        if let Some(source) = &instruction_source { source.validate_instruction_binding(&limits)?; }
         caller.validate(&limits.transport)?;
         if serde_json::to_vec(&caller)
             .map_err(|_| "caller encoding failed")?
@@ -44,6 +85,10 @@ impl Client {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            // The stdio bridge pauses its current-thread reactor between frames.
+            // Never retain idle sockets across that pause: a controller may close
+            // one before the reactor observes it. This is not a resend policy.
+            .pool_max_idle_per_host(0)
             .connect_timeout(std::time::Duration::from_millis(
                 limits.transport.client_connect_timeout_ms,
             ))
@@ -57,10 +102,15 @@ impl Client {
             caller,
             http,
             limits,
+            profile,
+            instruction_source,
             sequence: Arc::new(AtomicU64::new(1)),
         })
     }
     async fn exchange(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.exchange_observed(method, params).await.map_err(CallFailure::into_message)
+    }
+    async fn exchange_observed(&self, method: &str, params: Value) -> Result<Value, CallFailure> {
         let id = format!("borg-mcp-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
         let body =
             serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
@@ -81,7 +131,7 @@ impl Client {
             .body(body)
             .send()
             .await
-            .map_err(|_| "MCP transport outcome unknown; reconcile original occurrence")?;
+            .map_err(|_| CallFailure::Transport("MCP transport outcome unknown; reconcile original occurrence".into()))?;
         if response.status() != reqwest::StatusCode::OK {
             return Err("MCP HTTP outcome unavailable; reconcile original occurrence".into());
         }
@@ -89,7 +139,7 @@ impl Client {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| "MCP response incomplete; reconcile original occurrence")?
+            .map_err(|_| CallFailure::Transport("MCP response incomplete; reconcile original occurrence".into()))?
         {
             if bytes.len().saturating_add(chunk.len()) > self.limits.transport.body_bytes {
                 return Err("MCP response bound; reconcile original occurrence".into());
@@ -123,16 +173,16 @@ impl Client {
             serde_json::from_value(result).map_err(|_| "invalid bounded tool catalogue")?;
         // Both clients share the controller-owned closed catalogue, not model
         // or remote-server authority to expand local operations.
-        if result.tools != catalogue(&self.limits) {
+        if result.tools != catalogue_for_task(&self.limits, Some(&self.profile), self.instruction_source.as_ref()) {
             return Err("MCP catalogue differs from supported collaboration tools".into());
         }
         Ok(result.tools)
     }
-    async fn tool(&self, name: &str, args: Value, meta: Value) -> Result<CallResult, String> {
+    async fn tool_observed(&self, name: &str, args: Value, meta: Value) -> Result<CallResult, CallFailure> {
         let v = if name == "__host_lookup" {
-            self.exchange("borg/calls/get", args).await?
+            self.exchange_observed("borg/calls/get", args).await?
         } else {
-            self.exchange(
+            self.exchange_observed(
                 "tools/call",
                 json!({"name":name,"arguments":args,"_meta":meta}),
             )
@@ -167,11 +217,14 @@ impl Client {
         Ok(result)
     }
     pub async fn call(&self, call: &Invocation) -> Result<CallResult, String> {
+        self.call_observed(call).await.map_err(CallFailure::into_message)
+    }
+    pub(crate) async fn call_observed(&self, call: &Invocation) -> Result<CallResult, CallFailure> {
         call.validate(&self.limits)?;
         if call.caller != self.caller {
             return Err("host caller differs from invocation".into());
         }
-        let received=self.tool(&call.tool,call.arguments.clone(),json!({"borg":{"operation_id":call.operation_id,"logical_call_id":call.logical_call_id}})).await?;
+        let received=self.tool_observed(&call.tool,call.arguments.clone(),json!({"borg":{"operation_id":call.operation_id,"logical_call_id":call.logical_call_id}})).await?;
         let checked = result(call, received.reply)?;
         if received.requires_quiescence != checked.requires_quiescence {
             return Err("MCP quiescence disposition differs".into());
@@ -179,12 +232,15 @@ impl Client {
         Ok(checked)
     }
     pub async fn get_call(&self, call: &Invocation) -> Result<Option<CallResult>, String> {
+        self.get_call_observed(call).await.map_err(CallFailure::into_message)
+    }
+    pub(crate) async fn get_call_observed(&self, call: &Invocation) -> Result<Option<CallResult>, CallFailure> {
         call.validate(&self.limits)?;
         if call.caller != self.caller {
             return Err("host caller differs from invocation".into());
         }
         let received = self
-            .tool(
+            .tool_observed(
                 "__host_lookup",
                 json!({"call_id":call.operation_id}),
                 json!({}),
@@ -205,6 +261,10 @@ impl Client {
         {
             return Ok(None);
         }
-        recovered(call, received.reply).map(Some)
+        recovered(call, received.reply).map(Some).map_err(CallFailure::Contract)
     }
 }
+
+#[cfg(test)]
+#[path = "client_idle_tests.rs"]
+mod idle_connection_tests;

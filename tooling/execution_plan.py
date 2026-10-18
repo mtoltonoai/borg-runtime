@@ -58,6 +58,34 @@ def strings(value, label: str) -> list[str]:
     return sorted(value)
 
 
+def ownership_paths(value) -> list[str]:
+    paths = strings(value, "ownership paths")
+    for name in paths:
+        if name == "." or any(c in name for c in "*?[]") or name.startswith("/") or ".." in Path(name).parts or "\\" in name or str(Path(name)) != name:
+            raise ValueError("ownership paths must be canonical relative paths")
+    return paths
+
+
+def reported_ownership(value) -> list[dict]:
+    """Validate reported source responsibility, not identity or execution authority."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("ownership must be a nonempty list")
+    result, seen = [], set()
+    for record in value:
+        if (not isinstance(record, dict) or set(record) != {"owner", "role", "paths", "evidence"}
+                or not isinstance(record["owner"], str) or not record["owner"].strip()
+                or not isinstance(record["role"], str) or record["role"] not in {"author", "integrator"}
+                or not isinstance(record["evidence"], str) or not record["evidence"].strip()):
+            raise ValueError("invalid reported ownership record")
+        identity = (record["owner"], record["role"])
+        paths = ownership_paths(record["paths"])
+        if not paths or identity in seen:
+            raise ValueError("empty ownership paths or duplicate owner/role")
+        seen.add(identity)
+        result.append(dict(record, paths=paths))
+    return sorted(result, key=lambda record: (record["owner"], record["role"]))
+
+
 def parse_stages(text: str) -> list[dict]:
     rows = records(block(text, "stages", True), {"id", "order", "heading"}, {"approval", "approval_ref"})
     headings = re.findall(r"^### (.+)$", "\n".join(line for _, line in spec_set.active_lines(text)), re.M)
@@ -89,10 +117,7 @@ def validate_milestones(rows: list[dict]) -> list[dict]:
             parts = ref.split(":")
             if len(parts) != 2 or any(not ID.fullmatch(v) for v in parts):
                 raise ValueError("invalid required interface reference")
-        row["owns"] = strings(row.get("owns", []), "ownership paths")
-        for name in row["owns"]:
-            if name == "." or any(c in name for c in "*?[]") or name.startswith("/") or ".." in Path(name).parts or "\\" in name or str(Path(name)) != name:
-                raise ValueError("ownership paths must be canonical relative paths")
+        row["owns"] = ownership_paths(row.get("owns", []))
         row.setdefault("scope", "integration")
         if not isinstance(row["scope"], str) or row["scope"] not in {"integration", "interface"}:
             raise ValueError("invalid milestone scope")
@@ -157,8 +182,10 @@ def build_plan(capabilities: list[dict], stages: list[dict], milestones: list[di
     progress = {} if progress is None else progress
     if not isinstance(progress, dict) or progress.keys() - by_id.keys():
         raise ValueError("unknown milestone in progress overlay")
+    ownership = {}
+    effective_owns = {identity: row["owns"] for identity, row in by_id.items()}
     for identity, value in progress.items():
-        if not isinstance(value, dict) or value.keys() - {"interfaces", "gates", "assignment"}:
+        if not isinstance(value, dict) or value.keys() - {"interfaces", "gates", "assignment", "ownership"}:
             raise ValueError("unknown progress fields")
         for kind, allowed, statuses in (("interfaces", set(by_id[identity]["provides"]), {"ready", "not_ready", "unknown"}),
                                         ("gates", {g["id"] for g in by_id[identity]["gates"]}, {"pass", "fail", "unknown"})):
@@ -171,6 +198,10 @@ def build_plan(capabilities: list[dict], stages: list[dict], milestones: list[di
                     raise ValueError("invalid progress status/evidence")
         if "assignment" in value and not isinstance(value["assignment"], str):
             raise ValueError("invalid worker assignment")
+        if "ownership" in value:
+            ownership[identity] = reported_ownership(value["ownership"])
+            effective_owns[identity] = sorted(set(by_id[identity]["owns"]).union(
+                path for record in ownership[identity] for path in record["paths"]))
     blockers = []
     if not capabilities:
         blockers.append("missing_approved_capability_declarations")
@@ -187,7 +218,7 @@ def build_plan(capabilities: list[dict], stages: list[dict], milestones: list[di
                 blocked.append(label + "_approval_missing")
         if draft:
             blocked.append("unapproved_draft_view")
-        if not row["owns"]:
+        if not effective_owns[identity]:
             blocked.append("ownership_boundary_missing")
         ancestors[identity] = set(parents[identity])
         for parent in parents[identity]:
@@ -215,12 +246,14 @@ def build_plan(capabilities: list[dict], stages: list[dict], milestones: list[di
                                readiness_blockers=sorted(blocked), completion_blockers=sorted(incomplete), gates=gates,
                                deferred_capability_prerequisites=unbound if row["scope"] == "interface" else [],
                                assignment=progress.get(identity, {}).get("assignment", ""))
+        if identity in ownership:
+            views[identity].update(ownership=ownership[identity], effective_owns=effective_owns[identity])
         blockers += [identity + ":" + reason for reason in blocked]
     ready = sorted(key for key, view in views.items() if view["ready"])
     parallel = []
     for identity in ready:
         for group in parallel:
-            if all(not overlap(by_id[identity]["owns"], by_id[other]["owns"]) for other in group):
+            if all(not overlap(effective_owns[identity], effective_owns[other]) for other in group):
                 group.append(identity)
                 break
         else:

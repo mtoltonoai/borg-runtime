@@ -1,15 +1,22 @@
 //! Local-stdio adapter qualified against the supplied alpha.10 schema.
 use super::process::{self, Control, ManagedProcess};
 use crate::limits::{CodingLimits, ExecutionLimits, WorkerLimits};
-use crate::protocol::InferenceSettings;
+use crate::protocol::{ExecutionProfile, InferenceSettings};
+use crate::governance_completion::{CompletionBoundary, CompletionTarget};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
     time::Duration,
 };
+#[path = "codex_charter.rs"]
+mod charter_delivery;
+#[path="codex_charter_turns.rs"]
+mod charter_turns;
+pub use charter_delivery::Scope as InitialCharterScope;
+
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::mpsc,
@@ -27,10 +34,13 @@ fn validate_inference(settings: &InferenceSettings) -> std::result::Result<(), S
 /// Trusted host values; never supplied by model tool arguments.
 #[derive(Debug, Clone)]
 pub struct Collaboration {
+    pub instruction_source: Option<crate::protocol::RepositoryReadSource>,
     pub controller_url: String,
     pub caller: crate::mcp::Caller,
     pub bridge_binary: PathBuf,
     pub memory: Option<MemoryScope>,
+    /// Derived from the immutable accepted task profile by the worker host.
+    pub workflow_enabled: bool,
 }
 #[derive(Debug, Clone)]
 pub struct MemoryScope {
@@ -38,17 +48,42 @@ pub struct MemoryScope {
     pub session_id: String,
 }
 
-/// Explicit bridge disposition is kept separate from human diagnostics.
+/// The original worker attempt/session, independent of optional MCP capability.
+#[derive(Clone)]
+pub struct CompletionScope {
+    pub controller_url: String,
+    pub caller: crate::mcp::Caller,
+    pub session_id: String,
+    pub resume: Option<crate::governance_completion::CompletionResume>,
+}
+
+/// A sent turn remains unresolved through its start acknowledgment and process
+/// shutdown. Only its exact terminal event closes the execution boundary.
+#[derive(Clone, Default)]
+pub(super) struct ExecutionLifecycle(Arc<AtomicBool>);
+impl ExecutionLifecycle {
+    pub(super) fn uncertain(&self) -> bool { self.0.load(Ordering::SeqCst) }
+    fn dispatched(&self) { self.0.store(true, Ordering::SeqCst); }
+    fn terminal(&self) { self.0.store(false, Ordering::SeqCst); }
+}
+
+/// Explicit execution and bridge dispositions are separate from diagnostics.
 #[derive(Debug)]
 pub struct ExecutionFailure {
     pub message: String,
     pub collaboration_uncertain: bool,
+    pub execution_uncertain: bool,
+    pub completion_held: bool,
+    pub completion_uncertain: bool,
 }
 impl From<String> for ExecutionFailure {
     fn from(message: String) -> Self {
         Self {
             message,
             collaboration_uncertain: false,
+            execution_uncertain: false,
+            completion_held: false,
+            completion_uncertain: false,
         }
     }
 }
@@ -61,6 +96,16 @@ impl From<&str> for ExecutionFailure {
 pub enum Event {
     Started { thread_id: String, turn_id: String },
     Progress(String),
+    ReserveCompletionTurn {
+        begin_operation_id: String,
+        model_requests: u32,
+        acknowledged: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    AssociationBarrier {
+        thread_id: String,
+        initial_turn_id: String,
+        acknowledged: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
 }
 #[derive(Debug)]
 pub struct Result {
@@ -68,6 +113,9 @@ pub struct Result {
     pub summary: String,
     pub thread_id: String,
     pub turn_id: String,
+    pub initial_turn_id: String,
+    pub completion_blocked: bool,
+    pub completion_uncertain: bool,
     pub observed_usage: ObservedUsage,
 }
 
@@ -151,6 +199,7 @@ pub struct Session {
     next_id: u64,
     pending: VecDeque<Value>,
     collaboration: Option<super::codex_mcp::Config>,
+    lifecycle: ExecutionLifecycle,
 }
 impl Session {
     pub async fn start(
@@ -195,7 +244,7 @@ impl Session {
         worker_limits.validate()?;
         let model = &inference.model;
         process::private_directory(state)?;
-        let args = vec![
+        let mut args = vec![
             "app-server".into(),
             "--listen".into(),
             "stdio://".into(),
@@ -232,6 +281,7 @@ impl Session {
                 serde_json::to_string(&[cwd]).map_err(|e| e.to_string())?
             ),
         ];
+        context_args(&mut args, &limits.coding);
         let mut environment = vec![("CODEX_HOME".into(), state.to_string_lossy().into_owned())];
         // The Codex server alone needs its configured inference credential. Ordinary acceptance/Git children do not inherit it.
         if let Some(key) = inference_key {
@@ -259,6 +309,7 @@ impl Session {
             next_id: 1,
             pending: VecDeque::new(),
             collaboration: None,
+            lifecycle: ExecutionLifecycle::default(),
         })
     }
     async fn send(&mut self, value: Value) -> std::result::Result<(), String> {
@@ -267,11 +318,11 @@ impl Session {
             return Err("executor input exceeds limit (execution.coding.frame_bytes)".into());
         }
         bytes.push(b'\n');
-        self.process
-            .stdin
-            .as_mut()
-            .ok_or("executor stdin closed")?
-            .write_all(&bytes)
+        let stdin = self.process.stdin.as_mut().ok_or("executor stdin closed")?;
+        // From the first possible write onward, neither an ACK nor reaping the
+        // local process proves that this model turn reached a terminal result.
+        if value["method"] == "turn/start" { self.lifecycle.dispatched(); }
+        stdin.write_all(&bytes)
             .await
             .map_err(|_| "executor request write failed; outcome uncertain".into())
     }
@@ -449,11 +500,42 @@ pub async fn execute_with_collaboration(
     events: mpsc::Sender<Event>,
     collaboration: Option<&Collaboration>,
 ) -> std::result::Result<Result, ExecutionFailure> {
+    execute_with_governance(binary,cwd,state,registry,inference,limits,instruction,control,events,collaboration,None).await
+}
+
+pub async fn execute_with_governance(
+    binary: &Path, cwd: &Path, state: &Path, registry: &Path,
+    inference: &InferenceSettings, limits: &ExecutionLimits, instruction: &str,
+    control: &Control, events: mpsc::Sender<Event>,
+    collaboration: Option<&Collaboration>, completion_scope: Option<&CompletionScope>,
+) -> std::result::Result<Result, ExecutionFailure> {
+    execute_with_charter(binary,cwd,state,registry,inference,limits,instruction,control,
+        events,collaboration,completion_scope,None).await
+}
+
+pub async fn execute_with_charter(
+    binary: &Path, cwd: &Path, state: &Path, registry: &Path,
+    inference: &InferenceSettings, limits: &ExecutionLimits, instruction: &str,
+    control: &Control, events: mpsc::Sender<Event>,
+    collaboration: Option<&Collaboration>, completion_scope: Option<&CompletionScope>,
+    initial_charter: Option<&InitialCharterScope>,
+) -> std::result::Result<Result, ExecutionFailure> {
+    execute_with_charter_observed(binary,cwd,state,registry,inference,limits,instruction,
+        control,events,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default()).await
+}
+
+pub(super) async fn execute_with_charter_observed(
+    binary: &Path, cwd: &Path, state: &Path, registry: &Path,
+    inference: &InferenceSettings, limits: &ExecutionLimits, instruction: &str,
+    control: &Control, events: mpsc::Sender<Event>,
+    collaboration: Option<&Collaboration>, completion_scope: Option<&CompletionScope>,
+    initial_charter: Option<&InitialCharterScope>, lifecycle: ExecutionLifecycle,
+) -> std::result::Result<Result, ExecutionFailure> {
     let result = async {
         validate_inference(inference)?;
         let credentials = super::configured_credentials(&control.runtime_limits)?;
         let key = std::env::var("OPENAI_API_KEY").ok();
-        execute_with_credentials_and_collaboration(
+        execute_observed(
             binary,
             cwd,
             state,
@@ -466,6 +548,9 @@ pub async fn execute_with_collaboration(
             &credentials,
             key.as_deref(),
             collaboration,
+            completion_scope,
+            initial_charter,
+            lifecycle,
         )
         .await
     }
@@ -474,6 +559,8 @@ pub async fn execute_with_collaboration(
         // Also audit early setup/cancellation errors that never started a process.
         if let Some(host) = collaboration {
             let config = super::codex_mcp::Config {
+                instruction_source: host.instruction_source.clone(),
+                execution_profile: host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2{web_search:None}),
                 controller_url: host.controller_url.clone(),
                 caller: host.caller.clone(),
                 deadline_unix_ms: control.deadline_ms,
@@ -488,6 +575,10 @@ pub async fn execute_with_collaboration(
             ) {
                 error.collaboration_uncertain = true;
             }
+        }
+        if collaboration.is_some_and(|host|host.workflow_enabled)
+            && !matches!(super::collaboration_notice::unresolved(state,&control.runtime_limits),Ok(false)) {
+            error.collaboration_uncertain=true;
         }
         error
     })
@@ -521,39 +612,42 @@ async fn execute_with_credentials(
         credentials,
         inference_key,
         None,
+        None,
     )
     .await
     .map_err(|error| error.message)
 }
 
-// Traceability scope: Supported coding delivery uses pre-turn injection or the retained-result gate below; delivery itself sends no turn interrupt. Arbitrary executor-internal boundaries remain unqualified.
-//= spec/impl/v2/implementation.md#shared-memory-changes-reach-sessions
-//# Memory-change notification delivery MUST NOT interrupt a tool that has begun execution.
-async fn deliver_memory_notice(
-    session: &mut Session,
-    host: &mut super::memory_notice::Host,
-    thread_id: &str,
-    control: &Control,
+// Only before turn/start or at the owned retained-MCP-result gate. The exact
+// canonical append intent and local before-send marker precede executor I/O.
+// Traceability scope: caller invokes this before the owned first turn or while the existing retained MCP-result gate is closed. Generic shell/outer asynchronous boundaries remain outside this scope.
+//= spec/impl/v2/implementation.md#committed-resolutions-reach-their-consumers
+//# A resolution notice MUST be delivered to an active executor at a supported safe input boundary.
+async fn deliver_workflow_notice(
+    session: &mut Session, host: &mut super::collaboration_notice::Host,
+    thread_id: &str, control: &Control,
 ) -> std::result::Result<(), String> {
-    let Some(notice) = host.prepare(control).await? else {
-        return Ok(());
+    let notice=match host.prepare(control).await? {
+        super::collaboration_notice::PrepareDisposition::Notice(notice)=>notice,
+        // Continue only the already-required turn. Deferred means an unrelated
+        // scan prefix, never permission to omit an admitted continuation.
+        super::collaboration_notice::PrepareDisposition::NoChanges
+        | super::collaboration_notice::PrepareDisposition::Deferred=>return Ok(()),
     };
-    let context = format!("codex:{thread_id}");
-    if !matches!(
-        host.begin_append(&notice.batch_id, &context)?,
-        super::memory_notice::AppendDisposition::Ready
-    ) {
-        return Ok(()); // Exact retained ambiguous batch: never reinject this context.
+    let context=thread_id.to_owned();
+    match host.begin_append(&notice.batch_id,&context,control).await? {
+        super::collaboration_notice::AppendDisposition::Ready=>{},
+        super::collaboration_notice::AppendDisposition::Superseded=>return Ok(()),
+        super::collaboration_notice::AppendDisposition::Deferred=>return Err("workflow delivery original append remains unresolved".into()),
     }
     let reply=session.request("thread/inject_items",json!({"threadId":thread_id,"items":[
-        {"type":"message","id":format!("borg-memory-{}",notice.batch_id),"role":"developer","content":[{"type":"input_text","text":notice.text}]}
+        {"type":"message","id":format!("borg-workflow-{}",notice.batch_id),"role":"developer","content":[{"type":"input_text","text":notice.text}]}
     ]}),control).await?;
-    if reply != json!({}) {
-        return Err("memory append reply invalid; batch retained".into());
-    }
-    // ACK means appended, not consumed. A lost controller ACK reuses the exact
-    // saved mutation; no second executor append is authorized by it.
-    host.appended(&notice.batch_id, &context, control).await
+    if reply!=json!({}) {return Err("workflow append reply invalid; original intent retained".into());}
+// Traceability scope: only the exact successful inject_items response establishes this context retained the input; unknown replies retain the original intent.
+    //= spec/impl/v2/implementation.md#committed-resolutions-reach-their-consumers
+    //# A resolution-delivery acknowledgment MUST follow durable retention of the outcome for its receiving continuation.
+    host.appended(&notice.batch_id,&context,control).await
 }
 
 // Traceability scope: The coding consumer passes its accepted inference settings to startup, thread and turn requests and checks the effective thread settings.
@@ -572,22 +666,59 @@ async fn execute_with_credentials_and_collaboration(
     credentials: &[String],
     inference_key: Option<&str>,
     collaboration: Option<&Collaboration>,
+    completion_scope: Option<&CompletionScope>,
+) -> std::result::Result<Result, ExecutionFailure> {
+    execute_with_credentials_collaboration_and_charter(binary,cwd,state,registry,inference,limits,
+        instruction,control,events,credentials,inference_key,collaboration,completion_scope,None).await
+}
+
+async fn execute_with_credentials_collaboration_and_charter(
+    binary: &Path,
+    cwd: &Path,
+    state: &Path,
+    registry: &Path,
+    inference: &InferenceSettings,
+    limits: &ExecutionLimits,
+    instruction: &str,
+    control: &Control,
+    events: mpsc::Sender<Event>,
+    credentials: &[String],
+    inference_key: Option<&str>,
+    collaboration: Option<&Collaboration>,
+    completion_scope: Option<&CompletionScope>,
+    initial_charter: Option<&InitialCharterScope>,
+) -> std::result::Result<Result, ExecutionFailure> {
+    execute_observed(binary,cwd,state,registry,inference,limits,instruction,control,events,
+        credentials,inference_key,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default()).await
+}
+
+async fn execute_observed(
+    binary: &Path, cwd: &Path, state: &Path, registry: &Path,
+    inference: &InferenceSettings, limits: &ExecutionLimits, instruction: &str,
+    control: &Control, events: mpsc::Sender<Event>, credentials: &[String],
+    inference_key: Option<&str>, collaboration: Option<&Collaboration>,
+    completion_scope: Option<&CompletionScope>, initial_charter: Option<&InitialCharterScope>,
+    lifecycle: ExecutionLifecycle,
 ) -> std::result::Result<Result, ExecutionFailure> {
     validate_inference(inference)?;
+    if initial_charter.is_some() && control.runtime_limits.charter.is_none() {
+        return Err("accepted supplied charter policy is absent".into());
+    }
     limits.coding.validate()?;
     limits.collaboration.validate()?;
-    limits.memory_notice.validate()?;
     control.check()?;
     let model = &inference.model;
-    let mut memory = match collaboration.and_then(|h| h.memory.as_ref().map(|scope| (h, scope))) {
-        Some((host, scope)) => Some(super::memory_notice::Host::open(
-            crate::client::ApiClient::new(&host.controller_url, control.runtime_limits.clone())?,
-            state,
-            &host.caller,
-            &scope.session_id,
-            &scope.agent_id,
-            &limits.memory_notice,
+    let mut workflow = match (collaboration.filter(|h|h.workflow_enabled).and_then(|h|h.memory.as_ref().map(|scope|(h,scope))),control.runtime_limits.workflow.as_ref()) {
+        (Some((host,scope)),Some(policy))=>Some(super::collaboration_notice::Host::open(
+            crate::client::ApiClient::new(&host.controller_url,control.runtime_limits.clone())?,
+            state,&host.caller,&scope.session_id,&scope.agent_id,policy,
         )?),
+        _=>None,
+    };
+    let completion_host = match completion_scope.filter(|_|control.runtime_limits.governance.is_some()) {
+        Some(scope) => Some(super::completion::Host::open(
+            crate::client::ApiClient::new(&scope.controller_url,control.runtime_limits.clone())?,
+            scope.caller.clone(),&scope.session_id,state)?),
         None => None,
     };
     let mut session = Session::start_with_key(
@@ -601,6 +732,10 @@ async fn execute_with_credentials_and_collaboration(
         inference_key,
     )
     .await?;
+    session.lifecycle = lifecycle.clone();
+    let mut initial_completion_held = false;
+    let mut initial_dispatch_unknown = false;
+    let mut completion_started = false;
     let result=async {
         session.initialize(control).await?;
         session.preflight_command(cwd,control).await?;
@@ -608,9 +743,10 @@ async fn execute_with_credentials_and_collaboration(
         //# An unavailable executor history MUST NOT be reported as a recovered conversation.
         // The pinned schema uses kebab-case SandboxMode; the current web example uses a different spelling.
         let mut thread_config=json!({"model":model,"cwd":cwd,"approvalPolicy":"never","sandbox":"workspace-write","ephemeral":false,"config":{"model_reasoning_effort":inference.reasoning_effort}});
+        context_config(&mut thread_config, &limits.coding);
         if let Some(host)=collaboration {
             if !host.bridge_binary.is_absolute() {return Err("collaboration bridge executable must be host absolute path".into());}
-            let config=super::codex_mcp::Config{controller_url:host.controller_url.clone(),caller:host.caller.clone(),deadline_unix_ms:control.deadline_ms,state:state.to_owned(),runtime_limits:(*control.runtime_limits).clone(),limits:limits.collaboration.clone(),worker_limits:(*control.worker_limits).clone()};
+            let config=super::codex_mcp::Config{instruction_source:host.instruction_source.clone(),execution_profile:host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2{web_search:None}),controller_url:host.controller_url.clone(),caller:host.caller.clone(),deadline_unix_ms:control.deadline_ms,state:state.to_owned(),runtime_limits:(*control.runtime_limits).clone(),limits:limits.collaboration.clone(),worker_limits:(*control.worker_limits).clone()};
             config.validate()?;super::codex_mcp::check_stop(&config)?;
             if super::value_contains_credential(&serde_json::to_value(&config).map_err(|_|"bridge configuration encoding failed")?,credentials, &control.worker_limits)? {return Err("bridge identity contains configured credential".into());}
             let config_path=state.join("borg-collaboration-config.json");
@@ -618,42 +754,97 @@ async fn execute_with_credentials_and_collaboration(
             process::atomic_json(&config_path,&config)?;
             // Task-scoped stdio only. The key name is inherited for the bridge's
             // finite known-value hygiene; no value is in this retained config.
-            thread_config["config"]["mcp_servers"]=json!({(super::codex_mcp::SERVER_NAME):super::codex_mcp::server_config(&host.bridge_binary,&config_path,&control.runtime_limits,&limits.collaboration,control.deadline_ms.saturating_sub(process::now_ms()).div_ceil(1000).max(1))});
-            if memory.is_some() {super::codex_mcp::enable_memory_gate(&config)?;}
+            thread_config["config"]["mcp_servers"]=json!({(super::codex_mcp::SERVER_NAME):super::codex_mcp::server_config_for_profile(&host.bridge_binary,&config_path,&control.runtime_limits,&limits.collaboration,config.execution_profile.as_ref(),control.deadline_ms.saturating_sub(process::now_ms()).div_ceil(1000).max(1))});
+            if workflow.is_some() {super::codex_mcp::enable_memory_gate(&config)?;}
             session.collaboration=Some(config);
         }
-        let thread=session.request("thread/start",thread_config,control).await?;
+        let thread=match initial_charter {
+            Some(scope)=>charter_delivery::start_thread(&mut session,scope,state,thread_config,
+                inference,control,credentials).await?,
+            None=>session.request("thread/start",thread_config,control).await?,
+        };
         session.process.refresh_ownership()?;
         if thread["model"].as_str()!=Some(inference.model.as_str()) || thread["reasoningEffort"].as_str()!=Some(inference.reasoning_effort.as_str()) {return Err("executor effective model or reasoning effort differs from selected profile".into());}
         let thread_id=thread["thread"]["id"].as_str().ok_or("executor did not return a thread id")?.to_owned();
         check_association_ids(&thread_id, None, credentials)?;
         process::atomic_json(&state.join("borg-thread.json"),&json!({"thread_id":thread_id,"cwd":cwd,"turn_start_sent":false}))?;
-        if let Some(host)=memory.as_mut() {
-            deliver_memory_notice(&mut session,host,&thread_id,control).await?;
+        let mut pending_completion = None;
+        let mut paired_workflow_notice = None;
+        let mut initial_input = vec![json!({"type":"text","text":instruction})];
+        if let Some(resume)=completion_scope.and_then(|scope|scope.resume.as_ref()) {
+            initial_completion_held = true;
+            let host=completion_host.as_ref().ok_or("completion resume policy absent")?;
+            let required=super::completion::required_events(&resume.evaluation,resume.reset_event.as_ref());
+            let notice=if let Some(workflow)=workflow.as_mut() {
+                match workflow.prepare_completion(&required,control).await? {
+                    super::collaboration_notice::PrepareDisposition::Notice(notice)=>Some(notice),
+                    super::collaboration_notice::PrepareDisposition::NoChanges=>None,
+                    super::collaboration_notice::PrepareDisposition::Deferred=>return Err("completion initial workflow input deferred".into()),
+                }
+            } else {None};
+            let mut input=host.begin_initial(resume,&thread_id,CompletionTarget::InitialCodexTurn {thread_id:thread_id.clone()},
+                notice.as_ref().map(|notice|notice.batch_id.clone()),control).await?
+                .ok_or("completion initial input refused")?;
+            if let Some(notice)=notice.as_ref() {
+                if !matches!(workflow.as_mut().ok_or("completion workflow host absent")?
+                    .begin_append(&notice.batch_id,&thread_id,control).await?,super::collaboration_notice::AppendDisposition::Ready) {
+                    return Err("completion initial workflow input withheld".into());
+                }
+                initial_input.push(json!({"type":"text","text":notice.text}));
+            }
+            initial_input.push(json!({"type":"text","text":input.text()}));
+            input.mark_dispatch(&control.runtime_limits)?;
+            initial_dispatch_unknown = true;
+            pending_completion=Some(input);
+            paired_workflow_notice=notice;
+        } else if let Some(host)=workflow.as_mut() {
+            deliver_workflow_notice(&mut session,host,&thread_id,control).await?;
         }
         process::atomic_json(&state.join("borg-thread.json"),&json!({"thread_id":thread_id,"cwd":cwd,"turn_start_sent":true}))?;
         //= spec/impl/v2/implementation.md#the-supplied-executor-is-qualified-at-its-actual-boundary
         //# A lost start response MUST be reconciled before another executor turn is started for that command.
-        let turn=session.request("turn/start",json!({"threadId":thread_id,"model":model,"effort":inference.reasoning_effort,"cwd":cwd,"approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true},"input":[{"type":"text","text":instruction}]}),control).await.map_err(|e|format!("turn start outcome uncertain; never resubmitted: {e}"))?;
-        let turn_id=turn["turn"]["id"].as_str().ok_or("turn start outcome uncertain: missing turn id")?.to_owned();
+        // Traceability scope: A failed initial turn/start is reported as uncertain and never resubmitted by this adapter; recovery remains fenced by the original command and unresolved execution.
+        //= spec/impl/v2/implementation.md#platform-owned-model-retries
+        //# Platform recovery of a supplied executor MUST NOT create another session or repeat an uncertain start merely to implement a provider retry.
+        let params=json!({"threadId":thread_id,"model":model,"effort":inference.reasoning_effort,"cwd":cwd,"approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true},"input":initial_input});
+        let (turn,mut charter_capture)=match initial_charter {
+            Some(scope)=>{let (turn,capture)=charter_turns::start(&mut session,scope,state,1,&thread_id,params,control,credentials).await?;(turn,Some(capture))},
+            None=>(session.request("turn/start",params,control).await.map_err(|e|format!("turn start outcome uncertain; never resubmitted: {e}"))?,None),
+        };
+        let mut turn_id=turn["turn"]["id"].as_str().ok_or("turn start outcome uncertain: missing turn id")?.to_owned();
         check_association_ids(&thread_id, Some(&turn_id), credentials)
             .map_err(|_| "turn start outcome uncertain: executor identity contains a configured credential; association withheld")?;
         process::atomic_json(&state.join("borg-thread.json"),&json!({"thread_id":thread_id,"turn_id":turn_id,"cwd":cwd}))?;
+        if let Some(input)=pending_completion.as_mut() {
+            input.record_turn_start(CompletionBoundary::CodexTurn {thread_id:thread_id.clone(),turn_id:turn_id.clone()},&control.runtime_limits)?;
+            completion_started = true;
+        }
+        initial_dispatch_unknown = false;
+        initial_completion_held = false;
         events.send(Event::Started{thread_id:thread_id.clone(),turn_id:turn_id.clone()}).await.map_err(|_|"worker observer closed")?;
+        let initial_turn_id = turn_id.clone();
+        let mut association_committed = false;
+        let mut completion_in_flight = false;
+        // Existing coding admission reports no inner request count (baseline
+        // zero). Reserve each additional observed outer turn conservatively.
+        let mut reserved_completion_turns = 0u32;
         let mut summary=String::new();
+        let mut summary_phase:Option<String>=None;
         let mut observed_usage=ObservedUsage::default();
         loop {
             // Gate selection happens only at the cancellation-safe framed read.
             // It cannot cancel an interactive-error send or discard a prefix.
             let selected=if let Some(message)=session.pending.pop_front(){Ok(SessionInput::Message(message))}else{
-                session.next_input(control,Some(&events),memory.is_some()).await
+                session.next_input(control,Some(&events),workflow.is_some()).await
             };
             let incoming=match selected {
                 Err(error)=>Err(error),
                 Ok(SessionInput::Message(message))=>Ok(message),
                 Ok(SessionInput::MemoryBoundary(gate))=>{
                     if gate.thread_id!=thread_id {return Err("memory boundary thread differs".into());}
-                    if let Some(host)=memory.as_mut() {deliver_memory_notice(&mut session,host,&thread_id,control).await?;}
+                    if paired_workflow_notice.is_none() {
+                        if let Some(host)=workflow.as_mut() {deliver_workflow_notice(&mut session,host,&thread_id,control).await?;}
+                    }
                     super::codex_mcp::release_memory_boundary(session.collaboration.as_ref().ok_or("memory bridge absent")?,&gate)?;
                     continue;
                 }
@@ -667,18 +858,63 @@ async fn execute_with_credentials_and_collaboration(
                     return Err(e);
                 }
             };
+            if let Some(capture)=charter_capture.as_mut(){capture.item(&message,control)?;}
             if observed_usage.observe(&message,&thread_id,&turn_id) {
                 check_association_ids(&thread_id, Some(&turn_id), credentials)?;
                 process::atomic_json(&state.join("borg-usage.json"),&json!({"thread_id":thread_id,"turn_id":turn_id,"observed_usage":observed_usage}))?;
             }
-            if message["method"]=="item/completed" && message["params"]["item"]["type"]=="agentMessage" {
-                if let Some(text)=message["params"]["item"]["text"].as_str() {summary=text.chars().take(limits.coding.summary_chars).collect();}
+            if message["method"]=="item/completed" && message["params"]["threadId"]==thread_id && message["params"]["turnId"]==turn_id && message["params"]["item"]["type"]=="agentMessage" {
+                if let Some(text)=message["params"]["item"]["text"].as_str() {
+                    summary=text.chars().take(limits.coding.summary_chars).collect();
+                    summary_phase=message["params"]["item"]["phase"].as_str().map(str::to_owned);
+                }
             }
             if message["method"]=="turn/completed" && message["params"]["threadId"]==thread_id && message["params"]["turn"]["id"]==turn_id {
                 let status=message["params"]["turn"]["status"].as_str().ok_or("executor terminal event missing status")?;
                 if !matches!(status,"completed"|"failed"|"interrupted") {return Err("unrecognized executor terminal status".into());}
+                lifecycle.terminal();
+                if let (Some(scope),Some(capture))=(initial_charter,charter_capture.take()) {
+                    // A commentary item is not a supplied final result. Missing final
+                    // metadata stays an audit finding, with the public terminal retained.
+                    if let Some(result)=capture.finish(scope,&message,control).await? {
+                        summary=result.chars().take(limits.coding.summary_chars).collect();
+                    } else if matches!(summary_phase.as_deref(),Some("commentary"|"partial_answer")) {
+                        summary.clear();
+                    }
+                }
+                completion_started = false;
                 if summary.is_empty() {summary=format!("Executor turn {status}");}
-                return Ok(Result{success:status=="completed",summary,thread_id,turn_id,observed_usage});
+                if status == "completed" {
+                    completion_in_flight = false;
+                    if let Some(host) = completion_host.as_ref() {
+                        let advance = advance_completion(
+                            &mut session,host,&mut workflow,&mut pending_completion,&mut paired_workflow_notice,
+                            &thread_id,&turn_id,&initial_turn_id,&mut association_committed,&mut completion_in_flight,&mut reserved_completion_turns,
+                            cwd,inference,credentials,control,&events,initial_charter,state,&mut charter_capture,
+                        ).await;
+                        match advance {
+                            Ok(CompletionAdvance::Continue(next_turn)) => {
+                                completion_started = true;
+                                turn_id = next_turn;
+                                summary.clear();summary_phase=None;
+                                continue;
+                            },
+                            Ok(CompletionAdvance::Admit) => {},
+                            Ok(CompletionAdvance::Held) | Err(_) => {
+                                return Ok(Result {success:false,
+                                    summary:"Voluntary completion is held; its recorded decision or input requires reconciliation".into(),
+                                    thread_id,turn_id,initial_turn_id,completion_blocked:true,
+                                    completion_uncertain:completion_in_flight,observed_usage});
+                            },
+                        }
+                    }
+                }
+                if pending_completion.is_some() {
+                    return Ok(Result {success:false,summary:"Completion continuation did not reach a successful consuming boundary".into(),
+                        thread_id,turn_id,initial_turn_id,completion_blocked:true,completion_uncertain:false,observed_usage});
+                }
+                return Ok(Result{success:status=="completed",summary,thread_id,turn_id,initial_turn_id,
+                    completion_blocked:false,completion_uncertain:false,observed_usage});
             }
             // Error notifications include willRetry. They are observations, not a terminal result.
         }
@@ -686,8 +922,11 @@ async fn execute_with_credentials_and_collaboration(
     let stopped = session.shutdown().await;
     // Audit after actual process-tree shutdown, including cancellation paths
     // that won before the bridge could persist its static stop marker.
+    let mut collaboration_diagnostic = None;
     let collaboration_uncertain = collaboration.is_some_and(|host| {
         let config = super::codex_mcp::Config {
+                instruction_source: host.instruction_source.clone(),
+                execution_profile: host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2{web_search:None}),
             controller_url: host.controller_url.clone(),
             caller: host.caller.clone(),
             deadline_unix_ms: control.deadline_ms,
@@ -696,29 +935,152 @@ async fn execute_with_credentials_and_collaboration(
             limits: limits.collaboration.clone(),
             worker_limits: (*control.worker_limits).clone(),
         };
-        matches!(
-            super::codex_mcp::outcome_disposition(&config),
+        let disposition = super::codex_mcp::outcome_disposition(&config);
+        let unresolved = matches!(
+            &disposition,
             Ok(super::codex_mcp::OutcomeDisposition::Unresolved) | Err(_)
-        )
+        );
+        if matches!(disposition, Ok(super::codex_mcp::OutcomeDisposition::Unresolved)) {
+            collaboration_diagnostic = super::codex_mcp::diagnostic_reason(&config).ok().flatten();
+        }
+        unresolved
     });
     if let Err(error) = stopped {
         return Err(ExecutionFailure {
             message: format!("executor stop unverified: {error}"),
             collaboration_uncertain,
+            execution_uncertain: lifecycle.uncertain(),
+            completion_held:false,
+            completion_uncertain:initial_dispatch_unknown || completion_started,
         });
     }
     if collaboration_uncertain {
         return Err(ExecutionFailure {
             message: result
                 .err()
-                .unwrap_or_else(|| "collaboration outcome unresolved after executor stop".into()),
+                .unwrap_or_else(|| match collaboration_diagnostic {
+                    Some(stage) => {
+                        format!("collaboration outcome unresolved after executor stop ({stage})")
+                    }
+                    None => "collaboration outcome unresolved after executor stop".into(),
+                }),
             collaboration_uncertain: true,
+            execution_uncertain: lifecycle.uncertain(),
+            completion_held:initial_completion_held || completion_started,
+            completion_uncertain:initial_dispatch_unknown || completion_started,
         });
     }
     result.map_err(|message| ExecutionFailure {
         message,
         collaboration_uncertain: false,
+        execution_uncertain: lifecycle.uncertain(),
+        completion_held:initial_completion_held || completion_started,
+        completion_uncertain:initial_dispatch_unknown || completion_started,
     })
+}
+
+enum CompletionAdvance { Admit, Held, Continue(String) }
+
+/// Called only after the exact current outer turn reports completed. The same
+/// thread, task, deadline, accepted configuration and cumulative usage remain.
+/// A missing start response never permits another turn/start for this Begin.
+async fn advance_completion(
+    session: &mut Session,
+    host: &super::completion::Host,
+    workflow: &mut Option<super::collaboration_notice::Host>,
+    pending: &mut Option<super::completion::Input>,
+    paired: &mut Option<super::collaboration_notice::Notice>,
+    thread_id: &str, turn_id: &str, initial_turn_id: &str,
+    association_committed: &mut bool, in_flight: &mut bool, reserved_turns: &mut u32,
+    cwd: &Path, inference: &InferenceSettings, credentials: &[String],
+    control: &Control, events: &mpsc::Sender<Event>,
+    charter: Option<&InitialCharterScope>, state: &Path, capture: &mut Option<charter_turns::Capture>,
+) -> std::result::Result<CompletionAdvance, String> {
+    let boundary = CompletionBoundary::CodexTurn {thread_id:thread_id.into(),turn_id:turn_id.into()};
+    if !*association_committed {
+        let (acknowledged,received) = tokio::sync::oneshot::channel();
+        events.send(Event::AssociationBarrier {thread_id:thread_id.into(),initial_turn_id:initial_turn_id.into(),acknowledged})
+            .await.map_err(|_|"worker association observer closed")?;
+        let mut stopped = control.clone();
+        tokio::select! {biased;
+            _=stopped.stopped()=>return Err("completion association interrupted".into()),
+            result=received=>result.map_err(|_|"worker association acknowledgment absent")??,
+        }
+        *association_committed = true;
+    }
+    if let Some(input) = pending.as_mut() {
+        if input.delivery_batch_id() != paired.as_ref().map(|notice|notice.batch_id.as_str()) {
+            return Err("completion paired input binding differs".into());
+        }
+        let delivery_ack_operation_id = if let Some(notice) = paired.as_ref() {
+            Some(workflow.as_mut().ok_or("completion workflow host absent")?
+                .appended_with_receipt(&notice.batch_id,thread_id,control).await?)
+        } else { None };
+        host.acknowledged(input,boundary.clone(),delivery_ack_operation_id,None,control).await?;
+        *pending = None;
+        *paired = None;
+    }
+    let evaluation = match host.evaluate(&boundary,&[],control).await? {
+        super::completion::Gate::Admit => return Ok(CompletionAdvance::Admit),
+        super::completion::Gate::Held => return Ok(CompletionAdvance::Held),
+        super::completion::Gate::Blocked(decision) => decision,
+    };
+    let required=super::completion::required_events(&evaluation,None);
+    let notice = if let Some(workflow) = workflow.as_mut() {
+        match workflow.prepare_completion(&required,control).await? {
+            super::collaboration_notice::PrepareDisposition::Notice(notice) => Some(notice),
+            super::collaboration_notice::PrepareDisposition::NoChanges => None,
+            super::collaboration_notice::PrepareDisposition::Deferred => return Ok(CompletionAdvance::Held),
+        }
+    } else { None };
+    let Some(mut input) = host.begin(&boundary,&evaluation.decision,thread_id,
+        CompletionTarget::CodexTurn {thread_id:thread_id.into(),previous_turn_id:turn_id.into()},
+        notice.as_ref().map(|notice|notice.batch_id.clone()),control).await? else {
+        return Ok(CompletionAdvance::Held);
+    };
+    if let Some(notice) = notice.as_ref() {
+        match workflow.as_mut().ok_or("completion workflow host absent")?
+            .begin_append(&notice.batch_id,thread_id,control).await? {
+            super::collaboration_notice::AppendDisposition::Ready => {},
+            super::collaboration_notice::AppendDisposition::Superseded
+            | super::collaboration_notice::AppendDisposition::Deferred => return Ok(CompletionAdvance::Held),
+        }
+    }
+    // Both exact recorded bodies are genuine input to one outer turn. The
+    // workflow notice does not independently create or count a model request.
+    let mut items = vec![json!({"type":"text","text":input.text()})];
+    if let Some(notice) = notice.as_ref() {items.push(json!({"type":"text","text":notice.text}));}
+    let next_reservation = reserved_turns.checked_add(1).ok_or("coding outer-turn reservation overflow")?;
+    let (acknowledged,received) = tokio::sync::oneshot::channel();
+    events.send(Event::ReserveCompletionTurn {begin_operation_id:input.feedback().continuation.begin_operation_id.clone(),
+        model_requests:next_reservation,acknowledged}).await.map_err(|_|"worker reservation observer closed")?;
+    let mut stopped = control.clone();
+    tokio::select! {biased;
+        _=stopped.stopped()=>return Err("completion reservation interrupted".into()),
+        result=received=>result.map_err(|_|"worker reservation acknowledgment absent")??,
+    }
+    *reserved_turns = next_reservation;
+    input.mark_dispatch(&control.runtime_limits)?;
+    *in_flight = true;
+    let params=json!({
+        "threadId":thread_id,"model":inference.model,"effort":inference.reasoning_effort,
+        "cwd":cwd,"approvalPolicy":"never",
+        "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true},
+        "input":items,
+    });
+    let turn=if let Some(scope)=charter {
+        let ordinal=next_reservation.checked_add(1).ok_or("supplied outer occurrence overflow")?;
+        let (turn,observed)=charter_turns::start(session,scope,state,ordinal,thread_id,params,control,credentials).await?;
+        *capture=Some(observed);turn
+    }else{session.request("turn/start",params,control).await?};
+    let next_turn = turn["turn"]["id"].as_str().ok_or("completion turn start outcome uncertain: missing turn id")?.to_owned();
+    check_association_ids(thread_id,Some(&next_turn),credentials)?;
+    input.record_turn_start(CompletionBoundary::CodexTurn {thread_id:thread_id.into(),turn_id:next_turn.clone()},&control.runtime_limits)?;
+    // borg-thread.json and Started retain the immutable initial association.
+    // Only this exact input journal carries the actual next turn identity.
+    *pending = Some(input);
+    *paired = notice;
+    Ok(CompletionAdvance::Continue(next_turn))
 }
 
 // Identity is never rewritten: a matching configured value prevents the owned
@@ -767,6 +1129,137 @@ mod credential_tests {
         ));
         std::fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn completion_continuation_keeps_thread_usage_and_initial_association_without_replay() {
+        use crate::worker::completion::tests as fixture;
+        use crate::governance_completion::*;
+        use crate::governance::{CompletionDisposition,DecisionPoint,DecisionRef};
+        for mode in ["continue","exhausted","lost-start","initial","initial-refused","initial-lost"] {
+            let root=area(); let state=root.join("state"); process::private_directory(&state).unwrap();
+            let binary=root.join("completion-peer.py");
+            std::fs::write(root.join("mode"),mode).unwrap();
+            std::fs::write(&binary,r#"#!/usr/bin/python3
+import json,pathlib,sys
+mode=pathlib.Path('mode').read_text()
+starts=0
+def emit(value): print(json.dumps(value),flush=True)
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request: continue
+    method=request.get('method')
+    if method=='initialize': result={}
+    elif method=='command/exec': result={'exitCode':0,'stdout':'','stderr':''}
+    elif method=='thread/start':
+        result={'thread':{'id':'completion-thread'},'model':'gpt-6-astra','reasoningEffort':'max'}
+    elif method=='turn/start':
+        starts+=1
+        with open('starts.jsonl','a') as output: output.write(json.dumps(request['params'])+'\n')
+        if (mode=='lost-start' and starts==2) or (mode=='initial-lost' and starts==1): sys.exit(0)
+        turn='turn-'+str(starts)
+        emit({'id':request['id'],'result':{'turn':{'id':turn}}})
+        emit({'method':'thread/tokenUsage/updated','params':{'threadId':'completion-thread','turnId':turn,'tokenUsage':{'total':{'inputTokens':starts*10,'outputTokens':starts*2}}}})
+        emit({'method':'turn/completed','params':{'threadId':'completion-thread','turn':{'id':turn,'status':'completed'}}})
+        continue
+    else: result={}
+    emit({'id':request['id'],'result':result})
+"#).unwrap();
+            std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut limits=fixture::policy();
+            if mode=="exhausted" || mode=="initial-refused" {limits.governance.as_mut().unwrap().completion_continuations=0;}
+            let first=CompletionBoundary::CodexTurn {thread_id:"completion-thread".into(),turn_id:"turn-1".into()};
+            let second=CompletionBoundary::CodexTurn {thread_id:"completion-thread".into(),turn_id:"turn-2".into()};
+            let mut feedback=if mode.starts_with("initial") {
+                fixture::feedback(CompletionBoundary::StoppedResult {report_id:"old-final-candidate".into()},
+                    CompletionTarget::InitialCodexTurn {thread_id:"completion-thread".into()})
+            } else {fixture::feedback(first.clone(),CompletionTarget::CodexTurn {thread_id:"completion-thread".into(),previous_turn_id:"turn-1".into()})};
+            let resume=if mode.starts_with("initial") {
+                feedback.continuation.caller.attempt_id="completion-attempt-2".into();
+                feedback.continuation.caller.generation=2;
+                feedback.continuation.begin_operation_id=begin_id(&feedback.continuation.caller,&feedback.evaluation.decision).unwrap();
+                fixture::initial_begin_receipt(&state,&limits,&feedback,mode!="initial-refused");
+                Some(CompletionResume {evaluation:feedback.evaluation.clone(),reset_event:None})
+            } else {fixture::refused_and_begin(&state,&limits,&feedback,mode!="exhausted");None};
+            if mode=="continue" || mode=="initial" {
+                let completed=if mode=="initial" {first.clone()}else{second.clone()};
+                fixture::acknowledge_receipt(&state,&limits,&feedback,completed.clone());
+                let caller=feedback.continuation.caller.clone();
+                let id=evaluation_id(&caller,&completed).unwrap();
+                let mut admitted=feedback.evaluation.clone();
+                admitted.boundary=completed.clone();
+                admitted.state.subject.attempt_id=caller.attempt_id.clone();
+                admitted.state.subject.generation=caller.generation;
+                admitted.decision=DecisionRef {operation_id:id.clone(),point:DecisionPoint::Completion};
+                admitted.state.disposition=CompletionDisposition::Admit;
+                admitted.state.reasons.clear();
+                fixture::receipt(&state,&limits,&completed,"evaluate.json",crate::protocol::Operation::EvaluateCompletion(EvaluateCompletion {operation_id:id,caller,boundary:completed.clone(),intervening_requests:vec![]}),
+                    crate::protocol::Outcome::Ok {data:crate::protocol::Data::Completion(CompletionOutcome::Evaluated(admitted))});
+            }
+            let (_cancel,rx)=tokio::sync::watch::channel(false);
+            let mut control=crate::worker::test_control(process::now_ms()+10_000,rx);
+            control.runtime_limits=Arc::new(limits.clone());
+            control.worker_limits=Arc::new(limits.worker.clone());
+            let (events,mut received)=mpsc::channel(8);
+            let observer=tokio::spawn(async move {
+                let mut started=0; let mut barriers=0;
+                while let Some(event)=received.recv().await {
+                    match event {
+                        Event::Started {thread_id,turn_id}=>{assert_eq!(thread_id,"completion-thread");assert_eq!(turn_id,"turn-1");started+=1;},
+                        Event::AssociationBarrier {thread_id,initial_turn_id,acknowledged}=>{
+                            assert_eq!(thread_id,"completion-thread");assert_eq!(initial_turn_id,"turn-1");barriers+=1;acknowledged.send(Ok(())).unwrap();
+                        },
+                        Event::ReserveCompletionTurn {model_requests,acknowledged,..}=>{
+                            assert_eq!(model_requests,1);acknowledged.send(Ok(())).unwrap();
+                        },
+                        Event::Progress(_)=>{},
+                    }
+                }
+                (started,barriers)
+            });
+            let decision_peer=if mode.starts_with("initial") {None}else {
+                Some(fixture::DecisionQueryPeer::start(feedback.evaluation.decision.clone(),
+                    fixture::decision_record(&feedback,&limits),&limits).await)
+            };
+            let controller_url=decision_peer.as_ref().map(|peer|peer.url.clone()).unwrap_or_else(||"http://127.0.0.1:9".into());
+            let scope=CompletionScope {controller_url,caller:feedback.continuation.caller.clone(),session_id:"completion-session".into(),resume};
+            let result=execute_with_credentials_and_collaboration(&binary,&root,&state,&root.join("processes"),
+                &InferenceSettings::selected(),&limits.execution,"original task",&control,events,&[],None,None,Some(&scope)).await;
+            let observations=observer.await.unwrap();
+            if let Some(peer)=decision_peer {peer.finish().await;}
+            if mode=="initial-refused" || mode=="initial-lost" {
+                let error=result.unwrap_err();
+                assert!(error.completion_held);
+                assert_eq!(error.completion_uncertain,mode=="initial-lost");
+                assert_eq!(error.execution_uncertain,mode=="initial-lost");
+                assert_eq!(observations,(0,0));
+                if mode=="initial-refused" {assert!(!root.join("starts.jsonl").exists());}
+                else {assert_eq!(std::fs::read_to_string(root.join("starts.jsonl")).unwrap().lines().count(),1);}
+                continue;
+            }
+            let result=result.unwrap();
+            assert_eq!(observations,(1,1));
+            assert_eq!(result.initial_turn_id,"turn-1");
+            assert_eq!(result.thread_id,"completion-thread");
+            let starts=std::fs::read_to_string(root.join("starts.jsonl")).unwrap().lines()
+                .map(|line|serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
+            assert_eq!(starts.len(),if mode=="exhausted" || mode=="initial" {1}else{2});
+            assert_eq!(starts[0]["input"][0]["text"],"original task");
+            if mode=="initial" {
+                assert!(starts[0]["input"].as_array().unwrap().iter().any(|item|
+                    item["text"].as_str().is_some_and(|text|text.contains("remaining-child"))));
+            } else if mode!="exhausted" {
+                assert_eq!(starts[1]["threadId"],"completion-thread");
+                assert!(starts[1]["input"][0]["text"].as_str().unwrap().contains("remaining-child"));
+            }
+            assert_eq!(result.success,mode=="continue" || mode=="initial");
+            assert_eq!(result.completion_blocked,mode!="continue" && mode!="initial");
+            assert_eq!(result.completion_uncertain,mode=="lost-start");
+            assert_eq!(result.observed_usage.model_requests,None);
+            assert_eq!(result.observed_usage.input_tokens,Some(if mode=="continue" {20}else{10}));
+            let original:Value=serde_json::from_slice(&std::fs::read(state.join("borg-thread.json")).unwrap()).unwrap();
+            assert_eq!(original["turn_id"],"turn-1");
+        }
     }
 
     #[tokio::test]
@@ -990,10 +1483,11 @@ for line in sys.stdin:
             let (events, _received) = mpsc::channel(16);
             let state = root.join("state");
             let registry = root.join("processes");
-            let host = Collaboration {
+            let host = Collaboration { instruction_source: None,
                 controller_url: "http://127.0.0.1:9".into(),
                 bridge_binary: PathBuf::from("/host/selected/borg-runtime"),
                 memory: None,
+                workflow_enabled: false,
                 caller: crate::mcp::Caller {
                     task_id: "task-1".into(),
                     attempt_id: "attempt-1".into(),
@@ -1015,6 +1509,7 @@ for line in sys.stdin:
                 &[],
                 None,
                 if mode == "plain" { None } else { Some(&host) },
+                None,
             )
             .await;
             let config: Value =
@@ -1111,11 +1606,13 @@ for line in sys.stdin:
 import json,pathlib,sys
 mode=pathlib.Path('mode').read_text()
 assert 'model_reasoning_effort="max"' in sys.argv
+assert 'model_context_window=1050000' in sys.argv
 for line in sys.stdin:
  q=json.loads(line);m=q.get('method')
  if 'id' not in q:continue
  if m=='thread/start':
   assert q['params']['model']=='gpt-6-astra' and q['params']['config']['model_reasoning_effort']=='max'
+  assert q['params']['config']['model_context_window']==1050000
   r={'thread':{'id':'thread-fixture'},'model':'gpt-6.1-sol' if mode=='wrong_model' else 'gpt-6-astra','reasoningEffort':'high' if mode=='wrong_effort' else 'max'}
  elif m=='command/exec':r={'exitCode':0,'stdout':'','stderr':''}
  elif m=='turn/start':pathlib.Path('unexpected-turn').write_text('yes');r={}
@@ -1210,4 +1707,202 @@ async fn memory_boundary_cancellation_preserves_partial_executor_frame() {
         .unwrap(),
         Some(json!({"method":"next"}))
     );
+}
+
+
+fn context_args(args: &mut Vec<String>, limits: &crate::limits::CodingLimits) {
+    if let Some(window) = limits.model_context_window {
+        args.extend(["-c".into(), format!("model_context_window={window}")]);
+    }
+}
+fn context_config(config: &mut Value, limits: &crate::limits::CodingLimits) {
+    if let Some(window) = limits.model_context_window {
+        config["config"]["model_context_window"] = json!(window);
+    }
+}
+#[cfg(test)]
+#[test]
+fn accepted_context_window_reaches_both_codex_configuration_sites() {
+    let mut coding = crate::limits::RuntimeLimits::seed().unwrap().execution.coding;
+    for selected in [None, Some(1_050_000), Some(32_000)] {
+        coding.model_context_window = selected;
+        coding.validate().unwrap();
+        let mut args = vec!["app-server".to_owned()];
+        let mut config = json!({"config":{"model_reasoning_effort":"max"}});
+        context_args(&mut args, &coding);
+        context_config(&mut config, &coding);
+        if let Some(window) = selected {
+            assert_eq!(args, vec!["app-server".to_owned(), "-c".into(), format!("model_context_window={window}")]);
+            assert_eq!(config["config"]["model_context_window"], json!(window));
+        } else {
+            assert_eq!(args, vec!["app-server"]);
+            assert_eq!(config, json!({"config":{"model_reasoning_effort":"max"}}));
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "codex_workflow_join.rs"]
+mod workflow_join_tests;
+
+#[cfg(test)]
+#[path = "codex_charter_tests.rs"]
+mod charter_delivery_tests;
+
+#[cfg(test)]
+#[path = "codex_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+
+#[cfg(test)]
+mod metadata_frame_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn selected_frame_limit_admits_large_same_thread_second_turn_and_refuses_smaller_bounds() {
+        // Controlled stdio exercises the real Session sender and line decoder.
+        // It is not a provider context-window or governance continuation claim.
+        const FORMER_FRAME_BYTES: usize = 1_048_576;
+        const PAYLOAD_BYTES: usize = FORMER_FRAME_BYTES + 4096;
+        let request_payload = "q".repeat(PAYLOAD_BYTES);
+        let response_payload = "r".repeat(PAYLOAD_BYTES);
+        for mode in ["admitted", "outgoing-refused", "incoming-refused"] {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("artifacts/v2/build-60156282/worker/tests")
+                .join(format!("metadata-frame-{}-{}-{mode}", std::process::id(),
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::create_dir_all(&root).unwrap();
+            let binary = root.join("peer.py");
+            std::fs::write(root.join("mode"), mode).unwrap();
+            std::fs::write(&binary, r#"#!/usr/bin/python3
+import hashlib,json,pathlib,sys
+mode=pathlib.Path('mode').read_text()
+former=1048576
+payload_bytes=former+4096
+turns=0
+for raw in sys.stdin.buffer:
+    request=json.loads(raw)
+    if 'id' not in request: continue
+    method=request['method']
+    params=request['params']
+    text=''
+    if method=='initialize': result={}
+    elif method=='thread/start':
+        assert params['model']=='gpt-6-astra'
+        assert params['config']['model_reasoning_effort']=='max'
+        result={'thread':{'id':'metadata-frame-thread'},'model':'gpt-6-astra','reasoningEffort':'max'}
+    elif method=='turn/start':
+        turns+=1
+        assert turns<=2 and params['threadId']=='metadata-frame-thread'
+        assert params['model']=='gpt-6-astra' and params['effort']=='max'
+        text=params['input'][0]['text']
+        if turns==1: assert text=='original small turn'
+        elif mode=='incoming-refused': assert text=='small continuation input'
+        else: assert text=='q'*payload_bytes
+        result={'turn':{'id':'metadata-turn-'+str(turns)},'output':('r'*payload_bytes if turns==2 else 'small')}
+    else: raise AssertionError('unexpected method '+method)
+    response=(json.dumps({'id':request['id'],'result':result},separators=(',',':'))+'\n').encode()
+    observation={'id':request['id'],'method':method,'request_wire_bytes':len(raw),
+        'input_bytes':len(text.encode()),'input_sha256':hashlib.sha256(text.encode()).hexdigest(),
+        'thread_id':params.get('threadId'),'produced_response_wire_bytes':len(response)}
+    with open('requests.jsonl','a') as output:
+        output.write(json.dumps(observation,separators=(',',':'))+'\n')
+    sys.stdout.buffer.write(response)
+    sys.stdout.buffer.flush()
+"#).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut limits = (*crate::worker::test_limits()).clone();
+            limits.execution.coding.frame_bytes = if mode == "admitted" {
+                2 * FORMER_FRAME_BYTES
+            } else {
+                FORMER_FRAME_BYTES
+            };
+            limits.validate().unwrap();
+            let (_cancel, rx) = tokio::sync::watch::channel(false);
+            let mut control = crate::worker::test_control(process::now_ms() + 10_000, rx);
+            control.runtime_limits = Arc::new(limits.clone());
+            control.worker_limits = Arc::new(limits.worker.clone());
+            let registry = root.join("processes");
+            let mut session = Session::start_with_key(
+                &binary, &root, &root.join("state"), &registry,
+                &InferenceSettings::selected(), &limits.execution,
+                Arc::new(limits.worker.clone()), None,
+            ).await.unwrap();
+            let second_text = if mode == "incoming-refused" {
+                "small continuation input"
+            } else {
+                request_payload.as_str()
+            };
+            let second_params = json!({"threadId":"metadata-frame-thread",
+                "input":[{"type":"text","text":second_text}],
+                "model":"gpt-6-astra","effort":"max"});
+            let second_request_bytes = serde_json::to_vec(&json!({
+                "id":4,"method":"turn/start","params":second_params.clone()
+            })).unwrap().len();
+            // Keep cleanup outside all result assertions, including early refusal.
+            let result: std::result::Result<Value, String> = async {
+                session.initialize(&control).await?;
+                let thread = session.request("thread/start", json!({
+                    "model":"gpt-6-astra","config":{"model_reasoning_effort":"max"}
+                }), &control).await?;
+                if thread["thread"]["id"] != "metadata-frame-thread" {
+                    return Err("fixture returned wrong thread".into());
+                }
+                let first = session.request("turn/start", json!({
+                    "threadId":"metadata-frame-thread",
+                    "input":[{"type":"text","text":"original small turn"}],
+                    "model":"gpt-6-astra","effort":"max"
+                }), &control).await?;
+                if first != json!({"turn":{"id":"metadata-turn-1"},"output":"small"}) {
+                    return Err("fixture returned wrong first turn".into());
+                }
+                session.request("turn/start", second_params, &control).await
+            }.await;
+            let shutdown = session.shutdown().await;
+            shutdown.unwrap();
+            assert!(std::fs::read_dir(&registry).unwrap().all(|entry|
+                entry.unwrap().path().extension().is_none_or(|extension| extension != "json")));
+            let observations = std::fs::read_to_string(root.join("requests.jsonl")).unwrap()
+                .lines().map(|line|serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
+            assert_eq!(observations.iter().map(|v|v["id"].as_u64().unwrap()).collect::<Vec<_>>(),
+                if mode == "outgoing-refused" { vec![1,2,3] } else { vec![1,2,3,4] });
+            assert_eq!(observations[0]["method"], "initialize");
+            assert_eq!(observations[1]["method"], "thread/start");
+            assert_eq!(observations[2]["method"], "turn/start");
+            assert_eq!(observations[2]["thread_id"], "metadata-frame-thread");
+            if mode == "outgoing-refused" {
+                assert!(second_request_bytes > limits.execution.coding.frame_bytes);
+                assert_eq!(result.unwrap_err(), "executor input exceeds limit (execution.coding.frame_bytes)");
+                // The original small turn exists; the refused second turn never reached the peer.
+            } else {
+                let last = &observations[3];
+                assert_eq!(last["method"], "turn/start");
+                assert_eq!(last["thread_id"], "metadata-frame-thread");
+                assert_eq!(last["request_wire_bytes"].as_u64().unwrap() as usize, second_request_bytes + 1);
+                assert_eq!(last["input_bytes"].as_u64().unwrap() as usize, second_text.len());
+                let input_sha256: String = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, second_text.as_bytes())
+                    .as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+                assert_eq!(last["input_sha256"], input_sha256);
+                let response_bytes = serde_json::to_vec(&json!({"id":4,"result":{
+                    "turn":{"id":"metadata-turn-2"},"output":response_payload
+                }})).unwrap().len() + 1;
+                assert!(response_bytes > FORMER_FRAME_BYTES);
+                assert_eq!(last["produced_response_wire_bytes"].as_u64().unwrap() as usize, response_bytes);
+                if mode == "admitted" {
+                    assert!(second_request_bytes > FORMER_FRAME_BYTES);
+                    assert!(second_request_bytes + 1 <= limits.execution.coding.frame_bytes);
+                    assert!(response_bytes <= limits.execution.coding.frame_bytes);
+                    assert_eq!(result.unwrap(), json!({"turn":{"id":"metadata-turn-2"},"output":response_payload}));
+                } else {
+                    assert!(second_request_bytes < limits.execution.coding.frame_bytes);
+                    assert!(response_bytes > limits.execution.coding.frame_bytes);
+                    assert_eq!(result.unwrap_err(), "executor message exceeds limit (execution.coding.frame_bytes)");
+                }
+                println!("CODING_FRAME_METADATA mode={mode} selected={} request_body={} request_wire={} produced_response_wire={} former={} turns=2",
+                    limits.execution.coding.frame_bytes, second_request_bytes, second_request_bytes + 1,
+                    response_bytes, FORMER_FRAME_BYTES);
+            }
+        }
+    }
 }

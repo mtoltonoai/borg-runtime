@@ -127,6 +127,7 @@ async fn missing_or_unsupported_template_refuses_both_workers_before_effects() {
             &f.control,
             &f.reporter,
             None,
+            None,
             &f.state,
             lock,
         )
@@ -147,6 +148,7 @@ async fn missing_or_unsupported_template_refuses_both_workers_before_effects() {
             task: task.clone(),
             checkpoint: None,
             continuation: None,
+                workflow_continuation: None, completion_continuation: None,
         };
         let error = coding(
             &f.reporter.config,
@@ -173,17 +175,23 @@ fn typed_bridge_uncertainty_survives_plain_diagnostic() {
     let failure = AttemptFailure::from(codex::ExecutionFailure {
         message: "bridge stopped".into(),
         collaboration_uncertain: true,
+        execution_uncertain: false,
+        completion_uncertain: false,
+        completion_held: false,
     });
     assert!(failure.execution_uncertain(false));
     assert!(!receipt_completed(&Err(failure), true));
     let known = AttemptFailure::from(codex::ExecutionFailure {
         message: "known refusal".into(),
         collaboration_uncertain: false,
+        execution_uncertain: false,
+        completion_uncertain: false,
+        completion_held: false,
     });
     assert!(!known.execution_uncertain(false));
 }
-#[test]
-fn startup_audits_completed_coding_receipt_and_exact_old_caller() {
+#[tokio::test]
+async fn startup_audits_completed_coding_receipt_and_exact_old_caller() {
     let f = fixture();
     let task = input(&f, ExecutorKind::Coding);
     let a = &f.reporter.attempt;
@@ -199,6 +207,7 @@ fn startup_audits_completed_coding_receipt_and_exact_old_caller() {
         task: task.clone(),
         checkpoint: None,
         continuation: None,
+                workflow_continuation: None, completion_continuation: None,
     };
     atomic_json(
         &f.state.join("commands/command.json"),
@@ -209,7 +218,9 @@ fn startup_audits_completed_coding_receipt_and_exact_old_caller() {
         },
     )
     .unwrap();
-    audit_stopped_coding_collaboration(&f.reporter.config, &f.state).unwrap();
+    audit_stopped_coding_collaboration(&f.reporter.config, &f.state, &f.reporter.client)
+        .await
+        .unwrap();
     let caller = collaboration_caller(a);
     let dir = codex::state_path(&f.state.join("codex"), &a.id).join("collaboration-codex");
     std::fs::create_dir_all(&dir).unwrap();
@@ -237,7 +248,11 @@ fn startup_audits_completed_coding_receipt_and_exact_old_caller() {
     };
     save(&journal);
     assert!(!coding_collaboration_closed(&f.reporter.config, &task, a, &f.state).unwrap());
-    assert!(audit_stopped_coding_collaboration(&f.reporter.config, &f.state).is_err());
+    assert!(
+        audit_stopped_coding_collaboration(&f.reporter.config, &f.state, &f.reporter.client)
+            .await
+            .is_err()
+    );
     // Serialize the actual typed Reply so this fixture follows the wire contract.
     journal["entries"][0]["outcome"] = serde_json::to_value(crate::mcp::CallResult {
         reply: Reply {
@@ -256,12 +271,22 @@ fn startup_audits_completed_coding_receipt_and_exact_old_caller() {
     })
     .unwrap();
     save(&journal);
-    audit_stopped_coding_collaboration(&f.reporter.config, &f.state).unwrap();
+    audit_stopped_coding_collaboration(&f.reporter.config, &f.state, &f.reporter.client)
+        .await
+        .unwrap();
     journal["caller"]["incarnation"] = json!("new-incarnation");
     save(&journal);
-    assert!(audit_stopped_coding_collaboration(&f.reporter.config, &f.state).is_err());
+    assert!(
+        audit_stopped_coding_collaboration(&f.reporter.config, &f.state, &f.reporter.client)
+            .await
+            .is_err()
+    );
     std::fs::write(&path, b"corrupt").unwrap();
-    assert!(audit_stopped_coding_collaboration(&f.reporter.config, &f.state).is_err());
+    assert!(
+        audit_stopped_coding_collaboration(&f.reporter.config, &f.state, &f.reporter.client)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -276,10 +301,12 @@ async fn unbound_configured_child_refuses_before_parent_effects() {
             definition.execution_profile = None;
         }
         task.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {
-            child: CodingTaskTemplate {
+            child: CodingTaskTemplate { instruction_source: None,
+                pull_request: None,
                 instruction_prefix: "child".into(),
                 definition,
                 repository: Repository {
+                    pull_request_target: None,
                     registration: Some(crate::repository_catalogue::Revision {
                         repository_id: "fixture-repository".into(), registration_revision: "fixture-revision".into(),
                     }),
@@ -298,6 +325,7 @@ async fn unbound_configured_child_refuses_before_parent_effects() {
             &task,
             &f.control,
             &f.reporter,
+            None,
             None,
             &f.state,
             lock,
@@ -332,6 +360,7 @@ fn session_command(f: &Fixture) -> WorkerCommand {
         task,
         checkpoint: None,
         continuation: None,
+                workflow_continuation: None, completion_continuation: None,
     }
 }
 
@@ -392,8 +421,8 @@ async fn changed_session_association_refuses_before_receipt_report_or_launch() {
     }
 }
 
-#[test]
-fn completed_recovered_command_cannot_hide_changed_session_binding() {
+#[tokio::test]
+async fn completed_recovered_command_cannot_hide_changed_session_binding() {
     let f = fixture();
     let command = session_command(&f);
     let path = f.state.join("commands/session-launch.json");
@@ -415,7 +444,9 @@ fn completed_recovered_command_cannot_hide_changed_session_binding() {
         "session_binding_mismatch"
     );
     assert_eq!(
-        audit_stopped_coding_collaboration(&f.reporter.config, &f.state).unwrap_err(),
+        audit_stopped_coding_collaboration(&f.reporter.config, &f.state, &f.reporter.client)
+            .await
+            .unwrap_err(),
         "session_binding_mismatch"
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -514,4 +545,17 @@ fn coding_prompt_refuses_a_credential_formed_by_json_escaping() {
     let error = coding_prompt(&task, "source-commit", &[r"line\nbreak".into()]).unwrap_err();
     assert_eq!(error, "acceptance command contains configured credential");
     assert_eq!(serde_json::to_value(&task).unwrap(), accepted);
+}
+
+#[test]
+fn typed_supplied_execution_uncertainty_survives_plain_diagnostic() {
+    let failure = AttemptFailure::from(codex::ExecutionFailure {
+        message: "executor exited before its result".into(),
+        collaboration_uncertain: false,
+        execution_uncertain: true,
+        completion_uncertain: false,
+        completion_held: false,
+    });
+    assert!(matches!(failure, AttemptFailure::SuppliedExecutorUncertain(_)));
+    assert!(failure.execution_uncertain(false));
 }

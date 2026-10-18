@@ -12,12 +12,13 @@ use std::{
     time::Duration,
 };
 
-fn metadata() -> borg_runtime::limits::RuntimeLimits { borg_runtime::limits::RuntimeLimits::seed().unwrap() }
+fn metadata() -> borg_runtime::limits::RuntimeLimits { let mut p=borg_runtime::limits::RuntimeLimits::seed().unwrap(); p.execution.native.context_bytes=65_536; p }
 fn with_controller_limits(mut config:ControllerConfig, update:impl FnOnce(&mut borg_runtime::limits::ControllerLimits))->ControllerConfig {
     update(&mut Arc::make_mut(&mut config.limits).controller);config
 }
 fn fixture_repository_registration() -> borg_runtime::repository_catalogue::Registration {
     borg_runtime::repository_catalogue::Registration {
+        pull_request_target: None,
         repository_id: "controller-fixture".into(),
         registration_revision: "revision-1".into(),
         display_name: "Controller fixture repository".into(),
@@ -101,6 +102,7 @@ fn path() -> PathBuf {
 }
 fn config() -> ControllerConfig {
     with_controller_limits(ControllerConfig {
+        limits: std::sync::Arc::new(metadata()),
         validation_executable: PathBuf::from(env!("CARGO_BIN_EXE_borg-runtime")),
         ..ControllerConfig::default()
     }, |limits| { limits.command_wait_ms = (Duration::from_millis(20)).as_millis().try_into().unwrap(); })
@@ -113,10 +115,10 @@ fn future() -> u64 {
         + 600_000
 }
 fn native(agent: &str) -> TaskInput {
-    TaskInput {resolved_limits: None,
+    TaskInput { instruction_source: None, pull_request: None, resolved_limits: None,
         repository_read: None,
         instruction: "produce one structured answer".into(),
-        definition: Definition {limit_overrides: None,
+        definition: Definition {charter: None, limit_overrides: None,
             execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
             inference: Some(borg_runtime::protocol::InferenceSettings::selected()),
             id: agent.into(),
@@ -141,7 +143,7 @@ fn native(agent: &str) -> TaskInput {
 }
 fn coding(agent: &str) -> TaskInput {
     let mut t = native(agent);
-    t.definition = Definition {limit_overrides: None,
+    t.definition = Definition {charter: None, limit_overrides: None,
         execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
         inference: Some(borg_runtime::protocol::InferenceSettings::selected()),
         id: agent.into(),
@@ -149,6 +151,7 @@ fn coding(agent: &str) -> TaskInput {
         executor: ExecutorKind::Coding,
     };
     t.repository = Some(Repository {
+        pull_request_target: None,
         registration: Some(fixture_repository_binding()),
         url: String::new(),
         start_commit: "a".repeat(40),
@@ -159,11 +162,11 @@ fn coding(agent: &str) -> TaskInput {
     t
 }
 async fn call(c: &Controller, command: Operation) -> Outcome {
-    c.handle(Request {
+    Box::pin(c.handle(Request {
         protocol_revision: WIRE_REVISION,
         request_id: format!("request-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
         command,
-    })
+    }))
     .await
     .outcome
 }
@@ -275,6 +278,93 @@ async fn report(c: &Controller, a: &Attempt, id: &str, observation: Observation)
     )
     .await
 }
+/// Controlled positive request/response facts through the canonical receipt path.
+/// No provider is called: the fixed two-byte body is a fixture observation only.
+/// Deliberate malformed/over-budget Usage tests continue to use report unchanged.
+async fn controlled_native_request(
+    c: &Controller,
+    a: &Attempt,
+    index: u32,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) {
+    let operation = |report_id, observation| Operation::ObserveWorker {
+        report: Report {
+            report_id,
+            worker_id: a.worker_id.clone(),
+            incarnation: a.worker_incarnation.clone(),
+            task_id: a.task_id.clone(),
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            observation,
+        },
+    };
+    let reservation = operation(
+        borg_runtime::native_loop_contract::reservation_id(&a.id, index),
+        Observation::Usage {
+            native_diagnostic_reserved: true,
+            model_requests: index,
+            input_tokens,
+            output_tokens,
+        },
+    );
+    let reserved = Box::pin(c.handle(Request {
+        protocol_revision: WIRE_REVISION,
+        request_id: format!(
+            "positive-reservation-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ),
+        command: reservation.clone(),
+    }))
+    .await;
+    reserved.validate_for(&reservation).unwrap();
+    let accepted = task(reserved.outcome.clone());
+    assert_eq!(accepted.id, a.task_id);
+    assert_eq!(accepted.attempt.as_ref().unwrap().id, a.id);
+    let reservation_revision = reserved.commit.as_ref().unwrap().controller_revision;
+    let diagnostic = operation(
+        borg_runtime::native_loop_contract::diagnostic_id(&a.id, index),
+        Observation::NativeRequestDiagnostic {
+            request_index: index,
+            endpoint: "https://api.openai.com/v1/responses".into(),
+            model: accepted
+                .input
+                .definition
+                .required_inference()
+                .unwrap()
+                .model
+                .clone(),
+            request_binding: Some(borg_runtime::native::ProviderRequestBinding {
+                bytes: 2,
+                sha256: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
+            }),
+            observed_outcome:
+                borg_runtime::native_loop_contract::NativeRequestObservedOutcome::Completed,
+            failure: None,
+        },
+    );
+    let observed = Box::pin(c.handle(Request {
+        protocol_revision: WIRE_REVISION,
+        request_id: format!(
+            "positive-diagnostic-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ),
+        command: diagnostic.clone(),
+    }))
+    .await;
+    observed.validate_for(&diagnostic).unwrap();
+    assert!(
+        matches!(
+            observed.outcome,
+            Outcome::Ok {
+                data: Data::Acknowledged
+            }
+        ),
+        "{observed:?}"
+    );
+    assert!(observed.commit.as_ref().unwrap().controller_revision > reservation_revision);
+}
+
 /// Controlled one-response completion, using the actual canonical receipt path.
 /// Callers provide the matching stable Usage reservation before this observation.
 async fn complete_native_loop(c: &Controller, a: &Attempt) {
@@ -284,6 +374,8 @@ async fn complete_native_loop(c: &Controller, a: &Attempt) {
             a,
             &borg_runtime::native_loop_contract::completion_id(&a.id),
             Observation::NativeLoopCompleted {
+                requests: Vec::new(),
+                final_response_index: None,
                 model_requests: 1,
                 calls: vec![],
             },
@@ -304,25 +396,15 @@ async fn finish_native(c: &Controller, a: &Attempt, label: &str) -> Task {
         )
         .await,
     );
-    task(
-        report(
-            c,
-            a,
-            &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: Some(4),
-                output_tokens: Some(2),
-            },
-        )
-        .await,
-    );
+    controlled_native_request(c, a, 1, Some(4), Some(2)).await;
     task(
         report(
             c,
             a,
             &borg_runtime::native_loop_contract::completion_id(&a.id),
             Observation::NativeLoopCompleted {
+                requests: Vec::new(),
+                final_response_index: None,
                 model_requests: 1,
                 calls: vec![],
             },
@@ -688,7 +770,24 @@ async fn cancellation_and_success_are_ordered_by_committed_state() {
     register(&c, &w).await;
     let t = submit(&c, "s", native("a")).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    let success = finish_native(&c, &a, "success").await;
+    // Current native admission retains the marked charge and its exact terminal
+    // diagnostic before accepting completion. Historical shared helpers stay
+    // unchanged; this is controlled evidence through the real receipt path.
+    task(report(&c, &a, "success-started", Observation::Started {
+        thread_id: None, turn_id: None,
+    }).await);
+    governance::completed_native_request(&c, &a, Some(4), Some(2)).await;
+    complete_native_loop(&c, &a).await;
+    task(report(&c, &a, "success-executor", Observation::ExecutorOutcome {
+        success: true, summary: "actual controlled completion".into(),
+    }).await);
+    task(report(&c, &a, "success-stopped", Observation::ProcessTreeStopped).await);
+    let success = task(report(&c, &a, "success-result", Observation::ResultCandidate {
+        checks_passed: true, summary: "accepted structured answer".into(),
+        checkpoint: None,
+        validation: vec![borg_runtime::native_loop_contract::evidence(&a.id)],
+        output: Some(json!({"answer":42})),
+    }).await);
     let answer = task(
         call(
             &c,
@@ -932,19 +1031,7 @@ async fn native_schema_and_acceptance_are_not_executor_exit_status() {
         .await,
     );
     assert_eq!(get(&c, &t.id).await.status, TaskStatus::Active);
-    task(
-        report(
-            &c,
-            &a,
-            &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     complete_native_loop(&c, &a).await;
     task(report(&c, &a, "schema-stop", Observation::ProcessTreeStopped).await);
     assert_eq!(
@@ -1201,19 +1288,7 @@ async fn child_result_survives_restart_and_resumes_parent_once_without_refund() 
     let w = worker("w", "i", 1, 0);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    task(
-        report(
-            &c,
-            &a,
-            "parent-usage",
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     let mut child = native("child");
     child.limits.model_requests = 1;
     child.limits.deadline_unix_ms = parent.input.limits.deadline_unix_ms;
@@ -1738,19 +1813,7 @@ async fn oversized_child_handoff_refuses_without_stranding_parent_assignment() {
     );
     task(report(&c, &a, "parent-stop", Observation::ProcessTreeStopped).await);
     let ca = run(&commands(&c, &w, vec![]).await);
-    task(
-        report(
-            &c,
-            &ca,
-            &borg_runtime::native_loop_contract::reservation_id(&ca.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &ca, 1, None, None).await;
     complete_native_loop(&c, &ca).await;
     task(
         report(
@@ -1865,19 +1928,7 @@ async fn oversized_result_refusal_does_not_withhold_an_unrelated_stop_command() 
     );
     task(report(&c, &a, "parent-stop", Observation::ProcessTreeStopped).await);
     let ca = find(&commands(&c, &w, vec![]).await, &child.id);
-    task(
-        report(
-            &c,
-            &ca,
-            "usage",
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &ca, 1, None, None).await;
     task(
         report(
             &c,
@@ -1968,19 +2019,7 @@ async fn native_validation_releases_owner_and_ignores_unrelated_progress_revisio
     let w = worker("validation-worker", "inc-1", 1, 0);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    task(
-        report(
-            &c,
-            &a,
-            &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     complete_native_loop(&c, &a).await;
     task(
         report(
@@ -2083,19 +2122,7 @@ async fn native_validation_finalization_rechecks_cancel_deadline_and_new_attempt
         let w = worker("w", "inc", 1, 0);
         register(&c, &w).await;
         let a = run(&commands(&c, &w, vec![]).await);
-        task(
-            report(
-                &c,
-                &a,
-                &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-                Observation::Usage {
-                    model_requests: 1,
-                    input_tokens: None,
-                    output_tokens: None,
-                },
-            )
-            .await,
-        );
+        controlled_native_request(&c, &a, 1, None, None).await;
         complete_native_loop(&c, &a).await;
         task(
             report(
@@ -2434,6 +2461,25 @@ fn stored_usage_observations(path: &std::path::Path, task: &str) -> i64 {
 //= type=test
 //# Reconnecting or resuming an attempt MUST NOT reset its recorded model-request accounting.
 async fn cumulative_usage_upgrades_known_counts_and_rejects_downgrades_durably() {
+    // Exact controlled request/terminal facts; these are not provider calls.
+    // Diagnostic observations add no Usage rows or request/token increments.
+    async fn completed(c: &Controller, a: &Attempt, index: u32) {
+        let accepted = get(c, &a.task_id).await;
+        let outcome = report(c, a,
+            &borg_runtime::native_loop_contract::diagnostic_id(&a.id, index),
+            Observation::NativeRequestDiagnostic {
+                request_index: index,
+                endpoint: "https://api.openai.com/v1/responses".into(),
+                model: accepted.input.definition.required_inference().unwrap().model.clone(),
+                request_binding: Some(borg_runtime::native::ProviderRequestBinding {
+                    bytes: 2,
+                    sha256: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
+                }),
+                observed_outcome: borg_runtime::native_loop_contract::NativeRequestObservedOutcome::Completed,
+                failure: None,
+            }).await;
+        assert!(matches!(outcome, Outcome::Ok { data: Data::Acknowledged }), "{outcome:?}");
+    }
     let p = path();
     let c = Controller::open_with_config(&p, config()).unwrap();
     let mut input = native("usage-agent");
@@ -2442,12 +2488,15 @@ async fn cumulative_usage_upgrades_known_counts_and_rejects_downgrades_durably()
     let w = worker("usage-worker", "inc-1", 1, 0);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
+    let reservation_id = borg_runtime::native_loop_contract::reservation_id(&a.id, 1);
+    let increased_id = borg_runtime::native_loop_contract::reservation_id(&a.id, 2);
     let reservation = Observation::Usage {
+        native_diagnostic_reserved: true,
         model_requests: 1,
         input_tokens: None,
         output_tokens: None,
     };
-    let reserved = report(&c, &a, "usage-reserved", reservation.clone()).await;
+    let reserved = report(&c, &a, &reservation_id, reservation.clone()).await;
     assert_eq!(task(reserved.clone()).status, TaskStatus::Active);
     task(
         report(
@@ -2455,6 +2504,7 @@ async fn cumulative_usage_upgrades_known_counts_and_rejects_downgrades_durably()
             &a,
             "usage-input-known",
             Observation::Usage {
+                native_diagnostic_reserved: false,
                 model_requests: 1,
                 input_tokens: Some(17),
                 output_tokens: None,
@@ -2463,26 +2513,36 @@ async fn cumulative_usage_upgrades_known_counts_and_rejects_downgrades_durably()
         .await,
     );
     let known = Observation::Usage {
+        native_diagnostic_reserved: false,
         model_requests: 1,
         input_tokens: Some(17),
         output_tokens: Some(9),
     };
     let known_reply = report(&c, &a, "usage-known", known.clone()).await;
     assert_eq!(task(known_reply.clone()).status, TaskStatus::Active);
+    completed(&c, &a, 1).await;
     let increased = Observation::Usage {
+        native_diagnostic_reserved: true,
         model_requests: 2,
         input_tokens: Some(20),
         output_tokens: Some(12),
     };
-    task(report(&c, &a, "usage-increased", increased.clone()).await);
+    task(report(&c, &a, &increased_id, increased.clone()).await);
+    completed(&c, &a, 2).await;
     // A new observation can repeat the same cumulative snapshot. It is another
     // history event, never another increment to the stored request charge.
-    let latest = task(report(&c, &a, "usage-equal-new-id", increased.clone()).await);
+    let repeated = Observation::Usage {
+        native_diagnostic_reserved: false,
+        model_requests: 2,
+        input_tokens: Some(20),
+        output_tokens: Some(12),
+    };
+    let latest = task(report(&c, &a, "usage-equal-new-id", repeated).await);
     assert_eq!(latest.status, TaskStatus::Active);
     // A delayed exact outbox/report replay returns its historical reply even
     // after counters became known. It must not replay its earlier SQL update.
     assert_eq!(
-        report(&c, &a, "usage-reserved", reservation).await,
+        report(&c, &a, &reservation_id, reservation).await,
         reserved
     );
     assert_eq!(
@@ -2505,6 +2565,7 @@ async fn cumulative_usage_upgrades_known_counts_and_rejects_downgrades_durably()
                     &a,
                     id,
                     Observation::Usage {
+                        native_diagnostic_reserved: false,
                         model_requests,
                         input_tokens,
                         output_tokens
@@ -2551,20 +2612,9 @@ async fn failed_output_retains_usage_and_new_attempt_rejects_stale_accounting() 
     let w = worker("usage-failure-worker", "inc-1", 1, 0);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    task(
-        report(
-            &c,
-            &a,
-            &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     let known = Observation::Usage {
+        native_diagnostic_reserved: false,
         model_requests: 1,
         input_tokens: Some(17),
         output_tokens: Some(9),
@@ -2694,19 +2744,8 @@ async fn failed_output_retains_usage_and_new_attempt_rejects_stale_accounting() 
         "stale_incarnation"
     );
     assert_eq!(get(&c, &t.id).await, before);
-    let reserved = task(
-        report(
-            &c,
-            &a2,
-            "second-attempt-reservation",
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a2, 1, None, None).await;
+    let reserved = get(&c, &a2.task_id).await;
     assert_eq!(reserved.status, TaskStatus::Active);
     drop(c);
     assert_eq!(stored_attempt_usage(&p, &a.id), (1, Some(17), Some(9)));
@@ -2722,7 +2761,8 @@ fn configured_native(agent: &str) -> TaskInput {
     child.limits.deadline_unix_ms = input.limits.deadline_unix_ms;
     child.limits.result_bytes = 4096;
     input.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {
-        child: CodingTaskTemplate {
+        child: CodingTaskTemplate { instruction_source: None,
+            pull_request: None,
             instruction_prefix: "Use the configured repository and checks.".into(),
             definition: child.definition,
             repository: child.repository.unwrap(),
@@ -2737,7 +2777,7 @@ fn configured_native(agent: &str) -> TaskInput {
 fn configured_template_mut(input: &mut TaskInput) -> &mut CodingTaskTemplate {
     match input.native_workflow.as_deref_mut().unwrap() {
         NativeWorkflow::CodingThenContinue { child } => child,
-        NativeWorkflow::InspectCurrentTaskThenContinue {} => panic!("expected coding workflow"),
+        NativeWorkflow::InspectCurrentTaskThenContinue {} | NativeWorkflow::Reassign { .. } => panic!("expected coding workflow"),
     }
 }
 
@@ -2822,7 +2862,7 @@ async fn finish_controlled_coding(c: &Controller, a: &Attempt, label: &str) -> T
 //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
 //= type=test
 //# The application MUST identify the schema version of its stored task state.
-async fn schema_eleven_and_old_wire_have_explicit_original_refusal() {
+async fn current_schema_reopens_and_old_wire_has_explicit_original_refusal() {
     let p = path();
     let mut encoded = serde_json::to_value(native("schema-defaults")).unwrap();
     encoded["limits"]
@@ -2873,7 +2913,7 @@ async fn schema_eleven_and_old_wire_have_explicit_original_refusal() {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            12
+            24
         );
         assert_eq!(
             db.query_row("SELECT count(*) FROM tasks", [], |row| row.get::<_, i64>(0))
@@ -2898,19 +2938,7 @@ async fn full_accepted_result_bound_counts_escaped_fields_at_exact_boundary() {
     let w = worker("bounded-worker", "inc", 1, 0);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    task(
-        report(
-            &c,
-            &a,
-            &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     complete_native_loop(&c, &a).await;
     task(
         report(
@@ -2934,6 +2962,7 @@ async fn full_accepted_result_bound_counts_escaped_fields_at_exact_boundary() {
         .await,
     );
     let mut result = AcceptedResult {
+        pull_request: None,
         attempt_id: a.id.clone(),
         summary: "quoted \"\n\t\\".repeat(2),
         checkpoint: None,
@@ -3138,19 +3167,7 @@ async fn configured_child_matches_template_and_continuation_survives_replay_rest
     let w = worker("configured-worker", "inc", 1, 1);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    task(
-        report(
-            &c,
-            &a,
-            "decision-usage",
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     let child =
         borg_runtime::delegation::coding_child(&parent.input, "perform the bounded edit").unwrap();
     let delegate = |id: &str, child: TaskInput| Operation::DelegateTask {
@@ -3277,19 +3294,7 @@ async fn configured_child_matches_template_and_continuation_survives_replay_rest
         code(report(&c, &next, "missing-continuation-request", candidate.clone()).await),
         "invalid_transition"
     );
-    task(
-        report(
-            &c,
-            &next,
-            &borg_runtime::native_loop_contract::reservation_id(&next.id, 1),
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &next, 1, None, None).await;
     complete_native_loop(&c, &next).await;
     task(
         report(
@@ -3318,19 +3323,10 @@ async fn configured_delegation_reserves_last_request_and_cancellation_remains_fi
         let w = worker("w", "inc", 1, 1);
         register(&c, &w).await;
         let a = run(&commands(&c, &w, vec![]).await);
-        task(
-            report(
-                &c,
-                &a,
-                "usage",
-                Observation::Usage {
-                    model_requests: if mode == "no-room" { 2 } else { 1 },
-                    input_tokens: None,
-                    output_tokens: None,
-                },
-            )
-            .await,
-        );
+        // Two physical-request observations require two consecutive original charges.
+        for index in 1..=if mode == "no-room" { 2 } else { 1 } {
+            controlled_native_request(&c, &a, index, None, None).await;
+        }
         let child = borg_runtime::delegation::coding_child(&parent.input, "bounded edit").unwrap();
         let op = || Operation::DelegateTask {
             operation_id: "delegate".into(),
@@ -3391,19 +3387,7 @@ async fn configured_delegation_reserves_last_request_and_cancellation_remains_fi
         finish_controlled_coding(&c, &ca, "child").await;
         let continuation = commands(&c, &w, vec![]).await;
         let a2 = run(&continuation);
-        task(
-            report(
-                &c,
-                &a2,
-                "continuation-usage",
-                Observation::Usage {
-                    model_requests: 1,
-                    input_tokens: None,
-                    output_tokens: None,
-                },
-            )
-            .await,
-        );
+        controlled_native_request(&c, &a2, 1, None, None).await;
         task(
             report(
                 &c,
@@ -4446,7 +4430,8 @@ async fn release_uses_original_checkpoint_publication_after_successful_recovery_
         .iter()
         .map(|command| match command {
             WorkerCommand::RunAttempt { command_id, .. }
-            | WorkerCommand::StopAttempt { command_id, .. } => command_id.clone(),
+            | WorkerCommand::StopAttempt { command_id, .. }
+                    | WorkerCommand::CollaborationReady { command_id, .. } => command_id.clone(),
         })
         .collect();
     let accepting = run(&commands(&c, &w, ack).await);
@@ -4537,7 +4522,7 @@ async fn local_storage_admission_accepts_current_ext4_and_reopens_durable_task()
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        12
+        24
     );
 }
 
@@ -4922,21 +4907,25 @@ async fn task_recovery_view_clears_own_effect_and_child_ready_stale_reasons() {
     let w = worker("view-effect-worker", "view-effect-inc", 0, 1);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    assert!(matches!(
-        call(
-            &c,
-            Operation::PrepareOperation {
-                operation_id: "view-effect".into(),
-                task_id: parent.id.clone(),
-                attempt_id: a.id.clone(),
-                generation: a.generation,
-                kind: "pull_request".into(),
-                intended: json!({"fixture":"controlled-original"})
-            }
-        )
-        .await,
-        Outcome::Ok { .. }
-    ));
+    // This is a generic controlled effect, not typed PR publication.
+    let intended = json!({"fixture":"controlled-original"});
+    let prepared = call(
+        &c,
+        Operation::PrepareOperation {
+            operation_id: "view-effect".into(),
+            task_id: parent.id.clone(),
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            kind: "merge".into(),
+            intended: intended.clone(),
+        },
+    ).await;
+    assert!(matches!(&prepared, Outcome::Ok { data: Data::Operation(effect) }
+        if effect.id == "view-effect" && effect.task_id == parent.id
+            && effect.attempt_id == a.id && effect.generation == a.generation
+            && effect.kind == "merge" && effect.intended == intended
+            && effect.state == "pending" && effect.outcome.is_none()),
+        "generic effect must retain its exact preparation: {prepared:?}");
     let child = controlled_delegate(&c, &parent, &a, "view-effect-child", "view-effect-c", 1).await;
     task(
         report(
@@ -5024,17 +5013,7 @@ async fn refused_result_fixture(label: &str) -> (PathBuf, Controller, Attempt, O
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
     assert_eq!(a.task_id, task.id);
-    report(
-        &c,
-        &a,
-        &borg_runtime::native_loop_contract::reservation_id(&a.id, 1),
-        Observation::Usage {
-            model_requests: 1,
-            input_tokens: Some(2),
-            output_tokens: Some(1),
-        },
-    )
-    .await;
+    controlled_native_request(&c, &a, 1, Some(2), Some(1)).await;
     complete_native_loop(&c, &a).await;
     report(
         &c,
@@ -5260,19 +5239,7 @@ async fn task_recovery_result_reconciliation_rejects_noninfrastructure_originals
     let w = worker("permanent-worker", "inc", 1, 0);
     register(&c, &w).await;
     let a = run(&commands(&c, &w, vec![]).await);
-    task(
-        report(
-            &c,
-            &a,
-            "permanent-usage",
-            Observation::Usage {
-                model_requests: 1,
-                input_tokens: None,
-                output_tokens: None,
-            },
-        )
-        .await,
-    );
+    controlled_native_request(&c, &a, 1, None, None).await;
     task(
         report(
             &c,
@@ -5492,6 +5459,7 @@ async fn definition_revision_is_retained_in_original_task_and_successor_commands
             &original,
             "revision-used",
             Observation::Usage {
+                native_diagnostic_reserved: false,
                 model_requests: 2,
                 input_tokens: None,
                 output_tokens: None,
@@ -6182,3 +6150,52 @@ mod repository_calls;
 
 #[path = "controller/ui_reads.rs"]
 mod ui_reads;
+
+#[path = "controller/documents_reviews.rs"]
+mod documents_reviews;
+
+#[path = "controller/collaboration_work.rs"]
+mod collaboration_work;
+
+#[path = "controller/collaboration_finalizer.rs"]
+mod collaboration_finalizer;
+
+#[path = "controller/collaboration_maintenance_provenance.rs"]
+mod collaboration_maintenance_provenance;
+
+#[path = "controller/collaboration_startup_migration.rs"]
+mod collaboration_startup_migration;
+
+#[path = "controller/governance.rs"]
+mod governance;
+#[path = "controller/governance_override_invariants.rs"]
+mod governance_override_invariants;
+#[path = "controller/governance_agent_update_guards.rs"]
+mod governance_agent_update_guards;
+#[path = "controller/governance_mounts.rs"]
+mod governance_mounts;
+#[path = "controller/charters.rs"]
+mod charters;
+#[path = "controller/native_request_evidence.rs"]
+mod native_request_evidence;
+
+#[path = "controller/governance_completion.rs"]
+mod governance_completion;
+
+#[path = "controller/governance_completion_final_result.rs"]
+mod governance_completion_final_result;
+
+#[path = "controller/collaboration_joined_wait.rs"]
+mod collaboration_joined_wait;
+
+#[path = "controller/charter_definitions.rs"]
+mod charter_definitions;
+
+#[path = "controller/checkpoint_settlement_identity.rs"]
+mod checkpoint_settlement_identity;
+
+#[path = "controller/agent_directory.rs"]
+mod agent_directory;
+
+#[path = "controller/task_handoffs.rs"]
+mod task_handoffs;

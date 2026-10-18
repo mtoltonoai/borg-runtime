@@ -6,6 +6,7 @@ import protected_preparation_v2 as prep
 import protected_behavior_v2 as behavior
 import protected_release_v2 as producer
 import package_v2 as package
+from selected_package_fixture import selected_build_files
 
 ROOT=Path(__file__).resolve().parents[2]/'tooling'
 TEST_ROOT=Path(tempfile.mkdtemp(prefix='borg-protected-preparation-tests-'))
@@ -14,7 +15,7 @@ def source_repository():
     global _SOURCE
     if _SOURCE is None:
         _SOURCE=TEST_ROOT/'fixture-source';_SOURCE.mkdir();(_SOURCE/'src').mkdir()
-        for name in ('Cargo.toml','Cargo.lock'):(_SOURCE/name).write_bytes((ROOT.parent/name).read_bytes())
+        for name,raw in selected_build_files().items():(_SOURCE/name).write_bytes(raw)
         (_SOURCE/'src/main.rs').write_text('fn main() {}\n');(_SOURCE/'src/lib.rs').write_text('// controlled selected-profile source\n')
         prep.fixed_git(['init'],_SOURCE,TEST_ROOT);prep.fixed_git(['add','.'],_SOURCE,TEST_ROOT);prep.fixed_git(['commit','-m','controlled source'],_SOURCE,TEST_ROOT)
     return _SOURCE
@@ -126,7 +127,9 @@ class Preparation(unittest.TestCase):
         self.assertIn(str(self.job/'prepared/cargo-projection.json'),receipt['prepared_inputs'])
         self.assertEqual(build['source_commit'],self.s['artifact']['source_commit']);self.assertEqual(journey['binary'],str(self.binary))
         self.assertEqual(package.immutable_tree(Path(build['repo']),build['source_commit'])[:2],(self.s['artifact']['source_tree'],'sha1'))
-        self.assertEqual(journey['repository']['url'],str(self.job/'prepared/seed'))
+        self.assertEqual(journey['repository']['url'],str(self.ws/'journey-remote.git'))
+        self.assertEqual(journey['repository']['checkpoint_remote'],journey['repository']['url'])
+        self.assertEqual(journey['repository']['start_commit'],prep.fixed_git(['rev-parse','HEAD'],self.job/'prepared/seed',self.job))
         self.assertEqual(journey['protocol_revision'],8)
         selected=json.loads((ROOT.parent/'metadata/limits.json').read_bytes())
         self.assertEqual(journey['selected_limits_sha256'],prep.sha(ROOT.parent/'metadata/limits.json'))
@@ -153,6 +156,199 @@ class Preparation(unittest.TestCase):
         before={str(p):prep.sha(p) for p in seed.rglob('*') if p.is_file()}
         target=next(p for p in remote.rglob('*') if p.is_file());target.chmod(0o600);target.write_bytes(b'publication mutation')
         self.assertEqual(before,{str(p):prep.sha(p) for p in seed.rglob('*') if p.is_file()})
+    def test_execution_owned_source_clone_keeps_exact_start_after_publication_moves(self):
+        _,receipt=self.execute()
+        journey=json.loads((self.job/'prepared/journey.json').read_bytes())
+        source=Path(journey['repository']['url']);start=journey['repository']['start_commit']
+        self.assertEqual(source,self.ws/'journey-remote.git')
+        self.assertEqual(journey['repository_registration']['source_endpoint'],str(source))
+        self.assertEqual(journey['repository_registration']['checkpoint_endpoint'],str(source))
+        prepared={p:prep.sha(Path(p)) for p in receipt['prepared_inputs']}
+        clone=self.ws/'controlled-source-clone'
+        prep.fixed_git(['clone','--no-local','--no-hardlinks',str(source),str(clone)],self.ws,self.job)
+        prep.fixed_git(['checkout','--detach',start],clone,self.job)
+        self.assertEqual((clone/'answer.txt').read_bytes(),b'before\n')
+        self.assertEqual((clone/'src/main.rs').read_text(),prep.SOURCE_TEXT)
+        self.assertEqual(journey['expected_test_source'],prep.SOURCE_TEXT)
+        self.assertEqual(prep.fixed_git(['rev-parse','HEAD'],self.job/'prepared/seed',self.job),start)
+        (clone/'answer.txt').write_text('after\n')
+        prep.fixed_git(['add','answer.txt'],clone,self.job)
+        prep.fixed_git(['commit','-m','controlled publication'],clone,self.job)
+        changed=prep.fixed_git(['rev-parse','HEAD'],clone,self.job)
+        branch=prep.fixed_git(['symbolic-ref','HEAD'],source,self.job)
+        prep.fixed_git(['push','origin','HEAD:'+branch],clone,self.job)
+        self.assertNotEqual(changed,start)
+        self.assertEqual(prep.fixed_git(['rev-parse','HEAD'],source,self.job),changed)
+        self.assertEqual(prep.fixed_git(['show',start+':answer.txt'],source,self.job),'before')
+        self.assertEqual(prepared,{p:prep.sha(Path(p)) for p in receipt['prepared_inputs']})
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+    def test_source_endpoint_substitution_invalidates_prepared_input_receipt(self):
+        _,receipt=self.execute();path=self.job/'prepared/journey.json'
+        original=path.read_bytes()
+        for section,field in [('repository','url'),('repository_registration','source_endpoint')]:
+            with self.subTest(section=section,field=field):
+                journey=json.loads(original)
+                journey[section][field]=str(self.job/'prepared/seed')
+                path.chmod(0o600);save(path,journey);path.chmod(0o444)
+                with self.assertRaisesRegex(ValueError,'immutable prepared input changed'):
+                    prep.verify_prepared(self.r,receipt,self.work,local)
+                path.chmod(0o600);path.write_bytes(original);path.chmod(0o444)
+        prep.verify_prepared(self.r,receipt,self.work,local)
+    def test_explicit_wire20_is_bound_into_prepared_journey(self):
+        self.r['preparation']['profile']['application_wire_revision']=20
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],20)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire21_is_bound_into_prepared_journey(self):
+        self.r['preparation']['profile']['application_wire_revision']=21
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],21)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire22_is_bound_into_prepared_journey(self):
+        self.r['preparation']['profile']['application_wire_revision']=22
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],22)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire23_is_bound_into_prepared_journey(self):
+        protocol=(ROOT.parent/'src/protocol.rs').read_bytes()
+        self.assertIn(b'pub const WIRE_REVISION: u32 = 23;',protocol)
+        self.r['preparation']['profile']['application_wire_revision']=23
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],23)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire19_is_bound_into_prepared_journey(self):
+        self.assertEqual(prep.application_wire({'application_wire_revision':19}),19)
+        self.r['preparation']['profile']['application_wire_revision']=19
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],19)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire18_is_bound_into_prepared_journey(self):
+        self.assertEqual(prep.application_wire({'application_wire_revision':18}),18)
+        self.r['preparation']['profile']['application_wire_revision']=18
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],18)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire17_is_bound_into_prepared_journey(self):
+        self.assertEqual(prep.application_wire({'application_wire_revision':17}),17)
+        self.r['preparation']['profile']['application_wire_revision']=17
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],17)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire16_is_bound_into_prepared_journey(self):
+        self.assertEqual(prep.application_wire({'application_wire_revision':16}),16)
+        self.r['preparation']['profile']['application_wire_revision']=16
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],16)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire15_is_bound_into_prepared_journey(self):
+        self.r['preparation']['profile']['application_wire_revision']=15
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],15)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_historical_wire14_remains_bound_without_upgrade(self):
+        self.r['preparation']['profile']['application_wire_revision']=14
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],14)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+
+    def test_explicit_historical_wire11_remains_bound_without_upgrade(self):
+        self.r['preparation']['profile']['application_wire_revision']=11
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],11)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+
+    def test_explicit_historical_wire12_remains_bound_without_upgrade(self):
+        self.r['preparation']['profile']['application_wire_revision']=12
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],12)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+
+    def test_explicit_historical_wire13_remains_bound_without_upgrade(self):
+        self.r['preparation']['profile']['application_wire_revision']=13
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],13)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+
+    def test_candidate_wire_is_closed_typed_and_profile_owned(self):
+        self.assertEqual(prep.application_wire(self.r['preparation']['profile']),8)
+        for value in (True,False,None,'20',20.0,7,24):
+            r=copy.deepcopy(self.r);r['preparation']['profile']['application_wire_revision']=value
+            with self.subTest(value=value),self.assertRaisesRegex(ValueError,'application wire'):
+                prep.validate_profile(r['preparation'],r,local)
+        r=copy.deepcopy(self.r);r['preparation']['profile']['candidate_wire']=9
+        with self.assertRaisesRegex(ValueError,'inventory'):prep.validate_profile(r['preparation'],r,local)
+
     def test_source_tree_mismatch_before_any_build(self):
         self.c['artifact']['source_tree']='0'*40
         with self.assertRaisesRegex(ValueError,'tree/format'):self.execute()
@@ -316,7 +512,7 @@ class RecipeAndSourceAdmission(unittest.TestCase):
         with patch.object(behavior,'protected',local),self.assertRaisesRegex(ValueError,'mandatory checks'):behavior.load_recipe(self.root/'recipe.json',self.config,self.s)
     def test_real_distinct_commits_snapshot_and_tampered_profile(self):
         repo=self.root/'repo';repo.mkdir();(repo/'src').mkdir()
-        for name in ('Cargo.toml','Cargo.lock'):(repo/name).write_bytes((ROOT.parent/name).read_bytes())
+        for name,raw in selected_build_files().items():(repo/name).write_bytes(raw)
         (repo/'src/main.rs').write_text('fn main() {}\n');(repo/'src/lib.rs').write_text('// candidate one\n')
         prep.fixed_git(['init'],repo,self.root)
         commits=[]

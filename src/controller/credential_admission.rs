@@ -13,7 +13,7 @@ fn task(value: &TaskInput) -> bool {
             .repository_read
             .as_ref()
             .is_some_and(|source| repository_contains_credentials(&source.repository))
-        || crate::delegation::template(value).is_some_and(|child| repository(&child.repository))
+        || crate::delegation::configured_template(value).is_some_and(|child| repository(&child.repository))
 }
 
 fn checkpoint(value: &Checkpoint) -> bool {
@@ -27,6 +27,12 @@ pub(super) fn rejected(operation: &Operation) -> bool {
         | Operation::ReviseRepository { registration, .. } => {
             repository_contains_credentials(&registration.source_endpoint)
                 || repository_contains_credentials(&registration.checkpoint_endpoint)
+        }
+        Operation::SubmitTaskDraft { input, .. } => {
+            input.repository.as_ref().is_some_and(repository)
+                || input.repository_read.as_ref().is_some_and(|source| repository_contains_credentials(&source.repository))
+                || input.instruction_source.as_ref().is_some_and(|source| repository_contains_credentials(&source.repository))
+                || matches!(input.native_workflow.as_deref(), Some(NativeWorkflow::CodingThenContinue { child } | NativeWorkflow::Reassign { target: child }) if repository(&child.repository))
         }
         Operation::SubmitTask { input, .. } => task(input),
         Operation::DelegateTask { child, .. } => task(child),

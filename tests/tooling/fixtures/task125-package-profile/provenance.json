@@ -1,0 +1,19 @@
+{
+  "files": {
+    "Cargo.lock": {
+      "bytes": 62339,
+      "file": "Cargo.lock.fixture",
+      "git_blob_sha1": "04cb0e11b24649d1aab0e39df3bd9a0dddb939b6",
+      "sha256": "aeac8e626ea3e28dd88700353075859e12d3e5624e5ca23f6451e3a29ee1cf7b"
+    },
+    "Cargo.toml": {
+      "bytes": 1709,
+      "file": "Cargo.toml.fixture",
+      "git_blob_sha1": "8644761b18b1c3ecfcfc345cbaab18015ccf58d1",
+      "sha256": "221f255d5f2317caf59e4c7ac3df9929dbe248852a33752b78376a97df80ff83"
+    }
+  },
+  "scope": "Exact retained task125 package-profile inputs for verifier and preparation fixtures. Fake fixture sources/binaries are not this accepted commit and do not qualify a Rust build or the current workspace package profile.",
+  "source_commit": "77cadbb3fafb42814fbc4e5fda5e1aa9ef80f319",
+  "source_tree": "97a858acfda5ea817ef72c574e165441a6a4e260"
+}

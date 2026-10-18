@@ -4,12 +4,32 @@ use crate::{
     collaboration::{Query, QueryResult},
     repository_view::{Request, SourceSelector},
 };
-fn selected(value: &str) -> Result<SourceSelector, String> {
+pub(super) fn instruction_source_enabled(input: &TaskInput) -> bool {
+    input.definition.executor == ExecutorKind::Coding
+        && input.instruction_source.is_some()
+        && crate::execution_profile::collaboration(input)
+}
+pub(super) fn selected(value: &str, input: &TaskInput) -> Result<SourceSelector, String> {
     match value {
         "start" => Ok(SourceSelector::Start),
         "checkpoint" => Ok(SourceSelector::Checkpoint),
+        "instructions" if instruction_source_enabled(input) => Ok(SourceSelector::Instructions),
+        "instructions" => Err("This task has no accepted instruction source".into()),
         _ => Err("Choose the accepted start or checkpoint source".into()),
     }
+}
+pub(super) fn source_select(input: &TaskInput, name: &str, label: &str, current: &str) -> String {
+    let mut body = format!(
+        "<label>{label}<select name=\"{name}\"><option value=\"start\" {}>Start</option><option value=\"checkpoint\" {}>Acknowledged checkpoint</option>",
+        if current == "start" { "selected" } else { "" },
+        if current == "checkpoint" { "selected" } else { "" },
+    );
+    if instruction_source_enabled(input) {
+        let _ = write!(body, "<option value=\"instructions\" {}>Instructions</option>",
+            if current == "instructions" { "selected" } else { "" });
+    }
+    body.push_str("</select></label>");
+    body
 }
 fn amount(f: &Form, key: &str, default: usize) -> Result<usize, String> {
     match f.get(key).filter(|x| !x.is_empty()) {
@@ -40,7 +60,7 @@ async fn route(
     query: &str,
 ) -> Result<UiResponse, UiResponse> {
     let invalid = |e: String| error(400, &e);
-    let f = parse_form(query.as_bytes(), controller.limits()).map_err(invalid)?;
+    let f = parse_form(query.as_bytes(), controller.limits()).map_err(|e| error(400, &e))?;
     let reply = call(controller, Operation::GetTask { task_id: id.into() }).await;
     let Outcome::Ok {
         data: Data::Task(task),
@@ -82,6 +102,7 @@ async fn route(
                 "<h2>Original call and recorded outcome</h2><pre>{}</pre>",
                 escape(&serde_json::to_string_pretty(&record).unwrap_or_default())
             ));
+            let _ = write!(body, "<p><a href=\"/operations/{}\">Original operation receipt</a></p>", encode(op));
         }
         return Ok(page(200, "Collaboration call outcome", body));
     }
@@ -105,7 +126,7 @@ async fn route(
     let source = value("source", "start");
     let base_source = value("base_source", "start");
     let repo_path = value("path", "");
-    let selector = selected(&source).map_err(invalid)?;
+    let selector = selected(&source, &task.input).map_err(invalid)?;
     let request = match view.as_str() {
         "tree" => Request::Tree {
             source: selector,
@@ -137,7 +158,7 @@ async fn route(
         },
         "diff" => Request::Diff {
             source: selector,
-            base_source: selected(&base_source).map_err(invalid)?,
+            base_source: selected(&base_source, &task.input).map_err(invalid)?,
             path: repo_path.clone(),
         },
         "history" => Request::History {
@@ -168,16 +189,7 @@ async fn route(
         ("source", "Accepted source", source.as_str()),
         ("base_source", "Diff base source", base_source.as_str()),
     ] {
-        let _ = write!(
-            body,
-            "<label>{label}<select name=\"{name}\"><option value=\"start\" {}>Start</option><option value=\"checkpoint\" {}>Acknowledged checkpoint</option></select></label>",
-            if current == "start" { "selected" } else { "" },
-            if current == "checkpoint" {
-                "selected"
-            } else {
-                ""
-            }
-        );
+        body.push_str(&source_select(&task.input, name, label, current));
     }
     body.push_str(&field(
         "path",
@@ -234,6 +246,9 @@ async fn route(
         false,
     ));
     body.push_str("<button>Read accepted source</button></form>");
+    if instruction_source_enabled(&task.input) {
+        body.push_str("<p>Instructions reads the task's separately accepted instruction source at its fixed commit. Start and checkpoint continue to select the primary repository.</p>");
+    }
     if task.input.repository.is_none() && task.input.repository_read.is_none() {
         body.push_str("<p>This task has no accepted repository read source.</p>");
         return Ok(page(200, "Task repository", body));
@@ -297,8 +312,19 @@ async fn route(
             }
         }
         crate::repository_view::Data::File {
-            text, next_line, ..
+            path,
+            object,
+            start_line,
+            total_lines,
+            text,
+            next_line,
         } => {
+            body.push_str("<h2>File</h2><dl>");
+            term(&mut body, "Path", path);
+            term(&mut body, "Blob object", object);
+            term(&mut body, "Start line", &start_line.to_string());
+            term(&mut body, "Total lines", &total_lines.to_string());
+            body.push_str("</dl>");
             body.push_str(&format!("<pre>{}</pre>", escape(text)));
             if let Some(line) = next_line {
                 let _ = write!(

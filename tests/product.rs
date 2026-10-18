@@ -9,7 +9,12 @@ const ORIGIN: &str = "http://127.0.0.1:7080";
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 fn config() -> ControllerConfig {
+    let mut limits = borg_runtime::limits::RuntimeLimits::seed().unwrap();
+    // Keep widening and narrowing discriminators independent of the default ceiling.
+    limits.execution.native.context_bytes = 65_536;
+    limits.validate().unwrap();
     ControllerConfig {
+        limits: std::sync::Arc::new(limits),
         validation_executable: PathBuf::from(env!("CARGO_BIN_EXE_borg-runtime")),
         ..ControllerConfig::default()
     }
@@ -95,9 +100,11 @@ fn submission(operation: &str, instruction: &str, dependencies: &str) -> Vec<u8>
 
 fn workflow(deadline: u64) -> NativeWorkflow {
     NativeWorkflow::CodingThenContinue {
-        child: CodingTaskTemplate {
+        child: CodingTaskTemplate { instruction_source: None,
+            pull_request: None,
             instruction_prefix: "Make the requested change and preserve existing tests.".into(),
             definition: Definition {
+                charter: None,
                 limit_overrides: None,
                 id: "coding-child".into(),
                 revision: "revision-1".into(),
@@ -106,6 +113,7 @@ fn workflow(deadline: u64) -> NativeWorkflow {
                 execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
             },
             repository: Repository {
+                pull_request_target: None,
                 registration: Some(borg_runtime::repository_catalogue::Revision {
                     repository_id: "product-fixture-repository".into(),
                     registration_revision: "r1".into(),
@@ -154,7 +162,9 @@ fn native_submission(operation: &str, deadline: u64, workflow: Option<&str>) -> 
 }
 
 async fn ui(controller: &Controller, method: &str, path: &str, body: Vec<u8>) -> UiResponse {
-    handle(
+    // Keep the real route future off each long test's inline async state.
+    // This changes only fixture allocation, not requests, polling or assertions.
+    Box::pin(handle(
         controller,
         UiRequest {
             method: method.into(),
@@ -163,19 +173,20 @@ async fn ui(controller: &Controller, method: &str, path: &str, body: Vec<u8>) ->
             origin: Some(ORIGIN.into()),
             expected_origin: ORIGIN.into(),
         },
-    )
+    ))
     .await
 }
 
 async fn task(controller: &Controller, id: &str) -> Task {
-    match controller
-        .handle(Request {
-            protocol_revision: WIRE_REVISION,
-            request_id: format!("read-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
-            command: Operation::GetTask { task_id: id.into() },
-        })
-        .await
-        .outcome
+    // Keep the real controller future off the inline state of long UI tests.
+    // Requests, scheduling, returned projections and assertions are unchanged.
+    match Box::pin(controller.handle(Request {
+        protocol_revision: WIRE_REVISION,
+        request_id: format!("read-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+        command: Operation::GetTask { task_id: id.into() },
+    }))
+    .await
+    .outcome
     {
         Outcome::Ok {
             data: Data::Task(task),
@@ -185,13 +196,13 @@ async fn task(controller: &Controller, id: &str) -> Task {
 }
 
 async fn call(controller: &Controller, command: Operation) -> Data {
-    let reply = controller
-        .handle(Request {
-            protocol_revision: WIRE_REVISION,
-            request_id: format!("fixture-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
-            command,
-        })
-        .await;
+    // This is fixture allocation only, not a larger runtime stack or a bypass.
+    let reply = Box::pin(controller.handle(Request {
+        protocol_revision: WIRE_REVISION,
+        request_id: format!("fixture-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+        command,
+    }))
+    .await;
     match reply.outcome {
         Outcome::Ok { data } => data,
         other => panic!("fixture operation refused: {other:?}"),
@@ -204,6 +215,7 @@ async fn register_fixture_repository(controller: &Controller) {
         Operation::RegisterRepository {
             operation_id: "product-register-fixture".into(),
             registration: borg_runtime::repository_catalogue::Registration {
+                pull_request_target: None,
                 repository_id: "product-fixture-repository".into(),
                 registration_revision: "r1".into(),
                 display_name: "Product test repository".into(),
@@ -1264,7 +1276,8 @@ async fn failed_task_retry_and_active_cancellation_use_real_controller_transitio
                 .iter()
                 .map(|c| match c {
                     WorkerCommand::RunAttempt { command_id, .. }
-                    | WorkerCommand::StopAttempt { command_id, .. } => command_id.clone(),
+                    | WorkerCommand::StopAttempt { command_id, .. }
+                    | WorkerCommand::CollaborationReady { command_id, .. } => command_id.clone(),
                 })
                 .collect(),
         },
@@ -1670,6 +1683,7 @@ async fn root_result_routes_escape_output_and_distinguish_failure_and_uncertaint
             &fixture.controller,
             &attempt,
             Observation::Usage {
+                native_diagnostic_reserved: false,
                 model_requests: 1,
                 input_tokens: None,
                 output_tokens: None,
@@ -1692,6 +1706,8 @@ async fn root_result_routes_escape_output_and_distinguish_failure_and_uncertaint
                 &fixture.controller,
                 &attempt,
                 Observation::NativeLoopCompleted {
+                    requests: Vec::new(),
+                    final_response_index: None,
                     model_requests: 1,
                     calls: vec![],
                 },
@@ -1889,7 +1905,68 @@ async fn agent_directory_uses_distinct_bindings_and_all_bounded_pages() {
 //= spec/impl/v2/implementation.md#shared-product-state
 //= type=test
 //# The browser interface MUST provide an agent list.
-async fn agent_sessions_reject_cross_agent_retarget_and_keep_revision_and_failure_facts() {
+async fn agent_sessions_handoff_keeps_original_inputs_replay_revision_and_failure_facts() {
+    use borg_runtime::collaboration::{Query, QueryResult};
+    async fn session_input(c: &Controller, id: &str) -> (Session, TaskInput, bool) {
+        let Data::Collaboration(QueryResult::SessionInput {
+            session,
+            input,
+            current,
+        }) = call(
+            c,
+            Operation::QueryCollaboration {
+                query: Query::SessionInput {
+                    session_id: id.into(),
+                },
+            },
+        )
+        .await
+        else {
+            panic!("exact accepted session input")
+        };
+        (session, *input, current)
+    }
+    async fn history(
+        c: &Controller,
+        id: &str,
+    ) -> borg_runtime::collaboration::Page<borg_runtime::collaboration::HistoryEntry> {
+        let Data::Collaboration(QueryResult::TaskHistory(page)) = call(
+            c,
+            Operation::QueryCollaboration {
+                query: Query::TaskHistory {
+                    task_id: id.into(),
+                    after: None,
+                    limit: 10,
+                },
+            },
+        )
+        .await
+        else {
+            panic!("retained task history")
+        };
+        assert!(page.next_cursor.is_none());
+        page
+    }
+    async fn original(c: &Controller, id: &str) -> Reply {
+        let command = Operation::GetOperation {
+            operation_id: id.into(),
+        };
+        let reply = Box::pin(c.handle(Request {
+            protocol_revision: WIRE_REVISION,
+            request_id: format!(
+                "directory-original-{}",
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ),
+            command: command.clone(),
+        }))
+        .await;
+        reply.validate_for(&command).unwrap();
+        assert!(
+            matches!(&reply.outcome,Outcome::Ok { data:Data::Operation(record) } if record.id==id && record.state=="settled")
+        );
+        assert_eq!(reply.commit.as_ref().unwrap().operation_id, id);
+        reply
+    }
     let fixture = Fixture::new().await;
     let first = ui(
         &fixture.controller,
@@ -1898,6 +1975,7 @@ async fn agent_sessions_reject_cross_agent_retarget_and_keep_revision_and_failur
         agent_submission("directory-first", "agent-a", "revision-1"),
     )
     .await;
+    assert_eq!(first.status, 303, "{}", first.body);
     let first_id = task_id(&first).to_string();
     let other = ui(
         &fixture.controller,
@@ -1908,28 +1986,108 @@ async fn agent_sessions_reject_cross_agent_retarget_and_keep_revision_and_failur
     .await;
     assert_eq!(other.status, 303);
     let initial = task(&fixture.controller, &first_id).await;
-    let refused = ui(
+    let initial_session = session_input(&fixture.controller, &initial.session_id).await;
+    assert!(initial_session.2);
+    assert_eq!(initial_session.1, initial.input);
+    let initial_history = history(&fixture.controller, &first_id).await;
+    let cross_body = form(&[
+        ("operation_id", "directory-cross-agent".into()),
+        ("expected_revision", initial.revision.to_string()),
+        ("agent_id", "agent-b".into()),
+    ]);
+    let assigned = ui(
         &fixture.controller,
         "POST",
         &format!("/tasks/{first_id}/assign"),
-        form(&[
-            ("operation_id", "directory-cross-agent".into()),
-            ("expected_revision", initial.revision.to_string()),
-            ("agent_id", "agent-b".into()),
-        ]),
+        cross_body.clone(),
     )
     .await;
-    assert_eq!(refused.status, 409);
-    assert_eq!(task(&fixture.controller, &first_id).await, initial);
+    assert_eq!(assigned.status, 303, "{}", assigned.body);
+    let retargeted = task(&fixture.controller, &first_id).await;
+    assert_eq!(retargeted.id, initial.id);
+    assert_eq!(retargeted.assigned_agent_id, "agent-b");
+    assert_ne!(retargeted.session_id, initial.session_id);
+    assert!(retargeted.revision > initial.revision);
+    assert!(
+        retargeted.pending_assignment.is_none()
+            && retargeted.attempt.is_none()
+            && retargeted.result.is_none()
+    );
+    assert_eq!(retargeted.status, TaskStatus::Queued);
+    assert_eq!(retargeted.input.instruction, initial.input.instruction);
+    assert_eq!(retargeted.input.repository, initial.input.repository);
+    assert_eq!(
+        retargeted.input.acceptance_commands,
+        initial.input.acceptance_commands
+    );
+    assert_eq!(retargeted.input.limits, initial.input.limits);
+    assert_eq!(retargeted.input.output_schema, initial.input.output_schema);
+    assert_eq!(retargeted.input.dependencies, initial.input.dependencies);
+    let retained = session_input(&fixture.controller, &initial.session_id).await;
+    assert_eq!(
+        (retained.0, retained.1),
+        (initial_session.0.clone(), initial.input.clone())
+    );
+    assert!(!retained.2);
+    let successor = session_input(&fixture.controller, &retargeted.session_id).await;
+    assert_eq!(successor.0.task_id, first_id);
+    assert_eq!(successor.0.agent_id, "agent-b");
+    assert_eq!(successor.1, retargeted.input);
+    assert!(successor.2);
+    let cross_history = history(&fixture.controller, &first_id).await;
+    assert!(cross_history.items.starts_with(&initial_history.items));
+    assert!(
+        cross_history
+            .items
+            .iter()
+            .any(|entry| entry.kind == "assignment_activated")
+    );
+    let original_cross = original(&fixture.controller, "directory-cross-agent").await;
+    let replay = ui(
+        &fixture.controller,
+        "POST",
+        &format!("/tasks/{first_id}/assign"),
+        cross_body.clone(),
+    )
+    .await;
+    assert_eq!(replay.status, 303, "{}", replay.body);
+    let replay_cross = original(&fixture.controller, "directory-cross-agent").await;
+    assert_eq!(replay_cross.commit, original_cross.commit);
+    assert_eq!(replay_cross.outcome, original_cross.outcome);
+    assert_eq!(task(&fixture.controller, &first_id).await, retargeted);
+    assert_eq!(history(&fixture.controller, &first_id).await, cross_history);
     let old = ui(&fixture.controller, "GET", "/agents/agent-a", vec![]).await;
-    assert!(old.body.contains(&format!("href=\"/tasks/{first_id}\"")));
+    assert!(!old.body.contains(&format!("href=\"/tasks/{first_id}\"")));
     let other_view = ui(&fixture.controller, "GET", "/agents/agent-b", vec![]).await;
     assert!(
-        !other_view
+        other_view
             .body
             .contains(&format!("href=\"/tasks/{first_id}\""))
     );
     assert!(old.body.contains("Shared agent memory"));
+    let historical = ui(
+        &fixture.controller,
+        "GET",
+        &format!("/sessions/{}", encode(&initial.session_id)),
+        vec![],
+    )
+    .await;
+    assert_eq!(historical.status, 200, "{}", historical.body);
+    assert!(historical.body.contains("Historical — authority closed"));
+    assert!(!historical.body.contains("settings?task_id="));
+    let current_view = ui(
+        &fixture.controller,
+        "GET",
+        &format!("/sessions/{}", encode(&retargeted.session_id)),
+        vec![],
+    )
+    .await;
+    assert_eq!(current_view.status, 200, "{}", current_view.body);
+    assert!(
+        current_view
+            .body
+            .contains("<dt>Session authority</dt><dd>Current</dd>")
+    );
     let newer = ui(
         &fixture.controller,
         "POST",
@@ -1938,6 +2096,72 @@ async fn agent_sessions_reject_cross_agent_retarget_and_keep_revision_and_failur
     )
     .await;
     assert_eq!(newer.status, 303);
+    let newer_id = task_id(&newer).to_string();
+    let Data::Agent(selected) = call(
+        &fixture.controller,
+        Operation::GetAgent {
+            agent_id: "agent-a".into(),
+        },
+    )
+    .await
+    else {
+        panic!("selected agent")
+    };
+    // An explicit task revision does not advance the selected future-task head.
+    assert_eq!(selected.definition, initial.input.definition);
+    let newer_task = task(&fixture.controller, &newer_id).await;
+    assert_eq!(newer_task.input.definition.revision, "revision-2");
+    let newer_assigned = ui(
+        &fixture.controller,
+        "POST",
+        &format!("/tasks/{newer_id}/assign"),
+        form(&[
+            ("operation_id", "directory-newer-pinned".into()),
+            ("expected_revision", newer_task.revision.to_string()),
+            ("agent_id", "agent-a".into()),
+        ]),
+    )
+    .await;
+    assert_eq!(newer_assigned.status, 303);
+    let newer_current = task(&fixture.controller, &newer_id).await;
+    assert_eq!(newer_current.input, newer_task.input);
+    assert_eq!(
+        newer_current, newer_task,
+        "same-agent assignment must not allocate a session or increment task revision"
+    );
+    let no_op = original(&fixture.controller, "directory-newer-pinned").await;
+    let unchanged_history = history(&fixture.controller, &newer_id).await;
+    let replay = ui(
+        &fixture.controller,
+        "POST",
+        &format!("/tasks/{newer_id}/assign"),
+        form(&[
+            ("operation_id", "directory-newer-pinned".into()),
+            ("expected_revision", newer_task.revision.to_string()),
+            ("agent_id", "agent-a".into()),
+        ]),
+    )
+    .await;
+    assert_eq!(replay.status, 303);
+    let no_op_replay = original(&fixture.controller, "directory-newer-pinned").await;
+    assert_eq!(no_op_replay.commit, no_op.commit);
+    assert_eq!(no_op_replay.outcome, no_op.outcome);
+    assert_eq!(task(&fixture.controller, &newer_id).await, newer_task);
+    assert_eq!(
+        history(&fixture.controller, &newer_id).await,
+        unchanged_history
+    );
+    let Data::Agent(after_newer_assignment) = call(
+        &fixture.controller,
+        Operation::GetAgent {
+            agent_id: "agent-a".into(),
+        },
+    )
+    .await
+    else {
+        panic!("selected agent")
+    };
+    assert_eq!(after_newer_assignment, selected);
     let new = ui(&fixture.controller, "GET", "/agents/agent-a", vec![]).await;
     assert!(new.body.contains("agent-a @ revision-2 (coding)"));
     assert!(new.body.contains("agent-a @ revision-1 (coding)"));
@@ -1949,7 +2173,63 @@ async fn agent_sessions_reject_cross_agent_retarget_and_keep_revision_and_failur
             .revision,
         "revision-1"
     );
+    // A genuine cross-agent return to selected A1 creates another session.
+    // The independent stale-CAS check below uses the original pre-handoff revision.
+    let assigned = ui(
+        &fixture.controller,
+        "POST",
+        &format!("/tasks/{first_id}/assign"),
+        form(&[
+            ("operation_id", "directory-old-pinned".into()),
+            ("expected_revision", retargeted.revision.to_string()),
+            ("agent_id", "agent-a".into()),
+        ]),
+    )
+    .await;
+    assert_eq!(assigned.status, 303);
     let current = task(&fixture.controller, &first_id).await;
+    assert!(current.revision > retargeted.revision);
+    assert_ne!(current.session_id, initial.session_id);
+    assert_ne!(current.session_id, retargeted.session_id);
+    assert_eq!(current.id, initial.id);
+    assert_eq!(current.input, initial.input);
+    let old_b = session_input(&fixture.controller, &retargeted.session_id).await;
+    assert_eq!((old_b.0, old_b.1), (successor.0, successor.1));
+    assert!(!old_b.2);
+    let current_input = session_input(&fixture.controller, &current.session_id).await;
+    assert_eq!(current_input.1, initial.input);
+    assert!(current_input.2);
+    let returned_history = history(&fixture.controller, &first_id).await;
+    assert!(returned_history.items.starts_with(&cross_history.items));
+    // Original replay must not rewind current ownership to its old B session.
+    let replay = ui(
+        &fixture.controller,
+        "POST",
+        &format!("/tasks/{first_id}/assign"),
+        cross_body,
+    )
+    .await;
+    assert_eq!(replay.status, 303);
+    assert_eq!(task(&fixture.controller, &first_id).await, current);
+    assert_eq!(
+        history(&fixture.controller, &first_id).await,
+        returned_history
+    );
+    let after_return_original = original(&fixture.controller, "directory-cross-agent").await;
+    assert_eq!(after_return_original.commit, original_cross.commit);
+    assert_eq!(after_return_original.outcome, original_cross.outcome);
+    assert_eq!(current.assigned_agent_id, "agent-a");
+    let Data::Agent(after_old_assignment) = call(
+        &fixture.controller,
+        Operation::GetAgent {
+            agent_id: "agent-a".into(),
+        },
+    )
+    .await
+    else {
+        panic!("selected agent")
+    };
+    assert_eq!(after_old_assignment, selected);
     let rejected = ui(
         &fixture.controller,
         "POST",
@@ -2023,6 +2303,23 @@ async fn agent_sessions_reject_cross_agent_retarget_and_keep_revision_and_failur
     assert!(failed.body.contains("termination confirmed: no"));
     let directory = ui(&fixture.controller, "GET", "/agents", vec![]).await;
     assert!(!directory.body.contains("worker-not-agent"));
+    assert_eq!(attempt.session_id, current.session_id);
+    let historical = ui(
+        &fixture.controller,
+        "GET",
+        &format!("/sessions/{}", encode(&initial.session_id)),
+        vec![],
+    )
+    .await;
+    assert_eq!(historical.status, 200);
+    assert!(historical.body.contains("Historical — authority closed"));
+    assert!(
+        !historical.body.contains(&attempt.id),
+        "historical session must not borrow successor attempt"
+    );
+    let old_input = session_input(&fixture.controller, &initial.session_id).await;
+    assert_eq!(old_input.1, initial.input);
+    assert!(!old_input.2);
 }
 
 async fn next_ui_attempt(controller: &Controller, worker: &Worker, task_id: &str) -> Attempt {
@@ -2085,6 +2382,7 @@ async fn delegation_views_follow_committed_wait_child_and_parent_continuation() 
         &fixture.controller,
         &attempt,
         Observation::Usage {
+            native_diagnostic_reserved: false,
             model_requests: 1,
             input_tokens: None,
             output_tokens: None,
@@ -2221,6 +2519,7 @@ async fn delegation_views_follow_committed_wait_child_and_parent_continuation() 
         &fixture.controller,
         &resumed,
         Observation::Usage {
+            native_diagnostic_reserved: false,
             model_requests: 1,
             input_tokens: None,
             output_tokens: None,
@@ -2231,6 +2530,8 @@ async fn delegation_views_follow_committed_wait_child_and_parent_continuation() 
         &fixture.controller,
         &resumed,
         Observation::NativeLoopCompleted {
+            requests: Vec::new(),
+            final_response_index: None,
             model_requests: 1,
             calls: vec![],
         },
@@ -2635,13 +2936,32 @@ async fn browser_limit_refusals_render_fields_without_admitting_mutations() {
     std::sync::Arc::make_mut(&mut cfg.limits)
         .product
         .response_bytes = 1;
-    let bounded_view =
-        Controller::open_with_config(&root.join("bounded-view.sqlite"), cfg).unwrap();
-    let response = ui(&bounded_view, "GET", "/tasks", vec![]).await;
-    assert_eq!(response.status, 502, "{}", response.body);
-    assert!(
-        response.body.contains("product.response_bytes"),
-        "{}",
-        response.body
-    );
+    let invalid_path = root.join("bounded-view.sqlite");
+    let reason = match Controller::open_with_config(&invalid_path, cfg) {
+        Ok(_) => panic!("a one-byte response limit must fail configuration validation"),
+        Err(reason) => reason,
+    };
+    assert!(reason.contains("product.response_bytes"), "{reason}");
+    assert!(!invalid_path.exists(), "invalid metadata must refuse before database admission");
 }
+
+#[path = "product/definition_settings.rs"]
+mod definition_settings;
+
+#[path = "product/response_bounds.rs"]
+mod response_bounds;
+
+#[path = "product/call_receipts.rs"]
+mod call_receipts;
+
+#[path = "product/documents_reviews.rs"]
+mod documents_reviews;
+
+#[path = "product/collaboration_work.rs"]
+mod collaboration_work;
+
+#[path = "product/collaboration_joined.rs"]
+mod collaboration_joined;
+
+#[path = "product/default_task_submission.rs"]
+mod default_task_submission;

@@ -20,11 +20,9 @@ fn objects(conn: &Connection) -> Result<Vec<(String, String, String, Option<Stri
     .collect::<Result<Vec<_>, _>>()
     .map_err(|e| e.to_string())
 }
-pub(super) fn validate_shape(conn: &Connection) -> Result<(), String> {
+pub(super) fn validate_shape(conn: &Connection, version: i64) -> Result<(), String> {
     let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
-    expected
-        .execute_batch(include_str!("schema12.sql"))
-        .map_err(|e| e.to_string())?;
+    super::application_schema::expected_schema(&expected, version)?;
     if objects(conn)? != objects(&expected)? {
         return Err("unsupported controller schema shape; original data retained".into());
     }

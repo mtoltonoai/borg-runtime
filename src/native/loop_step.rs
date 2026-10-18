@@ -2,6 +2,7 @@
 //! This adapter does not call tools or grant authority. The worker must reserve
 //! each request and retain/reconcile the actual MCP result before continuing.
 use super::*;
+use crate::protocol::ExecutionProfile;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -29,6 +30,122 @@ pub struct NativeLoopProfile {
     pub web_search: Option<NativeWebSearch>,
 }
 
+// Responses accepts a smaller generation-schema language than the accepted
+// Draft202012 contract. Only the closed conditional-allOf form is projected;
+// no structural constraint is removed. This is guidance, not an equivalent
+// validator. ValidationInput and the durable TaskInput retain the exact schema,
+// and validate_response still checks the full contract before acceptance.
+fn response_format(schema: &Value) -> Result<Value, String> {
+    let conditional = schema.get("type").and_then(Value::as_str) == Some("object")
+        && schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .is_some_and(|clauses| {
+                !clauses.is_empty()
+                    && clauses.iter().all(|clause| {
+                        clause.as_object().is_some_and(|c| {
+                            c.contains_key("if")
+                                && c.contains_key("then")
+                                && c.keys()
+                                    .all(|key| matches!(key.as_str(), "if" | "then" | "else"))
+                        })
+                    })
+            });
+    if schema.get("allOf").is_some() && !conditional {
+        return Err("native_provider_schema_projection_unsupported".into());
+    }
+    let mut guidance = schema.clone();
+    if conditional {
+        guidance.as_object_mut().unwrap().remove("allOf");
+        explicit_scalar_types(&mut guidance)?;
+    }
+    Ok(
+        json!({"type":"json_schema", "name":"borg_native_result", "strict":false, "schema":guidance}),
+    )
+}
+
+// Equivalent scalar type spelling for enum/const leaves in the projected
+// guidance. Visit schema positions only, never application property names or
+// literal enum/const values. Mixed or nonscalar sets are left unchanged.
+fn explicit_scalar_types(schema: &mut Value) -> Result<(), String> {
+    fn scalar(value: &Value) -> Option<&'static str> {
+        match value {
+            Value::Null => Some("null"),
+            Value::Bool(_) => Some("boolean"),
+            Value::Number(_) => Some("number"),
+            Value::String(_) => Some("string"),
+            _ => None,
+        }
+    }
+    let Some(object) = schema.as_object_mut() else {
+        return Err("native_provider_schema_projection_unsupported".into());
+    };
+    // Closed schema positions only: an unhandled applicator could contain a
+    // reference into the removed clauses. Reject it rather than produce a
+    // dangling reference or silently strip more of the validation contract.
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "type"
+                | "properties"
+                | "required"
+                | "additionalProperties"
+                | "items"
+                | "enum"
+                | "const"
+                | "description"
+                | "title"
+                | "minimum"
+                | "maximum"
+                | "exclusiveMinimum"
+                | "exclusiveMaximum"
+                | "multipleOf"
+                | "minLength"
+                | "maxLength"
+                | "pattern"
+                | "format"
+                | "minItems"
+                | "maxItems"
+                | "anyOf"
+        )
+    }) {
+        return Err("native_provider_schema_projection_unsupported".into());
+    }
+    if !object.contains_key("type") {
+        let inferred = object.get("const").and_then(scalar).or_else(|| {
+            let values = object.get("enum")?.as_array()?;
+            let first = scalar(values.first()?)?;
+            values
+                .iter()
+                .all(|value| scalar(value) == Some(first))
+                .then_some(first)
+        });
+        if let Some(kind) = inferred {
+            object.insert("type".into(), json!(kind));
+        }
+    }
+    if let Some(children) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for child in children.values_mut() {
+            explicit_scalar_types(child)?;
+        }
+    }
+    if let Some(child) = object.get_mut("items") {
+        explicit_scalar_types(child)?;
+    }
+    if let Some(child) = object
+        .get_mut("additionalProperties")
+        .filter(|v| v.is_object())
+    {
+        explicit_scalar_types(child)?;
+    }
+    if let Some(children) = object.get_mut("anyOf").and_then(Value::as_array_mut) {
+        for child in children {
+            explicit_scalar_types(child)?;
+        }
+    }
+    Ok(())
+}
+
 /// Private fields prevent a provider/model value from manufacturing retained
 /// context. This is not a durable receipt: the worker owns that boundary.
 #[derive(Clone)]
@@ -39,11 +156,16 @@ pub struct NativeLoopCall {
     profile: NativeLoopProfile,
     context: Value,
     request_index: u32,
+    charged_through: u32,
+    compacted: bool,
     call_id: String,
     name: String,
     arguments: Value,
 }
 impl NativeLoopCall {
+    pub fn has_following_calls(&self) -> bool {
+        !self.pending.is_empty()
+    }
     pub fn call_index(&self) -> u32 {
         self.call_index
     }
@@ -104,8 +226,312 @@ impl NativeLoopCall {
     pub fn request_index(&self) -> u32 {
         self.request_index
     }
+    /// Render the exact completed tool result for a separately reserved
+    /// compaction. Receipt/current-owner verification remains with the worker.
+    pub fn compaction_input(&self, output: &str) -> Result<Value, String> {
+        if !self.pending.is_empty() {
+            return Err("native_compaction_calls_pending".into());
+        }
+        let policy = &self.task.execution_limits()?.native;
+        let appended =
+            json!({"type":"function_call_output","call_id":self.call_id,"output":output});
+        let old = schema::measure(
+            &self.context,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?
+        .0;
+        let add = schema::measure(
+            &appended,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?
+        .0;
+        if old
+            .checked_add(add)
+            .and_then(|n| n.checked_add(1))
+            .is_none_or(|n| n > policy.context_bytes)
+        {
+            return Err("native_compaction_context_bound_native_context_bytes".into());
+        }
+        let mut context = self.context.clone();
+        context
+            .as_array_mut()
+            .ok_or("native_tool_context_invalid")?
+            .push(appended);
+        Ok(context)
+    }
+    /// Advance only accounting after the host has committed the original known
+    /// rejection. This is not a reply, compaction, permission or retry decision.
+    pub fn after_rejected_request(&self, request_index: u32) -> Result<Self, String> {
+        if !self.pending.is_empty()
+            || request_index
+                != self
+                    .charged_through
+                    .checked_add(1)
+                    .ok_or("native_request_overflow")?
+            || request_index >= self.task.limits.model_requests
+        {
+            return Err("native_rejected_request_accounting_mismatch".into());
+        }
+        let mut next = self.clone();
+        next.charged_through = request_index;
+        Ok(next)
+    }
+    /// Called only after the canonical compaction reply is committed for the
+    /// effective source. Preserve original call identity separately from the
+    /// charged compaction request; the next request consumes the summary once.
+    pub fn after_compaction(
+        &self,
+        request_index: u32,
+        summary: Option<&str>,
+    ) -> Result<Self, String> {
+        let policy = &self.task.execution_limits()?.native;
+        if !self.pending.is_empty()
+            || request_index
+                != self
+                    .charged_through
+                    .checked_add(1)
+                    .ok_or("native_request_overflow")?
+            || request_index >= self.task.limits.model_requests
+            || summary.is_some_and(|v| v.is_empty() || v.len() > policy.summary_bytes)
+        {
+            return Err("native_compaction_continuation_mismatch".into());
+        }
+        let mut next = self.clone();
+        if let Some(summary) = summary {
+            let context = json!([{"role":"user","content":self.task.instruction},
+                {"role":"developer","content":format!("Derived conversation summary; not charter authority: {summary}")}]);
+            schema::measure(
+                &context,
+                policy.context_bytes,
+                policy,
+                "native_context_bytes",
+            )?;
+            next.context = context;
+            next.compacted = true;
+        }
+        next.charged_through = request_index;
+        Ok(next)
+    }
     pub fn retained_items(&self) -> &Value {
         &self.context
+    }
+}
+
+/// A validated final response retained for an explicitly admitted continuation.
+/// It cannot be manufactured from a tool call or model-supplied identifier.
+#[derive(Clone)]
+pub struct NativeLoopFinal {
+    task: TaskInput,
+    profile: NativeLoopProfile,
+    context: Value,
+    output_items: Value,
+    request_index: u32,
+    charged_through: u32,
+    compacted: bool,
+}
+impl NativeLoopFinal {
+    pub fn request_index(&self) -> u32 {
+        self.request_index
+    }
+    pub fn next_request_index(&self) -> Result<u32, String> {
+        self.charged_through
+            .checked_add(1)
+            .ok_or_else(|| "native_request_overflow".into())
+    }
+    pub fn compaction_input(&self) -> Result<Value, String> {
+        let policy = &self.task.execution_limits()?.native;
+        let old = schema::measure(
+            &self.context,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?
+        .0;
+        let add = schema::measure(
+            &self.output_items,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?
+        .0;
+        if !self.compacted
+            && old
+                .checked_add(add)
+                .is_none_or(|n| n > policy.context_bytes)
+        {
+            return Err("native_completion_context_bound_native_context_bytes".into());
+        }
+        let mut context = self.context.clone();
+        if !self.compacted {
+            context
+                .as_array_mut()
+                .ok_or("native_completion_context_invalid")?
+                .extend(
+                    self.output_items
+                        .as_array()
+                        .ok_or("native_completion_items_invalid")?
+                        .iter()
+                        .cloned(),
+                );
+        }
+        schema::measure(
+            &context,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?;
+        Ok(context)
+    }
+    /// Accounting-only transition after the exact original rejection receipt;
+    /// preserve the actual final response index and all original context bytes.
+    pub fn after_rejected_request(&self, request_index: u32) -> Result<Self, String> {
+        if request_index != self.next_request_index()?
+            || request_index >= self.task.limits.model_requests
+        {
+            return Err("native_rejected_request_accounting_mismatch".into());
+        }
+        let mut next = self.clone();
+        next.charged_through = request_index;
+        Ok(next)
+    }
+    /// The worker supplies only a committed canonical current-source summary.
+    /// An obsolete compaction still advances accounting, retaining old context.
+    pub fn after_compaction(
+        &self,
+        request_index: u32,
+        summary: Option<&str>,
+    ) -> Result<Self, String> {
+        let policy = &self.task.execution_limits()?.native;
+        if request_index != self.next_request_index()?
+            || request_index >= self.task.limits.model_requests
+            || summary.is_some_and(|v| v.is_empty() || v.len() > policy.summary_bytes)
+        {
+            return Err("native_compaction_continuation_mismatch".into());
+        }
+        let mut next = self.clone();
+        if let Some(summary) = summary {
+            next.context = json!([{"role":"user","content":self.task.instruction},
+                {"role":"developer","content":format!("Derived conversation summary; not charter authority: {summary}")}]);
+            schema::measure(
+                &next.context,
+                policy.context_bytes,
+                policy,
+                "native_context_bytes",
+            )?;
+            next.compacted = true;
+        }
+        next.charged_through = request_index;
+        Ok(next)
+    }
+}
+
+/// A completed final-text response that failed the declared format. This type
+/// is created only after the trusted validation helper's full typed response.
+/// Its private retained layout is never exposed as a validated final response.
+#[derive(Clone)]
+pub struct NativeLoopRepair {
+    retained: NativeLoopFinal,
+    issue: super::FormatIssue,
+}
+impl NativeLoopRepair {
+    pub fn request_index(&self) -> u32 {
+        self.retained.request_index
+    }
+    pub fn issue(&self) -> &super::FormatIssue {
+        &self.issue
+    }
+    pub fn output_items(&self) -> &Value {
+        &self.retained.output_items
+    }
+}
+
+/// A complete provider terminal at the output cap, never a final result or a
+/// dispatched call. Original items remain available for canonical binding.
+#[derive(Clone)]
+pub struct NativeLoopCap {
+    retained: NativeLoopFinal,
+    prefix: Option<String>,
+}
+impl NativeLoopCap {
+    pub fn request_index(&self) -> u32 {
+        self.retained.request_index
+    }
+    pub fn output_items(&self) -> &Value {
+        &self.retained.output_items
+    }
+    fn next_context(&self) -> Result<NativeLoopFinal, String> {
+        let policy = &self.retained.task.execution_limits()?.native;
+        let mut next = self.retained.clone();
+        let mut items = Vec::new();
+        for item in self
+            .retained
+            .output_items
+            .as_array()
+            .ok_or("native_output_cap_items_invalid")?
+        {
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                // These bytes were observed, but no function was dispatched.
+                // Quoting the partial call as data never fabricates a result or
+                // presents an incomplete function call as a completed input.
+                let original =
+                    serde_json::to_string(item).map_err(|_| "native_output_cap_encoding")?;
+                items.push(json!({"role":"assistant","content":format!("Original undispatched output-cap function item: {original}")}));
+            } else {
+                items.push(item.clone());
+            }
+        }
+        next.output_items = Value::Array(items);
+        schema::measure(
+            &next.output_items,
+            policy.context_bytes,
+            policy,
+            "native_context_bytes",
+        )?;
+        Ok(next)
+    }
+}
+const OUTPUT_CAP_FEEDBACK: &str = "The previous response stopped at its output cap. Continue from its retained partial output. No client function in the capped response was executed: issue any required functions as complete configured calls, never assume results. If final-answer text has already begun, emit only its remaining suffix; the host joins it to the exact retained prefix before validating the original task schema.";
+fn joined_text(prefix: Option<&str>, text: &str, limit: usize) -> Result<String, String> {
+    let bytes = prefix
+        .map_or(0, str::len)
+        .checked_add(text.len())
+        .ok_or("native_output_cap_prefix_bound_task_output_bytes")?;
+    if bytes > limit {
+        return Err("native_output_cap_prefix_bound_task_output_bytes".into());
+    }
+    let mut joined = String::new();
+    joined
+        .try_reserve_exact(bytes)
+        .map_err(|_| "native_output_cap_allocation_failed")?;
+    if let Some(prefix) = prefix {
+        joined.push_str(prefix);
+    }
+    joined.push_str(text);
+    Ok(joined)
+}
+fn joined_limit(output: usize, charter: bool, policy: &NativeLimits) -> Result<usize, String> {
+    if charter {
+        output
+            .checked_add(policy.decision_envelope_bytes)
+            .map(|n| n.min(output.max(policy.context_bytes)))
+            .ok_or_else(|| "native_output_cap_assembly_bound".into())
+    } else {
+        Ok(output)
+    }
+}
+fn final_value(value: Value, joined_charter: bool) -> Value {
+    if joined_charter
+        && value.as_object().is_some_and(|o| {
+            o.len() == 2 && o.contains_key("result") && o.contains_key("charter_references")
+        })
+    {
+        value["result"].clone()
+    } else {
+        value
     }
 }
 
@@ -117,6 +543,8 @@ pub struct NativeLoopReply<'a> {
 }
 
 pub enum NativeLoopStep {
+    OutputCap(NativeLoopCap),
+    FormatRepair(NativeLoopRepair),
     Call(NativeLoopCall),
     Complete {
         result: NativeResult,
@@ -124,6 +552,7 @@ pub enum NativeLoopStep {
         /// reasoning. Public progress excludes reasoning items and retains
         /// citation observations without treating them as facts or authority.
         output_items: Value,
+        continuation: NativeLoopFinal,
     },
 }
 pub struct NativeLoopObservation {
@@ -131,6 +560,7 @@ pub struct NativeLoopObservation {
     pub request_exposure: RequestExposure,
     pub usage: UsageObservation,
     pub provider_outcome: ProviderOutcome,
+    pub diagnostic: Option<ProviderFailureDiagnostic>,
 }
 
 /// Executes one POST only. No hidden request retry, MCP invocation, Codex
@@ -179,6 +609,319 @@ pub async fn execute_loop_step_with_notice<
     before_send: G,
     cancelled: F,
 ) -> NativeLoopObservation {
+    execute_loop_step_with_host_inputs(
+        input,
+        config,
+        profile,
+        prior,
+        host_notice,
+        None,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+/// Distinct workflow input obeys its accepted policy and the same aggregate context budget.
+pub async fn execute_loop_step_with_host_inputs<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    prior: Option<(&NativeLoopCall, NativeLoopReply<'_>)>,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    execute_loop_step_with_host_inputs_at(
+        input,
+        config,
+        profile,
+        prior,
+        host_notice,
+        workflow_notice,
+        None,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+/// Physical index advances only after the worker records a confirmed rejection.
+pub async fn execute_loop_step_with_host_inputs_at<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    prior: Option<(&NativeLoopCall, NativeLoopReply<'_>)>,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    request_index: Option<u32>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    execute_loop_step_inner(
+        input,
+        config,
+        profile,
+        prior,
+        None,
+        None,
+        None,
+        host_notice,
+        workflow_notice,
+        request_index,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+/// Genuine host feedback follows the actual final response in the same task
+/// context. This spends one ordinary reserved request and never fabricates a
+/// function call or function result.
+pub async fn execute_loop_step_after_completion<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    prior: &NativeLoopFinal,
+    feedback: &str,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    execute_loop_step_after_completion_at(
+        input,
+        config,
+        profile,
+        prior,
+        feedback,
+        host_notice,
+        workflow_notice,
+        None,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+/// Physical index advances only after the worker records a confirmed rejection.
+pub async fn execute_loop_step_after_completion_at<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    prior: &NativeLoopFinal,
+    feedback: &str,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    request_index: Option<u32>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    execute_loop_step_inner(
+        input,
+        config,
+        profile,
+        None,
+        Some((prior, feedback)),
+        None,
+        None,
+        host_notice,
+        workflow_notice,
+        request_index,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+/// A new logical request follows the exact completed invalid response and
+/// fixed, value-free validation feedback. This is never a same-body retry.
+pub async fn execute_loop_step_after_format_at<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    prior: &NativeLoopRepair,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    request_index: Option<u32>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    let feedback = prior.issue.feedback();
+    execute_loop_step_inner(
+        input,
+        config,
+        profile,
+        None,
+        Some((&prior.retained, &feedback)),
+        None,
+        None,
+        host_notice,
+        workflow_notice,
+        request_index,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+pub async fn execute_loop_step_after_output_cap_at<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    prior: &NativeLoopCap,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    request_index: Option<u32>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    let retained = match prior.next_context() {
+        Ok(v) => v,
+        Err(error) => {
+            return NativeLoopObservation {
+                result: Err(error),
+                request_exposure: RequestExposure::NotStarted,
+                usage: UsageObservation::Unknown,
+                provider_outcome: ProviderOutcome::NotStarted,
+                diagnostic: Some(ProviderFailureDiagnostic::new(
+                    ProviderFailureClass::LocalAdmission,
+                )),
+            };
+        }
+    };
+    execute_loop_step_inner(
+        input,
+        config,
+        profile,
+        None,
+        Some((&retained, OUTPUT_CAP_FEEDBACK)),
+        prior.prefix.as_deref(),
+        None,
+        host_notice,
+        workflow_notice,
+        request_index,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+/// First genuine input of an ordinarily admitted successor attempt. The
+/// immutable task remains unchanged; recorded refusal is a distinct host input.
+pub async fn execute_loop_step_with_completion_input<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    feedback: &str,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    execute_loop_step_with_completion_input_at(
+        input,
+        config,
+        profile,
+        feedback,
+        host_notice,
+        workflow_notice,
+        None,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+/// Physical index advances only after the worker records a confirmed rejection.
+pub async fn execute_loop_step_with_completion_input_at<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    feedback: &str,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    request_index: Option<u32>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
+    execute_loop_step_inner(
+        input,
+        config,
+        profile,
+        None,
+        None,
+        None,
+        Some(feedback),
+        host_notice,
+        workflow_notice,
+        request_index,
+        host,
+        before_send,
+        cancelled,
+    )
+    .await
+}
+
+async fn execute_loop_step_inner<
+    F: Future<Output = ()> + Send,
+    G: Future<Output = Result<(), String>> + Send,
+>(
+    input: &TaskInput,
+    config: &NativeConfig,
+    profile: &NativeLoopProfile,
+    prior: Option<(&NativeLoopCall, NativeLoopReply<'_>)>,
+    completion: Option<(&NativeLoopFinal, &str)>,
+    output_prefix: Option<&str>,
+    initial_feedback: Option<&str>,
+    host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    request_index: Option<u32>,
+    host: &ValidationHost,
+    before_send: G,
+    cancelled: F,
+) -> NativeLoopObservation {
     let deadline = match super::deadline(input.limits.deadline_unix_ms) {
         Ok(value) => value,
         Err(error) => {
@@ -187,18 +930,27 @@ pub async fn execute_loop_step_with_notice<
                 request_exposure: RequestExposure::NotStarted,
                 usage: UsageObservation::Unknown,
                 provider_outcome: ProviderOutcome::NotStarted,
+                diagnostic: Some(ProviderFailureDiagnostic::new(
+                    ProviderFailureClass::Deadline,
+                )),
             };
         }
     };
     let mut cpu = cpu::State::new(host);
     let mut exposure = RequestExposure::NotStarted;
+    let mut interrupted = None;
     let mut result = {
         let work = before(
             input,
             config,
             profile,
             prior,
+            completion,
+            output_prefix,
+            initial_feedback,
             host_notice,
+            workflow_notice,
+            request_index,
             host,
             before_send,
             deadline,
@@ -207,20 +959,33 @@ pub async fn execute_loop_step_with_notice<
         );
         tokio::pin!(work, cancelled);
         tokio::select! { biased;
-            _ = &mut cancelled => Err("native_cancelled".into()),
-            _ = tokio::time::sleep_until(deadline) => Err("native_deadline_exceeded".into()),
+            _ = &mut cancelled => { interrupted = Some(ProviderFailureClass::Cancelled); Err("native_cancelled".into()) },
+            _ = tokio::time::sleep_until(deadline) => { interrupted = Some(ProviderFailureClass::Deadline); Err("native_deadline_exceeded".into()) },
             result = &mut work => result,
         }
     };
+    if let Some(class) = interrupted {
+        cpu.record_failure(class);
+    }
+    if result.is_err() {
+        cpu.record_result_failure(exposure, deadline);
+    }
     if let Err(error) = cpu.finish(true).await {
+        cpu.record_failure(ProviderFailureClass::ValidationCleanup);
         result = Err(error);
     }
+    let diagnostic = cpu.finish_diagnostic(result.is_err(), exposure);
     NativeLoopObservation {
         result,
+        diagnostic,
         request_exposure: exposure,
         usage: cpu.provider_usage(),
         provider_outcome: if exposure == RequestExposure::NotStarted {
             ProviderOutcome::NotStarted
+        } else if let Some(rejection) = cpu.provider_rejection() {
+            ProviderOutcome::Rejected(rejection)
+        } else if cpu.provider_output_capped() {
+            ProviderOutcome::OutputCapped
         } else if cpu.provider_completed() {
             ProviderOutcome::Completed
         } else {
@@ -235,6 +1000,12 @@ pub(super) struct ValidationInput {
     pub schema: Value,
     pub profile: NativeLoopProfile,
     pub output_bytes: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repair_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub joined_charter: bool,
 }
 
 fn valid_id(value: &str, policy: &NativeLimits) -> bool {
@@ -293,7 +1064,12 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
     config: &NativeConfig,
     profile: &NativeLoopProfile,
     prior: Option<(&NativeLoopCall, NativeLoopReply<'_>)>,
+    completion: Option<(&NativeLoopFinal, &str)>,
+    output_prefix: Option<&str>,
+    initial_feedback: Option<&str>,
     host_notice: Option<&str>,
+    workflow_notice: Option<&str>,
+    request_index: Option<u32>,
     host: &ValidationHost,
     before_send: G,
     deadline: Instant,
@@ -301,6 +1077,9 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
     exposure: &mut RequestExposure,
 ) -> Result<NativeLoopStep, String> {
     let policy = &input.execution_limits()?.native;
+    if input.definition.charter.is_some() && host.charter.is_none() {
+        return Err("native_charter_consumer_required".into());
+    }
     policy.validate()?;
     if *policy != *host.native_limits {
         return Err("native_validation_policy_mismatch".into());
@@ -341,9 +1120,31 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
         .ok_or("native_output_schema_missing")?;
     schema::measure(schema, policy.schema_bytes, policy, "native_schema_bytes")?;
     let url = endpoint(&config.endpoint, policy)?;
-    let (mut context, index) = match prior {
-        None => (json!([{"role":"user","content":input.instruction}]), 1),
-        Some((call, reply)) => {
+    let (mut context, index) = match (prior, completion) {
+        (None, None) => (json!([{"role":"user","content":input.instruction}]), 1),
+        (Some(_), Some(_)) => return Err("native_continuation_kind_conflict".into()),
+        (None, Some((final_response, feedback))) => {
+            if final_response.task != *input
+                || final_response.profile != *profile
+                || feedback.is_empty()
+                || feedback.len() > policy.context_bytes
+            {
+                return Err("native_completion_observation_mismatch".into());
+            }
+            let mut context = final_response.compaction_input()?;
+            context
+                .as_array_mut()
+                .ok_or("native_completion_context_invalid")?
+                .push(json!({"role":"developer","content":feedback}));
+            schema::measure(
+                &context,
+                policy.context_bytes,
+                policy,
+                "native_context_bytes",
+            )?;
+            (context, final_response.next_request_index()?)
+        }
+        (Some((call, reply)), None) => {
             if call.task != *input
                 || call.profile != *profile
                 || reply.call_id != call.call_id
@@ -352,49 +1153,89 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
                 return Err("native_tool_observation_mismatch".into());
             }
             let index = call
-                .request_index
+                .charged_through
                 .checked_add(1)
                 .ok_or("native_request_budget_exhausted_task_model_requests")?;
-            if reply.output.len() > policy.context_bytes {
-                return Err("native_tool_result_bound_native_context_bytes".into());
+            if call.compacted {
+                schema::measure(
+                    &call.context,
+                    policy.context_bytes,
+                    policy,
+                    "native_context_bytes",
+                )?;
+                (call.context.clone(), index)
+            } else {
+                if reply.output.len() > policy.context_bytes {
+                    return Err("native_tool_result_bound_native_context_bytes".into());
+                }
+                // Charge serialized framing before cloning/appending accumulated
+                // context. JSON escaping is included, and nothing is truncated.
+                // Traceability scope: The helper verifies the prior task/profile/call identity and appends that corresponding recorded tool output unchanged.
+                //= spec/impl/v2/implementation.md#native-tool-profiles-and-continuations
+                //# A native model continuation MUST use the recorded outcome of its corresponding tool call.
+                let appended = json!({"type":"function_call_output","call_id":reply.call_id,"output":reply.output});
+                let old = schema::measure(
+                    &call.context,
+                    policy.context_bytes,
+                    policy,
+                    "native_context_bytes",
+                )?
+                .0;
+                let next = schema::measure(
+                    &appended,
+                    policy.context_bytes,
+                    policy,
+                    "native_context_bytes",
+                )?
+                .0;
+                if old.saturating_add(next).saturating_add(1) > policy.context_bytes {
+                    return Err("native_tool_context_bound_native_context_bytes".into());
+                }
+                let mut context = call.context.clone();
+                context
+                    .as_array_mut()
+                    .ok_or("native_tool_context_invalid")?
+                    .push(appended);
+                (context, index)
             }
-            // Charge serialized framing before cloning/appending accumulated
-            // context. JSON escaping is included, and nothing is truncated.
-            // Traceability scope: The helper verifies the prior task/profile/call identity and appends that corresponding recorded tool output unchanged.
-            //= spec/impl/v2/implementation.md#native-tool-profiles-and-continuations
-            //# A native model continuation MUST use the recorded outcome of its corresponding tool call.
-            let appended = json!({"type":"function_call_output","call_id":reply.call_id,"output":reply.output});
-            let old = schema::measure(
-                &call.context,
-                policy.context_bytes,
-                policy,
-                "native_context_bytes",
-            )?
-            .0;
-            let next = schema::measure(
-                &appended,
-                policy.context_bytes,
-                policy,
-                "native_context_bytes",
-            )?
-            .0;
-            if old.saturating_add(next).saturating_add(1) > policy.context_bytes {
-                return Err("native_tool_context_bound_native_context_bytes".into());
-            }
-            let mut context = call.context.clone();
-            context
-                .as_array_mut()
-                .ok_or("native_tool_context_invalid")?
-                .push(appended);
-            (context, index)
         }
+    };
+    if let Some(feedback) = initial_feedback {
+        if index != 1 || feedback.is_empty() || feedback.len() > policy.context_bytes {
+            return Err("native_initial_completion_input_mismatch".into());
+        }
+        context
+            .as_array_mut()
+            .ok_or("native_completion_context_invalid")?
+            .push(json!({"role":"developer","content":feedback}));
+    }
+    let index = match request_index {
+        Some(actual) if actual >= index => actual,
+        Some(_) => return Err("native_physical_request_index_precedes_context".into()),
+        None => index,
     };
     if index > input.limits.model_requests {
         return Err("native_request_budget_exhausted_task_model_requests".into());
     }
-    if let Some(notice) = host_notice {
-        if notice.is_empty() || notice.len() > policy.memory_notice_bytes {
-            return Err("native_memory_notice_bound_native_memory_notice_bytes".into());
+    // Retain the legacy argument/codec for historical data, but do not append
+    // retired automatic memory hints to a newly admitted model request.
+    if host_notice.is_some() {
+        return Err("native_memory_notifications_disabled".into());
+    }
+    if let Some(notice) = workflow_notice {
+        if !matches!(
+            input.definition.execution_profile,
+            Some(ExecutionProfile::CollaborationV2 { .. })
+        ) {
+            return Err("native_workflow_profile_not_configured".into());
+        }
+        let workflow = input
+            .resolved_limits
+            .as_ref()
+            .and_then(|s| s.global_metadata.workflow.as_ref())
+            .ok_or("native_workflow_delivery_disabled")?;
+        if notice.is_empty() || notice.len() > workflow.notice_bytes {
+            return Err("native_workflow_notice_bound_workflow_notice_bytes".into());
         }
         context
             .as_array_mut()
@@ -408,9 +1249,15 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
         "native_context_bytes",
     )?;
     let validation = serde_json::to_value(ValidationInput {
+        output_prefix: output_prefix.map(str::to_owned),
+        joined_charter: output_prefix.is_some() && input.definition.charter.is_some(),
         schema: schema.clone(),
         profile: profile.clone(),
         output_bytes: input.limits.output_bytes,
+        repair_enabled: input
+            .resolved_limits
+            .as_ref()
+            .is_some_and(|v| v.global_metadata.native_retry.is_some()),
     })
     .map_err(|_| "native_request_encoding")?;
     schema::measure(
@@ -451,11 +1298,12 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
     // Traceability scope: The native wire request uses the accepted definition settings checked above; it does not select a worker default.
     //= spec/impl/v2/implementation.md#definitions-select-execution
     //# An execution attempt MUST use the inference settings of its accepted definition revision.
+    let format = response_format(&schema)?;
     let mut body = json!({
         "model":inference.model,"reasoning":{"effort":inference.reasoning_effort}, "input":context, "store":false, "stream":false,
         "include":["reasoning.encrypted_content"], "max_output_tokens":policy.max_output_tokens,
         "tools":tools, "tool_choice":"auto", "parallel_tool_calls":policy.function_calls_per_response > 1,
-        "text":{"format":{"type":"json_schema","name":"borg_native_result","strict":false,"schema":schema}}
+        "text":{"format":format}
     });
     if let Some(search) = &profile.web_search {
         body["max_tool_calls"] = json!(search.max_tool_calls);
@@ -466,7 +1314,8 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
     }
     before_send.await?;
     live(deadline)?;
-    let (wire, key) = send_request(url, config, &body, bound, deadline, exposure, host).await?;
+    let (wire, key) =
+        send_request_observed(url, config, &body, bound, deadline, exposure, host, cpu).await?;
     let encoded = cpu
         .run_loop(
             host,
@@ -489,7 +1338,66 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
     if contains_credential(&items, &key) {
         return Err("native_output_contains_credential".into());
     }
+    if cpu.provider_output_capped() {
+        let found = shape_with_mode(&items, profile, deadline, policy, true)?;
+        if found.refused
+            || !input
+                .resolved_limits
+                .as_ref()
+                .is_some_and(|v| v.global_metadata.native_retry.is_some())
+        {
+            return Err("native_output_cap_reply_invalid".into());
+        }
+        let prefix = match found.text {
+            Some(text) => Some(joined_text(
+                output_prefix,
+                text,
+                input.limits.output_bytes.max(policy.context_bytes),
+            )?),
+            None => output_prefix.map(str::to_owned),
+        }
+        .filter(|value| !value.is_empty());
+        if prefix.as_ref().is_some_and(|value| value.contains(&key)) {
+            return Err("native_output_contains_credential".into());
+        }
+        return Ok(NativeLoopStep::OutputCap(NativeLoopCap {
+            retained: NativeLoopFinal {
+                task: input.clone(),
+                profile: profile.clone(),
+                context,
+                output_items: items,
+                request_index: index,
+                charged_through: index,
+                compacted: false,
+            },
+            prefix,
+        }));
+    }
     let shape = shape(&items, profile, deadline, policy)?;
+    if let Some(issue) = cpu.format_issue().cloned() {
+        if !shape.calls.is_empty()
+            || shape.refused
+            || shape.text.is_none()
+            || !input
+                .resolved_limits
+                .as_ref()
+                .is_some_and(|v| v.global_metadata.native_retry.is_some())
+        {
+            return Err("native_format_reply_invalid".into());
+        }
+        return Ok(NativeLoopStep::FormatRepair(NativeLoopRepair {
+            retained: NativeLoopFinal {
+                task: input.clone(),
+                profile: profile.clone(),
+                context,
+                output_items: items,
+                request_index: index,
+                charged_through: index,
+                compacted: false,
+            },
+            issue,
+        }));
+    }
     if !shape.calls.is_empty() {
         let mut calls = Vec::new();
         for (id, name, args) in shape.calls {
@@ -551,6 +1459,8 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
             profile: profile.clone(),
             context,
             request_index: index,
+            charged_through: index,
+            compacted: false,
             call_id,
             name,
             arguments,
@@ -558,20 +1468,44 @@ async fn before<G: Future<Output = Result<(), String>> + Send>(
             call_index: 1,
         }))
     } else {
-        let text = shape.text.ok_or(ShapeFault::FinalTextMissing.code())?;
+        let raw_limit = joined_limit(
+            input.limits.output_bytes,
+            output_prefix.is_some() && input.definition.charter.is_some(),
+            policy,
+        )?;
+        let text = joined_text(
+            output_prefix,
+            shape.text.ok_or(ShapeFault::FinalTextMissing.code())?,
+            raw_limit,
+        )?;
         let output = decode::parse(
             text.as_bytes(),
-            input.limits.output_bytes,
+            raw_limit,
             deadline,
             "native_output_not_json",
             policy,
             "task_output_bytes",
         )?;
+        if contains_credential(&output, &key) {
+            return Err("native_output_contains_credential".into());
+        }
         Ok(NativeLoopStep::Complete {
             result: NativeResult {
                 summary: "Native output validated against the task schema".into(),
-                output,
+                output: final_value(
+                    output,
+                    output_prefix.is_some() && input.definition.charter.is_some(),
+                ),
                 requests: 1,
+            },
+            continuation: NativeLoopFinal {
+                task: input.clone(),
+                profile: profile.clone(),
+                context,
+                output_items: items.clone(),
+                request_index: index,
+                charged_through: index,
+                compacted: false,
             },
             output_items: items,
         })
@@ -803,11 +1737,12 @@ fn annotations(part: &Value) -> Result<(), String> {
 // Traceability scope: Response validation rejects functions and hosted search absent from the host-selected profile. The worker derives that profile from the accepted task; this primitive does not independently authorize a profile.
 //= spec/impl/v2/implementation.md#native-tool-profiles-and-continuations
 //# The native executor MUST refuse a provider tool that is absent from the task's accepted configuration.
-fn shape<'a>(
+fn shape_with_mode<'a>(
     items: &'a Value,
     profile: &NativeLoopProfile,
     deadline: Instant,
     policy: &NativeLimits,
+    capped: bool,
 ) -> Result<Shape<'a>, String> {
     let mut found = Shape {
         calls: Vec::new(),
@@ -842,10 +1777,11 @@ fn shape<'a>(
                     ],
                     ShapeFault::ReasoningFields,
                 )?;
-                if item
-                    .get("status")
-                    .is_some_and(|v| !v.is_null() && v.as_str() != Some("completed"))
-                {
+                if item.get("status").is_some_and(|v| {
+                    !v.is_null()
+                        && v.as_str() != Some("completed")
+                        && !(capped && v.as_str() == Some("incomplete"))
+                }) {
                     return Err("native_provider_response_not_completed".into());
                 }
                 if item
@@ -892,7 +1828,9 @@ fn shape<'a>(
                 if item.get("role").and_then(Value::as_str) != Some("assistant") {
                     return Err(ShapeFault::MessageRole.code().into());
                 }
-                if item.get("status").and_then(Value::as_str) != Some("completed") {
+                if item.get("status").and_then(Value::as_str) != Some("completed")
+                    && !(capped && item.get("status").and_then(Value::as_str) == Some("incomplete"))
+                {
                     return Err("native_provider_response_not_completed".into());
                 }
                 if item.get("phase").is_some_and(|v| {
@@ -904,6 +1842,9 @@ fn shape<'a>(
                     .get("content")
                     .and_then(Value::as_array)
                     .ok_or(ShapeFault::MessageContent.code())?;
+                if capped && parts.is_empty() {
+                    continue;
+                }
                 if parts.len() != 1 {
                     return Err(ShapeFault::MessageContentCount.code().into());
                 }
@@ -948,7 +1889,9 @@ fn shape<'a>(
                 if found.calls.len() >= policy.function_calls_per_response {
                     return Err("native_tool_call_count_native_function_calls_per_response".into());
                 }
-                if item.get("status").and_then(Value::as_str) != Some("completed") {
+                if item.get("status").and_then(Value::as_str) != Some("completed")
+                    && !(capped && item.get("status").and_then(Value::as_str) == Some("incomplete"))
+                {
                     return Err("native_provider_response_not_completed".into());
                 }
                 let name = text_field(item, "name", ShapeFault::FunctionName)?;
@@ -1001,11 +1944,74 @@ fn shape<'a>(
             _ => return Err("native_tool_unconfigured".into()),
         }
     }
-    if found.calls.is_empty() && found.text.is_none() && !found.refused {
+    if !capped && found.calls.is_empty() && found.text.is_none() && !found.refused {
         return Err(ShapeFault::TerminalMissing.code().into());
     }
     if !found.calls.is_empty() && found.refused {
         return Err(ShapeFault::CallsWithRefusal.code().into());
+    }
+    Ok(found)
+}
+
+fn shape<'a>(
+    items: &'a Value,
+    profile: &NativeLoopProfile,
+    deadline: Instant,
+    policy: &NativeLimits,
+) -> Result<Shape<'a>, String> {
+    shape_with_mode(items, profile, deadline, policy, false)
+}
+pub(super) fn capped(
+    envelope: &Value,
+    input: &ValidationInput,
+    deadline: Instant,
+    policy: &NativeLimits,
+) -> bool {
+    cap_shape(envelope, input, deadline, policy).is_ok()
+}
+fn cap_shape<'a>(
+    envelope: &'a Value,
+    input: &ValidationInput,
+    deadline: Instant,
+    policy: &NativeLimits,
+) -> Result<Shape<'a>, String> {
+    live(deadline)?;
+    if !input.repair_enabled
+        || envelope.get("status").and_then(Value::as_str) != Some("incomplete")
+        || envelope.get("error").is_some_and(|v| !v.is_null())
+    {
+        return Err("native_output_cap_terminal_invalid".into());
+    }
+    let details = envelope
+        .get("incomplete_details")
+        .and_then(Value::as_object)
+        .ok_or("native_output_cap_terminal_invalid")?;
+    if details.len() != 1
+        || details.get("reason").and_then(Value::as_str) != Some("max_output_tokens")
+    {
+        return Err("native_output_cap_terminal_invalid".into());
+    }
+    let found = shape_with_mode(
+        envelope
+            .get("output")
+            .ok_or("native_output_cap_items_invalid")?,
+        &input.profile,
+        deadline,
+        policy,
+        true,
+    )?;
+    if found.refused {
+        return Err("native_provider_refused".into());
+    }
+    if input.output_prefix.is_some() && !found.calls.is_empty() {
+        return Err("native_output_cap_final_text_call_conflict".into());
+    }
+    if let Some(text) = found.text {
+        joined_text(
+            input.output_prefix.as_deref(),
+            text,
+            input.output_bytes.max(policy.context_bytes),
+        )?;
     }
     Ok(found)
 }
@@ -1018,6 +2024,12 @@ pub(super) fn preflight(value: &Value, policy: &NativeLimits) -> Result<Validati
     selected(&input.profile, policy)?;
     if input.output_bytes == 0 || input.output_bytes > policy.output_bytes {
         return Err("native_output_limit_invalid_native_output_bytes".into());
+    }
+    if input.output_prefix.as_ref().is_some_and(|p| {
+        !input.repair_enabled || p.len() > input.output_bytes.max(policy.context_bytes)
+    }) || (input.joined_charter && input.output_prefix.is_none())
+    {
+        return Err("native_output_cap_prefix_invalid".into());
     }
     schema::Schema::compile(&input.schema, policy)?;
     for function in &input.profile.functions {
@@ -1062,7 +2074,26 @@ pub(super) fn validate_response(
     deadline: Instant,
     policy: &NativeLimits,
 ) -> Result<Vec<u8>, String> {
-    let found = completed_shape(envelope, &input.profile, deadline, policy)?;
+    let (bytes, issue) = validate_response_typed(envelope, input, limit, deadline, policy)?;
+    match issue {
+        Some(issue) => Err(issue.stable_error().into()),
+        None => Ok(bytes),
+    }
+}
+
+pub(super) fn validate_response_typed(
+    envelope: &Value,
+    input: &ValidationInput,
+    limit: usize,
+    deadline: Instant,
+    policy: &NativeLimits,
+) -> Result<(Vec<u8>, Option<super::FormatIssue>), String> {
+    let found = if capped(envelope, input, deadline, policy) {
+        cap_shape(envelope, input, deadline, policy)?
+    } else {
+        completed_shape(envelope, &input.profile, deadline, policy)?
+    };
+    let is_cap = envelope.get("status").and_then(Value::as_str) == Some("incomplete");
     let items = envelope
         .get("output")
         .ok_or(ShapeFault::OutputMissing.code())?;
@@ -1079,7 +2110,17 @@ pub(super) fn validate_response(
     if found.refused {
         return Err("native_provider_refused".into());
     }
+    let mut issue = None;
+    if is_cap {
+        return Ok((
+            serde_json::to_vec(items).map_err(|_| "native_output_cap_encoding")?,
+            None,
+        ));
+    }
     if !found.calls.is_empty() {
+        if input.output_prefix.is_some() {
+            return Err("native_output_cap_final_text_call_conflict".into());
+        }
         for (_, name, args) in found.calls {
             let function = input
                 .profile
@@ -1103,25 +2144,48 @@ pub(super) fn validate_response(
             schema::measure(items, policy.context_bytes, policy, "native_context_bytes")?;
         }
     } else {
-        let output = decode::parse(
-            found
-                .text
-                .ok_or(ShapeFault::FinalTextMissing.code())?
-                .as_bytes(),
-            input.output_bytes,
-            deadline,
-            "native_output_not_json",
-            policy,
-            "task_output_bytes",
+        let raw_limit = joined_limit(input.output_bytes, input.joined_charter, policy)?;
+        let text = joined_text(
+            input.output_prefix.as_deref(),
+            found.text.ok_or(ShapeFault::FinalTextMissing.code())?,
+            raw_limit,
         )?;
-        schema::Schema::compile(&input.schema, policy)?.validate(
-            &output,
-            input.output_bytes,
-            "task_output_bytes",
-        )?;
+        if input.repair_enabled {
+            match decode::parse_final(
+                text.as_bytes(),
+                raw_limit,
+                deadline,
+                policy,
+                "task_output_bytes",
+            )? {
+                Ok(output) => {
+                    issue = schema::Schema::compile(&input.schema, policy)?.final_issue(
+                        &final_value(output, input.joined_charter),
+                        input.output_bytes,
+                        "task_output_bytes",
+                    )?
+                }
+                Err(found) => issue = Some(found),
+            }
+        } else {
+            let output = decode::parse(
+                text.as_bytes(),
+                input.output_bytes,
+                deadline,
+                "native_output_not_json",
+                policy,
+                "task_output_bytes",
+            )?;
+            schema::Schema::compile(&input.schema, policy)?.validate(
+                &output,
+                input.output_bytes,
+                "task_output_bytes",
+            )?;
+        }
     }
     live(deadline)?;
-    serde_json::to_vec(items).map_err(|_| "native_tool_context_encoding".into())
+    let bytes = serde_json::to_vec(items).map_err(|_| "native_tool_context_encoding")?;
+    Ok((bytes, issue))
 }
 
 #[cfg(test)]
@@ -1192,6 +2256,8 @@ mod policy_tests {
     fn validation(profile: NativeLoopProfile, policy: &NativeLimits) -> ValidationInput {
         preflight(
             &serde_json::to_value(ValidationInput {
+                output_prefix: None,
+                joined_charter: false,
                 schema: json!({
                     "type": "object",
                     "properties": {"result": {"type": "string"}},
@@ -1200,6 +2266,7 @@ mod policy_tests {
                 }),
                 profile,
                 output_bytes: policy.output_bytes,
+                repair_enabled: false,
             })
             .unwrap(),
             policy,
@@ -1324,6 +2391,8 @@ mod policy_tests {
             profile: profile.clone(),
             context: envelope(json!({"version": 1}))["output"].clone(),
             request_index: 1,
+            charged_through: 1,
+            compacted: false,
             call_id: "logical-first".into(),
             name: "inspect_record".into(),
             arguments: json!({"key": "alpha"}),
@@ -1428,9 +2497,12 @@ mod shape_diagnostic_tests {
     fn documented_reasoning_content_is_optional_and_retains_exact_items() {
         let policy = policy();
         let validation = ValidationInput {
+            output_prefix: None,
+            joined_charter: false,
             schema: json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}),
             profile: profile(),
             output_bytes: policy.output_bytes,
+            repair_enabled: false,
         };
         for content in [
             None,
@@ -1486,9 +2558,12 @@ mod shape_diagnostic_tests {
         )
         .unwrap();
         let validation = ValidationInput {
+            output_prefix: None,
+            joined_charter: false,
             schema: json!(true),
             profile: profile(),
             output_bytes: "{\"ok\":true}".len(),
+            repair_enabled: false,
         };
         let envelope = json!({"status":"completed","error":null,"output":output});
         validate_response(
@@ -1555,9 +2630,12 @@ mod shape_diagnostic_tests {
     fn malformed_reasoning_content_refuses_with_closed_diagnostics() {
         let policy = policy();
         let validation = ValidationInput {
+            output_prefix: None,
+            joined_charter: false,
             schema: json!(true),
             profile: profile(),
             output_bytes: policy.output_bytes,
+            repair_enabled: false,
         };
         for (content, expected) in [
             (Value::Null, ShapeFault::ReasoningContent),
@@ -1740,9 +2818,12 @@ mod shape_diagnostic_tests {
         ];
         let policy = policy();
         let validation = ValidationInput {
+            output_prefix: None,
+            joined_charter: false,
             schema: json!(true),
             profile: profile(),
             output_bytes: policy.output_bytes,
+            repair_enabled: false,
         };
         for (output, fault) in cases {
             let envelope = json!({"status":"completed","error":null,"output":output});
@@ -1828,9 +2909,12 @@ mod shape_diagnostic_tests {
     fn diagnostic_change_preserves_acceptance_and_validation_order() {
         let policy = policy();
         let validation = ValidationInput {
+            output_prefix: None,
+            joined_charter: false,
             schema: json!(true),
             profile: profile(),
             output_bytes: policy.output_bytes,
+            repair_enabled: false,
         };
         let output = items();
         let mut envelope = json!({"status":"completed","error":null,"output":output});
@@ -1880,3 +2964,310 @@ mod shape_diagnostic_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod provider_schema_tests {
+    use super::*;
+
+    fn diagnostic() -> (Value, ValidationInput, NativeLimits) {
+        let source: Value =
+            serde_json::from_str(include_str!("../../metadata/operational-diagnostic.json"))
+                .unwrap();
+        let limits = crate::limits::RuntimeLimits::seed().unwrap();
+        let definition: crate::protocol::Definition =
+            serde_json::from_value(source["definition"].clone()).unwrap();
+        let selected = limits.resolve_definition(&definition).unwrap();
+        let profile = NativeLoopProfile {
+            functions: crate::mcp::catalogue(&limits)
+                .into_iter()
+                .map(|tool| NativeFunction {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.input_schema,
+                })
+                .collect(),
+            web_search: None,
+        };
+        let validation = ValidationInput {
+            output_prefix: None,
+            joined_charter: false,
+            schema: source["output_schema"].clone(),
+            profile,
+            output_bytes: limits.task_defaults.output_bytes,
+            repair_enabled: false,
+        };
+        (source, validation, selected.native)
+    }
+    fn report() -> Value {
+        json!({"disposition":"no_action","origin_task_id":"origin","target_agent_id":"agent",
+            "reason":"No justified configured-limit change","change":null,
+            "measurement":{"status":"not_applied","baseline":null,"later":null,
+                "comparison":"not_comparable","causal_improvement_claim":false,"limitations":[]}})
+    }
+    fn envelope(report: &Value) -> Value {
+        json!({"status":"completed","error":null,"output":[{
+            "type":"message","id":"msg-report","role":"assistant","status":"completed",
+            "content":[{"type":"output_text","text":serde_json::to_string(report).unwrap(),"annotations":[]}]
+        }]})
+    }
+    fn supported_shape(schema: &Value) {
+        let Some(object) = schema.as_object() else {
+            panic!("diagnostic guidance schema must be an object");
+        };
+        for key in [
+            "allOf",
+            "not",
+            "dependentRequired",
+            "dependentSchemas",
+            "if",
+            "then",
+            "else",
+        ] {
+            assert!(
+                !object.contains_key(key),
+                "unsupported provider keyword {key}"
+            );
+        }
+        assert!(
+            object.contains_key("type"),
+            "diagnostic guidance leaves use explicit types"
+        );
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            assert_eq!(object.get("additionalProperties"), Some(&json!(false)));
+            let required = object["required"].as_array().unwrap();
+            assert_eq!(required.len(), properties.len());
+            for (key, value) in properties {
+                assert!(required.contains(&json!(key)));
+                supported_shape(value);
+            }
+        }
+        if let Some(items) = object.get("items") {
+            supported_shape(items);
+        }
+    }
+
+    #[test]
+    fn diagnostic_generation_guidance_preserves_structure_and_exact_accepted_schema_bound() {
+        let (source, input, policy) = diagnostic();
+        let before = input.schema.clone();
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert_eq!(serde_json::to_vec(&serialized).unwrap().len(), 19_746);
+        assert_eq!(policy.schema_bytes, 19_746);
+        assert_eq!(source["schema_binding"]["schema_bytes"], json!(19_746));
+        let format = response_format(&input.schema).unwrap();
+        assert_eq!(format["type"], json!("json_schema"));
+        assert_eq!(format["strict"], json!(false));
+        let guidance = &format["schema"];
+        supported_shape(guidance);
+        assert_eq!(guidance["required"], before["required"]);
+        assert_eq!(
+            guidance["additionalProperties"],
+            before["additionalProperties"]
+        );
+        assert_eq!(
+            input.schema, before,
+            "the accepted contract is never rewritten"
+        );
+        assert_eq!(input.schema["allOf"].as_array().unwrap().len(), 6);
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(guidance)
+            .unwrap();
+        assert!(validator.is_valid(&report()));
+        let mut missing = report();
+        missing.as_object_mut().unwrap().remove("change");
+        assert!(!validator.is_valid(&missing));
+        let mut extra = report();
+        extra["unexpected"] = json!(true);
+        assert!(!validator.is_valid(&extra));
+    }
+
+    #[test]
+    fn guidance_valid_contradictions_are_refused_by_actual_final_validation() {
+        let (_, input, policy) = diagnostic();
+        let format = response_format(&input.schema).unwrap();
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&format["schema"])
+            .unwrap();
+        let original = report();
+        assert!(
+            validate_response(
+                &envelope(&original),
+                &input,
+                policy.context_bytes,
+                Instant::now() + Duration::from_secs(5),
+                &policy
+            )
+            .is_ok()
+        );
+        let mut missing_change = original.clone();
+        missing_change["disposition"] = json!("measured");
+        let mut wrong_state = original.clone();
+        wrong_state["measurement"]["status"] = json!("incomplete_evidence");
+        for contradictory in [missing_change, wrong_state] {
+            assert!(
+                validator.is_valid(&contradictory),
+                "guidance is deliberately not the acceptance oracle"
+            );
+            assert_eq!(
+                validate_response(
+                    &envelope(&contradictory),
+                    &input,
+                    policy.context_bytes,
+                    Instant::now() + Duration::from_secs(5),
+                    &policy
+                )
+                .unwrap_err(),
+                "native_output_schema_mismatch"
+            );
+        }
+        assert_eq!(input.schema["allOf"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn simple_schema_is_unchanged_and_unexpected_projection_constructs_refuse() {
+        let simple = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
+        assert_eq!(response_format(&simple).unwrap()["schema"], simple);
+        for schema in [
+            json!({"type":"object","allOf":[{"required":["ok"]}],"properties":{"ok":{"type":"boolean"}}}),
+            json!({"type":"object","allOf":[{"if":true,"then":true,"required":["ok"]}]}),
+            json!({"type":"object","allOf":[{"if":true,"then":true}],"properties":{"ok":{"$ref":"#/allOf/0/then"}}}),
+            json!({"type":"object","allOf":[{"if":true,"then":true}],"properties":{"ok":{"allOf":[{"type":"boolean"}]}}}),
+            json!({"type":"object","allOf":[{"if":true,"then":{"type":"string"}}],"patternProperties":{".*":{"$ref":"#/allOf/0/then"}}}),
+            json!({"type":"object","allOf":[{"if":true,"then":true}],"unevaluatedProperties":{"$ref":"#/allOf/0/then"}}),
+            json!({"type":"object","allOf":[{"if":true,"then":true}],"properties":{"rows":{"type":"array","contains":{"$ref":"#/allOf/0/then"}}}}),
+            json!({"type":"object","allOf":[{"if":true,"then":true}],"properties":{"rows":{"type":"array","prefixItems":[{"$ref":"#/allOf/0/then"}]}}}),
+            json!({"type":"object","allOf":[{"if":true,"then":true}],"propertyNames":{"$ref":"#/allOf/0/then"}}),
+        ] {
+            assert_eq!(
+                response_format(&schema).unwrap_err(),
+                "native_provider_schema_projection_unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_types_do_not_guess_mixed_enums_or_transform_literal_values() {
+        let mut schema = json!({"type":"object","properties":{
+            "allOf":{"enum":["if","then"]},"mixed":{"enum":[true,1]},
+            "numeric":{"enum":[1,1.5]},"null_only":{"const":null},
+            "literal":{"const":{"enum":[true]}}
+        }});
+        explicit_scalar_types(&mut schema).unwrap();
+        assert_eq!(schema["properties"]["allOf"]["type"], json!("string"));
+        assert!(schema["properties"]["mixed"].get("type").is_none());
+        assert_eq!(schema["properties"]["numeric"]["type"], json!("number"));
+        assert_eq!(schema["properties"]["null_only"]["type"], json!("null"));
+        assert_eq!(
+            schema["properties"]["literal"],
+            json!({"const":{"enum":[true]}})
+        );
+    }
+}
+
+#[cfg(test)]
+mod format_repair_tests {
+    use super::*;
+    fn input() -> (ValidationInput, NativeLimits) {
+        let policy = crate::limits::RuntimeLimits::seed()
+            .unwrap()
+            .execution
+            .native;
+        (
+            ValidationInput {
+                output_prefix: None,
+                joined_charter: false,
+                schema: json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}),
+                profile: NativeLoopProfile {
+                    functions: vec![],
+                    web_search: None,
+                },
+                output_bytes: 1024,
+                repair_enabled: true,
+            },
+            policy,
+        )
+    }
+    fn reply(text: &str) -> Value {
+        json!({"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}]})
+    }
+    #[test]
+    fn only_completed_final_format_mismatch_yields_typed_repair() {
+        let (input, p) = input();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (text, want) in [
+            ("bad", 0),
+            ("{\"answer\":\"bad\"}", 1),
+            ("{\"answer\":1,\"answer\":2}", 2),
+        ] {
+            let envelope = reply(text);
+            let (items, issue) =
+                validate_response_typed(&envelope, &input, p.context_bytes, deadline, &p).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&items).unwrap(),
+                envelope["output"]
+            );
+            assert!(match (want, issue) {
+                (0, Some(super::super::FormatIssue::InvalidJson { .. })) => true,
+                (
+                    1,
+                    Some(super::super::FormatIssue::Schema {
+                        rule: super::super::SchemaRule::Type,
+                    }),
+                ) => true,
+                (2, Some(super::super::FormatIssue::DuplicateKey {})) => true,
+                _ => false,
+            });
+        }
+        assert!(
+            validate_response_typed(
+                &reply("{\"answer\":1}"),
+                &input,
+                p.context_bytes,
+                deadline,
+                &p
+            )
+            .unwrap()
+            .1
+            .is_none()
+        );
+    }
+    #[test]
+    fn wire_refusal_bounds_and_historical_disabled_policy_never_become_format_repair() {
+        let (mut input, p) = input();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut incomplete = reply("bad");
+        incomplete["status"] = json!("incomplete");
+        assert!(
+            validate_response_typed(&incomplete, &input, p.context_bytes, deadline, &p).is_err()
+        );
+        let refusal = json!({"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"no"}]}]});
+        assert!(validate_response_typed(&refusal, &input, p.context_bytes, deadline, &p).is_err());
+        input.output_bytes = 1;
+        assert!(
+            validate_response_typed(&reply("bad"), &input, p.context_bytes, deadline, &p)
+                .unwrap_err()
+                .contains("bound")
+        );
+        input.output_bytes = 1024;
+        input.repair_enabled = false;
+        assert_eq!(
+            validate_response_typed(&reply("bad"), &input, p.context_bytes, deadline, &p)
+                .unwrap_err(),
+            "native_output_not_json"
+        );
+        assert!(
+            validate_response_typed(&reply("bad"), &input, p.context_bytes, Instant::now(), &p)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "output_cap_tests.rs"]
+mod output_cap_tests;
+
+#[cfg(test)]
+#[path = "charter_profile_admission_tests.rs"]
+mod charter_profile_admission_tests;

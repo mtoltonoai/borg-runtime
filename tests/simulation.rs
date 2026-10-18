@@ -60,11 +60,13 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn input(agent: &str, label: u8) -> TaskInput {
-    TaskInput {
+    TaskInput { instruction_source: None,
+        pull_request: None,
         resolved_limits: None,
         repository_read: None,
         instruction: format!("answer for input {label}"),
         definition: Definition {
+            charter: None,
             limit_overrides: None,
             inference: Some(InferenceSettings::selected()),
             execution_profile: Some(ExecutionProfile::CollaborationV1 { web_search: None }),
@@ -235,6 +237,7 @@ async fn prepare_result(controller: &Controller, attempt: &Attempt) {
             attempt,
             "usage",
             Observation::Usage {
+                native_diagnostic_reserved: false,
                 model_requests: 1,
                 input_tokens: Some(3),
                 output_tokens: Some(2),
@@ -251,6 +254,8 @@ async fn prepare_result(controller: &Controller, attempt: &Attempt) {
             attempt,
             "completed",
             Observation::NativeLoopCompleted {
+                requests: Vec::new(),
+                final_response_index: None,
                 model_requests: 1,
                 calls: vec![],
             },

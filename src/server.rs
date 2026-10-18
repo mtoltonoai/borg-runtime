@@ -38,6 +38,18 @@ fn response(status: u16, content_type: &str, body: impl Into<Bytes>) -> Response
     r
 }
 
+// Construct the large product future outside the HTTP handler's polling frame,
+// then retain only its heap pointer across the await. A direct Box::pin call at
+// the await site still constructs the unboxed future in that caller in debug.
+#[inline(never)]
+fn boxed_product<F, Fut>(make: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = product::UiResponse>,
+{
+    Box::pin(make())
+}
+
 async fn handle(
     controller: Controller,
     origin: String,
@@ -179,7 +191,7 @@ async fn handle(
             ),
         });
     }
-    let result = product::handle(
+    let result = boxed_product(|| product::handle(
         &controller,
         UiRequest {
             method,
@@ -188,7 +200,7 @@ async fn handle(
             origin: request_origin,
             expected_origin: origin,
         },
-    )
+    ))
     .await;
     let mut reply = response(result.status, &result.content_type, result.body);
     if let Some(location) = result.location {

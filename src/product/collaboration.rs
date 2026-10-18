@@ -3,7 +3,7 @@
 use super::*;
 use crate::collaboration::{Query, QueryResult};
 
-fn fields(query: &str, allowed: &[&str], metadata: &RuntimeLimits) -> Result<Form, String> {
+fn fields(query: &str, allowed: &[&str], metadata: &RuntimeLimits) -> Result<Form, FormError> {
     let f = parse_form(query.as_bytes(), metadata)?;
     fields_only(&f, allowed)?;
     Ok(f)
@@ -43,8 +43,14 @@ async fn query(controller: &Controller, query: Query) -> Result<QueryResult, UiR
         _ => Err(not_task(reply)),
     }
 }
-pub(super) fn index() -> UiResponse {
-    page(200, "Collaboration", "<p>Browse the same committed collaboration information available to agents.</p><ul><li><a href=\"/tasks\">Tasks, progress and results</a> — each task links to its history, attempts, checkpoints, repository, child tasks and release candidates.</li><li><a href=\"/agents\">Agents, sessions and shared memory</a> — recorded agent identities, memory and accepted agent revisions.</li><li><a href=\"/workers\">Workers and capacity</a> — current registered incarnation and controller-known occupancy.</li></ul><p>Cancellation and retry use the existing task controls. Agent progress reports, configured child delegation and memory writes remain tied to the actual executing agent; this interface displays their committed records and does not act as that agent. Release checks are observations; this interface cannot grant protected release or rollout authority.</p>".into())
+pub(super) fn index(workflow_enabled: bool) -> UiResponse {
+    let mut body: String = "<p>Browse the same committed collaboration information available to agents.</p><ul><li><a href=\"/tasks\">Tasks, progress and results</a> — each task links to its history, attempts, checkpoints, repository, child tasks and release candidates.</li><li><a href=\"/agents\">Agents, sessions and shared memory</a> — recorded agent identities, memory and accepted agent revisions.</li><li><a href=\"/workers\">Workers and capacity</a> — current registered incarnation and controller-known occupancy.</li></ul><p>Cancellation and retry use the existing task controls. Agent progress reports, configured child delegation and memory writes remain tied to the actual executing agent; this interface displays their committed records and does not act as that agent. Release checks are observations; this interface cannot grant protected release or rollout authority.</p>".into();
+    if workflow_enabled {
+        //= spec/impl/v2/implementation.md#collaboration-surfaces-preserve-existing-authority
+        //# The browser interface MUST expose every supported collaboration operation permitted to its caller.
+        body.push_str("<h2>Collaboration workflows</h2><ul><li><a href=\"/documents\">Documents and immutable versions</a> · <a href=\"/documents/new\">Create a document</a></li><li><a href=\"/questions\">Questions and answer history</a> · <a href=\"/questions/new\">Pose a question</a></li><li><a href=\"/reviews\">Exact-subject reviews</a></li><li><a href=\"/decisions\">Your decision queue</a></li></ul><p>Each task links to its collaboration owner, resolver waits, comments and available accepted-result review targets. Product decisions do not authorize protected actions.</p>");
+    }
+    page(200, "Collaboration", body)
 }
 
 pub(super) async fn get(
@@ -62,9 +68,8 @@ async fn route(
     path: &str,
     raw_query: &str,
 ) -> Result<Option<UiResponse>, UiResponse> {
-    let invalid = |m: String| error(400, &m);
     if path == "/limits" {
-        let f = fields(raw_query, &["task_id"], controller.limits()).map_err(invalid)?;
+        let f = fields(raw_query, &["task_id"], controller.limits()).map_err(|e| error(400, &e))?;
         let task_id = f.get("task_id").filter(|v| !v.is_empty()).cloned();
         let QueryResult::Limits { global, execution } = query(
             controller,
@@ -97,7 +102,10 @@ async fn route(
             // explicit bounds without treating current defaults as task values.
             let reply = call(controller, Operation::GetTask { task_id }).await;
             match reply.outcome {
-                Outcome::Ok { data: Data::Task(task) } => body.push_str(&task_limits_view(&task)),
+                Outcome::Ok { data: Data::Task(task) } => {
+                    body.push_str(&task_limits_view(&task));
+                    let _ = write!(body, "<p><a href=\"{}/settings?task_id={}\">Compare selected and accepted agent settings</a></p>", agents::path(&task.input.definition.id), encode(&task.id));
+                },
                 _ => return Err(not_task(reply)),
             }
         }
@@ -105,8 +113,8 @@ async fn route(
     }
 
     if path == "/collaboration" {
-        fields(raw_query, &[], controller.limits()).map_err(invalid)?;
-        return Ok(Some(index()));
+        fields(raw_query, &[], controller.limits()).map_err(|e| error(400, &e))?;
+        return Ok(Some(index(controller.limits().workflow.is_some())));
     }
     if path == "/tasks"
         && (raw_query.contains("agent_id=") || raw_query.contains("parent_task_id="))
@@ -116,7 +124,7 @@ async fn route(
             &["agent_id", "parent_task_id", "after"],
             controller.limits(),
         )
-        .map_err(invalid)?;
+        .map_err(|e| error(400, &e))?;
         let agent_id = f.get("agent_id").filter(|x| !x.is_empty()).cloned();
         let parent_task_id = f.get("parent_task_id").filter(|x| !x.is_empty()).cloned();
         let QueryResult::Tasks(tasks) = query(
@@ -174,7 +182,7 @@ async fn route(
         return Ok(Some(page(200, "Filtered tasks", body)));
     }
     if path == "/workers" {
-        let f = fields(raw_query, &["after"], controller.limits()).map_err(invalid)?;
+        let f = fields(raw_query, &["after"], controller.limits()).map_err(|e| error(400, &e))?;
         let QueryResult::Workers(workers) = query(
             controller,
             Query::Workers {
@@ -210,8 +218,8 @@ async fn route(
         return Ok(Some(page(200, "Workers", body)));
     }
     if let Some(raw) = path.strip_prefix("/workers/").filter(|x| !x.contains('/')) {
-        fields(raw_query, &[], controller.limits()).map_err(invalid)?;
-        let worker_id = id(raw, controller.limits()).map_err(invalid)?;
+        fields(raw_query, &[], controller.limits()).map_err(|e| error(400, &e))?;
+        let worker_id = id(raw, controller.limits()).map_err(|e| error(400, &e))?;
         let QueryResult::Worker(w) = query(controller, Query::Worker { worker_id }).await? else {
             return Err(error(502, "Unexpected worker projection"));
         };
@@ -228,9 +236,9 @@ async fn route(
         .strip_prefix("/definitions/")
         .filter(|x| !x.contains('/'))
     {
-        let f = fields(raw_query, &["revision"], controller.limits()).map_err(invalid)?;
-        let definition_id = id(raw, controller.limits()).map_err(invalid)?;
-        let revision = required(&f, "revision").map_err(invalid)?.to_string();
+        let f = fields(raw_query, &["revision"], controller.limits()).map_err(|e| error(400, &e))?;
+        let definition_id = id(raw, controller.limits()).map_err(|e| error(400, &e))?;
+        let revision = required(&f, "revision").map_err(|e| error(400, &e))?.to_string();
         let QueryResult::Definition(d) = query(
             controller,
             Query::Definition {
@@ -256,7 +264,7 @@ async fn route(
         .and_then(|r| r.split_once('/'))
     {
         if sub == "memory" || sub.starts_with("memory/") {
-            let agent_id = id(raw, controller.limits()).map_err(invalid)?;
+            let agent_id = id(raw, controller.limits()).map_err(|e| error(400, &e))?;
             let agent = call(
                 controller,
                 Operation::GetAgent {
@@ -274,11 +282,11 @@ async fn route(
             }
             let route = format!("/agents/{}/memory", encode(&agent_id));
             let mut body = format!(
-                "<p><a href=\"{}\">Agent</a></p><p>Memory is shown for this exact recorded agent ID. This is a read-only operator view; writes require the actual current agent caller.</p>",
+                "<p><a href=\"{}\">Agent</a></p><p>Memory is shown for this exact recorded agent ID. A displayed memory revision does not establish that any particular session consumed it. This is a read-only operator view; writes require the actual current agent caller.</p>",
                 agents::path(&agent_id)
             );
             if sub == "memory" {
-                let f = fields(raw_query, &["after"], controller.limits()).map_err(invalid)?;
+                let f = fields(raw_query, &["after"], controller.limits()).map_err(|e| error(400, &e))?;
                 let QueryResult::MemoryKeys(keys) = query(
                     controller,
                     Query::MemoryKeys {
@@ -310,9 +318,9 @@ async fn route(
                 }
                 next(&mut body, &route, keys.next_cursor.as_deref());
             } else {
-                fields(raw_query, &[], controller.limits()).map_err(invalid)?;
+                fields(raw_query, &[], controller.limits()).map_err(|e| error(400, &e))?;
                 let key = id(sub.strip_prefix("memory/").unwrap(), controller.limits())
-                    .map_err(invalid)?;
+                    .map_err(|e| error(400, &e))?;
                 let reply = call(controller, Operation::GetMemory { agent_id, key }).await;
                 match reply.outcome {
                     Outcome::Ok {
@@ -333,8 +341,8 @@ async fn route(
     }
     if let Some((raw, sub)) = path.strip_prefix("/tasks/").and_then(|r| r.split_once('/')) {
         if ["history", "attempts", "checkpoints"].contains(&sub) {
-            let task_id = id(raw, controller.limits()).map_err(invalid)?;
-            let f = fields(raw_query, &["after"], controller.limits()).map_err(invalid)?;
+            let task_id = id(raw, controller.limits()).map_err(|e| error(400, &e))?;
+            let f = fields(raw_query, &["after"], controller.limits()).map_err(|e| error(400, &e))?;
             let q = match sub {
                 "history" => Query::TaskHistory {
                     task_id: task_id.clone(),
@@ -401,8 +409,8 @@ async fn route(
         .strip_prefix("/releases/")
         .and_then(|r| r.split_once('/'))
     {
-        let release_id = id(raw, controller.limits()).map_err(invalid)?;
-        let f = fields(raw_query, &["after"], controller.limits()).map_err(invalid)?;
+        let release_id = id(raw, controller.limits()).map_err(|e| error(400, &e))?;
+        let f = fields(raw_query, &["after"], controller.limits()).map_err(|e| error(400, &e))?;
         let QueryResult::ReleaseChecks(checks) = query(
             controller,
             Query::ReleaseChecks {

@@ -1,8 +1,9 @@
 //! Shared v2 task contract. No executor-owned result is an accepted task result.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use crate::native_loop_contract::NativeRequestEvidence;
 
-pub const WIRE_REVISION: u32 = 8;
+pub const WIRE_REVISION: u32 = 23;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
@@ -14,6 +15,8 @@ pub enum ExecutorKind {
 pub enum TaskStatus {
     Queued,
     Active,
+    /// Durable native retry hold, never automatically scheduled.
+    Blocked,
     Succeeded,
     Failed,
     Cancelled,
@@ -53,6 +56,9 @@ impl InferenceSettings {
 //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
 //# An agent definition MUST carry the execution-limit overrides specific to that agent revision.
 pub struct Definition {
+    /// Original immutable charter source; absent historical definitions stay absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charter: Option<crate::charter::DefinitionCharter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_overrides: Option<Box<crate::limits::ExecutionLimitOverrides>>,
     /// Sole immutable provider/tool capability selection for this revision.
@@ -84,6 +90,33 @@ impl Definition {
         }
         Ok(settings)
     }
+}
+/// Closed request carried inside the ordinary collaboration occurrence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DefinitionUpdate {
+    pub agent_id: String,
+    pub expected_revision: String,
+    pub expected_global_revision: String,
+    pub expected_policy_revision: String,
+    pub changes: std::collections::BTreeMap<crate::limits::DefinitionLimitField, usize>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationChangeClass { Neutral, Narrowing, Widening, PreviousUnspecified }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationEffect { FutureSubmissions }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DefinitionUpdateOutcome {
+    pub previous_revision: String,
+    pub selected_definition: Definition,
+    pub global_revision: String,
+    pub policy: crate::limits::DefinitionUpdatePolicy,
+    pub changed_fields: Vec<crate::limits::DefinitionLimitField>,
+    pub classification: ConfigurationChangeClass,
+    pub effective_for: ConfigurationEffect,
 }
 /// One controller-issued instantiation of an immutable agent revision. Execution
 /// state remains in its associated task and fenced attempts, not a second copy.
@@ -128,10 +161,17 @@ impl Session {
 pub struct AgentSummary {
     pub id: String,
     pub definition: Definition,
+    /// Retirement disables new use, not historical identity or accepted work.
+    #[serde(default, skip_serializing_if = "agent_is_active")]
+    pub retired: bool,
 }
+fn agent_is_active(retired: &bool) -> bool { !*retired }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Repository {
+    /// Server-copied immutable target; external submissions leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_target: Option<crate::pull_request::Target>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration: Option<crate::repository_catalogue::Revision>,
     /// Server-owned accepted endpoint projection; external submissions leave it empty.
@@ -153,6 +193,40 @@ pub struct RepositoryReadSource {
     pub repository: String,
     pub start_commit: String,
 }
+impl RepositoryReadSource {
+    /// Shape validation for an already resolved instruction binding. This does
+    /// not resolve a catalogue head, authorize a caller, or acquire material.
+    pub fn validate_instruction_binding(
+        &self,
+        limits: &crate::limits::RuntimeLimits,
+    ) -> Result<(), String> {
+        let binding = self.registration.as_ref().ok_or("instruction_source_registration_missing")?;
+        for identity in [&binding.repository_id, &binding.registration_revision] {
+            if identity.is_empty() || identity.len() > limits.transport.identity_bytes
+                || identity.chars().any(char::is_control)
+            {
+                return Err("instruction_source_identity_invalid: transport.identity_bytes".into());
+            }
+        }
+        if self.repository.is_empty() || self.repository.chars().any(char::is_control)
+            || crate::credential::repository_contains_credentials(&self.repository)
+        {
+            return Err("instruction_source_endpoint_invalid".into());
+        }
+        if self.repository.len() > limits.controller.max_repository_identity_bytes {
+            return Err("instruction_source_endpoint_bound: controller.max_repository_identity_bytes".into());
+        }
+        if self.repository.len() > limits.repository.endpoint_bytes {
+            return Err("instruction_source_endpoint_bound: repository.endpoint_bytes".into());
+        }
+        if !matches!(self.start_commit.len(), 40 | 64)
+            || !self.start_commit.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("instruction_source_commit_invalid".into());
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -167,6 +241,12 @@ pub struct Limits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CodingTaskTemplate {
+    /// Immutable secondary read scope, resolved when the parent is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_source: Option<RepositoryReadSource>,
+    /// Explicit requested result; absence retains checkpoint-only behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::pull_request::Request>,
     pub instruction_prefix: String,
     pub definition: Definition,
     pub repository: Repository,
@@ -178,6 +258,8 @@ pub struct CodingTaskTemplate {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeWorkflow {
     CodingThenContinue { child: CodingTaskTemplate },
+    /// Explicit same-task handoff scope; never creates a delegated child.
+    Reassign { target: CodingTaskTemplate },
     InspectCurrentTaskThenContinue {},
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -188,6 +270,12 @@ pub enum NativeWorkflow {
 //= spec/impl/v2/implementation.md#repository-associations-are-versioned-metadata
 //# A task MUST have at most one primary repository association.
 pub struct TaskInput {
+    /// Optional Coding instruction tree; distinct from its primary repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_source: Option<RepositoryReadSource>,
+    /// Explicit requested result; never inferred from the instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::pull_request::Request>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_limits: Option<Box<crate::limits::LimitSnapshot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,6 +292,55 @@ pub struct TaskInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_workflow: Option<Box<NativeWorkflow>>,
 }
+/// Root submission draft. Omission chooses configured routing; explicit null is invalid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDraft {
+    /// Optional Coding instruction tree; distinct from its primary repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_source: Option<RepositoryReadSource>,
+    /// Explicit requested result; never inferred from the instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::pull_request::Request>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_read: Option<RepositoryReadSource>,
+
+    pub instruction: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_definition")]
+    pub definition: Option<Definition>,
+    pub repository: Option<Repository>,
+    pub acceptance_commands: Vec<Vec<String>>,
+    pub output_schema: Option<Value>,
+    pub limits: Limits,
+    pub dependencies: Vec<String>,
+    /// Explicit immutable task configuration, never inferred from model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_workflow: Option<Box<NativeWorkflow>>,
+}
+impl TaskDraft {
+    /// Admission supplies the exact selected head; accepted tasks never retain an omission.
+    pub(crate) fn resolve(&self, definition: Definition) -> TaskInput {
+        TaskInput {
+            resolved_limits: None,
+            instruction_source: self.instruction_source.clone(),
+            pull_request: self.pull_request.clone(),
+            repository_read: self.repository_read.clone(),
+            instruction: self.instruction.clone(),
+            definition,
+            repository: self.repository.clone(),
+            acceptance_commands: self.acceptance_commands.clone(),
+            output_schema: self.output_schema.clone(),
+            limits: self.limits.clone(),
+            dependencies: self.dependencies.clone(),
+            native_workflow: self.native_workflow.clone(),
+        }
+    }
+}
+
+fn present_definition<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Definition>, D::Error> {
+    Definition::deserialize(d).map(Some)
+}
+
 impl TaskInput {
     pub fn execution_limits(&self) -> Result<&crate::limits::ExecutionLimits, String> {
         let snapshot = self
@@ -224,6 +361,9 @@ pub struct Checkpoint {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AcceptedResult {
+    /// Controller-derived reference to the exact settled original PR operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::pull_request::ResultReference>,
     pub attempt_id: String,
     pub summary: String,
     pub checkpoint: Option<Checkpoint>,
@@ -244,17 +384,29 @@ pub struct Attempt {
     pub uncertain: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingAssignment {
+    pub operation_id: String,
+    pub from_session_id: String,
+    /// Reserved identity only. No session authority exists until activation.
+    pub session: Session,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: String,
     pub session_id: String,
     pub input: TaskInput,
     pub assigned_agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_assignment: Option<PendingAssignment>,
     pub status: TaskStatus,
     pub revision: u64,
     pub attempt: Option<Attempt>,
     pub selected_checkpoint: Option<Checkpoint>,
     pub result: Option<AcceptedResult>,
     pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_retry_block: Option<crate::native::NativeRetryBlock>,
     pub progress: String,
     pub recent_output: String,
     pub output_truncated: bool,
@@ -286,6 +438,16 @@ pub enum WorkerCommand {
         task: TaskInput,
         checkpoint: Option<Checkpoint>,
         continuation: Option<ChildOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_continuation: Option<crate::collaboration::workflow::WorkflowContinuation>,
+        /// Original held decision carried by a fresh ordinary attempt; not input ACK.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_continuation: Option<crate::governance_completion::CompletionResume>,
+    },
+    CollaborationReady {
+        command_id: String,
+        caller: crate::mcp::Caller,
+        through: crate::collaboration::workflow::EventId,
     },
     StopAttempt {
         command_id: String,
@@ -298,9 +460,41 @@ pub enum WorkerCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Observation {
+    /// Immutable facts for one acknowledged native request reservation. This
+    /// report does not authorize retry or change the current attempt's owner.
+    NativeRequestDiagnostic {
+        request_index: u32,
+        endpoint: String,
+        model: String,
+        request_binding: Option<crate::native::ProviderRequestBinding>,
+        observed_outcome: crate::native_loop_contract::NativeRequestObservedOutcome,
+        failure: Option<crate::native::ProviderFailureDiagnostic>,
+    },
+    NativeRequestRejected {
+        request_index: u32, endpoint: String, model: String,
+        rejection: crate::native::ProviderRejection, diagnostic: String,
+        request_binding: crate::native::ProviderRequestBinding,
+    },
+    NativeOutputCapped {
+        request_index: u32,
+        undispatched_calls: u32,
+        request_binding: crate::native::ProviderRequestBinding,
+        output_binding: crate::native::ProviderRequestBinding,
+    },
+    NativeFormatFailure {
+        request_index: u32,
+        issue: crate::native::FormatIssue,
+        request_binding: crate::native::ProviderRequestBinding,
+        output_binding: crate::native::ProviderRequestBinding,
+    },
+    NativeRetryBlocked { block: crate::native::NativeRetryBlock },
     NativeLoopCompleted {
         model_requests: u32,
         calls: Vec<NativeCallEvidence>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requests: Vec<NativeRequestEvidence>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_response_index: Option<u32>,
     },
     Started {
         thread_id: Option<String>,
@@ -323,6 +517,10 @@ pub enum Observation {
         model_requests: u32,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        /// Present only on the original new native request charge. Historical
+        /// absent/false receipts keep their bytes and acquire no synthetic credit.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        native_diagnostic_reserved: bool,
     },
     ResultCandidate {
         checks_passed: bool,
@@ -425,6 +623,41 @@ pub struct MemoryValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum Operation {
+    /// Private host coordination, never advertised as MCP tools.
+    AcquireNativeRequest {
+        operation_id: String, caller: crate::mcp::Caller, request_index: u32,
+        key: crate::native_retry::CircuitKey, credential_configuration: String,
+    },
+    SettleNativeRequest {
+        operation_id: String, caller: crate::mcp::Caller,
+        acquire_operation_id: String, outcome: crate::native_retry::NativeRequestOutcome,
+    },
+    /// Readiness hint for an original Wait; never a grant or mutation receipt.
+    ObserveNativeRequest { caller: crate::mcp::Caller, acquire_operation_id: String },
+    /// Established operator invocation only; not part of an agent tool catalogue.
+    MutateGovernance { operation_id: String, mutation: crate::governance::GovernanceMutation },
+    QueryGovernance { query: crate::governance::GovernanceQuery },
+    /// Existing trusted host path; not an agent MCP operation.
+    MutateCharter { operation_id: String, mutation: crate::charter::CharterMutation },
+    /// Original occurrence audit is not new execution authority.
+    ObserveCharter { operation_id: String, caller: crate::mcp::Caller, observation: crate::charter::CharterObservation },
+    QueryCharter { query: crate::charter::CharterQuery },
+    EvaluateCompletion(crate::governance_completion::EvaluateCompletion),
+    BeginCompletionContinuation(crate::governance_completion::BeginCompletionContinuation),
+    AcknowledgeCompletionInput(crate::governance_completion::AcknowledgeCompletionInput),
+    MutateQuestion { operation_id: String, mutation: crate::collaboration::questions::QuestionMutation },
+    QueryQuestion { query: crate::collaboration::questions::QuestionQuery },
+    MutateDocument { operation_id: String, mutation: crate::collaboration::documents::DocumentMutation },
+    QueryDocument { query: crate::collaboration::documents::DocumentQuery },
+    MutateReview { operation_id: String, mutation: crate::collaboration::documents::ReviewMutation },
+    QueryReview { query: crate::collaboration::documents::ReviewQuery },
+    MutateWork { operation_id: String, mutation: crate::collaboration::work::WorkMutation },
+    QueryWork { query: crate::collaboration::work::WorkQuery },
+    /// Trusted-host operator action; shares the exact definition-update transaction.
+    UpdateDefinition {
+        operation_id: String,
+        update: DefinitionUpdate,
+    },
     RegisterRepository {
         operation_id: String,
         registration: crate::repository_catalogue::Registration,
@@ -474,6 +707,23 @@ pub enum Operation {
         caller: crate::mcp::Caller,
         operation_id: String,
     },
+    ObserveCollaborationDelivery { caller: crate::mcp::Caller, limit: usize },
+    PrepareCollaborationDelivery {
+        operation_id: String, caller: crate::mcp::Caller,
+        expected_cursor: crate::collaboration::workflow::DeliveryCursor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_routing_cursor: Option<crate::collaboration::workflow::EventId>,
+        through: crate::collaboration::workflow::EventId, limit: usize,
+    },
+    BeginCollaborationDelivery {
+        operation_id: String, caller: crate::mcp::Caller,
+        batch_id: String, context_binding: String,
+    },
+    AcknowledgeCollaborationDelivery {
+        operation_id: String, caller: crate::mcp::Caller,
+        batch_id: String, context_binding: String,
+    },
+    QueryWorkflowActivity { cursor: Option<String>, limit: usize },
     QueryCollaboration {
         query: crate::collaboration::Query,
     },
@@ -492,6 +742,19 @@ pub enum Operation {
     SubmitTask {
         operation_id: String,
         input: TaskInput,
+    },
+    SubmitTaskDraft {
+        operation_id: String,
+        input: TaskDraft,
+    },
+    RegisterAgent {
+        operation_id: String,
+        definition: Definition,
+    },
+    RetireAgent {
+        operation_id: String,
+        agent_id: String,
+        expected_revision: String,
     },
     ListAgents {
         after: Option<String>,
@@ -595,6 +858,23 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Data {
+    NativeRequestAdmission(crate::native_retry::NativeRequestAdmission),
+    NativeRequestSettlement(crate::native_retry::NativeRequestSettlement),
+    NativeRequestReadiness { acquire_operation_id: String, changed: bool },
+    Governance(Box<crate::governance::GovernanceResult>),
+    Charter(crate::charter::CharterOutcome),
+    CharterQuery(crate::charter::CharterQueryResult),
+    Completion(crate::governance_completion::CompletionOutcome),
+    CollaborationDelivery(crate::collaboration::notifications::DeliveryObservation),
+    WorkflowActivity(crate::collaboration::workflow::WorkflowActivityPage),
+    QuestionMutation(crate::collaboration::questions::QuestionMutationOutcome),
+    QuestionQuery(crate::collaboration::questions::QuestionQueryResult),
+    DocumentMutation(crate::collaboration::documents::DocumentMutationOutcome),
+    DocumentQuery(crate::collaboration::documents::DocumentQueryOutcome),
+    ReviewMutation(crate::collaboration::documents::ReviewMutationOutcome),
+    ReviewQuery(crate::collaboration::documents::ReviewQueryOutcome),
+    WorkQuery(crate::collaboration::work::WorkQueryResult),
+    WorkMutation(crate::collaboration::work::WorkMutationOutcome),
     RepositoryRegistration(crate::repository_catalogue::Entry),
     RepositoryRegistrations(crate::collaboration::Page<crate::repository_catalogue::Entry>),
     AgentMemory(crate::collaboration::AgentMemoryObservation),
@@ -604,6 +884,7 @@ pub enum Data {
     ProtectedRelease(Box<crate::protected_release::StageView>),
     Release(Box<ReleaseCandidate>),
     Releases(Vec<ReleaseCandidate>),
+    DefinitionUpdate(Box<DefinitionUpdateOutcome>),
     Agent(AgentSummary),
     Agents(Vec<AgentSummary>),
     Task(Box<Task>),
@@ -642,15 +923,34 @@ pub struct MutationCommit {
 impl Operation {
     pub fn mutation_id(&self) -> Option<&str> {
         match self {
-            Self::RegisterRepository { operation_id, .. }
+            Self::AcquireNativeRequest { operation_id, .. }
+            | Self::SettleNativeRequest { operation_id, .. }
+            | Self::MutateGovernance { operation_id, .. }
+            | Self::MutateCharter { operation_id, .. }
+            | Self::ObserveCharter { operation_id, .. }
+            | Self::MutateQuestion { operation_id, .. }
+            | Self::MutateDocument { operation_id, .. }
+            | Self::MutateReview { operation_id, .. }
+            | Self::MutateWork { operation_id, .. }
+            | Self::UpdateDefinition { operation_id, .. }
+            | Self::RegisterAgent { operation_id, .. }
+            | Self::RetireAgent { operation_id, .. }
+            | Self::RegisterRepository { operation_id, .. }
             | Self::ReviseRepository { operation_id, .. }
             | Self::SetRepositoryEnabled { operation_id, .. } => Some(operation_id),
+            Self::EvaluateCompletion(value) => Some(&value.operation_id),
+            Self::BeginCompletionContinuation(value) => Some(&value.operation_id),
+            Self::AcknowledgeCompletionInput(value) => Some(&value.operation_id),
             Self::CallCollaboration { call } => Some(&call.operation_id),
             Self::PrepareRelease(input) => Some(&input.operation_id),
             Self::ReconcileResult(input) => Some(&input.operation_id),
             Self::PrepareAgentMemory { operation_id, .. }
             | Self::AcknowledgeAgentMemory { operation_id, .. }
+            | Self::PrepareCollaborationDelivery { operation_id, .. }
+            | Self::BeginCollaborationDelivery { operation_id, .. }
+            | Self::AcknowledgeCollaborationDelivery { operation_id, .. }
             | Self::SubmitTask { operation_id, .. }
+            | Self::SubmitTaskDraft { operation_id, .. }
             | Self::AssignTask { operation_id, .. }
             | Self::CancelTask { operation_id, .. }
             | Self::RetryTask { operation_id, .. }
@@ -702,6 +1002,33 @@ impl Reply {
     /// Validate the supplied controller context, not fresh execution authority.
     /// The original receipt revision and a later read revision are distinct.
     pub fn validate_for(&self, operation: &Operation) -> Result<(), String> {
+        if let Outcome::Ok { data } = &self.outcome {
+            if !native_request_response_matches(operation, data) {
+                return Err("native request response differs from original operation".into());
+            }
+            let valid = match (operation, data) {
+                (Operation::RegisterAgent { definition, .. }, Data::Agent(agent)) =>
+                    agent.id == definition.id && agent.definition == *definition && !agent.retired,
+                (Operation::RetireAgent { agent_id, expected_revision, .. }, Data::Agent(agent)) =>
+                    agent.id == *agent_id && agent.definition.revision == *expected_revision && agent.retired,
+                (Operation::RegisterAgent { .. } | Operation::RetireAgent { .. }, _) => false,
+                (Operation::MutateCharter { mutation, .. }, Data::Charter(value)) => match (mutation,value) {
+                    (crate::charter::CharterMutation::Publish { agent_id, expected_definition_revision, .. }, crate::charter::CharterOutcome::Definition(value)) =>
+                        value.effect==crate::charter::CharterDefinitionEffect::PublicationOnly && value.definition.id==*agent_id && value.previous_revision==*expected_definition_revision,
+                    (crate::charter::CharterMutation::SelectForFutureTasks { agent_id, expected_definition_revision, .. }, crate::charter::CharterOutcome::Definition(value)) =>
+                        value.effect==crate::charter::CharterDefinitionEffect::FutureSubmissions && value.definition.id==*agent_id && value.previous_revision==*expected_definition_revision,
+                    (crate::charter::CharterMutation::SetPending { .. },crate::charter::CharterOutcome::Session(_)) => true,
+                    _=>false,
+                },
+                (Operation::ObserveCharter { .. }, Data::Charter(crate::charter::CharterOutcome::Definition(_))) => false,
+                (Operation::ObserveCharter { .. }, Data::Charter(_))
+                | (Operation::QueryCharter { .. }, Data::CharterQuery(_)) => true,
+                (Operation::MutateCharter { .. } | Operation::ObserveCharter { .. } | Operation::QueryCharter { .. }, _)
+                | (_, Data::Charter(_) | Data::CharterQuery(_)) => false,
+                _ => true,
+            };
+            if !valid { return Err("charter result differs from operation".into()); }
+        }
         if let Outcome::Pending { operation_id } | Outcome::Uncertain { operation_id, .. } =
             &self.outcome
         {
@@ -778,6 +1105,15 @@ impl Reply {
         {
             return Err("successful mutation lacks its committed context".into());
         }
+        if let Outcome::Ok { data } = &self.outcome {
+            match (operation, data) {
+                (Operation::MutateGovernance { .. } | Operation::QueryGovernance { .. }, Data::Governance(value))
+                    if governance_response_matches(operation, value) => (),
+                (Operation::MutateGovernance { .. } | Operation::QueryGovernance { .. }, _)
+                | (_, Data::Governance(_)) => return Err("governance response differs from its original request".into()),
+                _ => (),
+            }
+        }
         if matches!(self.outcome, Outcome::Ok { .. }) && self.observed_controller_revision.is_none()
         {
             return Err("successful reply lacks observed controller revision".into());
@@ -785,6 +1121,74 @@ impl Reply {
         Ok(())
     }
 }
+
+// Repeated acquisition/settlement may return an older canonical occurrence.
+// Compare its immutable subject, not its ID with the new request envelope.
+fn native_request_response_matches(operation: &Operation, data: &Data) -> bool {
+    use crate::native_retry::NativeRequestAdmission;
+    match (operation, data) {
+        (Operation::AcquireNativeRequest { caller, request_index, key, credential_configuration, .. },
+            Data::NativeRequestAdmission(NativeRequestAdmission::Granted { permit })) =>
+            &permit.circuit.caller == caller && permit.request_index == *request_index
+                && &permit.circuit.key == key
+                && &permit.credential_configuration == credential_configuration,
+        (Operation::AcquireNativeRequest { .. },
+            Data::NativeRequestAdmission(NativeRequestAdmission::Wait { .. })) => true,
+        (Operation::SettleNativeRequest { caller, acquire_operation_id, outcome, .. },
+            Data::NativeRequestSettlement(settlement)) =>
+            &settlement.permit.circuit.caller == caller
+                && &settlement.permit.circuit.operation_id == acquire_operation_id
+                && &settlement.outcome == outcome,
+        (Operation::ObserveNativeRequest { acquire_operation_id, .. },
+            Data::NativeRequestReadiness { acquire_operation_id: original, .. }) =>
+            acquire_operation_id == original,
+        (Operation::AcquireNativeRequest { .. } | Operation::SettleNativeRequest { .. }
+            | Operation::ObserveNativeRequest { .. }, _)
+        | (_, Data::NativeRequestAdmission(_) | Data::NativeRequestSettlement(_)
+            | Data::NativeRequestReadiness { .. }) => false,
+        _ => true,
+    }
+}
+
+// Exact typed response association, not a new authority decision. Current
+// transport/receipt bounds and committed mutation context remain independent.
+fn governance_response_matches(operation: &Operation, value: &crate::governance::GovernanceResult) -> bool {
+    use crate::governance::{GovernanceMutation as M, GovernanceQuery as Q, GovernanceResult as V};
+    use crate::collaboration::workflow::{ActorProvenance, PrincipalRef, TrustedHostPath};
+    let operator = |actor: &crate::collaboration::workflow::RecordedActor| {
+        actor.principal == PrincipalRef::TrustedHostOperator
+            && actor.provenance == (ActorProvenance::TrustedHost { path: TrustedHostPath::OperatorApi })
+    };
+    match (operation, value) {
+        (Operation::MutateGovernance { mutation: M::RegisterRule { rule }, .. }, V::Rule(observed)) => observed == rule,
+        (Operation::MutateGovernance { mutation: M::RegisterConfiguration { configuration }, .. }, V::Configuration(observed)) => observed == configuration,
+        (Operation::MutateGovernance { mutation: M::EvaluateShadow { original, candidate, configuration_revision }, .. }, V::Shadow(observed)) =>
+            &observed.original == original && &observed.candidate == candidate && &observed.configuration_revision == configuration_revision,
+        (Operation::MutateGovernance { mutation: M::Promote { configuration_revision, .. }, .. }, V::State(observed)) =>
+            &observed.selected_revision == configuration_revision && observed.temporary_override.is_none(),
+        (Operation::MutateGovernance { operation_id, mutation: M::Pause { scope, reason } }, V::Hold(observed)) =>
+            &observed.operation_id == operation_id && &observed.scope == scope && &observed.reason == reason && operator(&observed.actor),
+        (Operation::MutateGovernance { mutation: M::ReleaseHold { scope, .. }, .. }, V::Released(observed)) => observed == scope,
+        (Operation::MutateGovernance { mutation: M::Stop { task_id, .. }, .. }, V::StopRequested { task_id: observed }) => observed == task_id,
+        (Operation::MutateGovernance { operation_id, mutation: M::Override { expected_revision, configuration_revision, expires_at_ms, reason } }, V::State(observed)) =>
+            &observed.selected_revision == configuration_revision && observed.temporary_override.as_ref().is_some_and(|original|
+                &original.operation_id == operation_id && &original.prior_revision == expected_revision
+                && &original.replacement_revision == configuration_revision && original.expires_at_ms == *expires_at_ms
+                && &original.reason == reason && operator(&original.actor)),
+        (Operation::MutateGovernance { mutation: M::ReconcileExpiry { .. }, .. }, V::State(observed)) => observed.temporary_override.is_none(),
+        (Operation::QueryGovernance { query: Q::Decision { decision } }, V::Decision(observed)) => &observed.id == decision,
+        (Operation::QueryGovernance { query: Q::TaskCompletion { task_id } }, V::TaskCompletion { task_id: observed, decision }) =>
+            observed == task_id && decision.as_ref().is_none_or(|record|
+                record.id.point == crate::governance::DecisionPoint::Completion
+                    && matches!(&record.detail, crate::governance::DecisionDetail::Completion(detail)
+                        if &detail.subject.task_id == task_id)),
+        (Operation::QueryGovernance { query: Q::Rule { rule } }, V::Rule(observed)) => &observed.reference == rule,
+        (Operation::QueryGovernance { query: Q::Configuration { revision } }, V::Configuration(observed)) => &observed.revision == revision,
+        (Operation::QueryGovernance { query: Q::State }, V::State(_)) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,6 +1483,10 @@ pub struct NativeSearchProfile {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutionProfile {
     CollaborationV1 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        web_search: Option<NativeSearchProfile>,
+    },
+    CollaborationV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         web_search: Option<NativeSearchProfile>,
     },

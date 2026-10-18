@@ -1,0 +1,20 @@
+{
+  "dependency_profile_sha256": "2b234c5c92901f8ff1247854eab3748f922bd495905f64976780837adeebd90b",
+  "files": {
+    "Cargo.lock": {
+      "bytes": 62366,
+      "file": "Cargo.lock.fixture",
+      "git_blob_sha1": "4d5dd631b6ecbac0c7ac495a186fe85b7b91fb98",
+      "sha256": "df189e6ea91a5e05839f2773611a59830bafc0114f13a06cbc8359b44195c28b"
+    },
+    "Cargo.toml": {
+      "bytes": 1818,
+      "file": "Cargo.toml.fixture",
+      "git_blob_sha1": "b761d4fd6f596956ce2fc5667a79effd02e60104",
+      "sha256": "20f1acdf87b07698a2881653d76c579e81c3c98eacbfdd735e161a20bb80cc1d"
+    }
+  },
+  "scope": "Exact already-selected current Cargo/profile bytes for strict package consumer mechanics; fixture sources and synthetic ELF are not runtime or reproducible-build qualification. Historical task125 fixtures remain separate.",
+  "source_commit": "dcb301ccc7a3bd7f386ee267c50a7f31eee4e168",
+  "source_tree": "448253c2f25d2965cb6bf5df6ce4bcc10f234756"
+}

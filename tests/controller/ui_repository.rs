@@ -104,6 +104,7 @@ async fn ui_reads_repository_source_recheck_and_detached_cleanup_without_receipt
     let c = Controller::open_with_config(path(), f.config()).unwrap();
     let mut input = coding("ui-checkpoint");
     input.repository = Some(Repository {
+        pull_request_target: None,
         registration: Some(read_repository_registration().binding()),
         url: String::new(),
         start_commit: f.old.clone(),
@@ -235,21 +236,25 @@ async fn ui_reads_activity_uses_existing_history_sanitizer() {
         )
         .await,
     );
-    assert!(matches!(
-        call(
-            &c,
-            Operation::PrepareOperation {
-                operation_id: "opaque-effect".into(),
-                task_id: a.task_id.clone(),
-                attempt_id: a.id.clone(),
-                generation: a.generation,
-                kind: "pull_request".into(),
-                intended: json!({"opaque":"opaque-intent-marker"})
-            }
-        )
-        .await,
-        Outcome::Ok { .. }
-    ));
+    // This is a generic controlled effect, not typed PR publication.
+    let intended = json!({"opaque":"opaque-intent-marker"});
+    let prepared = call(
+        &c,
+        Operation::PrepareOperation {
+            operation_id: "opaque-effect".into(),
+            task_id: a.task_id.clone(),
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            kind: "merge".into(),
+            intended: intended.clone(),
+        },
+    ).await;
+    assert!(matches!(&prepared, Outcome::Ok { data: Data::Operation(effect) }
+        if effect.id == "opaque-effect" && effect.task_id == a.task_id
+            && effect.attempt_id == a.id && effect.generation == a.generation
+            && effect.kind == "merge" && effect.intended == intended
+            && effect.state == "pending" && effect.outcome.is_none()),
+        "generic effect must retain its exact preparation: {prepared:?}");
     let page = call(
         &c,
         Operation::QueryCollaboration {
