@@ -193,6 +193,35 @@ enum SessionInput {
     MemoryBoundary(super::codex_mcp::MemoryBoundary),
 }
 
+// Closed diagnostic labels; no supplied method, identifier or payload is logged.
+fn rpc_class(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize",
+        "command/exec" => "command_exec",
+        "thread/start" => "thread_start",
+        "thread/read" => "thread_read",
+        "thread/resume" => "thread_resume",
+        "thread/inject_items" => "thread_inject_items",
+        "turn/start" => "turn_start",
+        _ => "other_rpc",
+    }
+}
+fn notification_class(message: &Value) -> (usize, &'static str) {
+    match message["method"].as_str() {
+        Some("turn/completed") => (0, "terminal"),
+        Some("item/started" | "item/completed") => (1, "item"),
+        Some("thread/tokenUsage/updated") => (2, "usage"),
+        Some("error") => (3, "error"),
+        _ => (4, "other"),
+    }
+}
+fn progress_notification(message: &Value) -> bool {
+    message.as_object().is_some_and(|o| o.len() == 2 && o.contains_key("method") && o.contains_key("params"))
+        && message["method"] == "item/agentMessage/delta"
+        && message["params"].as_object().is_some_and(|p| p.len() == 4
+            && ["threadId", "turnId", "itemId", "delta"].iter().all(|key| p.get(*key).is_some_and(Value::is_string)))
+}
+
 pub struct Session {
     limits: CodingLimits,
     process: ManagedProcess,
@@ -201,6 +230,7 @@ pub struct Session {
     stderr: tokio::task::JoinHandle<std::result::Result<(Vec<u8>, bool), String>>,
     next_id: u64,
     pending: VecDeque<Value>,
+    progress: Option<mpsc::Sender<Event>>,
     collaboration: Option<super::codex_mcp::Config>,
     lifecycle: ExecutionLifecycle,
 }
@@ -311,6 +341,7 @@ impl Session {
             stderr: tokio::spawn(process::read_bounded(stderr, limits.coding.stderr_bytes)),
             next_id: 1,
             pending: VecDeque::new(),
+            progress: None,
             collaboration: None,
             lifecycle: ExecutionLifecycle::default(),
         })
@@ -339,6 +370,55 @@ impl Session {
             SessionInput::MemoryBoundary(_) => Err("unexpected nested memory boundary".into()),
         }
     }
+    // Only framed reads are cancelled by a competing canonical acknowledgment.
+    // The retained frame survives that cut; interactive replies and ownership
+    // checks run to completion outside select so no partial write is abandoned.
+    async fn read_input(
+        &mut self,
+        control: &Control,
+        allow_memory_boundary: bool,
+    ) -> std::result::Result<Option<SessionInput>, String> {
+        let mut stopped = control.clone();
+        let bridge = self.collaboration.clone();
+        tokio::select! {
+            _=stopped.stopped()=>Err("executor cancelled or deadline reached".into()),
+            _=async {match &bridge {Some(config)=>super::codex_mcp::wait_stop(config).await,None=>std::future::pending::<()>().await}} =>Err("collaboration bridge stopped; executor must quiesce".into()),
+            gate=async {match bridge.as_ref().filter(|_|allow_memory_boundary) {Some(config)=>super::codex_mcp::wait_memory_boundary(config).await,None=>std::future::pending().await}} => gate.map(|gate|Some(SessionInput::MemoryBoundary(gate))),
+            m=line(&mut self.reader, &mut self.frame, self.limits.frame_bytes)=>m.map(|m|m.map(SessionInput::Message)),
+        }
+    }
+    async fn process_input(
+        &mut self,
+        msg: Value,
+        events: Option<&mpsc::Sender<Event>>,
+    ) -> std::result::Result<Option<Value>, String> {
+        if let Some(config) = &self.collaboration {
+            super::codex_mcp::check_stop(config)?;
+        }
+        if self.collaboration.is_some()
+            && msg["method"] == "item/completed"
+            && msg["params"]["item"]["type"] == "mcpToolCall"
+            && msg["params"]["item"]["server"] == super::codex_mcp::SERVER_NAME
+            && !msg["params"]["item"]["error"].is_null()
+        {
+            return Err("collaboration transport failed; executor must quiesce".into());
+        }
+        if matches!(msg["method"].as_str(), Some("item/started" | "item/completed" | "turn/completed")) {
+            self.process.refresh_ownership()?;
+        }
+        if msg.get("method").is_some() && msg.get("id").is_some() {
+            //= spec/impl/v2/implementation.md#the-supplied-executor-is-qualified-at-its-actual-boundary
+            //# An unknown executor request MUST fail without silently granting authority.
+            self.send(json!({"id":msg["id"],"error":{"code":-32601,"message":"This worker does not grant interactive requests"}})).await?;
+            return Ok(None);
+        }
+        if msg["method"] == "item/agentMessage/delta" {
+            if let (Some(e), Some(s)) = (events.or(self.progress.as_ref()), msg["params"]["delta"].as_str()) {
+                let _ = e.try_send(Event::Progress(s.chars().take(self.limits.progress_chars).collect()));
+            }
+        }
+        Ok(Some(msg))
+    }
     async fn next_input(
         &mut self,
         control: &Control,
@@ -346,45 +426,59 @@ impl Session {
         allow_memory_boundary: bool,
     ) -> std::result::Result<SessionInput, String> {
         loop {
-            let mut stopped = control.clone();
-            let bridge = self.collaboration.clone();
-            let msg = tokio::select! {
-                m=line(&mut self.reader, &mut self.frame, self.limits.frame_bytes)=>m?.ok_or("executor exited before its result")?,
-                gate=async {match bridge.as_ref().filter(|_|allow_memory_boundary) {Some(config)=>super::codex_mcp::wait_memory_boundary(config).await,None=>std::future::pending().await}} => return gate.map(SessionInput::MemoryBoundary),
-                _=stopped.stopped()=>return Err("executor cancelled or deadline reached".into()),
+            match self.read_input(control, allow_memory_boundary).await?.ok_or("executor exited before its result")? {
+                SessionInput::MemoryBoundary(gate) => return Ok(SessionInput::MemoryBoundary(gate)),
+                SessionInput::Message(msg) => if let Some(msg) = self.process_input(msg, events).await? {
+                    return Ok(SessionInput::Message(msg));
+                },
+            }
+        }
+    }
+    fn defer_notification(&mut self, msg: Value, waiting: &str) -> std::result::Result<(), String> {
+        // The pinned agent delta is only best-effort progress, already projected
+        // by process_input. Final text, usage, terminal and authority never come
+        // from this delta. Unknown/malformed shapes remain in the bounded FIFO.
+        if progress_notification(&msg) { return Ok(()); }
+        if self.pending.len() >= self.limits.pending_notifications {
+            let mut counts = [0usize; 5];
+            for item in &self.pending { counts[notification_class(item).0] += 1; }
+            return Err(format!("executor notification backlog exceeds bound (execution.coding.pending_notifications); waiting={waiting}; queued={}; incoming={}; terminal={}; item={}; usage={}; error={}; other={}",
+                self.pending.len(), notification_class(&msg).1, counts[0], counts[1], counts[2], counts[3], counts[4]));
+        }
+        self.pending.push_back(msg);
+        Ok(())
+    }
+    async fn wait_with_notifications<T, F, Fut>(
+        &mut self,
+        make: F,
+        control: &Control,
+    ) -> std::result::Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, String>>,
+    {
+        // Called only after the exact acknowledged terminal. EOF cannot grant
+        // a retry: the original canonical wait/dispatch still decides, followed
+        // by the existing process reaping and retained-thread checks.
+        let mut waiting = super::boxed_execution(make);
+        let mut stdout_closed = false;
+        let mut stopped = control.clone();
+        let bridge = self.collaboration.clone();
+        loop {
+            let input = tokio::select! {
+                biased;
+                _=stopped.stopped()=>return Err("supplied retry cancelled or deadline reached".into()),
                 _=async {match &bridge {Some(config)=>super::codex_mcp::wait_stop(config).await,None=>std::future::pending::<()>().await}} =>return Err("collaboration bridge stopped; executor must quiesce".into()),
+                result=&mut waiting=>return result,
+                input=self.read_input(control, false), if !stdout_closed=>input?,
             };
-            if let Some(config) = &self.collaboration {
-                super::codex_mcp::check_stop(config)?;
+            match input {
+                None => stdout_closed = true,
+                Some(SessionInput::MemoryBoundary(_)) => return Err("unexpected retry memory boundary".into()),
+                Some(SessionInput::Message(msg)) => if let Some(msg) = self.process_input(msg, None).await? {
+                    if msg.get("method").is_some() { self.defer_notification(msg, "supplied_retry")?; }
+                },
             }
-            if self.collaboration.is_some()
-                && msg["method"] == "item/completed"
-                && msg["params"]["item"]["type"] == "mcpToolCall"
-                && msg["params"]["item"]["server"] == super::codex_mcp::SERVER_NAME
-                && !msg["params"]["item"]["error"].is_null()
-            {
-                return Err("collaboration transport failed; executor must quiesce".into());
-            }
-            if matches!(
-                msg["method"].as_str(),
-                Some("item/started" | "item/completed" | "turn/completed")
-            ) {
-                self.process.refresh_ownership()?;
-            }
-            if msg.get("method").is_some() && msg.get("id").is_some() {
-                //= spec/impl/v2/implementation.md#the-supplied-executor-is-qualified-at-its-actual-boundary
-                //# An unknown executor request MUST fail without silently granting authority.
-                self.send(json!({"id":msg["id"],"error":{"code":-32601,"message":"This worker does not grant interactive requests"}})).await?;
-                continue;
-            }
-            if msg["method"] == "item/agentMessage/delta" {
-                if let (Some(e), Some(s)) = (events, msg["params"]["delta"].as_str()) {
-                    let _ = e.try_send(Event::Progress(
-                        s.chars().take(self.limits.progress_chars).collect(),
-                    ));
-                }
-            }
-            return Ok(SessionInput::Message(msg));
         }
     }
     pub async fn request(
@@ -414,10 +508,7 @@ impl Session {
                     .ok_or_else(|| "executor response has no result".into());
             }
             if msg.get("method").is_some() {
-                if self.pending.len() >= self.limits.pending_notifications {
-                    return Err("executor notification backlog exceeds bound (execution.coding.pending_notifications)".into());
-                }
-                self.pending.push_back(msg);
+                self.defer_notification(msg, rpc_class(method))?;
             }
         }
     }
@@ -739,6 +830,7 @@ async fn execute_observed(
     )
     .await?;
     session.lifecycle = lifecycle.clone();
+    session.progress = Some(events.clone());
     let mut initial_completion_held = false;
     let mut initial_dispatch_unknown = false;
     let mut completion_started = false;
@@ -912,7 +1004,7 @@ async fn execute_observed(
                     if let Some(owner)=retry_owner.as_mut() {
                         let cause=owner.rate_cause(control)?;
                         events.send(Event::Progress("Supplied executor rate limited; waiting under accepted retry policy".into())).await.map_err(|_|"worker observer closed")?;
-                        reserved_completion_turns=owner.reserve(cause,control,&events).await?;
+                        reserved_completion_turns=super::boxed_execution(|| session.wait_with_notifications(|| owner.reserve(cause,control,&events),control)).await?;
                         // Reaping the exact old tree is required before a cold
                         // app-server may load the same durable thread. A live
                         // app-server continues without restart or reinjection.
@@ -924,6 +1016,7 @@ async fn execute_observed(
                             session=Session::start_with_key(binary,cwd,state,registry,inference,limits,
                                 control.worker_limits.clone(),inference_key).await?;
                             session.lifecycle=lifecycle.clone();
+                            session.progress=Some(events.clone());
                             session.collaboration=bridge;
                             session.initialize(control).await?;
                             session.preflight_command(cwd,control).await?;
@@ -1128,7 +1221,7 @@ async fn advance_completion(
     if let Some(notice) = notice.as_ref() {items.push(json!({"type":"text","text":notice.text}));}
     let next_reservation = reserved_turns.checked_add(1).ok_or("coding outer-turn reservation overflow")?;
     if let Some(owner)=retry_owner.as_mut() {
-        let reserved=owner.reserve(crate::supplied_outer::Cause::Completion{begin_operation_id:input.feedback().continuation.begin_operation_id.clone()},control,events).await?;
+        let reserved=super::boxed_execution(|| session.wait_with_notifications(|| owner.reserve(crate::supplied_outer::Cause::Completion{begin_operation_id:input.feedback().continuation.begin_operation_id.clone()},control,events),control)).await?;
         if reserved!=next_reservation {return Err("shared supplied outer reservation differs".into());}
     }else {
     let (acknowledged,received) = tokio::sync::oneshot::channel();
@@ -1436,7 +1529,7 @@ for line in sys.stdin:
             assert_eq!(error, if input_bound {
                 "executor input exceeds limit (execution.coding.frame_bytes)"
             } else {
-                "executor notification backlog exceeds bound (execution.coding.pending_notifications)"
+                "executor notification backlog exceeds bound (execution.coding.pending_notifications); waiting=other_rpc; queued=1; incoming=other; terminal=0; item=0; usage=0; error=0; other=1"
             });
         }
     }
@@ -2047,3 +2140,7 @@ async fn association_barrier(thread:&str,turn:&str,control:&Control,events:&mpsc
     let mut stopped=control.clone();
     tokio::select!{biased;_=stopped.stopped()=>Err("initial supplied association interrupted".into()),result=received=>result.map_err(|_|"initial supplied association ACK absent")?,}
 }
+
+#[cfg(test)]
+#[path = "codex_notification_tests.rs"]
+mod notification_tests;

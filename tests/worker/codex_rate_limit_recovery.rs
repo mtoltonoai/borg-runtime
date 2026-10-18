@@ -89,6 +89,10 @@ scenario=(root/'scenario').read_text()
 home=pathlib.Path(os.environ['CODEX_HOME']); cwd=pathlib.Path.cwd()
 thread='retained-rate-thread'
 def send(v): print(json.dumps(v),flush=True)
+def progress(turn,n):
+ for i in range(n):send({'method':'item/agentMessage/delta','params':{'threadId':thread,'turnId':turn,'itemId':'progress','delta':'progress-'+str(i)}})
+def usage(turn,n):
+ send({'method':'thread/tokenUsage/updated','params':{'threadId':thread,'turnId':turn,'tokenUsage':{'total':{'inputTokens':n*10,'outputTokens':n*2}}}})
 def terminal(turn,status,error=None):
  t={'id':turn,'status':status,'error':error}
  (home/'public-terminal.json').write_text(json.dumps(t))
@@ -123,11 +127,20 @@ for line in sys.stdin:
    assert (cwd/'answer.txt').read_text()=='dirty source survives rate failure\n'
    assert 'retained conversation' in p['input'][0]['text']
   if scenario=='unknown-start' and n==2:sys.exit(0)
+  if scenario in ('preack-progress','trailing-progress','terminal-before-ack','progress-lost-ack'):progress(turn,128)
+  if scenario=='progress-lost-ack' and n==2:sys.exit(0)
+  if scenario=='required-overflow' and n==2:
+   for i in range(65):send({'method':'item/completed','params':{'threadId':thread,'turnId':turn,'item':{'id':'required-'+str(i),'type':'agentMessage','phase':'commentary','text':'required item'}}})
+   continue
+  if scenario=='terminal-before-ack' and n==2:
+   send({'method':'item/completed','params':{'threadId':thread,'turnId':turn,'item':{'id':'before-ack-final','type':'agentMessage','phase':'final_answer','text':'source ready before ACK'}}})
+   usage(turn,n);terminal(turn,'completed')
+   send({'id':m['id'],'result':{'turn':{'id':turn,'status':'inProgress'}}});continue
   send({'id':m['id'],'result':{'turn':{'id':'turn-1' if scenario=='duplicate-ack' else turn,'status':'inProgress'}}})
   if scenario=='will-retry':
    send({'method':'error','params':{'threadId':thread,'turnId':turn,'willRetry':True,'error':{'codexErrorInfo':'rateLimitExceeded','message':'internal retry'}}})
    terminal(turn,'completed');continue
-  if n==1 or scenario=='repeat-rate':
+  if n==1 or scenario=='repeat-rate' or scenario=='trailing-progress' and n<4:
    if scenario in ('held-terminal','cancel','effects'):
     until=time.monotonic()+30
     while not (root/'release-terminal').exists():
@@ -136,9 +149,16 @@ for line in sys.stdin:
    if scenario=='generic':cls='other'
    message='typed rate rejection; text says wait 999999 hours'
    if scenario=='credential':message='synthetic-rate-fixture-key'
+   if scenario=='trailing-progress':usage(turn,n)
    terminal(turn,'failed',{'codexErrorInfo':cls,'message':message})
+   if scenario=='trailing-progress':
+    # Arrive during the canonical backoff. These cannot settle the next turn or
+    # inflate its usage, and the progress burst must not occupy pending slots.
+    progress(turn,256);usage(turn,999)
+    send({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':turn,'status':'failed','error':{'codexErrorInfo':'rateLimitExceeded','message':'trailing duplicate'}}}})
    if scenario.startswith('cold'):sys.exit(0)
   else:
+   if scenario=='trailing-progress':usage(turn,n)
    send({'method':'item/completed','params':{'threadId':thread,'turnId':turn,'item':{'type':'agentMessage','phase':'final_answer','text':'source ready'}}})
    terminal(turn,'completed')
  elif method=='turn/interrupt':send({'id':m['id'],'result':{}})
@@ -800,4 +820,64 @@ async fn cleanup_holds_pending_retry_and_releases_only_under_selected_policy() {
             .exists()
     );
     lab.close().await;
+}
+
+#[tokio::test]
+async fn progress_bursts_before_ack_and_across_retries_preserve_one_thread_and_usage() {
+    for scenario in ["preack-progress", "trailing-progress", "terminal-before-ack"] {
+        let mut lab = Lab::start(scenario, 8, 100, true, false).await;
+        assert_eq!(lab.policy.execution.coding.pending_notifications, 64);
+        let t = lab.finished().await;
+        let expected = if scenario == "trailing-progress" { 4 } else { 2 };
+        assert_eq!(t.status, TaskStatus::Succeeded, "{scenario}: {t:?}");
+        assert_eq!(lab.starts(), expected);
+        let requests = lab.requests();
+        assert_eq!(requests.iter().filter(|v|v["method"]=="thread/start").count(), 1);
+        let starts = requests.iter().filter(|v|v["method"]=="turn/start").collect::<Vec<_>>();
+        assert!(starts.iter().all(|v|v["pid"]==starts[0]["pid"] && v["home"]==starts[0]["home"] && v["cwd"]==starts[0]["cwd"]));
+        assert!(!t.attempt.as_ref().unwrap().uncertain);
+        assert!(t.selected_checkpoint.is_some());
+        assert!(t.result.as_ref().unwrap().validation.iter().all(|v|v.contains("pass")));
+        if scenario != "preack-progress" {
+            let usage:Value=serde_json::from_slice(&std::fs::read(lab.home(&t).join("borg-usage.json")).unwrap()).unwrap();
+            assert_eq!(usage["turn_id"], format!("turn-{expected}"));
+            assert_eq!(usage["observed_usage"]["input_tokens"], expected * 10);
+            assert_eq!(usage["observed_usage"]["output_tokens"], expected * 2);
+        }
+        for index in 2..=expected {
+            let wait = lab.original(&t, index as u32, "wait").await;
+            let dispatch = lab.original(&t, index as u32, "dispatch").await;
+            let ack = lab.original(&t, index as u32, "ack").await;
+            assert!(matches!(serde_json::from_value::<Outcome>(wait.outcome.unwrap()).unwrap(), Outcome::Ok {..}));
+            assert!(matches!(serde_json::from_value::<Outcome>(dispatch.outcome.unwrap()).unwrap(), Outcome::Ok {..}));
+            assert!(matches!(serde_json::from_value::<Outcome>(ack.outcome.unwrap()).unwrap(), Outcome::Ok {..}));
+        }
+        lab.close().await;
+    }
+}
+
+#[tokio::test]
+async fn pre_ack_required_overflow_and_lost_ack_never_resend_uncertain_start() {
+    for scenario in ["required-overflow", "progress-lost-ack"] {
+        let mut lab = Lab::start(scenario, 8, 20, true, false).await;
+        let mut t = lab.finished().await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        while t.progress != "Completed result acceptance is refused; original decision retained for reconciliation" {
+            lab.worker.live();
+            assert!(tokio::time::Instant::now() < until, "final refusal observation absent: {t:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            t = task(&lab.api, &t.id).await;
+        }
+        assert_eq!(t.status, TaskStatus::Failed, "{scenario}: {t:?}");
+        assert!(t.attempt.as_ref().unwrap().uncertain);
+        assert_eq!(lab.starts(), 2);
+        let journal = std::fs::read(lab.home(&t).join("borg-supplied-outer.json")).unwrap();
+        let value:Value=serde_json::from_slice(&journal).unwrap();
+        assert_eq!(value["dispatched"], true);
+        assert!(value["turn_id"].is_null());
+        assert_eq!(task(&lab.api, &t.id).await, t);
+        assert_eq!(std::fs::read(lab.home(&t).join("borg-supplied-outer.json")).unwrap(), journal);
+        assert_eq!(lab.starts(), 2);
+        lab.close().await;
+    }
 }
