@@ -954,7 +954,7 @@ async fn memory_boundary_above_1024_uses_exact_retained_occurrence_without_count
             thread_id: "thread-1".into(),
             session_id: "session-1".into(),
             invocation,
-            outcome: Some(outcome),
+            outcome: Some(CallBody::Inline(outcome)),
             delivered: index < selected,
         });
     }

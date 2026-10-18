@@ -52,7 +52,10 @@ async fn shared_read_pagination_codex_bridge_same_page_and_recovery() {
     let result:CallResult=serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(result.reply.outcome,Outcome::Ok{data:Data::ReadPage(Box::new(page.clone()))});
     assert_eq!(wire,original);
-    assert_eq!(bridge.journal.entries[index].outcome.as_ref().unwrap().reply.outcome,result.reply.outcome);
+    let CallBody::Inline(retained) = bridge.journal.entries[index].outcome.as_ref().unwrap() else {
+        panic!("expected the original inline page outcome before delivery");
+    };
+    assert_eq!(retained.reply.outcome,result.reply.outcome);
     bridge.delivered(index).unwrap();let original=std::fs::read(&bridge.path).unwrap();
     let (replay,_)=bridge.invoke("collab_task_get",arguments,&meta("page-original")).await.unwrap();assert_eq!(replay,wire);
     assert_eq!(transport.state.lock().unwrap().0,1);assert_eq!(transport.state.lock().unwrap().1,1);
