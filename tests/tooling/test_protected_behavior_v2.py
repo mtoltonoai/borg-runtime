@@ -211,6 +211,7 @@ print(json.dumps({'revision':1,'subject_sha256':c['subject_sha256'],'recipe_sha2
         self.write_recipe()
         self.bare=profile_root/'repository.git'
         prep.fixed_git(['clone','--bare','--no-hardlinks',str(self.case.repo),str(self.bare)],self.root,self.root)
+        self.bare.chmod(0o755)
         prep.fixed_git(['--git-dir='+str(self.bare),'update-ref',self.subject['target_ref'],base],self.root,self.root)
         self.controller_config['repository_path']=str(self.bare);self.write_controller()
         self.producer_config=self.root/'reuse-producer.json';self.producer_config.write_bytes(producer.canonical(self.config));self.producer_config.chmod(0o600)
