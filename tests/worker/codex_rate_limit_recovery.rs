@@ -677,7 +677,34 @@ async fn unresolved_tool_write_or_completion_obligation_blocks_continuation() {
         }
     ));
     std::fs::write(lab.root.join("release-terminal"), "release").unwrap();
-    let t = lab.finished().await;
+    // An unresolved external intent prevents terminal acceptance even after
+    // physical shutdown. Wait for the original refusal notice, not a terminal
+    // task status that would incorrectly discard this reconciliation barrier.
+    let until = tokio::time::Instant::now() + Duration::from_secs(45);
+    let t = loop {
+        lab.worker.live();
+        lab.controller.live();
+        let current = task(&lab.api, &lab.submitted.id).await;
+        assert_eq!(lab.starts(), 1, "pending effect must prevent another start");
+        if current.attempt.as_ref().is_some_and(|a| a.stopped && a.uncertain)
+            && current.progress
+                == "Completed result acceptance is refused; original decision retained for reconciliation"
+        {
+            break current;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "stopped uncertain task and original refusal notice absent: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(t.status, TaskStatus::Active);
+    assert!(t.result.is_none());
+    assert_eq!(t.attempt.as_ref().unwrap().id, attempt.id);
+    let wait = lab.original(&t, 2, "wait").await;
+    let wait_outcome: Outcome = serde_json::from_value(wait.outcome.clone().unwrap()).unwrap();
+    assert!(matches!(wait_outcome, Outcome::Refused { code, .. }
+        if code == "reconciliation_required"));
     assert_eq!(lab.starts(), 1);
     assert!(t.attempt.as_ref().unwrap().uncertain);
     let retained = call(
@@ -691,6 +718,13 @@ async fn unresolved_tool_write_or_completion_obligation_blocks_continuation() {
         matches!(&retained.outcome,Outcome::Ok{data:Data::Operation(v)} if v.state=="pending"&&v.outcome.is_none())
     );
     assert_eq!(call(&lab.api, prepare).await.outcome, retained.outcome);
+    std::fs::write(
+        lab.root.join("unresolved-effects-held.json"),
+        serde_json::to_vec_pretty(&json!({
+            "task": &t, "retry_wait_original": wait,
+            "pending_effect_original": &retained, "requests": lab.requests(),
+        })).unwrap(),
+    ).unwrap();
     // A failed public request did not settle the earlier external intent, nor
     // publish the changed dirty file as an acknowledged checkpoint.
     assert!(t.selected_checkpoint.is_none());
