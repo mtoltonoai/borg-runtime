@@ -88,8 +88,10 @@ impl Model {
                     let bytes=request.into_body().collect().await.unwrap().to_bytes();let body:Value=serde_json::from_slice(&bytes).unwrap();assert!(!body.to_string().contains(TOKEN));let index={let mut saved=posts.lock().unwrap();let n=saved.len();saved.push(body.clone());n};
                     let function=|name:&str,args:Value|json!([{"type":"function_call","status":"completed","call_id":format!("publication-model-call-{index}"),"name":name,"arguments":args.to_string()}]);
                     let output=if index==0 {assert!(body["tools"].as_array().unwrap().iter().any(|t|t["name"]=="collab_repository_publish"));function("collab_repository_publish",publish)} else {
-                        let value=body["input"].as_array().unwrap().iter().rev().find(|i|i["type"]=="function_call_output").unwrap();let result:Reply=serde_json::from_str(value["output"].as_str().unwrap()).unwrap();
-                        let Outcome::Ok{data:Data::Publication(view)}=result.outcome else{panic!("native original tool result {result:?}")};
+                        let value=body["input"].as_array().unwrap().iter().rev().find(|i|i["type"]=="function_call_output").unwrap();let result:Value=serde_json::from_str(value["output"].as_str().unwrap()).unwrap();
+                        // Native continuations carry the retained outcome envelope, not a transport Reply.
+                        let outcome:Outcome=serde_json::from_value(result["outcome"].clone()).unwrap();
+                        let Outcome::Ok{data:Data::Publication(view)}=outcome else{panic!("native original tool result {result:?}")};
                         if index==1 {assert_eq!(view.branch.state,p::State::Pending);let current=task(api.call(Operation::GetTask{task_id:task_id.clone()}).await.unwrap());wait_status(&api,&actor(&current),&view.publication_id,false,expected).await;function("collab_publication_get",json!({"publication_id":view.publication_id}))}
                         else {assert_eq!(index,2,"no model rerun discovers an unknown effect");assert_eq!(view.branch.state,expected);json!([{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"{\"handled\":true}"}]}])}
                     };
