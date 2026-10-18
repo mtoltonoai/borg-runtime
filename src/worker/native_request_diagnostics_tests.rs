@@ -1006,3 +1006,66 @@ async fn selected_metadata_preflight_fits_startup_and_refuses_oversized_error_bo
     })
     .await;
 }
+
+
+// Traceability scope: Exact proposed metadata, real consumer admission and a
+// small retained diagnostic; no provider request or maximum-size allocation.
+//= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+//= type=test
+//# A component MUST validate its configured limits before admitting work governed by those limits.
+#[tokio::test]
+async fn maximum_session_profile_native_preflight_and_small_retained_diagnostic() {
+    Box::pin(async {
+        let mut f = fixture("maximum-session-profile").await;
+        let selected = Arc::new(RuntimeLimits::parse(include_bytes!(
+            "../../tests/fixtures/maximum-session-controller-metadata-04.json"
+        )).unwrap());
+        let startup = Arc::new(RuntimeLimits::parse(include_bytes!(
+            "../../tests/fixtures/maximum-session-worker-metadata-04.json"
+        )).unwrap());
+        assert_eq!(selected.execution, startup.execution);
+        assert_eq!(selected.transport, startup.transport);
+        assert_eq!(selected.worker, startup.worker);
+        assert_eq!(selected.controller.queue_capacity, tokio::sync::Semaphore::MAX_PERMITS);
+        assert_eq!(selected.execution.collaboration.channel_items, tokio::sync::Semaphore::MAX_PERMITS);
+        assert!(f.input.definition.limit_overrides.is_none());
+        f.input.resolved_limits = Some(selected.resolve_task(&f.input).unwrap());
+        f.reporter.config.limits = startup.clone();
+        f.reporter.client = ApiClient::new(f.reporter.config.controller_url.clone(), selected.clone()).unwrap();
+        let original_input = serde_json::to_vec(&f.input).unwrap();
+        let admission = preflight(&f.reporter, &f.input, &f.config, 1).unwrap();
+        assert_eq!(admission.accepted, *selected);
+        assert_eq!(admission.startup, *startup);
+        assert_eq!(admission.client, *selected);
+        assert_eq!(admission.native, selected.execution.native);
+        assert_eq!(serde_json::to_vec(&f.input).unwrap(), original_input);
+        assert!(f.script.lock().unwrap().requests.is_empty());
+        assert_eq!(std::fs::read_dir(&f.reporter.outbox).unwrap().count(), 0);
+
+        // Size the complete worst-case diagnostic symbolically. A one-byte
+        // smaller original-lookup envelope still refuses, without constructing
+        // error_body_bytes of payload or changing the selected real profile.
+        let extra = ProviderFailureDiagnostic::maximum_encoded_bytes(&admission.native).unwrap() - 4;
+        let outcome = Outcome::Ok { data: Data::Operation(lookup_record(&admission.original).unwrap()) };
+        let exact = serde_json::to_vec(&outcome).unwrap().len().checked_add(extra).unwrap();
+        let mut edge = (*selected).clone();
+        edge.controller.outcome_bytes = exact;
+        assert!(envelope(&admission.original, extra, &edge).is_ok());
+        edge.controller.outcome_bytes = exact - 1;
+        assert!(envelope(&admission.original, extra, &edge).unwrap_err().contains("original lookup"));
+
+        let saved = retain_with_credentials(&f.reporter, &admission,
+            ProviderOutcome::Unknown, Some(&binding()), Some(&unknown()), &[]).unwrap();
+        let path = f.path(&saved.original);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(serde_json::from_slice::<Report>(&raw).unwrap(), saved.original);
+        assert_eq!(saved.original.report_id, contract::diagnostic_id(&f.reporter.attempt.id, 1));
+        let replay = retain_with_credentials(&f.reporter, &admission,
+            ProviderOutcome::Unknown, Some(&binding()), Some(&unknown()), &[]).unwrap();
+        assert_eq!(replay.original, saved.original);
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        assert!(f.script.lock().unwrap().requests.is_empty());
+        assert_eq!(std::fs::read_dir(&f.reporter.outbox).unwrap().count(), 1);
+        assert_eq!(serde_json::to_vec(&f.input).unwrap(), original_input);
+    }).await;
+}

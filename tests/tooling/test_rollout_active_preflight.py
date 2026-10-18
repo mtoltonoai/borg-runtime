@@ -437,3 +437,114 @@ class ActivePreflightTests(NoExternalEffects):
                 self.assertIsNone(hostmod.active_preflight_writers(f.host))
                 with self.assertRaisesRegex(AssertionError, 'one content traversal'):
                     f.host.execute('preflight')
+
+
+    def test_publication_union_installed_family_matches_selected_29b_contract(self):
+        # Installed package manifest 27a90eb9 binds these four source files.
+        # The candidate manifest cannot substitute for the installed writers.
+        self.assertEqual(hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_FORMATS,
+                         {'wire': 27, 'controller_schema': 28, 'worker_format': 22})
+        expected = {
+            'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+            'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
+            'src/worker/cleanup.rs': '54f15913412870da6984ade05477d09004a28ab07cece96931759d2381bba898',
+            'src/worker/mod.rs': 'e98160bfee5aa035bbf8ec72706aa4871f9dfef65e9bbe8ef6b4ed60b7af1bed',
+        }
+        self.assertEqual(hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS, expected)
+        with active_fixture() as f:
+            f.host.p['formats']['before'] = dict(hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_FORMATS)
+            f.host._verified_before_manifest = {'source': {'files': {
+                name: {'sha256': sha} for name, sha in expected.items()}}}
+            self.assertEqual(hostmod.active_preflight_writers(f.host), expected)
+            self.assertEqual(hostmod.ActiveWorkerSample(f.host).writer_sources, expected)
+
+    def test_publication_union_installed_family_samples_atomic_writers_and_keeps_stopped_strict(self):
+        for kind in ('mutations', 'cleanup'):
+            with self.subTest(kind=kind), active_fixture() as f:
+                f.host.p['formats']['before'] = dict(hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_FORMATS)
+                f.host._verified_before_manifest = {'source': {'files': {
+                    name: {'sha256': sha}
+                    for name, sha in hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS.items()}}}
+                directory = f.root / kind
+                target = f.root / (f.name if kind == 'cleanup' else 'mutations/await.json')
+                successor = C.canonical(clock_successor(f.record)) if kind == 'cleanup' else target.read_bytes()
+                old = directory.stat()
+                def update():
+                    atomic_write(target, successor)
+                    advance_directory_clock(directory)
+                with writer(update) as dispatch, after_directory_scan(directory, dispatch) as fired:
+                    result = f.host.execute('preflight')
+                self.assertEqual(fired, [True])
+                self.assertEqual(target.read_bytes(), successor)
+                current = directory.stat()
+                identity = ('st_dev', 'st_ino', 'st_uid', 'st_gid', 'st_mode', 'st_nlink', 'st_size')
+                self.assertEqual(tuple(getattr(old, name) for name in identity),
+                                 tuple(getattr(current, name) for name in identity))
+                self.assertNotEqual((old.st_mtime_ns, old.st_ctime_ns),
+                                    (current.st_mtime_ns, current.st_ctime_ns))
+                sample = result['worker_inventory']
+                self.assertEqual(sample['installed_writer_sources'],
+                                 hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS)
+                self.assertGreater(sample['directory_time_changes'], 0)
+                self.assertEqual(sample['cleanup_records'], 1)
+                self.assertFalse(sample['owned_snapshot'])
+                self.assertFalse(sample['simultaneous_snapshot'])
+                self.assertFalse(sample['complete_historical_membership'])
+                self.assertEqual(f.host.check_running.call_count, 2)
+                f.host.state_size.assert_not_called()
+                self.assertNotIn('_worker_capture', f.host.__dict__)
+                with after_directory_scan(directory, update), self.assertRaisesRegex(ValueError, 'state_directory_changed'):
+                    f.host.state_files()
+
+    def test_publication_union_family_requires_each_installed_pin(self):
+        for name in hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS:
+            for change in ('missing', 'wrong', 'malformed'):
+                with self.subTest(name=name, change=change), active_fixture() as f:
+                    f.host.p['formats']['before'] = dict(hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_FORMATS)
+                    files = {path: {'sha256': sha}
+                             for path, sha in hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS.items()}
+                    f.host._verified_before_manifest = {'source': {'files': files}}
+                    f.host._verified_manifest = copy.deepcopy(f.host._verified_before_manifest)
+                    if change == 'missing': del files[name]
+                    elif change == 'wrong': files[name]['sha256'] = '0' * 64
+                    else: files[name] = files[name]['sha256']
+                    self.assertIsNone(hostmod.active_preflight_writers(f.host))
+                    with self.assertRaisesRegex(ValueError, 'active sample installed writer differs'):
+                        hostmod.ActiveWorkerSample(f.host)
+                    with self.assertRaisesRegex(AssertionError, 'one content traversal'):
+                        f.host.execute('preflight')
+
+    def test_publication_union_family_refuses_wrong_missing_mixed_formats_and_candidate_only(self):
+        exact = hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_FORMATS
+        guards = [('missing_before', None), ('candidate_only', None)]
+        for field in exact:
+            guards.extend((('wrong_format', field), ('missing_format', field), ('string_format', field)))
+        guards.extend([('mixed_tuple', {'wire': 25, 'controller_schema': 28, 'worker_format': 22}),
+                       ('mixed_tuple', {'wire': 27, 'controller_schema': 26, 'worker_format': 22}),
+                       ('mixed_tuple', {'wire': 27, 'controller_schema': 28, 'worker_format': 20}),
+                       ('extra_format', None)])
+        for family in (hostmod._ACTIVE_PREFLIGHT_WRITERS, hostmod._ACTIVE_PREFLIGHT_CURRENT_WRITERS):
+            for name, sha in family.items():
+                if sha != hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS[name]:
+                    guards.append(('mixed_writer', (name, sha)))
+        for guard, value in guards:
+            with self.subTest(guard=guard, value=value), active_fixture() as f:
+                f.host.p['formats']['before'] = dict(exact)
+                files = {name: {'sha256': sha}
+                         for name, sha in hostmod._ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS.items()}
+                f.host._verified_before_manifest = {'source': {'files': files}}
+                f.host._verified_manifest = copy.deepcopy(f.host._verified_before_manifest)
+                if guard == 'missing_before': del f.host.p['formats']['before']
+                elif guard == 'candidate_only': f.host._verified_before_manifest = {'source': {'files': {}}}
+                elif guard == 'wrong_format': f.host.p['formats']['before'][value] += 1
+                elif guard == 'missing_format': del f.host.p['formats']['before'][value]
+                elif guard == 'string_format': f.host.p['formats']['before'][value] = str(exact[value])
+                elif guard == 'mixed_tuple': f.host.p['formats']['before'] = value
+                elif guard == 'extra_format': f.host.p['formats']['before']['extra'] = 1
+                else:
+                    name, sha = value; files[name]['sha256'] = sha
+                self.assertIsNone(hostmod.active_preflight_writers(f.host))
+                with self.assertRaisesRegex(ValueError, 'active sample installed writer differs'):
+                    hostmod.ActiveWorkerSample(f.host)
+                with self.assertRaisesRegex(AssertionError, 'one content traversal'):
+                    f.host.execute('preflight')

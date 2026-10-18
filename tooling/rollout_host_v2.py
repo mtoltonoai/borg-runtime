@@ -140,14 +140,14 @@ _PUBLICATION_UNION_CODEX_HOME_SOURCES = {
     'src/controller/identity_administration.rs': '521c01d2db8419e65fd4c209d61f652c14e248506d02590607156a9b46ed45a4',
     'src/controller/identity_limit_fields.rs': 'feae44991d67c43b3da5d4a7a03b16daab68e0505fc6be39630e611de2c1d4bd',
     'src/controller/machine_resources.rs': 'cd2617a4b80d732d4ccbd876dc39761db69046e17c15952d4f9d01cf9cd3d1cd',
-    'src/controller/mod.rs': '399dfaaf3936e0fa4d8bcb4b1d9668ae4648f0bcf740b86dd05e328be4a2d141',
+    'src/controller/mod.rs': '09b6bc869f325be51fa08876ac94c2d4ac6015556d12199264039206ba530b5f',
     'src/controller/operations.rs': '5f36d904b3a722c7a4f5d0e627d0f10e7b70aa465888076356fd895b86c69ef7',
     'src/controller/operations/effects.rs': '9d7647d45f99ebb346a37f2bec0150ec87532f2454d3bd686df3f875d610846d',
     'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7',
     'src/controller/operations/supplied_outer.rs': 'c51a074820b443b263bc93721c2f6a9fdbe329fb4bcae14e9a767e53d79a87b5',
     'src/controller/publication_requests.rs': 'bd707c5990774258046bcbf8afdbc24e33d0a64645d01fe444cb4043fef76561',
     'src/controller/pull_request.rs': '8ed6d5afd654f0046cc6cc9a884d111f2f1b0e3f3da4c799fdf6e3b3f7c394b5',
-    'src/controller/read_pages.rs': '8a9639595f104ab0b680cf706fec072e978bf56a0e1406f0648659e1851faf26',
+    'src/controller/read_pages.rs': '8cc33ee914bf20d54f0a5aa8e81dd473ebdffc1351eabd37d6def108e4fd8db2',
     'src/controller/read_pagination.rs': '17be85fdb045bdd18892c1dc051b32f386283edd6468042cf08c00c5b6f922c7',
     'src/controller/read_retention.rs': '22b2eeb67dfb7402a72a97dd1eef9a81d891aea1f2da6446e65d421ee63b155a',
     'src/controller/schema23-from22.sql': '95e229e4f9140322e176f7fdec8cb05a010634c0462ed7bb97643025519a2634',
@@ -160,7 +160,7 @@ _PUBLICATION_UNION_CODEX_HOME_SOURCES = {
     'src/lib.rs': 'b9eeb9c686c1531c04b186ad153193f06e5b189c6589afa3f30d258e48bba60e',
     'src/limits/identity.rs': 'eb5b55eda454c3bd98a81b3c962428c0c02bc650042f7e288e0cd04112292293',
     'src/limits/mod.rs': '30b4da4cc6b8992603ed88ad5b1accf4a4484a458c01744ea8e87bfc913fc1d3',
-    'src/limits/worker.rs': '6b727ae7279c58fcfc67e7cc43d5990c463104f982943189b8900a1b89fa8b94',
+    'src/limits/worker.rs': 'ab15ed61cd95a3d69b7fd2edd925bb0435bd864c3f9c346b9637292d6004d2e9',
     'src/machine_resources.rs': 'b98c54d7e79b87a54d0e4e4ce4367c047fe2779efabbbf107fa9d3fbc2a1887e',
     'src/mcp/identity_administration.rs': '9c9aa2daae61cbcbb208e761310774059393a950d102c387f96d472eb0bdb347',
     'src/mcp/mod.rs': '6c1efc59c9cc296c240c7a2b7cece9efb3ae597d8a74b4af960538b84e4bc6d7',
@@ -185,7 +185,7 @@ _PUBLICATION_UNION_CODEX_HOME_SOURCES = {
     'src/worker/codex.rs': '14057a27f939b0c0e23c300e0044658b2e9fd11228e8eb38cf006763c529af2b',
     'src/worker/codex_charter.rs': '81c409316aa2cb4b651942c51688bd6c1719588ababed672d0f5b6e7dbef6e58',
     'src/worker/codex_charter_turns.rs': 'db9798de3c855716f3b6d65df0df2c66ec9dadf3c75e700b4d548aefc85c43c3',
-    'src/worker/codex_mcp.rs': '30de80b575c44c6fbeb3bd5612fc8db34122953277ca72ce89195c1177b81cfb',
+    'src/worker/codex_mcp.rs': '9a5371e298fb62ef45341b989564f950b03dc6ee81b689212c66510f9b7015a0',
     'src/worker/codex_retry.rs': 'ca3e0f8d26a57d6ab8a073b9b90573f781ee521db886446ccd6935820847e5a0',
     'src/worker/collaboration_notice.rs': 'b6924a898af2dc8990512421819f5d58f1b1cee7eea7d00d899455fa3e3fdc19',
     'src/worker/completion.rs': '9fde728db6228fe7377137c817390c224d4782ae4c99e070f8eb1cb9a72159a5',
@@ -477,11 +477,25 @@ _ACTIVE_PREFLIGHT_CURRENT_WRITERS = {
 }
 
 
+# The installed publication-union predecessor has distinct atomic writer source
+# identities. Admit this exact before tuple independently of candidate sources;
+# the existing live sample and stopped-owner validation remain unchanged.
+_ACTIVE_PREFLIGHT_PUBLICATION_UNION_FORMATS = {'wire': 27, 'controller_schema': 28, 'worker_format': 22}
+_ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS = {
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+    'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
+    'src/worker/cleanup.rs': '54f15913412870da6984ade05477d09004a28ab07cece96931759d2381bba898',
+    'src/worker/mod.rs': 'e98160bfee5aa035bbf8ec72706aa4871f9dfef65e9bbe8ef6b4ed60b7af1bed',
+}
+
+
 def active_preflight_writers(host):
     files = getattr(host, '_verified_before_manifest', {}).get('source', {}).get('files', {})
     families = [_ACTIVE_PREFLIGHT_WRITERS]
     if _same(c, host.p.get('formats', {}).get('before'), _ACTIVE_PREFLIGHT_CURRENT_FORMATS):
         families.append(_ACTIVE_PREFLIGHT_CURRENT_WRITERS)
+    if _same(c, host.p.get('formats', {}).get('before'), _ACTIVE_PREFLIGHT_PUBLICATION_UNION_FORMATS):
+        families.append(_ACTIVE_PREFLIGHT_PUBLICATION_UNION_WRITERS)
     for family in families:
         if all(isinstance(files.get(name), dict) and files[name].get('sha256') == sha
                for name, sha in family.items()):

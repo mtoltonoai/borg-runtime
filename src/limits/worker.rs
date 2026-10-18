@@ -889,9 +889,9 @@ impl CollaborationLimits {
                 "CollaborationLimits.frame_bytes exceeds addressable representation".into(),
             );
         }
-        if self.channel_items > isize::MAX as usize {
+        if self.channel_items > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(
-                "CollaborationLimits.channel_items exceeds addressable representation".into(),
+                "CollaborationLimits.channel_items exceeds semaphore representation".into(),
             );
         }
         if self.journal_bytes > isize::MAX as usize {

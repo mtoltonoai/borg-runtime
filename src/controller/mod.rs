@@ -76,7 +76,7 @@ pub struct Controller {
 }
 
 struct Inner {
-    sender: mpsc::SyncSender<Envelope>,
+    sender: mpsc::Sender<Envelope>,
     pending: Option<Arc<tokio::sync::Semaphore>>,
     episodes: store_retry::Episodes,
     changes: watch::Receiver<u64>,
@@ -155,12 +155,12 @@ struct Envelope {
     message: Message,
     admitted: std::time::Instant,
     episode: Option<Arc<store_retry::Episode>>,
-    // Counts queued, active and parked transport waiters together. It never
-    // retains Controller/sender and therefore cannot keep its owner alive.
+    // Legacy ownership releases on dequeue; store-retry ownership retains the
+    // permit through active and parked waiters. It never retains the sender.
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl Inner {
-    // Traceability scope: Configured owner capacity counts queued, active and parked waiters; a full semaphore or bounded channel refuses admission.
+    // Traceability scope: Admission reserves configured logical capacity before a lazy queue allocates a message; store-retry includes active and parked waiters.
     //= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
     //# Admission MUST enforce configured queue and resource bounds.
     fn send(&self, message: Message) -> Result<(), mpsc::TrySendError<Message>> {
@@ -174,10 +174,8 @@ impl Inner {
         let episode = self.config.store_retry.as_ref()
             .and_then(|policy| self.episodes.admit(&message, admitted, policy));
         let envelope = Envelope { message, admitted, permit, episode };
-        self.sender.try_send(envelope).map_err(|error| match error {
-            mpsc::TrySendError::Full(e) => mpsc::TrySendError::Full(e.message),
-            mpsc::TrySendError::Disconnected(e) => mpsc::TrySendError::Disconnected(e.message),
-        })
+        self.sender.send(envelope)
+            .map_err(|mpsc::SendError(e)| mpsc::TrySendError::Disconnected(e.message))
     }
 }
 enum ExternalProof {
@@ -236,7 +234,9 @@ impl Controller {
             return Err("controller requires an absolute trusted validation executable".into());
         }
         let path = path.as_ref().to_path_buf();
-        let (sender, receiver) = mpsc::sync_channel::<Envelope>(config.queue_capacity);
+        // Allocate storage for submitted messages, never for the metadata ceiling.
+        // Every send reserves capacity first; dequeue releases it in legacy mode.
+        let (sender, receiver) = mpsc::channel::<Envelope>();
         let (changed, changes) = watch::channel(0u64);
         let (started, start) = mpsc::sync_channel(1);
         let settings = config.clone();
@@ -339,7 +339,7 @@ impl Controller {
         Ok(Self {
             inner: Arc::new(Inner {
                 sender,
-                pending: config.store_retry.as_ref().map(|_| Arc::new(tokio::sync::Semaphore::new(config.queue_capacity))),
+                pending: Some(Arc::new(tokio::sync::Semaphore::new(config.queue_capacity))),
                 episodes: store_retry::Episodes::default(),
                 validation_host,
                 changes,

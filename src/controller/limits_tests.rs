@@ -533,3 +533,122 @@ async fn admission_refusals_identify_the_exact_limiting_metadata_field() {
 }
 
 fn small_context_metadata() -> RuntimeLimits { let mut p=RuntimeLimits::seed().unwrap(); p.execution.native.context_bytes=65_536; p }
+
+#[tokio::test]
+async fn lazy_legacy_queue_still_refuses_full_and_releases_capacity_on_dequeue() {
+    let p = path();
+    let mut metadata = RuntimeLimits::seed().unwrap();
+    metadata.controller.queue_capacity = 1;
+    assert!(metadata.controller.store_retry.is_none());
+    let mut controller = Controller::open_with_config(&p, config(metadata)).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    // Own the queue receiver to place a deterministic boundary before dequeue.
+    // Dropping the original sender lets the real database owner drain normally.
+    let inner = Arc::get_mut(&mut controller.inner).unwrap();
+    inner.sender = sender;
+    let message = || Message::Revision { reply: oneshot::channel().0 };
+    assert!(inner.send(message()).is_ok());
+    assert!(matches!(inner.send(message()),Err(mpsc::TrySendError::Full(_))));
+    let queued = receiver.try_recv().map(|envelope|envelope.message).unwrap();
+    assert!(matches!(queued,Message::Revision {..}));
+    assert!(inner.send(message()).is_ok(),"dequeue must release the legacy permit");
+    drop(receiver);
+    assert!(matches!(inner.send(message()),Err(mpsc::TrySendError::Disconnected(_))));
+    drop(controller);
+    controller_owner_released(&p).await;
+}
+
+
+// Traceability scope: Small controlled reports exercise actual admission,
+// durable result acceptance, helper validation and reopen under the exact
+// full selected metadata. This is not a provider or maximum-payload test.
+//= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+//= type=test
+//# An accepted task MUST retain its resolved execution-limit values.
+#[tokio::test]
+async fn maximum_session_profile_small_progress_result_and_restart_remain_durable() {
+    Box::pin(async {
+        let selected = RuntimeLimits::parse(include_bytes!(
+            "../../tests/fixtures/maximum-session-controller-metadata-04.json"
+        )).unwrap();
+        let mut cfg = config(selected.clone());
+        cfg.validation_executable = PathBuf::from(std::env::var_os("BORG_TEST_RUNTIME")
+            .expect("existing same-build ordinary runtime helper"));
+        let p = path();
+        let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
+        let mut input = coding(&selected, "maximum-profile-native");
+        input.definition.executor = ExecutorKind::Native;
+        input.repository = None;
+        input.output_schema = Some(serde_json::json!({"type":"object","required":["answer"],
+            "properties":{"answer":{"type":"integer"}},"additionalProperties":false}));
+        let submit = Operation::SubmitTask { operation_id:"maximum-profile-submit".into(), input };
+        let submitted = command(&c, submit.clone()).await;
+        let initial = task(&submitted);
+        let pinned = serde_json::to_vec(&initial.input).unwrap();
+        assert_eq!(*initial.input.resolved_limits.as_ref().unwrap().global_metadata, selected);
+        assert_eq!(initial.input.execution_limits().unwrap(), &selected.execution);
+        let w = Worker { id:"maximum-profile-worker".into(), incarnation:"original".into(), coding_capacity:0, native_capacity:1 };
+        assert!(matches!(command(&c, Operation::RegisterWorker {
+            operation_id:"maximum-profile-register".into(), worker:w.clone()
+        }).await.outcome, Outcome::Ok { data:Data::Worker(_) }));
+        let dispatch = command(&c, Operation::AwaitCommands {
+            operation_id:"maximum-profile-await".into(), worker_id:w.id.clone(),
+            incarnation:w.incarnation.clone(), acknowledged:vec![]
+        }).await;
+        let a = match dispatch.outcome {
+            Outcome::Ok { data:Data::Commands(commands) } => commands.iter().find_map(|v|match v {
+                WorkerCommand::RunAttempt { attempt, .. } if attempt.task_id == initial.id => Some(attempt.clone()), _ => None
+            }).expect("original Native attempt"), other => panic!("{other:?}")
+        };
+        let report = |id:String, observation| Operation::ObserveWorker { report:Report {
+            report_id:id, worker_id:a.worker_id.clone(), incarnation:a.worker_incarnation.clone(),
+            task_id:a.task_id.clone(), attempt_id:a.id.clone(), generation:a.generation, observation
+        }};
+        task(&command(&c, report("maximum-profile-started".into(), Observation::Started { thread_id:None, turn_id:None })).await);
+        let progressed = task(&command(&c, report("maximum-profile-progress".into(), Observation::Progress {
+            text:"small progress".into(), output:"small output".into(), truncated:false
+        })).await);
+        assert_eq!(progressed.progress, "small progress");
+        assert_eq!(progressed.recent_output, "small output");
+        task(&command(&c, report(crate::native_loop_contract::reservation_id(&a.id,1), Observation::Usage {
+            model_requests:1, input_tokens:Some(4), output_tokens:Some(2), native_diagnostic_reserved:true
+        })).await);
+        let diagnostic = command(&c, report(crate::native_loop_contract::diagnostic_id(&a.id,1), Observation::NativeRequestDiagnostic {
+            request_index:1, endpoint:"https://api.openai.com/v1/responses".into(),
+            model:initial.input.definition.required_inference().unwrap().model.clone(),
+            request_binding:Some(crate::native::ProviderRequestBinding { bytes:2,
+                sha256:"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into() }),
+            observed_outcome:crate::native_loop_contract::NativeRequestObservedOutcome::Completed, failure:None
+        })).await;
+        assert!(matches!(diagnostic.outcome, Outcome::Ok { data:Data::Acknowledged }), "{diagnostic:?}");
+        task(&command(&c, report(crate::native_loop_contract::completion_id(&a.id), Observation::NativeLoopCompleted {
+            model_requests:1, calls:vec![], requests:vec![], final_response_index:None
+        })).await);
+        task(&command(&c, report("maximum-profile-executor".into(), Observation::ExecutorOutcome {
+            success:true, summary:"controlled completion".into()
+        })).await);
+        task(&command(&c, report("maximum-profile-stopped".into(), Observation::ProcessTreeStopped)).await);
+        let result_operation = report("maximum-profile-result".into(), Observation::ResultCandidate {
+            checks_passed:true, summary:"small accepted result".into(), checkpoint:None,
+            validation:vec![crate::native_loop_contract::evidence(&a.id)], output:Some(serde_json::json!({"answer":42}))
+        });
+        let result_reply = command(&c, result_operation.clone()).await;
+        let accepted = task(&result_reply);
+        assert_eq!(accepted.status, TaskStatus::Succeeded);
+        assert!(accepted.attempt.as_ref().unwrap().stopped);
+        assert!(!accepted.attempt.as_ref().unwrap().uncertain);
+        assert_eq!(accepted.result.as_ref().unwrap().output, Some(serde_json::json!({"answer":42})));
+        assert_eq!(serde_json::to_vec(&accepted.input).unwrap(), pinned);
+        drop(c);
+        controller_owner_released(&p).await;
+        let c = Controller::open_with_config(&p, cfg).unwrap();
+        assert_eq!(task(&command(&c, Operation::GetTask { task_id:accepted.id.clone() }).await), accepted);
+        for (operation, original) in [(submit, submitted), (result_operation, result_reply)] {
+            let replay = command(&c, operation).await;
+            assert_eq!(replay.outcome, original.outcome);
+            assert_eq!(replay.commit, original.commit);
+        }
+        drop(c);
+        controller_owner_released(&p).await;
+    }).await;
+}

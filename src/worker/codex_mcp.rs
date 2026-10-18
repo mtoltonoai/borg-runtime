@@ -1472,7 +1472,9 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
         .enable_all()
         .build()
         .map_err(|_| "collaboration bridge runtime unavailable")?;
-    let (tx, rx) = std::sync::mpsc::sync_channel(channel_items);
+    // Tokio's bounded queues allocate occupied blocks, not one slot for every
+    // allowed item. Blocking I/O stays on the same two owned OS threads.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(channel_items);
     std::thread::spawn(move || {
         let mut input = std::io::stdin().lock();
         loop {
@@ -1503,21 +1505,21 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
             {
                 cancelled.store(true, Ordering::SeqCst);
             }
-            if tx.send(item).is_err() {
+            if tx.blocking_send(item).is_err() {
                 return;
             }
         }
     });
-    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_items);
-    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(channel_items);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(channel_items);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(channel_items);
     std::thread::spawn(move || {
         let mut output = std::io::stdout().lock();
-        while let Ok(bytes) = out_rx.recv() {
+        while let Some(bytes) = out_rx.blocking_recv() {
             let ok = output
                 .write_all(&bytes)
                 .and_then(|_| output.flush())
                 .is_ok();
-            if ack_tx.send(ok).is_err() || !ok {
+            if ack_tx.blocking_send(ok).is_err() || !ok {
                 return;
             }
         }
@@ -1531,9 +1533,11 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                     .deadline_unix_ms
                     .saturating_sub(process::now_ms()),
             );
-            let frame = rx
-                .recv_timeout(remaining)
+            let frame = runtime.block_on(async {
+                tokio::time::timeout(remaining, rx.recv()).await
+            })
                 .map_err(|_| "collaboration input ended or deadline reached")?
+                .ok_or("collaboration input ended or deadline reached")?
                 .map_err(str::to_owned)?;
             let value = mcp::strict::parse(&frame, frame_bytes)?;
             let obj = value.as_object().ok_or("invalid MCP request")?;
@@ -1637,9 +1641,11 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                     .deadline_unix_ms
                     .saturating_sub(process::now_ms()),
             );
-            if !ack_rx
-                .recv_timeout(remaining)
+            if !runtime.block_on(async {
+                tokio::time::timeout(remaining, ack_rx.recv()).await
+            })
                 .map_err(|_| "MCP output incomplete before deadline")?
+                .ok_or("MCP output incomplete before deadline")?
             {
                 return Err("MCP output closed".into());
             }

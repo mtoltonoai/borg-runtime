@@ -8,6 +8,17 @@ fn fault(e: Error) -> Fault { Fault::Refused(e.code, e.message) }
 fn invalid(message: &str) -> Fault { fault(Error::invalid(message)) }
 fn stored(message: impl Into<String>) -> Fault { Fault::Store(message.into()) }
 
+// Count worst-case identity escaping without allocating metadata-sized strings.
+// Padding is exact for the former backslash-filled identities at both JSON layers.
+fn padded_size<T: serde::Serialize>(value: &T, width: usize, escaped_bytes: usize, cap: usize)
+    -> std::result::Result<usize, ()>
+{
+    let padding = width.checked_mul(escaped_bytes).ok_or(())?;
+    let available = cap.checked_sub(padding).ok_or(())?;
+    let base = bounded_json_size(value, available).map_err(|_| ())?;
+    base.checked_add(padding).ok_or(())
+}
+
 pub(super) struct Bounds<'a> {
     pub limits: &'a crate::limits::RuntimeLimits,
     pub call: Option<&'a Invocation>,
@@ -47,18 +58,19 @@ impl Bounds<'_> {
         bounded_json_size(&outcome,l.controller.outcome_bytes).map_err(|_|Error::bound("controller.outcome_bytes"))?;
         let id = self.call.map_or("public-read",|call|call.operation_id.as_str());
         let frame = crate::mcp::CallResult { reply:Reply {
-            request_id:"\\".repeat(l.transport.identity_bytes),
+            request_id:String::new(),
             commit:Some(MutationCommit {operation_id:id.into(),controller_revision:i64::MAX as u64}),
             observed_controller_revision:Some(i64::MAX as u64), outcome:outcome.clone(),
         },requires_quiescence:false };
-        bounded_json_size(&frame,l.execution.collaboration.complete_result_bytes)
+        padded_size(&frame,l.transport.identity_bytes,2,l.execution.collaboration.complete_result_bytes)
             .map_err(|_|Error::bound("execution.collaboration.complete_result_bytes"))?;
-        // The MCP text string escapes the complete CallResult a second time.
-        // Use its real serializer, including the maximum permitted RPC identity.
-        let wire = crate::mcp::tool_result(json!("\\".repeat(l.transport.identity_bytes)), &frame);
-        bounded_json_size(&wire,l.transport.body_bytes).map_err(|_|Error::bound("transport.body_bytes"))?;
+        // The MCP text string escapes the request ID a second time (4 bytes
+        // per backslash); the outer RPC ID is escaped once (2 bytes).
+        let wire = crate::mcp::tool_result(json!(""), &frame);
+        padded_size(&wire,l.transport.identity_bytes,6,l.transport.body_bytes)
+            .map_err(|_|Error::bound("transport.body_bytes"))?;
         if let Some(max)=self.max_bytes {
-            bounded_json_size(&wire,max).map_err(|_|Error::bound("requested max_bytes"))?;
+            padded_size(&wire,l.transport.identity_bytes,6,max).map_err(|_|Error::bound("requested max_bytes"))?;
         }
         if let Some(call) = self.call {
             super::metadata::receipt_bound(l,&call.operation(),&outcome).map_err(|e|match e {
@@ -416,4 +428,44 @@ pub(super) fn repository_observe(tx:&StoreContext<'_>,context:&Context<'_>,origi
     let Data::ReadPage(page)=repository_output(&selection,cursor.as_ref(),&bounds,&original.task,output,true)? else {return Err(stored("repository page projection shape"));};
     outer.data=crate::repository_view::Data::ReadPage(page);
     Ok(outer)
+}
+
+#[cfg(test)]
+mod envelope_sizing_tests {
+    use super::*;
+
+    #[test]
+    fn arithmetic_identity_padding_matches_both_serialized_json_layers() {
+        for width in [0, 1, 256, 4096] {
+            for message in ["plain", "quote\" backslash\\ newline\n unicodeé"] {
+                let empty = crate::mcp::CallResult {
+                    reply: Reply { request_id:String::new(),
+                        commit:Some(MutationCommit {operation_id:"original".into(),controller_revision:i64::MAX as u64}),
+                        observed_controller_revision:Some(i64::MAX as u64),
+                        outcome:Outcome::Refused {code:"fixture".into(),message:message.into()} },
+                    requires_quiescence:false,
+                };
+                let mut materialized = empty.clone();
+                materialized.reply.request_id = "\\".repeat(width);
+                let frame_bytes = serde_json::to_vec(&materialized).unwrap().len();
+                assert_eq!(padded_size(&empty,width,2,frame_bytes),Ok(frame_bytes));
+                assert!(padded_size(&empty,width,2,frame_bytes-1).is_err());
+                let wire = crate::mcp::tool_result(json!("\\".repeat(width)),&materialized);
+                let wire_bytes = serde_json::to_vec(&wire).unwrap().len();
+                let empty_wire = crate::mcp::tool_result(json!(""),&empty);
+                assert_eq!(padded_size(&empty_wire,width,6,wire_bytes),Ok(wire_bytes));
+                assert!(padded_size(&empty_wire,width,6,wire_bytes-1).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn enormous_identity_bounds_refuse_without_materializing_the_ceiling() {
+        let value = json!({"tiny":"actual reply"});
+        assert!(padded_size(&value,usize::MAX,2,usize::MAX).is_err());
+        assert!(padded_size(&value,isize::MAX as usize,6,usize::MAX).is_err());
+        assert!(padded_size(&value,1_000_000_000,6,4096).is_err());
+        let size = serde_json::to_vec(&value).unwrap().len();
+        assert_eq!(padded_size(&value,0,6,size),Ok(size));
+    }
 }

@@ -74,6 +74,10 @@ impl Lab {
         Self::with_limits(label, limits).await
     }
     async fn with_limits(label: &str, mut limits: RuntimeLimits) -> Self {
+        limits.controller.command_wait_ms = 10;
+        Self::with_exact_limits(label, limits).await
+    }
+    async fn with_exact_limits(label: &str, limits: RuntimeLimits) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("artifacts/operational-feedback-codex")
             .join(format!(
@@ -84,7 +88,6 @@ impl Lab {
             ));
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("tasks.sqlite");
-        limits.controller.command_wait_ms = 10;
         limits.validate().unwrap();
         let limits = Arc::new(limits);
         let controller = Controller::open_with_config(
@@ -1497,4 +1500,85 @@ async fn codex_discovery_response_does_not_mask_invalid_frames_or_cancellation()
     assert_eq!(proxy.calls.lock().unwrap().len(), 3);
     proxy.owner.stop().await;
     lab.finish(&[task], (1, 0)).await;
+}
+
+// Uses the real controller and bridge executable, with only a controlled peer.
+// A metadata maximum is an admission count, not a startup allocation request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maximum_queue_metadata_boots_and_delivers_a_single_original_call() {
+    let mut limits = RuntimeLimits::seed().unwrap();
+    limits.controller.queue_capacity = tokio::sync::Semaphore::MAX_PERMITS;
+    limits.execution.collaboration.channel_items = tokio::sync::Semaphore::MAX_PERMITS;
+    let mut lab = Lab::with_limits("maximum-lazy-queues", limits).await;
+    let input = lab.input(65_536);
+    let task = lab.start(input, "lazy-queues").await;
+    let pinned = serde_json::to_vec(&task.input).unwrap();
+    let mut proxy = Proxy::start(lab.url.clone(), false).await;
+    let config = lab.config(&task, &proxy.url, "bridge");
+    let mut peer = Peer::start(config.clone()).await;
+    let tools = peer.rpc("tools/list", json!({})).await;
+    assert!(tools["tools"].as_array().unwrap().iter().any(|tool|tool["name"]=="collab_memory_set"));
+    let args = json!({"key":"lazy-queue","expected_revision":null,"value":"original"});
+    let result = peer.call("original", "collab_memory_set", args.clone()).await;
+    assert!(matches!(result.reply.outcome, Outcome::Ok {..}), "{result:?}");
+    let original = peer.invocation("original");
+    exact_lookup(&lab, &original, &result).await;
+    assert_eq!(peer.call("original", "collab_memory_set", args).await,result);
+    assert_eq!(proxy.calls.lock().unwrap().as_slice(), &[original]);
+    assert_eq!(proxy.lookups.load(Ordering::SeqCst),0);
+    assert!(!config.stop_path().exists());
+    assert_eq!(serde_json::to_vec(&lab.get(&task.id).await.input).unwrap(),pinned);
+    peer.close(false).await;
+    proxy.owner.stop().await;
+    lab.finish(&[task],(1,0)).await;
+}
+
+
+// Traceability scope: Exact full metadata through the genuine Borg stdio bridge
+// and real SQLite original call/replay. No supplied Codex or provider is run.
+//= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+//= type=test
+//# A component MUST validate its configured limits before admitting work governed by those limits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maximum_session_profile_coding_bridge_retains_exact_original_tool_result() {
+    Box::pin(async {
+        let selected = RuntimeLimits::parse(include_bytes!(
+            "fixtures/maximum-session-controller-metadata-04.json"
+        )).unwrap();
+        let startup = RuntimeLimits::parse(include_bytes!(
+            "fixtures/maximum-session-worker-metadata-04.json"
+        )).unwrap();
+        let mut lab = Lab::with_exact_limits("maximum-session-profile", selected.clone()).await;
+        assert_eq!(*lab.limits, selected);
+        let mut input = lab.input(selected.execution.collaboration.complete_result_bytes);
+        input.definition.limit_overrides = None;
+        let accepted = lab.start(input, "maximum-profile").await;
+        let snapshot = accepted.input.resolved_limits.as_ref().unwrap();
+        assert_eq!(*snapshot.global_metadata, selected);
+        assert_eq!(snapshot.values, selected.execution);
+        snapshot.validate_for(&accepted.input).unwrap();
+        let pinned = serde_json::to_vec(&accepted.input).unwrap();
+        let mut proxy = Proxy::start(lab.url.clone(), false).await;
+        let mut config = lab.config(&accepted, &proxy.url, "bridge");
+        config.worker_limits = startup.worker.clone();
+        config.validate().unwrap();
+        assert_eq!(config.runtime_limits, selected);
+        assert_eq!(config.limits, selected.execution.collaboration);
+        let mut peer = Peer::start(config.clone()).await;
+        let tools = peer.rpc("tools/list", json!({})).await;
+        assert!(tools["tools"].as_array().unwrap().iter().any(|tool|tool["name"]=="collab_memory_set"));
+        let args = json!({"key":"maximum-profile","expected_revision":null,"value":{"small":"durable"}});
+        let result = peer.call("original", "collab_memory_set", args.clone()).await;
+        assert!(matches!(result.reply.outcome, Outcome::Ok {..}), "{result:?}");
+        let original = peer.invocation("original");
+        exact_lookup(&lab, &original, &result).await;
+        assert_eq!(peer.call("original", "collab_memory_set", args).await, result);
+        assert_eq!(proxy.calls.lock().unwrap().as_slice(), &[original]);
+        assert_eq!(proxy.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(serde_json::to_vec(&lab.get(&accepted.id).await.input).unwrap(), pinned);
+        assert!(!config.stop_path().exists());
+        peer.close(false).await;
+        proxy.owner.stop().await;
+        lab.finish(&[accepted], (1, 0)).await;
+    }).await;
 }

@@ -179,6 +179,11 @@ impl ControllerLimits {
             self.memory_notice_event_bytes,self.memory_pending_bytes,self.collaboration_cursor_bytes] {
             value.checked_add(1).ok_or("controller read bound overflow")?;
         }
+        // rusqlite converts milliseconds to SQLite's signed C-int timeout.
+        // Reject before its checked conversion panics during controller startup.
+        if self.sqlite_busy_timeout_ms > i32::MAX as u64 {
+            return Err("controller.sqlite_busy_timeout_ms exceeds SQLite timeout representation".into());
+        }
         for value in [self.command_wait_ms,self.validation_timeout_ms,self.sqlite_busy_timeout_ms,self.owner_lock_wait_ms,self.owner_lock_retry_ms] {
             std::time::Instant::now().checked_add(std::time::Duration::from_millis(value)).ok_or("controller timeout exceeds clock representation")?;
         }
@@ -190,6 +195,31 @@ impl ControllerLimits {
 #[cfg(test)]
 mod store_retry_tests {
     use super::*;
+
+    #[test]
+    fn sqlite_busy_timeout_rejects_values_outside_the_actual_driver_representation() {
+        let mut limits = crate::limits::RuntimeLimits::seed().unwrap().controller;
+        limits.sqlite_busy_timeout_ms = i32::MAX as u64;
+        limits.validate().unwrap();
+        for value in [i32::MAX as u64 + 1, u64::MAX] {
+            limits.sqlite_busy_timeout_ms = value;
+            assert_eq!(limits.validate().unwrap_err(),
+                "controller.sqlite_busy_timeout_ms exceeds SQLite timeout representation");
+        }
+    }
+
+    #[test]
+    fn collaboration_queue_metadata_matches_lazy_channel_representation() {
+        let mut limits = crate::limits::RuntimeLimits::seed().unwrap().execution.collaboration;
+        limits.channel_items = tokio::sync::Semaphore::MAX_PERMITS;
+        limits.validate().unwrap();
+        limits.channel_items += 1;
+        assert_eq!(limits.validate().unwrap_err(),
+            "CollaborationLimits.channel_items exceeds semaphore representation");
+        limits.channel_items = 0;
+        assert_eq!(limits.validate().unwrap_err(),
+            "CollaborationLimits.channel_items must be positive");
+    }
 
     #[test]
     fn absent_store_policy_round_trips_without_an_added_field() {

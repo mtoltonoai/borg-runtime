@@ -53,7 +53,7 @@ impl Lab {
             clock: Arc::new(move || held_clock.load(Ordering::SeqCst)),
             ..ControllerConfig::default()
         };
-        let (sender, receiver) = mpsc::sync_channel::<Envelope>(capacity);
+        let (sender, receiver) = mpsc::channel::<Envelope>();
         let (changed, changes) = watch::channel(0);
         let (ready, startup) = mpsc::sync_channel(1);
         let (done, finished) = mpsc::sync_channel(1);
@@ -294,7 +294,7 @@ async fn preexpired_admission_cannot_start_a_fresh_phase_budget() {
         permit: Some(permit),
         episode: None,
     };
-    if lab.controller().inner.sender.try_send(envelope).is_err() { panic!("fixture queue unexpectedly unavailable"); }
+    if lab.controller().inner.sender.send(envelope).is_err() { panic!("fixture queue unexpectedly unavailable"); }
     let result = receive(response).await;
     refused(&result, "store_unavailable");
     assert_eq!(result.request_id, "already-expired");
@@ -338,7 +338,7 @@ async fn queued_duplicate_retains_original_expiry_after_first_waiter_has_finishe
     let rollbacks = lab.seen.rollbacks.load(Ordering::SeqCst);
     assert!(attempts > 0 && rollbacks > 0);
     reader.execute_batch("ROLLBACK").unwrap();
-    if inner.sender.try_send(held).is_err() { panic!("held duplicate must fit its reserved admission slot"); }
+    if inner.sender.send(held).is_err() { panic!("held duplicate must fit its reserved admission slot"); }
     let duplicate = receive(response).await;
     refused(&duplicate, "store_unavailable");
     assert_eq!(duplicate.request_id, "late-dequeued-duplicate");
