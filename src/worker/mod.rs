@@ -2614,7 +2614,10 @@ fn coding_collaboration_closed(
     if !handoff::admits_default_assignment(state, &config.worker_limits)? {
         codex_mcp::admit_worker18_outcomes(&config)?;
     }
-    if !handoff::admits_machine_resources(state, &config.worker_limits)? {
+    // The combined worker19 admission retains both typed vocabularies.
+    if !handoff::admits_identity_administration(state, &config.worker_limits)?
+        || !handoff::admits_machine_resources(state, &config.worker_limits)?
+    {
         codex_mcp::admit_worker19_outcomes(&config)?;
     }
     if collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {

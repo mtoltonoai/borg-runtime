@@ -686,4 +686,3 @@ mod tests {
         assert_eq!(read_file(&area.0.join("malformed"),0),Err(Reason::ReadBound));
     }
 }
-
