@@ -926,3 +926,83 @@ async fn cancelled_unknown_or_foreign_reservation_never_dispatches_diagnostic() 
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert_eq!(f.sends(), 0);
 }
+
+
+// Traceability scope: The frozen selected global and unchanged worker startup
+// metadata pass the real diagnostic consumer preflight; no provider is invoked.
+//= spec/impl/v2/implementation.md#limits-are-versioned-metadata
+//# A component MUST validate its configured limits before admitting work governed by those limits.
+#[tokio::test]
+async fn selected_metadata_preflight_fits_startup_and_refuses_oversized_error_body_without_dispatch() {
+    Box::pin(async {
+        let mut f = fixture("selected-metadata-preflight").await;
+        let selected = Arc::new(
+            RuntimeLimits::parse(include_bytes!(
+                "../../tests/fixtures/native-diagnostic-controller-metadata-03.json"
+            ))
+            .unwrap(),
+        );
+        let startup = Arc::new(
+            RuntimeLimits::parse(include_bytes!(
+                "../../tests/fixtures/native-diagnostic-worker-startup-bb5d.json"
+            ))
+            .unwrap(),
+        );
+        assert_eq!(selected.execution.native.error_body_bytes, 102_561);
+        assert_eq!(startup.worker.credential_scan_units, 262_144);
+        assert_eq!(startup.transport.body_bytes, 1_048_576);
+        assert_eq!(startup.controller.outcome_bytes, 1_047_552);
+        assert!(f.input.definition.limit_overrides.is_none());
+        assert_eq!(
+            f.config.model,
+            f.input.definition.required_inference().unwrap().model
+        );
+        f.input.resolved_limits = Some(selected.resolve_task(&f.input).unwrap());
+        f.reporter.config.limits = startup.clone();
+        f.reporter.client = ApiClient::new(
+            f.reporter.config.controller_url.clone(),
+            selected.clone(),
+        )
+        .unwrap();
+        let input_before = serde_json::to_vec(&f.input).unwrap();
+        let admission = preflight(&f.reporter, &f.input, &f.config, 1).unwrap();
+        assert_eq!(admission.accepted, *selected);
+        assert_eq!(admission.client, *selected);
+        assert_eq!(admission.startup, *startup);
+        assert_eq!(admission.native, selected.execution.native);
+        assert_eq!(serde_json::to_vec(&f.input).unwrap(), input_before);
+        assert!(f.script.lock().unwrap().requests.is_empty());
+        assert_eq!(std::fs::read_dir(&f.reporter.outbox).unwrap().count(), 0);
+
+        // A parse-valid global candidate still cannot override the separately
+        // retained worker scanner. Re-resolve the original accepted carrier so
+        // rejection cannot be explained by a stale snapshot or client policy.
+        let mut oversized = (*selected).clone();
+        oversized.revision.push_str("-oversized-error-body-test");
+        oversized.execution.native.error_body_bytes = 262_144;
+        oversized.validate().unwrap();
+        let oversized = Arc::new(oversized);
+        f.input.resolved_limits = Some(oversized.resolve_task(&f.input).unwrap());
+        f.reporter.client = ApiClient::new(
+            f.reporter.config.controller_url.clone(),
+            oversized.clone(),
+        )
+        .unwrap();
+        let oversized_input_before = serde_json::to_vec(&f.input).unwrap();
+        assert_eq!(
+            preflight(&f.reporter, &f.input, &f.config, 1)
+                .err()
+                .expect("startup scanner must refuse the oversized diagnostic"),
+            "native diagnostic admission exceeds worker.credential_scan_units"
+        );
+        assert_eq!(
+            serde_json::to_vec(&f.input).unwrap(),
+            oversized_input_before
+        );
+        assert_eq!(*f.reporter.config.limits, *startup);
+        assert_eq!(f.reporter.client.limits(), &*oversized);
+        assert!(f.script.lock().unwrap().requests.is_empty());
+        assert_eq!(std::fs::read_dir(&f.reporter.outbox).unwrap().count(), 0);
+    })
+    .await;
+}

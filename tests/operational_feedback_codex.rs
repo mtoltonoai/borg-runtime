@@ -704,14 +704,33 @@ async fn exact_lookup(lab: &Lab, call: &Invocation, result: &CallResult) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_apply_later_bound() {
-    let mut lab = Lab::new("apply", true).await;
+    // This control exercises an authorized identity manager. The canonical
+    // actor still comes from the accepted session; tool arguments grant none.
+    let mut limits = RuntimeLimits::seed().unwrap();
+    limits.execution.native.context_bytes = 65_536;
+    limits.identity_administration = Some(borg_runtime::limits::IdentityAdministrationPolicy {
+        version: 1,
+        revision: "coding-manager-fixture-1".into(),
+        enabled: true,
+        manager_agent_id: "coding-agent".into(),
+        complete_definitions: false,
+    });
+    let mut lab = Lab::with_limits("apply", limits).await;
     let old_bound = 32_768;
     let new_bound = 65_536;
-    let input = lab.input(old_bound);
+    let mut input = lab.input(old_bound);
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 {
+        publication: None, web_search: None,
+    });
+    input.definition.limit_overrides.as_mut().unwrap().collaboration.as_mut().unwrap()
+        .capabilities = Some(borg_runtime::limits::CollaborationCapabilities {
+            version: 1, task_creation: false, identity_administration: true,
+        });
     let first = lab.start(input, "first").await;
     let pinned = serde_json::to_vec(&first.input).unwrap();
     let mut proxy = Proxy::start(lab.url.clone(), true).await;
-    let config = lab.config(&first, &proxy.url, "first-bridge");
+    let mut config = lab.config(&first, &proxy.url, "first-bridge");
+    config.execution_profile = first.input.definition.execution_profile.clone();
     let config_bytes = serde_json::to_vec(&config).unwrap();
     let mut peer = Peer::start(config.clone()).await;
     let tools = peer.rpc("tools/list", json!({})).await;
@@ -821,7 +840,9 @@ async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_ap
     next.definition = update.selected_definition.clone();
     let later = lab.start(next, "later").await;
     assert_eq!(later.input.execution_limits().unwrap(), &expected);
-    let mut next_peer = Peer::start(lab.config(&later, &proxy.url, "later-bridge")).await;
+    let mut later_config = lab.config(&later, &proxy.url, "later-bridge");
+    later_config.execution_profile = later.input.definition.execution_profile.clone();
+    let mut next_peer = Peer::start(later_config).await;
     assert_eq!(next_peer.config.limits.complete_result_bytes, new_bound);
     // A second accepted caller cannot read the first caller's occurrence.
     let mismatch = lab
