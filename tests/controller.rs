@@ -4674,6 +4674,13 @@ async fn task_recovery_cancel_traverses_settled_child_at_receipt_capacity() {
             ..config()
         }, |limits| { limits.max_receipts = 24; limits.max_cleanup_receipts = 64; });
         let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
+        for agent_id in ["chain-c", "chain-g"] {
+            let definition = coding(agent_id).definition;
+            assert!(matches!(call(&c, Operation::RegisterAgent {
+                operation_id: format!("chain-register-{agent_id}"),
+                definition: definition.clone(),
+            }).await, Outcome::Ok { data: Data::Agent(agent) } if agent.definition == definition));
+        }
         let parent = submit(&c, "chain-parent", coding("chain-p")).await;
         let w = worker("chain-worker", "chain-inc", 0, 1);
         register(&c, &w).await;
@@ -4978,6 +4985,11 @@ async fn task_recovery_view_clears_own_effect_and_child_ready_stale_reasons() {
 #[tokio::test]
 async fn task_recovery_terminal_root_cancel_preserves_existing_noop_contract() {
     let c = Controller::open_with_config(path(), config()).unwrap();
+    let definition = coding("terminal-child").definition;
+    assert!(matches!(call(&c, Operation::RegisterAgent {
+        operation_id: "terminal-root-register-child".into(),
+        definition: definition.clone(),
+    }).await, Outcome::Ok { data: Data::Agent(agent) } if agent.definition == definition));
     let parent = submit(&c, "terminal-root", coding("terminal-root-agent")).await;
     let w = worker("terminal-root-worker", "inc", 0, 1);
     register(&c, &w).await;

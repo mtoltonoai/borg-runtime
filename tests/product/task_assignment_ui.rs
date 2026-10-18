@@ -187,7 +187,7 @@ async fn descendant_assignment_cancellation_journey() {
     let worker=Worker {id:"assignment-tree-worker".into(),incarnation:"1".into(),coding_capacity:1,native_capacity:1};
     call(&f.controller,Operation::RegisterWorker {operation_id:"assignment-tree-register".into(),worker:worker.clone()}).await;
     let parent_attempt=next_ui_attempt(&f.controller,&worker,&parent_id).await;
-    report(&f.controller,&parent_attempt,Observation::Usage {native_diagnostic_reserved:false,model_requests:1,input_tokens:None,output_tokens:None}).await;
+    report(&f.controller,&parent_attempt,Observation::Usage {native_diagnostic_reserved:true,model_requests:1,input_tokens:None,output_tokens:None}).await;
     let parent=task(&f.controller,&parent_id).await;
     let child_input=borg_runtime::delegation::coding_child(&parent.input,"retain descendant work").unwrap();
     let Data::Task(child)=call(&f.controller,Operation::DelegateTask {
