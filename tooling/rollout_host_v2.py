@@ -7,7 +7,7 @@ or uncertain phase replay. Systemd/HTTP are the explicit integration test seam.
 from __future__ import annotations
 import argparse, copy, contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, stat, struct, sys, tarfile, time
 from pathlib import Path
-_COMMON_SHA = 'e0cbc1b20eeb19aded6c88fc42191982bd1614218baa66d90367d42dedd37156'
+_COMMON_SHA = 'deed09974a62ca4b4d94892850d2eccc9006426f16a73f533618b24660911f21'
 
 def _walk_error(error):
     # An unreadable or vanished inventory is not proof that it is empty.

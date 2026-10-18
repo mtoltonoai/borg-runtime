@@ -22,7 +22,7 @@ def save(path,value):
 def fake_package(root):
     # Same deterministic archive/verifier; deliberately non-runnable ELF fixture.
     binary=root/'fake-binary';raw=bytearray(128);raw[:7]=b'\x7fELF\x02\x01\x01';raw[16:18]=(3).to_bytes(2,'little');raw[18:20]=(62).to_bytes(2,'little');binary.write_bytes(raw);binary.chmod(0o500)
-    files={name:{'mode':'100644','git_blob':'a'*40,'size':1,'sha256':'2'*64} for name in ({'Cargo.toml','Cargo.lock','src/main.rs','src/lib.rs'}|common.AGENT_DIRECTORY_SOURCES)}
+    files={name:{'mode':'100644','git_blob':'a'*40,'size':1,'sha256':'2'*64} for name in ({'Cargo.toml','Cargo.lock','src/main.rs','src/lib.rs'}|common.COMPOSED_SOURCES)}
     files['Cargo.toml']['sha256']=package.MANIFEST_SHA;files['Cargo.lock']['sha256']=package.LOCK_SHA
     build={'tools':{'sha256':package.TOOL_SHA,'versions':{'gcc':'13.3.0','gcc_target':'x86_64-linux-gnu','ar':'GNU ar 2.42','pkg-config':'1.8.1','cargo':'cargo 1.99.0 (fixture)','rustc':'rustc 1.99.0 (fixture)\nhost: '+package.TARGET}},'sqlite':{'identity':{'version':'3.54.0','source_id':package.SQLITE_SOURCE,'threadsafe':1,'api_armor':1,'foreign_keys':1},'source_sha256':package.SQLITE_FILES,'archive_sha256':package.SQLITE_ARCHIVE_SHA,'cflags':package.CFLAGS,'static_library_sha256':'1'*64}}
     m={'format':'borg-v2-release/1','source':{'commit':'a'*40,'tree':'b'*40,'object_format':'sha1','files':files},'profile':package.PROFILE,'recipe':{'packager_sha256':'3'*64,'build_helper_sha256':package.BUILDER_SHA,**package.READER_SHA,'environment':package.ENV_PROFILE},'build':build,'files':{'bin/borg-runtime':package.elf_binary(binary)}}
@@ -174,6 +174,36 @@ class Fixture:
         self.on_start=startup
         save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
 
+    def composed_transition(self):
+        """Controlled schema24/worker18 startup, not runtime qualification."""
+        self.agent_directory_transition()
+        for h in self.profile['hosts']:self.on_start(h)
+        source=Path(adapter.__file__).parents[1]/'src/controller'
+        controller=self.profile['hosts'][0]
+        con=sqlite3.connect(controller['state']['database'])
+        con.executescript('BEGIN;'+(source/'schema24-from23.sql').read_text()+'PRAGMA user_version=24;COMMIT;')
+        con.execute("INSERT INTO session_inputs VALUES('session','task',?,NULL,NULL)",['retained accepted input bytes'])
+        con.execute("INSERT INTO task_assignments VALUES('handoff','task','session','pending',NULL,?)",['retained pending handoff bytes'])
+        con.commit();con.close()
+        worker=self.profile['hosts'][1]
+        save(Path(worker['state']['format_file']),{'format_revision':18})
+        f=self.profile['formats']
+        f['before']=dict(common.COMPOSED_BEFORE);f['after']=dict(common.COMPOSED_AFTER)
+        f['source_files']={n:self.manifest['source']['files'][n]['sha256'] for n in common.COMPOSED_SOURCES}
+        f['forward']['kind']=common.COMPOSED_KIND
+        self.bind_supplied_predecessors()
+        def startup(host):
+            if host['role']=='controller':
+                con=sqlite3.connect(host['state']['database'])
+                if con.execute('PRAGMA user_version').fetchone()[0]==24:
+                    con.executescript('BEGIN;PRAGMA user_version=25;COMMIT;')
+                con.close()
+            else:
+                path=Path(host['state']['format_file']);temporary=path.with_name('upgraded-marker')
+                save(temporary,{'format_revision':19});os.replace(temporary,path);common.sync(path.parent)
+        self.on_start=startup
+        save(self.profile_path,self.profile);self.profile_sha=pin(self.profile_path)['sha256']
+
     def bind_supplied_predecessors(self):
         proofs={}
         for h in self.profile['hosts']:
@@ -183,7 +213,7 @@ class Fixture:
             raw=common.canonical(manifest);old['manifest_sha256']=common.digest(raw)
             release=Path(h['release_root'])/old['package_sha256'];release.mkdir(mode=0o700,exist_ok=True)
             path=release/'manifest.json';path.write_bytes(raw);path.chmod(0o600)
-            proofs[h['id']]={'formats':dict(common.SUPPLIED_TURN_BEFORE),'artifact':copy.deepcopy(old),
+            proofs[h['id']]={'formats':dict(self.profile['formats']['before']),'artifact':copy.deepcopy(old),
                 'unit':copy.deepcopy(h['unit']),
                 'source_files':{n:manifest['source']['files'][n]['sha256'] for n in common.SUPPLIED_TURN_BEFORE_SOURCES}}
         self.profile['formats']['forward']['before_hosts']=proofs

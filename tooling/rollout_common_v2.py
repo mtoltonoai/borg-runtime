@@ -487,13 +487,52 @@ AGENT_DIRECTORY_SOURCES = SUPPLIED_TURN_SOURCES | {'src/controller/agents.rs',
 AGENT_RETIREMENT_COLUMNS = 'id definition_revision operation_id'
 
 
+# Coordinated wire23/schema24/worker18 to wire24/schema25/worker19.
+# The validated runtime changes only the controller schema marker and worker
+# outer marker. Existing SQL tables/rows and inner worker records stay intact.
+# Source membership binds the selected package; it does not create permission
+# to rewrite retained state or bypass runtime typed admission.
+COMPOSED_KIND = 'validated-controller24-worker18-to-wire24-controller25-worker19/1'
+COMPOSED_BEFORE = {'wire':23,'controller_schema':24,'worker_format':18}
+COMPOSED_AFTER = {'wire':24,'controller_schema':25,'worker_format':19}
+COMPOSED_SOURCES = AGENT_DIRECTORY_SOURCES | {
+    'src/controller/compatibility.rs',
+    'src/controller/governance_completion.rs',
+    'src/controller/governance_completion_actions.rs',
+    'src/controller/identity_administration.rs',
+    'src/controller/machine_resources.rs',
+    'src/controller/metadata.rs',
+    'src/controller/operations/supplied_outer.rs',
+    'src/controller/schema24-from23.sql',
+    'src/controller/sessions.rs',
+    'src/controller/task_handoffs.rs',
+    'src/controller/task_submission.rs',
+    'src/governance_completion.rs',
+    'src/limits/identity.rs',
+    'src/limits/mod.rs',
+    'src/limits/worker.rs',
+    'src/machine_resources.rs',
+    'src/protocol_identity.rs',
+    'src/supplied_outer.rs',
+    'src/worker/codex_retry.rs',
+    'src/worker/completion.rs',
+    'src/worker/machine_resources.rs',
+    'src/worker/process.rs',
+}
+
+
+def composed_forward(profile):
+    transition=forward(profile)
+    return transition is not None and transition.get('kind')==COMPOSED_KIND
+
+
 def directory_forward(profile):
     transition=forward(profile)
     return transition is not None and transition.get('kind')==AGENT_DIRECTORY_KIND
 
 
 def per_host_forward(profile):
-    return supplied_forward(profile) or directory_forward(profile)
+    return supplied_forward(profile) or directory_forward(profile) or composed_forward(profile)
 
 
 def supplied_forward(profile):
@@ -503,6 +542,7 @@ def supplied_forward(profile):
 
 def supplied_before_hosts(profile):
     transition=forward(profile);hosts=profile['hosts'];proofs=transition['before_hosts']
+    before=COMPOSED_BEFORE if composed_forward(profile) else SUPPLIED_TURN_BEFORE
     if (not isinstance(proofs,dict) or not isinstance(hosts,list)
             or len({h['id'] for h in hosts})!=len(hosts)
             or set(proofs)!={h['id'] for h in hosts}):
@@ -513,7 +553,7 @@ def supplied_before_hosts(profile):
     for h in hosts:
         proof=proofs[h['id']]
         fields(proof,'formats artifact unit source_files','supplied forward before-host proof')
-        if (canonical(proof['formats'])!=canonical(SUPPLIED_TURN_BEFORE)
+        if (canonical(proof['formats'])!=canonical(before)
                 or canonical(proof['artifact'])!=canonical(h['old_artifact'])
                 or canonical(proof['unit'])!=canonical(h['unit'])):
             raise ValueError('supplied forward exact host binding')
@@ -551,7 +591,7 @@ def forward(profile):
 def format_sources(profile):
     transition=forward(profile)
     if transition is None:return FORMAT_SOURCES
-    return AGENT_DIRECTORY_SOURCES if transition['kind']==AGENT_DIRECTORY_KIND else SUPPLIED_TURN_SOURCES if transition['kind']==SUPPLIED_TURN_KIND else INSTRUCTION_SOURCE_SOURCES if transition['kind']==INSTRUCTION_SOURCE_KIND else PR_PUBLICATION_SOURCES if transition['kind']==PR_PUBLICATION_KIND else MEMORY_NOTICE_REMOVAL_SOURCES if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else CHARTER_ADOPTION_SOURCES if transition['kind']==CHARTER_ADOPTION_KIND else DIAGNOSTIC_SOURCES if transition['kind']==DIAGNOSTIC_KIND else LOSSLESS_SOURCES if transition['kind']==LOSSLESS_KIND else FORWARD_SOURCES
+    return COMPOSED_SOURCES if composed_forward(profile) else AGENT_DIRECTORY_SOURCES if transition['kind']==AGENT_DIRECTORY_KIND else SUPPLIED_TURN_SOURCES if transition['kind']==SUPPLIED_TURN_KIND else INSTRUCTION_SOURCE_SOURCES if transition['kind']==INSTRUCTION_SOURCE_KIND else PR_PUBLICATION_SOURCES if transition['kind']==PR_PUBLICATION_KIND else MEMORY_NOTICE_REMOVAL_SOURCES if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else CHARTER_ADOPTION_SOURCES if transition['kind']==CHARTER_ADOPTION_KIND else DIAGNOSTIC_SOURCES if transition['kind']==DIAGNOSTIC_KIND else LOSSLESS_SOURCES if transition['kind']==LOSSLESS_KIND else FORWARD_SOURCES
 
 
 def format_contract(profile):
@@ -561,8 +601,8 @@ def format_contract(profile):
         if f['before']!=f['after']: raise ValueError('incompatible state formats: qualified forward transition required')
         return
     fields(transition,'kind before_package_sha256 after_package_sha256 evidence'+(' before_hosts' if per_host_forward(profile) else ''),'forward transition')
-    expected=AGENT_DIRECTORY_AFTER if directory_forward(profile) else SUPPLIED_TURN_AFTER if supplied_forward(profile) else FORWARD_AFTER if transition['kind']==FORWARD_KIND else LOSSLESS_AFTER if transition['kind']==LOSSLESS_KIND else DIAGNOSTIC_AFTER if transition['kind']==DIAGNOSTIC_KIND else CHARTER_ADOPTION_AFTER if transition['kind']==CHARTER_ADOPTION_KIND else MEMORY_NOTICE_REMOVAL_AFTER if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else PR_PUBLICATION_AFTER if transition['kind']==PR_PUBLICATION_KIND else INSTRUCTION_SOURCE_AFTER if transition['kind']==INSTRUCTION_SOURCE_KIND else None
-    before=AGENT_DIRECTORY_BEFORE if directory_forward(profile) else SUPPLIED_TURN_BEFORE if supplied_forward(profile) else FORWARD_BEFORE
+    expected=COMPOSED_AFTER if composed_forward(profile) else AGENT_DIRECTORY_AFTER if directory_forward(profile) else SUPPLIED_TURN_AFTER if supplied_forward(profile) else FORWARD_AFTER if transition['kind']==FORWARD_KIND else LOSSLESS_AFTER if transition['kind']==LOSSLESS_KIND else DIAGNOSTIC_AFTER if transition['kind']==DIAGNOSTIC_KIND else CHARTER_ADOPTION_AFTER if transition['kind']==CHARTER_ADOPTION_KIND else MEMORY_NOTICE_REMOVAL_AFTER if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else PR_PUBLICATION_AFTER if transition['kind']==PR_PUBLICATION_KIND else INSTRUCTION_SOURCE_AFTER if transition['kind']==INSTRUCTION_SOURCE_KIND else None
+    before=COMPOSED_BEFORE if composed_forward(profile) else AGENT_DIRECTORY_BEFORE if directory_forward(profile) else SUPPLIED_TURN_BEFORE if supplied_forward(profile) else FORWARD_BEFORE
     if expected is None or canonical(f['before'])!=canonical(before) or canonical(f['after'])!=canonical(expected):
         raise ValueError('incompatible or unsupported forward transition')
     for key in ('before_package_sha256','after_package_sha256'):
