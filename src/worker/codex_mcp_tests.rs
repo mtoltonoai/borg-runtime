@@ -535,6 +535,8 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
         "collab_task_retry",
         "collab_workers_list",
         "collab_worker_get",
+        "collab_machines_list",
+        "collab_machine_get",
         "collab_task_attempts_list",
         "collab_task_checkpoints_list",
         "collab_task_releases_list",
@@ -584,10 +586,12 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
         "collab_repository_history",
         "collab_repositories_list",
         "collab_repository_get",
+        "collab_machines_list",
+        "collab_machine_get",
     ] {
         assert!(
             enabled.contains(&json!(name)),
-            "repository read absent: {name}"
+            "read tool absent: {name}"
         );
         assert!(
             !tools.contains_key(name),

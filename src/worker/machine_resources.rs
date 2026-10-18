@@ -108,6 +108,7 @@ mod tests {
         }
         let state=std::env::temp_dir().join(mutations::fresh_id("machine-upgrade").unwrap());process::private_directory(&state).unwrap();
         atomic_json(&state.join("format.json"),&json!({"format_revision":18})).unwrap();atomic_json(&state.join("limits.json"),&*metadata).unwrap();
+        process::private_directory(&state.join("commands")).unwrap();
         let before=std::fs::read(state.join("limits.json")).unwrap();let lease=process::WorkerLease::claim(&state.join("worker-owner.json"),&metadata.worker).unwrap();
         handoff::finish_state_upgrade(&state,&metadata,&lease).unwrap();assert!(handoff::admits_machine_resources(&state,&metadata.worker).unwrap());assert_eq!(std::fs::read(state.join("limits.json")).unwrap(),before);
         drop(lease);std::fs::remove_dir_all(&state).unwrap();
