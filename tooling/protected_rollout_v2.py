@@ -16,6 +16,64 @@ def _common():
 c=_common()
 
 
+def require_selected_reader(profile,role,executing_path):
+    selected=profile['modules'][role]
+    if (str(Path(executing_path).absolute())!=selected['path']
+            or c.digest(c.read(executing_path,profile['limits']['module_bytes'],True))!=selected['sha256']):
+        raise ValueError('unbound observation reader requires explicit binding')
+
+
+def observation_arguments(args, scope):
+    values=(args.observation_binding,args.observation_binding_sha256,args.observation_binding_bytes)
+    if all(v is None for v in values):return None
+    if any(v is None for v in values) or scope not in ('reconcile','inspect'):
+        raise ValueError('observation binding requires readback-only scope')
+    return dict(zip(('path','sha256','bytes'),values))
+
+
+def validate_observation_binding(profile,path,sha,profile_bytes,subject,action_id,
+                                 binding_pin,role,executing_path):
+    """Select new observation code without replacing the original effect profile."""
+    if role not in ('adapter','host'):raise ValueError('observation reader role')
+    c.fields(binding_pin,'path sha256 bytes','observation binding pin')
+    c.positive(binding_pin['bytes'],'observation binding byte bound')
+    if binding_pin['bytes']>profile['limits']['module_bytes']:raise ValueError('observation binding byte bound')
+    raw=c.pin({k:binding_pin[k] for k in ('path','sha256')},binding_pin['bytes'])
+    if len(raw)!=binding_pin['bytes']:raise ValueError('observation binding length')
+    value=c.strict(raw)
+    c.fields(value,'revision kind action_id subject_sha256 original_intent_sha256 effect_profile original_modules observation_modules host_ids','observation binding')
+    if type(value['revision']) is not int or value['revision']!=1 or value['kind']!='borg-v2-rollout-observation/1':raise ValueError('observation binding revision/kind')
+    if value['action_id']!=action_id or value['subject_sha256']!=c.digest(c.canonical(subject)):
+        raise ValueError('observation action/subject differs')
+    if not c._hex(value['original_intent_sha256']):raise ValueError('observation original intent digest')
+    effect={'path':str(path),'sha256':sha,'bytes':profile_bytes}
+    if value['effect_profile']!=effect:raise ValueError('observation original profile differs')
+    if c.load_profile(path,sha,profile_bytes)!=profile:raise ValueError('observation loaded profile differs')
+    original={key:profile['modules'][key] for key in ('adapter','host','common')}
+    if value['original_modules']!=original:raise ValueError('observation original modules differ')
+    c.fields(value['observation_modules'],'adapter host','observation modules')
+    if value['host_ids']!=sorted(h['id'] for h in profile['hosts']):raise ValueError('observation host set differs')
+    for key,item in value['observation_modules'].items():
+        c.fields(item,'path sha256','observation module')
+        if item['path'] in {v['path'] for v in profile['modules'].values()}:
+            raise ValueError('observation reader must preserve original modules')
+        c.pin(item,profile['limits']['module_bytes'])
+    selected=value['observation_modules'][role]
+    if str(Path(executing_path).absolute())!=selected['path'] or c.digest(c.read(executing_path,profile['limits']['module_bytes'],True))!=selected['sha256']:
+        raise ValueError('executing observation reader differs')
+    if role=='adapter':
+        work=Path(profile['state_root'])/('action-'+c.digest(action_id.encode()))
+        intent=c.read(work/'intent.json',profile['limits']['receipt_bytes'],True)
+        if c.digest(intent)!=value['original_intent_sha256']:raise ValueError('observation original intent differs')
+        saved=c.strict(intent)
+        if any(saved.get(k)!=v for k,v in {'revision':1,'action_id':action_id,'subject':subject,'profile_sha256':sha}.items()):
+            raise ValueError('observation original intent binding differs')
+    provenance={'binding':binding_pin,'action_id':action_id,'subject_sha256':value['subject_sha256'],
+        'effect_profile':effect,'original_intent_sha256':value['original_intent_sha256'],
+        'original_modules':original,'observation_modules':value['observation_modules']}
+    return {'binding_pin':binding_pin,'descriptor':value,'provenance':provenance}
+
+
 def verified_task_context(preflight_raw, result):
     preflight=c.strict(preflight_raw)
     if result['tasks']!=preflight['tasks']:raise ValueError('cleanup_complete_original_tasks_changed')
@@ -61,7 +119,7 @@ class Refused(ValueError):
 
 
 class Rollout:
-    def __init__(self,profile,path,sha,profile_bytes,subject,action_id):
+    def __init__(self,profile,path,sha,profile_bytes,subject,action_id,observation=None):
         self.p=profile;self.path=str(path);self.sha=sha;self.profile_bytes=profile_bytes;self.s=subject;self.action_id=action_id;self.l=profile['limits']
         c.fields(subject,'release_id artifact repository target_ref expected_base policy deployment_target target_revision installed_package_sha256','subject')
         for k in ('policy','deployment_target','target_revision'):
@@ -82,6 +140,7 @@ class Rollout:
         if not any(x['uid']==actual_uid and x['role']=='rollout' for x in self.controller['producers']) or actual_uid in self.controller['worker_uids']:raise ValueError('configured rollout authority unavailable')
         self.producer_identity=next(x for x in self.controller['producers'] if x['uid']==actual_uid and x['role']=='rollout')
         self.work=Path(profile['state_root'])/('action-'+c.digest(action_id.encode()));self.original=None
+        self.observation_pin=observation;self.observation=None
     def exchange(self,q):
         remaining=min(self.l['transport_timeout_ms'],self.end-c.now_ms())
         if remaining<=0:raise ValueError('operation deadline before protected transport')
@@ -148,6 +207,10 @@ class Rollout:
             if current['state']!='started' or any(current[k]!=self.original[k] for k in ('dispatch_until_ms','check_id','grant_id')):raise ValueError('current action is not originally Started')
         if c.now_ms()+self.l['clock_uncertainty_ms']>=min(self.end,self.original['dispatch_until_ms']):raise ValueError('original dispatch deadline expired')
     def host(self,h,phase,recovery=False):
+        if self.observation_pin is not None:
+            if phase!='inspect' or not recovery:raise ValueError('observation binding cannot dispatch an effect')
+            self.observation=validate_observation_binding(self.p,self.path,self.sha,self.profile_bytes,
+                self.s,self.action_id,self.observation_pin,'adapter',__file__)
         request={'revision':1,'action_id':self.action_id,'subject':self.s,'profile_path':h['profile_path'],'profile_sha256':self.sha,'profile_bytes':self.profile_bytes,'phase':phase,
                  'dispatch_until_ms':self.original['dispatch_until_ms'] if self.original else 0,'deadline_ms':self.end}
         if phase=='inspect' and h['role']=='worker':
@@ -155,10 +218,17 @@ class Rollout:
             if stop.get('cleanup_records'):
                 request['cleanup_authority']=project_cleanup_authority(h,getattr(self,'_cleanup_controller_context',None))
         key=phase+'-'+c.digest(h['id'].encode());path=self.work/(key+'.request.json');out=self.work/(key+'.result.json')
+        if self.observation is not None:
+            n=len(list(self.work.glob(key+'.readback-*.json')))
+            if len(list(self.work.iterdir()))+2>self.l['state_entries']:raise ValueError('readback inventory bound')
+            path=self.work/(key+'.readback-'+str(n)+'.request.json');out=self.work/(key+'.readback-'+str(n)+'.json')
         mutating=phase in ('stop','install','start')
         if mutating and path.exists():raise ValueError('possible host effect; read-only reconciliation required')
         if not path.exists():c.save(path,request,self.l['receipt_bytes'])
-        helper=self.p['modules']['host'];argv=[self.p['python']['path'],'-I','-S','-B',helper['path'],'--profile',h['profile_path'],'--profile-sha256',self.sha,'--profile-bytes',str(self.profile_bytes),'--host',h['id']]
+        helper=self.p['modules']['host'] if self.observation is None else self.observation['descriptor']['observation_modules']['host']
+        argv=[self.p['python']['path'],'-I','-S','-B',helper['path'],'--profile',h['profile_path'],'--profile-sha256',self.sha,'--profile-bytes',str(self.profile_bytes),'--host',h['id']]
+        if self.observation is not None:
+            argv+=['--observation-binding',self.observation_pin['path'],'--observation-binding-sha256',self.observation_pin['sha256'],'--observation-binding-bytes',str(self.observation_pin['bytes'])]
         if h['transport']['kind']=='ssh':
             c.pin(h['transport']['ssh_config'],self.profile_bytes)
             argv=['/usr/bin/ssh','-F',h['transport']['ssh_config']['path'],'-T','-o','BatchMode=yes','-o','ControlMaster=no','-o','ControlPath=none',h['transport']['alias'],shlex.join(['/usr/bin/sudo','-n','/usr/bin/env','-i','PATH=/usr/bin:/bin',*argv])]
@@ -167,6 +237,8 @@ class Rollout:
         raw=c.run(argv,self.l,self.end,request_raw)
         if len(raw)>self.l['transport_bytes']:raise ValueError('host response bound')
         result=c.strict(raw)
+        if self.observation is not None and result.get('observation_reader')!=self.observation['provenance']:
+            raise ValueError('host observation reader proof differs')
         if not out.exists():c.save(out,result,self.l['receipt_bytes'])
         elif recovery:
             n=len(list(self.work.glob(key+'.readback-*.json')))
@@ -217,6 +289,7 @@ class Rollout:
                 'cleanup_transition_proof':row.get('cleanup_transition_proof'),
                 'stop_marker_proof':row.get('stop_marker_proof'),
                 'reconciliation_scope':row['reconciliation_scope']}
+            if self.observation is not None:compact[host_id]['observation_reader']=row['observation_reader']
         if len(list(self.work.iterdir()))>=self.l['state_entries']:raise ValueError('proof reference inventory bound')
         index=len(list(self.work.glob('verified-host-proof-references-*.json')))
         c.save(self.work/('verified-host-proof-references-'+str(index)+'.json'),compact,self.l['receipt_bytes'])
@@ -224,6 +297,10 @@ class Rollout:
     def observe(self,observed):
         return self.mutation('observe-applied' if observed else 'observe-unknown',{'operation':'observe_rollout','input':{'action_id':self.action_id,'subject':self.s,'installed_package_sha256':self.s['artifact']['package_sha256'] if observed else 'unknown','observed':observed}})
     def execute(self,mode):
+        if self.observation_pin is not None:
+            if mode!='reconcile':raise ValueError('observation binding requires reconcile')
+            self.observation=validate_observation_binding(self.p,self.path,self.sha,self.profile_bytes,
+                self.s,self.action_id,self.observation_pin,'adapter',__file__)
         with c.locked(Path(self.p['state_root'])/'rollout.lock'):
             if not self.work.exists():self.work.mkdir(mode=0o700);c.sync(self.work.parent)
             intent=self.work/'intent.json'
@@ -238,6 +315,7 @@ class Rollout:
             # Reconciliation can observe after dispatch expiry, but is separately bounded.
             self.end=(c.now_ms() if mode=='reconcile' else prior['started_at_ms'])+self.l['overall_timeout_ms']
             result={'status':'UNKNOWN','action_id':self.action_id,'effect_retried':False,'automatic_rollback':False,'host_results':{}}
+            if self.observation is not None:result['observation_reader']=self.observation['provenance']
             try:
                 if mode=='apply':
                     current=self.read_action()
@@ -277,9 +355,12 @@ class Rollout:
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('mode',choices=['apply','reconcile']);p.add_argument('--profile',required=True);p.add_argument('--profile-sha256',required=True);p.add_argument('--profile-bytes',type=int,required=True);p.add_argument('--subject',required=True);p.add_argument('--action-id',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('mode',choices=['apply','reconcile']);p.add_argument('--profile',required=True);p.add_argument('--profile-sha256',required=True);p.add_argument('--profile-bytes',type=int,required=True);p.add_argument('--subject',required=True);p.add_argument('--action-id',required=True)
+    p.add_argument('--observation-binding');p.add_argument('--observation-binding-sha256');p.add_argument('--observation-binding-bytes',type=int);a=p.parse_args()
+    observation=observation_arguments(a,a.mode)
     profile=c.load_profile(a.profile,a.profile_sha256,a.profile_bytes);subject=c.strict(c.read(a.subject,profile['limits']['receipt_bytes'],True))
-    value=Rollout(profile,a.profile,a.profile_sha256,a.profile_bytes,subject,a.action_id).execute(a.mode)
+    if observation is None:require_selected_reader(profile,'adapter',__file__)
+    value=Rollout(profile,a.profile,a.profile_sha256,a.profile_bytes,subject,a.action_id,observation).execute(a.mode)
     print(json.dumps(value,sort_keys=True));return 0 if value['status']=='APPLIED' else 2
 if __name__=='__main__':
     try:sys.exit(main())

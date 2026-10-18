@@ -1180,7 +1180,18 @@ class RolloutTests(unittest.TestCase):
                 path.write_bytes(raw)
                 def change(index,data):
                     if index!=1:return
+                    before=path.stat()
                     with path.open('r+b' if mode=='mutate' else 'ab') as stream:stream.write(b'changed')
+                    if mode=='mutate':
+                        # This rewrites an already-read prefix without changing
+                        # size. Establish the metadata change explicitly: two
+                        # real writes can share a filesystem timestamp quantum.
+                        with path.open('rb') as check:self.assertEqual(check.read(7),b'changed')
+                        after=path.stat()
+                        self.assertEqual((before.st_dev,before.st_ino,before.st_size),
+                                         (after.st_dev,after.st_ino,after.st_size))
+                        os.utime(path,ns=(after.st_atime_ns,before.st_mtime_ns+1_000_000_000))
+                        self.assertNotEqual(path.stat().st_mtime_ns,before.st_mtime_ns)
                 opened,reads=self.opaque_stream_probe(path,chunk,change)
                 with patch.object(hostmod.os,'fdopen',side_effect=opened):
                     with self.assertRaisesRegex(ValueError,'changed|grew'):host.state_files()

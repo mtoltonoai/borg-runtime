@@ -27,6 +27,8 @@ _CLEANUP_SOURCE_SHAS = frozenset({_CLEANUP_SOURCE_SHA,
 _CLEANUP_POLICY_SHA = 'bb5d7bad225865bb9c810b075f0162ab9eb511b5158171398ea37150a1bf7f92'
 _PROCESS_SOURCE_SHA = 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb'
 _STOP_SOURCE_SHA = '4c44680700823fb6d0bd0ff165819ed60e03a20475b0b38857ac2449089a877d'
+# Exact retained-hold producer; this adds observation, never reclamation authority.
+_RETAINED_HOLD_SOURCE_SHA = '4b0e33c95ae3f0d1c37a4a8f6af8dab9838ec7661c162824d7983b857242d3ea'
 
 
 # Exact package producers selected independently of the storage-format contract.
@@ -102,7 +104,7 @@ def cleanup_record(raw, name, selected):
     return value
 
 
-def cleanup_clocks(original,observed):
+def cleanup_clocks(original,observed,*,retained_holds=False):
     before=dict(original);after=dict(observed)
     start=before.pop('last_observed_ms');end=after.pop('last_observed_ms')
     old_due=before.pop('next_due_ms');new_due=after.pop('next_due_ms')
@@ -119,6 +121,16 @@ def cleanup_clocks(original,observed):
         if before['cache_safe_ms'] is not None or before['first_safe_ms'] is not None:raise ValueError('cleanup retry safe interval differs')
         delay=before['policy']['retry_delay_ms']
         if old_due!=add(start,delay) or new_due!=add(end,delay):raise ValueError('cleanup retry deadline differs')
+    elif retained_holds and before['reason'] in ('uncertain_effect','canonical_binding'):
+        # These exact producer branches return before status/checkpoint updates.
+        # A hold tick does not settle the task or authorize any cleanup effect.
+        if (before['first_safe_ms'] is not None or before['disposition']!='retained'
+                or before['cache_started'] or before['cache_done']
+                or any(slot['started'] or slot['done'] for slot in before['worktrees'])):
+            raise ValueError('cleanup retained hold scope differs')
+        delay=before['policy']['retry_delay_ms']
+        if old_due!=add(start,delay) or new_due!=add(end,delay):
+            raise ValueError('cleanup retained hold deadline differs')
     elif before['reason']=='cache_dependency':
         # cleanup.rs saves the updated observation at796 before its dependency
         # await. That intermediate record still carries the preceding deadline.
@@ -1843,7 +1855,10 @@ class Host:
         observed=cleanup_record(self.cleanup_bytes(name,new,bound),name,selected)
         # atomic_json replaces this one inode; device, owner, group and mode stay exact.
         if old['identity'][0:1]+old['identity'][2:]!=new['identity'][0:1]+new['identity'][2:] or old['identity'][2]!=self.h['service_uid'] or old['identity'][4]!=0o600:raise ValueError('cleanup owner/mode/device changed')
-        return {'original':old,'observed':new,**cleanup_clocks(original,observed)}
+        sources=self.p['formats']['source_files']
+        retained_holds=(sources.get('src/worker/cleanup.rs')==_RETAINED_HOLD_SOURCE_SHA
+                        and sources.get('src/worker/process.rs')==_PROCESS_SOURCE_SHA)
+        return {'original':old,'observed':new,**cleanup_clocks(original,observed,retained_holds=retained_holds)}
     def worker_history(self,stop,current):
         preserved={};observations={};mutable={'mutations/registration.json','mutations/await.json','worker-owner.json'}
         if c.forward(self.p):
@@ -2230,15 +2245,41 @@ def phase(profile,host,request):
         c.save(result,value,bound);return value
 
 
+
+def observation_reader(profile,request,values):
+    if all(v is None for v in values):
+        selected=profile['modules']['host']
+        if (str(Path(__file__).absolute())!=selected['path']
+                or c.digest(c.read(__file__,profile['limits']['module_bytes'],True))!=selected['sha256']):
+            raise ValueError('unselected host reader requires explicit binding')
+        return None
+    if any(v is None for v in values) or request.get('phase')!='inspect':
+        raise ValueError('observation binding requires inspect-only scope')
+    binding=dict(zip(('path','sha256','bytes'),values))
+    c.positive(binding['bytes'],'observation binding byte bound')
+    if binding['bytes']>profile['limits']['module_bytes']:raise ValueError('observation binding byte bound')
+    raw=c.pin({k:binding[k] for k in ('path','sha256')},binding['bytes'])
+    if len(raw)!=binding['bytes']:raise ValueError('observation binding length')
+    descriptor=c.strict(raw)
+    c.fields(descriptor['observation_modules'],'adapter host','observation modules')
+    reader=c.load_module('rollout_observation_adapter',descriptor['observation_modules']['adapter'],profile['limits']['module_bytes'])
+    return reader.validate_observation_binding(profile,request['profile_path'],request['profile_sha256'],
+        request['profile_bytes'],request['subject'],request['action_id'],binding,'host',__file__)
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--profile',required=True);p.add_argument('--profile-sha256',required=True);p.add_argument('--profile-bytes',required=True,type=int);p.add_argument('--host',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--profile',required=True);p.add_argument('--profile-sha256',required=True);p.add_argument('--profile-bytes',required=True,type=int);p.add_argument('--host',required=True)
+    p.add_argument('--observation-binding');p.add_argument('--observation-binding-sha256');p.add_argument('--observation-binding-bytes',type=int);a=p.parse_args()
     profile=c.load_profile(a.profile,a.profile_sha256,a.profile_bytes)
     host=next(h for h in profile['hosts'] if h['id']==a.host)
     raw=sys.stdin.buffer.read(profile['limits']['transport_bytes']+1)
     if len(raw)>profile['limits']['transport_bytes']:raise ValueError('host request bound')
     req=c.strict(raw)
     if req['profile_path']!=a.profile or req['profile_sha256']!=a.profile_sha256 or req['profile_bytes']!=a.profile_bytes:raise ValueError('host profile binding')
-    try:value=phase(profile,host,req)
+    observation=observation_reader(profile,req,(a.observation_binding,a.observation_binding_sha256,a.observation_binding_bytes))
+    try:
+        value=phase(profile,host,req)
+        if observation is not None:value={**value,'observation_reader':observation['provenance']}
     except Exception as error:
         failure=c.canonical({'host_error':c.error_record(error,req.get('phase'))})
         if len(failure)>profile['limits']['transport_bytes']:raise ValueError('host error reply bound')
