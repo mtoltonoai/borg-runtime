@@ -98,9 +98,13 @@ async fn host_resources_controller_workers_fresh_stale_and_restart() {
     let v=view(&c,2).await;assert_eq!(v.freshness,Freshness::Fresh);assert_eq!(v.sample.unwrap().memory,failed.memory);
     mono.store(30100,Ordering::SeqCst);send(&c,failed).await;assert_eq!(view(&c,2).await.freshness,Freshness::Stale,"duplicate does not renew receiver time");
     let stored=snapshot(&c).await;drop(c);controller_owner_released(&p).await;
+    let sql=Connection::open(&p).unwrap();let original_receipts=receipts(&sql);drop(sql);
     let restarted=Controller::open_with_config(&p,cfg).unwrap();
     for index in 0..4 {let v=view(&restarted,index).await;assert_eq!(v.freshness,Freshness::Unobserved);assert!(v.sample.is_none());assert!(v.received_at_unix_ms.is_none());}
     assert_eq!(snapshot(&restarted).await,stored,"restart does not restore fabricated host samples");
+    drop(restarted);controller_owner_released(&p).await;
+    let sql=Connection::open(&p).unwrap();
+    assert_eq!(receipts(&sql),original_receipts,"controller restart preserves all original receipt bytes");
 }
 async fn actor(c:&Controller,id:&str,coding_task:bool)->borg_runtime::mcp::Caller {
     let t=submit(c,id,if coding_task{coding(id)}else{native(id)}).await;
