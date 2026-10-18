@@ -715,6 +715,10 @@ pub(super) fn validate_instruction_sources(
                             return Err(instruction_invalid());
                         }
                     }
+                    Operation::CallCollaboration { call } if call.tool == "collab_task_create" => {
+                        super::task_creation::validate_original(tx,&record)?;
+                        if !admitted.insert(task.id.clone()) { return Err(instruction_invalid()); }
+                    }
                     Operation::CallCollaboration { call }
                         if call.tool == "collab_task_delegate" =>
                     {

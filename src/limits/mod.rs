@@ -2,6 +2,8 @@
 /// Selected gpt-6-astra context window: input, output and reasoning tokens together.
 /// Source: https://developers.openai.com/api/docs/models/gpt-6-astra (2026-10-15).
 pub const SELECTED_MODEL_CONTEXT_TOKENS: usize = 1_050_000;
+mod identity;
+pub use identity::{IdentityAdministrationPolicy, TaskCreationPolicy, CollaborationCapabilities};
 mod charter;
 pub use charter::CharterLimits;
 mod controller;
@@ -141,6 +143,10 @@ pub struct ExecutionLimitOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_administration: Option<IdentityAdministrationPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_creation: Option<TaskCreationPolicy>,
     /// Historical absence neither selects nor enforces governance rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governance: Option<GovernanceLimits>,
@@ -245,6 +251,8 @@ impl RuntimeLimits {
         {
             return Err("invalid limits metadata revision".into());
         }
+        if let Some(policy) = &self.identity_administration { policy.validate(&self.transport)?; }
+        if let Some(policy) = &self.task_creation { policy.validate(&self.transport)?; }
         if let Some(policy) = &self.definition_updates {
             policy.validate(&self.transport)?;
         }

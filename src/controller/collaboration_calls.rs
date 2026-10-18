@@ -292,8 +292,12 @@ pub(super) fn apply(
     original.task.input.execution_limits().map_err(|reason| Fault::Store(reason))?;
     let selected = original.task.input.resolved_limits.as_ref().ok_or_else(|| Fault::Store("accepted caller limits absent".into()))?;
     let limits = selected.global_metadata.as_ref();
-    let bound_tx = tx.with_limits(limits);
-    let bound_validation = Context { issuer:validation.issuer, request:validation.request, proof:validation.proof, repository:validation.repository, limits };
+    let mut selected_limits=limits.clone();
+    selected_limits.execution.collaboration.capabilities=original.task.input.execution_limits().map_err(Fault::Store)?.collaboration.capabilities.clone();
+    let limits=&selected_limits;
+    let mut bound_tx = tx.with_limits(limits);
+    bound_tx.bound_actor=Some(super::identity_administration::bound_actor(&original.task,&call.caller));
+    let bound_validation = Context { creation: None, issuer:validation.issuer, request:validation.request, proof:validation.proof, repository:validation.repository, limits };
     let result = apply_inner(&bound_tx, call, cfg, now, &bound_validation)?;
     let observed = (cfg.clock)();
     if observed < now {
@@ -318,6 +322,16 @@ fn apply_inner(
     let original = caller(tx, &call.caller, now)?;
     let actor = &call.caller;
     let id = call.operation_id.clone();
+    if crate::mcp::identity_administration::handles(&call.tool) {
+        call.validate(limits).map_err(|e|Fault::Refused("invalid_input",e))?;
+        crate::mcp::validate_arguments_for_profile(&call.tool,&call.arguments,limits,original.task.input.definition.execution_profile.as_ref()).map_err(|e|Fault::Refused("invalid_input",e))?;
+        if call.tool=="collab_task_create" {
+            let args:TaskCreate=serde_json::from_value(call.arguments.clone()).map_err(|e|Fault::Refused("invalid_input",e.to_string()))?;
+            return super::task_creation::apply(tx,call,&args,cfg,now,validation);
+        }
+        let args=crate::mcp::identity_administration::parse(&call.tool,&call.arguments).map_err(|e|Fault::Refused("invalid_input",e))?;
+        return super::identity_administration::apply(tx,&call.operation_id,&args,cfg,now);
+    }
     if crate::mcp::workflow_tool(&call.tool) {
         return super::collaboration_routing::agent(tx, call, now);
     }
@@ -790,6 +804,7 @@ fn list(
                 cfg,
                 now,
                 &Context {
+                    creation: None,
                     limits,
                     issuer: &std::sync::Arc::new(()),
                     request: "read",

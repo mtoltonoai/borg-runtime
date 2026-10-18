@@ -71,7 +71,9 @@ impl Config {
             self.profile(), self.instruction_source.clone())
     }
     fn catalogue(&self) -> Vec<mcp::Tool> {
-        mcp::catalogue_for_task(&self.runtime_limits, Some(&self.profile()), self.instruction_source.as_ref())
+        let mut selected=self.runtime_limits.clone();
+        selected.execution.collaboration.capabilities=self.limits.capabilities.clone();
+        mcp::catalogue_for_task(&selected, Some(&self.profile()), self.instruction_source.as_ref())
     }
     pub fn directory(&self) -> PathBuf {
         self.state.join("collaboration-codex")
@@ -1071,17 +1073,21 @@ pub enum OutcomeDisposition {
     Unresolved,
 }
 pub fn outcome_disposition(config: &Config) -> Result<OutcomeDisposition, String> {
-    inspect_retained_outcomes(config, false)
+    inspect_retained_outcomes(config, false, false)
 }
 
 /// Historical outer markers must not silently adopt newly typed Task fields.
 /// Uses the same private bounded reader, identity joins and result validation as
 /// recovery; this function neither rewrites a record nor resolves an outcome.
 pub(super) fn admit_worker18_outcomes(config: &Config) -> Result<(), String> {
-    inspect_retained_outcomes(config, true).map(|_| ())
+    inspect_retained_outcomes(config, true, false).map(|_| ())
 }
 
-fn inspect_retained_outcomes(config: &Config, historical_marker: bool) -> Result<OutcomeDisposition, String> {
+pub(super) fn admit_worker19_outcomes(config:&Config)->Result<(),String> {
+    if crate::protocol::policy_requires_wire24(&config.runtime_limits)||config.limits.capabilities.is_some() {return Err("Coding accepted identity/task metadata requires worker19".into())}
+    inspect_retained_outcomes(config,false,true).map(|_|())
+}
+fn inspect_retained_outcomes(config: &Config, historical_marker: bool, historical_identity:bool) -> Result<OutcomeDisposition, String> {
     config.validate()?;
     // The host reconstructs this scope from the original RunAttempt. A retained
     // bridge configuration cannot silently substitute or drop that source.
@@ -1116,6 +1122,7 @@ fn inspect_retained_outcomes(config: &Config, historical_marker: bool) -> Result
     let mut operations = std::collections::BTreeSet::new();
     let mut unresolved = false;
     for entry in &journal.entries {
+        if historical_identity && (mcp::identity_administration::handles(&entry.invocation.tool) || entry.outcome.as_ref().is_some_and(|o|crate::protocol::outcome_requires_wire24(&o.reply.outcome))) { return Err("original Coding identity/task call requires worker19, including refusals".into()); }
         entry.invocation.validate(&config.runtime_limits)?;
         if entry.invocation.caller != config.caller
             || !logical.insert(&entry.invocation.logical_call_id)
@@ -1167,6 +1174,9 @@ pub fn server_config_for_profile(
     binary: &Path, config_path: &Path, runtime_limits: &RuntimeLimits,
     limits: &CollaborationLimits, profile: Option<&ExecutionProfile>, timeout_seconds: u64,
 ) -> Value {
+    let mut selected_policy=runtime_limits.clone();
+    selected_policy.execution.collaboration.capabilities=limits.capabilities.clone();
+    let runtime_limits=&selected_policy;
     let selected=match profile {
         Some(profile)=>mcp::catalogue_for_profile(runtime_limits,Some(profile)),
         None=>mcp::catalogue(runtime_limits),

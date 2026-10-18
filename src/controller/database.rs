@@ -8,6 +8,7 @@ use std::{path::Path, time::Duration};
 /// global defaults, reload, or mutable policy copy is introduced.
 pub(crate) struct StoreContext<'a> {
     sql: &'a SqlConnection,
+    pub(super) bound_actor: Option<crate::collaboration::workflow::RecordedActor>,
     pub limits: &'a crate::limits::RuntimeLimits,
     /// Established by the in-process invocation path, never by request fields.
     pub invocation_path: crate::collaboration::workflow::TrustedHostPath,
@@ -21,7 +22,7 @@ pub(crate) struct StoreContext<'a> {
 }
 impl<'a> StoreContext<'a> {
     pub fn new(sql: &'a SqlConnection, limits: &'a crate::limits::RuntimeLimits) -> Self {
-        Self { sql, limits, invocation_path: crate::collaboration::workflow::TrustedHostPath::OperatorApi,
+        Self { sql, limits, bound_actor: None, invocation_path: crate::collaboration::workflow::TrustedHostPath::OperatorApi,
             workflow_policy: limits.workflow.as_ref(),
             workflow_terminals: super::collaboration_finalizer::TerminalBuffer::new(),
             governance_limits: limits, governance_decisions: super::governance::DecisionBuffer::new() }
@@ -29,7 +30,7 @@ impl<'a> StoreContext<'a> {
     /// Borrow another accepted policy without losing request provenance or the
     /// root transaction's terminal buffer. This never creates a SQL transaction.
     pub fn with_limits<'b>(&'b self, limits: &'b crate::limits::RuntimeLimits) -> StoreContext<'b> {
-        StoreContext { sql: self.sql, limits, invocation_path: self.invocation_path,
+        StoreContext { sql: self.sql, limits, bound_actor: self.bound_actor.clone(), invocation_path: self.invocation_path,
             workflow_policy: self.workflow_policy, workflow_terminals: self.workflow_terminals.clone(),
             governance_limits: self.governance_limits, governance_decisions: self.governance_decisions.clone() }
     }
@@ -337,7 +338,7 @@ impl Database {
         }
         //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
         //# An unsupported stored schema version MUST be refused without rewriting its data.
-        if !fresh && (app != APPLICATION || ![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, SCHEMA].contains(&version)) {
+        if !fresh && (app != APPLICATION || ![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, SCHEMA].contains(&version)) {
             return Err("unsupported controller database schema; clean development reset required; original data retained".into());
         }
         // The OS owner lock also excludes validators whose original DB thread
@@ -426,6 +427,8 @@ impl Database {
         })?;
         super::compatibility::validate_shape(conn, stored_version)?;
         super::compatibility::validate_records(conn)?;
+        super::identity_administration::validate_existing(conn, config, stored_version)
+            .map_err(|_| "invalid identity/task creation records; original bytes retained".to_string())?;
         super::task_submission::validate_existing(conn, config, stored_version)
             .map_err(|_| "invalid retained default assignment; original bytes retained".to_string())?;
         super::agents::validate_existing(conn, config, stored_version)
@@ -708,7 +711,7 @@ impl Database {
         };
         tx.execute_batch("SAVEPOINT request_action")?;
         let context = validation::Context {
-            issuer: &self.validation_issuer,
+            creation: None, issuer: &self.validation_issuer,
             limits: &self.config.limits,
             request: &request,
             proof: match proof {

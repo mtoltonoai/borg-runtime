@@ -2495,6 +2495,32 @@ fn outcome_requires_worker18(outcome: &Outcome) -> bool {
     }
 }
 
+fn admit_identity_administration(state:&Path,limits:&RuntimeLimits)->Result<(),String> {
+    if handoff::admits_identity_administration(state,&limits.worker)? {return Ok(())}
+    if crate::protocol::policy_requires_wire24(limits) {return Err("identity/task policy requires worker19".into())}
+    handoff::admit_retained_identity(state,limits)?;
+    for (_,receipt) in command_receipts(state,limits)? {
+        let WorkerCommand::RunAttempt{task,attempt,..}=&receipt.command else{continue};
+        if crate::protocol::input_requires_wire24(task){return Err("accepted identity/task capability requires worker19".into())}
+        let directory=state.join("collaboration").join(component(&attempt.id));
+        let entries=match std::fs::read_dir(&directory){Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,Err(_)=>return Err("native call inventory unavailable".into())};
+        let maximum=(task.limits.model_requests as usize).checked_mul(task.execution_limits()?.native.function_calls_per_response).ok_or("native call inventory overflow")?;
+        for (index,entry) in entries.enumerate() {
+            if index>=maximum {return Err("native call inventory exceeds accepted bounds".into())}
+            let path=entry.map_err(|e|e.to_string())?.path();
+            let snapshot=task.resolved_limits.as_ref().ok_or("accepted metadata absent")?;
+            let journal=mutations::read(&path,&snapshot.global_metadata)?.ok_or("native call journal absent")?;
+            if crate::protocol::requires_wire24(&journal.request)||journal.outcome.as_ref().is_some_and(crate::protocol::outcome_requires_wire24) {
+                return Err("original native identity/task call requires worker19, including refusals".into());
+            }
+        }
+    }
+    if mutations::read(&state.join("mutations/await.json"),limits)?.is_some_and(|j|crate::protocol::requires_wire24(&j.request)||j.outcome.as_ref().is_some_and(crate::protocol::outcome_requires_wire24)) {
+        return Err("retained task creation command/outcome requires worker19".into());
+    }
+    Ok(())
+}
+
 fn admit_default_assignment(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
     if handoff::admits_default_assignment(state, &limits.worker)? { return Ok(()); }
     if limits.task_defaults.agent_id.is_some() {
@@ -2584,6 +2610,7 @@ fn coding_collaboration_closed(
         limits: input.execution_limits()?.collaboration.clone(),
         worker_limits: config.limits.worker.clone(),
     };
+    if !handoff::admits_identity_administration(state, &config.worker_limits)? { codex_mcp::admit_worker19_outcomes(&config)?; }
     if !handoff::admits_default_assignment(state, &config.worker_limits)? {
         codex_mcp::admit_worker18_outcomes(&config)?;
     }

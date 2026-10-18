@@ -469,6 +469,7 @@ fn effective(tx:&StoreContext<'_>,session:CharterSession,l:&CharterLimits)->Resu
 /// This helper never receives an asserted model actor or creates a wake event.
 pub(crate) fn mutate(ctx:&Context<'_, '_>,input:&CharterMutation)->Result<CharterOutcome> {
     identity(ctx.tx,ctx.operation_id)?;
+    super::identity_administration::authorize(ctx.tx)?;
     match input {
         CharterMutation::Publish{..}|CharterMutation::SelectForFutureTasks{..} => super::charter_definitions::apply(ctx,input),
         CharterMutation::SetPending{session_id,expected_revision,target}=>{
@@ -706,6 +707,7 @@ fn version_transition(tx:&StoreContext<'_>,previous:Option<&CharterSession>,next
     };
     let operation_id=operation_id.ok_or_else(||corrupt("charter transition lacks original operation identity"))?;
     let original=receipt(tx,operation_id)?;
+    let original=super::identity_administration::project(original)?;
     let outcome=charter_outcome(&original)?;
     let mut expected=previous.clone();
     match (&original.request,outcome) {
@@ -767,6 +769,8 @@ fn validate_request_vocabulary(tx:&StoreContext<'_>,request:&Operation)->Result<
     Ok(())
 }
 fn validate_original_membership(tx:&StoreContext<'_>,original:&metadata::Recorded,l:&CharterLimits)->Result<()> {
+    let projected=super::identity_administration::project(metadata::Recorded{request:original.request.clone(),outcome:original.outcome.clone(),commit:original.commit.clone()})?;
+    let original=&projected;
     validate_request_vocabulary(tx,&original.request)?;
     if !matches!(&original.request,Operation::MutateCharter{..}|Operation::ObserveCharter{..})||matches!(&original.outcome,Outcome::Refused{..}){return Ok(())}
     if matches!(&original.request,Operation::ObserveCharter{observation:CharterObservation::OutputChunk{..},..}){return outputs::validate_original_membership(tx,original,l)}

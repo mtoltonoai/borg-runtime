@@ -27,6 +27,7 @@ use rusqlite::{OptionalExtension, params};
 //= spec/impl/v2/implementation.md#decision-rules-have-versions-and-evidence
 //# A mandatory safety check MUST NOT be disabled or converted to shadow evaluation by governance configuration.
 pub(super) fn apply(tx: &StoreContext<'_>, input: &DefinitionUpdate, cfg: &ControllerConfig, operation_id: &str, actor: &crate::collaboration::workflow::RecordedActor) -> Result<(Data, bool)> {
+    super::identity_administration::authorize_actor(tx, actor)?;
     // This is today's controller policy, never the caller's accepted historical
     // defaults. The outer collaboration handler retains that caller's fences,
     // deadline and complete-response limits through finalization.

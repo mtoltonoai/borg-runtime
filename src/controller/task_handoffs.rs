@@ -285,7 +285,7 @@ pub(super) fn validate_existing(tx:&Connection<'_>,cfg:&ControllerConfig,version
     for id in ids {
         let receipt=super::metadata::read(tx,&id)?.ok_or_else(||Fault::Store("receipt disappeared".into()))?;
         let initial=matches!(&receipt.request,Operation::SubmitTask{..}|Operation::SubmitTaskDraft{..}|Operation::DelegateTask{..})
-            ||matches!(&receipt.request,Operation::CallCollaboration{call} if call.tool=="collab_task_delegate");
+            ||matches!(&receipt.request,Operation::CallCollaboration{call} if matches!(call.tool.as_str(),"collab_task_delegate"|"collab_task_create"));
         if !initial {continue}
         if let Outcome::Ok{data:Data::Task(task)}=&receipt.outcome {
             let (session,input)=original_inputs.get(&task.id).ok_or_else(||Fault::Store("original accepted input absent".into()))?;

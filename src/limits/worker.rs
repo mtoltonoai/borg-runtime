@@ -859,6 +859,8 @@ impl CodingLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CollaborationLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<super::CollaborationCapabilities>,
     pub config_bytes: usize,
     pub frame_bytes: usize,
     pub channel_items: usize,
@@ -872,6 +874,7 @@ pub struct CollaborationLimits {
 }
 impl CollaborationLimits {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(capabilities) = &self.capabilities { capabilities.validate()?; }
         if self.config_bytes > isize::MAX as usize {
             return Err(
                 "CollaborationLimits.config_bytes exceeds addressable representation".into(),

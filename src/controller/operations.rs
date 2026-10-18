@@ -24,6 +24,7 @@ pub(crate) fn apply(
 ) -> Result<(Data, bool)> {
     let limits = tx.limits;
     match op {
+        Operation::AdministerIdentity { operation_id, input } => super::identity_administration::apply(tx, operation_id, input, cfg, now),
         Operation::AcquireNativeRequest { .. } | Operation::SettleNativeRequest { .. }
         | Operation::ObserveNativeRequest { .. } => super::native_request_coordination::apply(tx, op, cfg, now),
         Operation::MutateGovernance { operation_id, mutation } => {
@@ -329,7 +330,11 @@ pub(crate) fn apply(
                     );
                 }
             }
-            let child = submit(tx, child, cfg, now, Some(&parent), depth, validation)?;
+            let mut agent_tx=tx.with_limits(tx.limits);
+            let a=parent.task.attempt.as_ref().ok_or_else(||Fault::Store("delegation caller attempt absent".into()))?;
+            let caller=crate::mcp::Caller{task_id:parent.task.id.clone(),attempt_id:a.id.clone(),generation:a.generation,worker_id:a.worker_id.clone(),incarnation:a.worker_incarnation.clone()};
+            agent_tx.bound_actor=Some(super::identity_administration::bound_actor(&parent.task,&caller));
+            let child = submit(&agent_tx, child, cfg, now, Some(&parent), depth, validation)?;
             let final_now = (cfg.clock)();
             if final_now < now {
                 return refuse(
@@ -655,6 +660,7 @@ pub(super) fn configured_sources(
             .map_err(|reason| Fault::Refused("invalid_limits", reason))?,
     );
     validate(&child, cfg, now)?;
+    super::identity_administration::admit_definition(tx, &child.definition, None)?;
     super::charters::validate_definition(&tx.with_limits(selected), &child.definition)?;
     for dependency in &child.dependencies {
         load(tx, dependency)?;
@@ -723,7 +729,7 @@ pub(super) fn commit_id(s: &str) -> bool {
 // Traceability scope: Resolution is attached to accepted input and persisted in the same transaction as acceptance.
 //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
 //# An accepted task MUST retain its resolved execution-limit values.
-fn submit(
+pub(super) fn submit(
     tx: &Connection,
     input: &TaskInput,
     cfg: &ControllerConfig,
@@ -732,6 +738,7 @@ fn submit(
     depth: u32,
     validation: &Context<'_>,
 ) -> Result<StoredTask> {
+    super::identity_administration::admit_definition(tx, &input.definition, parent.filter(|p| crate::delegation::template(&p.task.input).is_some()).map(|p| &p.task.input))?;
     super::agents::require_active(tx, &input.definition.id)?;
     // This runs only after the original durable operation receipt lookup.
     // The receipt retains caller bytes; only the accepted task receives this
@@ -771,7 +778,7 @@ fn submit(
         parent.map(|p| p.task.id.as_str()),
         depth,
     )?;
-    if input.definition.executor == ExecutorKind::Native {
+    if input.definition.executor == ExecutorKind::Native || validation.creation.is_some() {
         validation.require(input, None, parent, now)?;
     }
     // Traceability scope: Durable task admission checks the configured task count and cancellation reserve; worker and owner-queue bounds are checked at their own admission boundaries.

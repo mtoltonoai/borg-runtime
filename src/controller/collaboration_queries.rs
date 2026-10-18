@@ -187,6 +187,10 @@ fn history_body(
     raw: &str,
 ) -> Result<serde_json::Value> {
     use serde_json::json;
+    if kind == "created_by" {
+        let origin: TaskCreationProvenance = read_record(limits, raw)?;
+        return Ok(serde_json::to_value(origin)?);
+    }
     // A historical provider association is not a tool-accessible conversation.
     if kind == "worker_observation" {
         let observation: Observation = read_record(limits, raw)?;

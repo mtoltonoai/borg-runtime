@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, params};
 //# A retired agent identity MUST remain resolvable for historical reads.
 //= spec/impl/v2/implementation.md#agent-identity-lifecycle
 //# Agent retirement MUST preserve retained historical records.
-fn agent(tx: &Connection, id: &str) -> Result<AgentSummary> {
+pub(super) fn agent(tx: &Connection, id: &str) -> Result<AgentSummary> {
     let limits = tx.limits;
     if !valid_id(limits, id) {
         return refuse("invalid_input", "invalid agent identity");
@@ -45,7 +45,7 @@ pub(super) fn apply(
 ) -> Result<(Data, bool)> {
     match op {
         Operation::RegisterAgent { definition, .. } => {
-            super::governance::operator(tx)?;
+            super::identity_administration::authorize(tx)?;
             register(tx, definition, cfg)?;
             Ok((Data::Agent(agent(tx, &definition.id)?), true))
         }
@@ -56,7 +56,7 @@ pub(super) fn apply(
             agent_id,
             expected_revision,
         } => {
-            super::governance::operator(tx)?;
+            super::identity_administration::authorize(tx)?;
             if !valid_id(tx.limits, expected_revision) {
                 return refuse(
                     "invalid_input",
@@ -196,7 +196,7 @@ pub(super) fn require_directory_capacity(
 }
 //= spec/impl/v2/implementation.md#agent-identity-lifecycle
 //# The controller MUST support explicit agent registration without creating a task.
-fn register(tx: &Connection<'_>, definition: &Definition, cfg: &ControllerConfig) -> Result<()> {
+pub(super) fn register(tx: &Connection<'_>, definition: &Definition, cfg: &ControllerConfig) -> Result<()> {
     if !valid_id(tx.limits, &definition.id) || !valid_id(tx.limits, &definition.revision) {
         return refuse("invalid_input", "invalid agent definition identity");
     }
@@ -300,6 +300,7 @@ pub(super) fn validate_existing(
             }
             let record = super::metadata::read(tx, &operation)?
                 .ok_or_else(|| Fault::Store("retired agent receipt absent".into()))?;
+            let record = super::identity_administration::project(record)?;
             if !matches!(
                 &record.request,
                 Operation::RetireAgent { operation_id, agent_id, expected_revision }
@@ -321,6 +322,7 @@ pub(super) fn validate_existing(
         let id: String = row.get(0)?;
         let record = super::metadata::read(tx, &id)?
             .ok_or_else(|| Fault::Store("agent directory receipt disappeared".into()))?;
+        let record=super::identity_administration::project(record)?;
         let new_op = matches!(
             &record.request,
             Operation::RegisterAgent { .. } | Operation::RetireAgent { .. }

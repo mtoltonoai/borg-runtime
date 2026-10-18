@@ -173,7 +173,24 @@ impl Client {
             serde_json::from_value(result).map_err(|_| "invalid bounded tool catalogue")?;
         // Both clients share the controller-owned closed catalogue, not model
         // or remote-server authority to expand local operations.
-        if result.tools != catalogue_for_task(&self.limits, Some(&self.profile), self.instruction_source.as_ref()) {
+        let mut selected = self.limits.clone();
+        // Old tasks retain their exact catalogue. For opted-in metadata obtain
+        // the canonical accepted definition/override, bound to this attempt.
+        if selected.identity_administration.is_some() || selected.task_creation.is_some() {
+            let api = crate::client::ApiClient::new(&self.base, Arc::new(self.limits.clone()))?;
+            let reply = api.call(Operation::GetTask { task_id:self.caller.task_id.clone() }).await?;
+            let Outcome::Ok { data:Data::Task(task) } = reply.outcome else { return Err("accepted MCP task unavailable".into()); };
+            let a=task.attempt.as_ref().ok_or("accepted MCP attempt absent")?;
+            if a.id!=self.caller.attempt_id || a.generation!=self.caller.generation || a.worker_id!=self.caller.worker_id || a.worker_incarnation!=self.caller.incarnation {
+                return Err("accepted MCP caller changed".into());
+            }
+            let snapshot=task.input.resolved_limits.as_ref().ok_or("accepted MCP metadata absent")?;
+            if *snapshot.global_metadata!=self.limits || task.input.definition.execution_profile.as_ref()!=Some(&self.profile) {
+                return Err("accepted MCP metadata changed".into());
+            }
+            selected.execution.collaboration.capabilities=task.input.execution_limits()?.collaboration.capabilities.clone();
+        }
+        if result.tools != catalogue_for_task(&selected, Some(&self.profile), self.instruction_source.as_ref()) {
             return Err("MCP catalogue differs from supported collaboration tools".into());
         }
         Ok(result.tools)

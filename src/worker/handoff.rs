@@ -79,6 +79,17 @@ pub(super) fn admit_retained_outcomes(state: &Path, limits: &RuntimeLimits) -> R
     Ok(())
 }
 
+pub(super) fn admit_retained_identity(state:&Path,limits:&RuntimeLimits)->Result<(),String> {
+    for (_,receipt) in command_receipts(state,limits)? {
+        let WorkerCommand::RunAttempt{attempt,task,..}=&receipt.command else{continue};
+        let path=path(state,attempt);
+        if path.exists() {
+            let saved=load(&path,attempt,task)?;
+            if crate::protocol::requires_wire24(&saved.request)||saved.outcome.as_ref().is_some_and(crate::protocol::outcome_requires_wire24) {return Err("retained handoff identity/task vocabulary requires worker19".into())}
+        }
+    }
+    Ok(())
+}
 fn record(
     state: &Path,
     attempt: &Attempt,
@@ -397,7 +408,8 @@ struct Format {
 // Original absent fields retain exact serialization; no new state namespace.
 // Outer17 fences supplied public outer-turn journals and output manifests.
 // Outer18 carries optional default-assignment metadata in accepted snapshots.
-const CURRENT_STATE_FORMAT: u32 = 18;
+const CURRENT_STATE_FORMAT: u32 = 19;
+const DEFAULT_ASSIGNMENT_STATE_FORMAT: u32 = 18;
 const SUPPLIED_STATE_FORMAT: u32 = 17;
 const INSTRUCTION_SOURCE_STATE_FORMAT: u32 = 16;
 const PULL_REQUEST_STATE_FORMAT: u32 = 15;
@@ -432,26 +444,28 @@ fn read_state_format(state: &Path, limits: &WorkerLimits) -> Result<Format, Stri
     }
     let format: Format =
         serde_json::from_slice(&bytes).map_err(|_| "unsupported worker state format")?;
-    if !matches!(format.format_revision, INSTALLED_STATE_FORMAT | EARLIER_STATE_FORMAT | PREVIOUS_STATE_FORMAT | OUTPUT_CAP_STATE_FORMAT | OUTPUT_RETENTION_STATE_FORMAT | DIAGNOSTIC_STATE_FORMAT | PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT) {
+    if !matches!(format.format_revision, INSTALLED_STATE_FORMAT | EARLIER_STATE_FORMAT | PREVIOUS_STATE_FORMAT | OUTPUT_CAP_STATE_FORMAT | OUTPUT_RETENTION_STATE_FORMAT | DIAGNOSTIC_STATE_FORMAT | PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT) {
         return Err("unsupported worker state format; no migration performed".into());
     }
     Ok(format)
 }
 
 pub(super) fn admits_instruction_sources(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admits_supplied_turn_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admits_default_assignment(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(read_state_format(state, limits)?.format_revision == CURRENT_STATE_FORMAT)
+    Ok(matches!(read_state_format(state, limits)?.format_revision, DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
+pub(super) fn admits_identity_administration(state:&Path,limits:&WorkerLimits)->Result<bool,String> { Ok(read_state_format(state,limits)?.format_revision==CURRENT_STATE_FORMAT) }
+
 pub(super) fn admits_pull_request_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn initialize_state(state: &Path, limits: &WorkerLimits) -> Result<(), String> {
@@ -500,6 +514,7 @@ pub(super) fn finish_state_upgrade(
 ) -> Result<(), String> {
     read_state_format(state, &limits.worker)?;
     crate::worker::admit_default_assignment(state, limits)?;
+    crate::worker::admit_identity_administration(state, limits)?;
     // Also re-persist an observed 18: a prior rename may have succeeded before
     // its directory sync failed. Visibility alone is not a durable barrier.
     write_current_state_format(state, &limits.worker)
@@ -1856,7 +1871,7 @@ mod tests {
         assert_eq!(crate::worker::read_receipt(&command_path, &retained).unwrap().command, command);
         assert!(mutations::read(&await_path, &retained).unwrap().unwrap().outcome.is_some());
         finish_state_upgrade(&state, &retained, &lease).unwrap();
-        assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, 18);
+        assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, 19);
         assert!(admits_supplied_turn_records(&state, &limits.worker).unwrap());
         assert!(admits_default_assignment(&state, &limits.worker).unwrap());
         for (path, bytes) in originals { assert_eq!(std::fs::read(path).unwrap(), bytes); }

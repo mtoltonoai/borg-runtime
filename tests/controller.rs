@@ -6199,3 +6199,6 @@ mod agent_directory;
 
 #[path = "controller/task_handoffs.rs"]
 mod task_handoffs;
+
+#[path = "controller/identity_administration.rs"]
+mod identity_administration;

@@ -208,7 +208,7 @@ pub(super) fn apply(
     input: &CharterMutation,
 ) -> Result<CharterOutcome> {
     let tx = ctx.tx;
-    let actor = governance::operator(tx)?;
+    let actor = super::identity_administration::authorize(tx)?;
     let selected = governance::selection(tx)?;
     let (agent, expected, global, governance_revision, effect) = operands(input)?;
     for id in [
@@ -283,6 +283,8 @@ pub(super) fn validate_decision(
     request: &Operation,
     outcome: &Outcome,
 ) -> Result<bool> {
+    let projected=super::identity_administration::project(metadata::Recorded{request:request.clone(),outcome:outcome.clone(),commit:MutationCommit{operation_id:record.id.operation_id.clone(),controller_revision:record.controller_revision}})?;
+    let request=&projected.request; let outcome=&projected.outcome;
     let Operation::MutateCharter { mutation, .. } = request else {
         return Ok(false);
     };
@@ -370,7 +372,7 @@ pub(super) fn validate_selected_heads(tx: &StoreContext<'_>) -> Result<()> {
         }
         let id: String = row.get(0)?;
         identity(tx, &id)?;
-        let original = charters::receipt(tx, &id)?;
+        let original = super::identity_administration::project(charters::receipt(tx, &id)?)?;
         let (before, after, charter) = match original.outcome {
             Outcome::Ok {
                 data: Data::Charter(CharterOutcome::Definition(value)),
@@ -394,6 +396,12 @@ pub(super) fn validate_selected_heads(tx: &StoreContext<'_>) -> Result<()> {
                     definition_revision: value.previous_revision,
                 };
                 (before, reference(&value.selected_definition), false)
+            }
+            Outcome::Ok { data:Data::IdentityAdministration(value) } => {
+                if let IdentityEffect::Replaced(agent)=&value.effect {
+                    let prior=value.before.as_ref().ok_or_else(||bad("replacement predecessor absent"))?;
+                    (reference(prior),reference(&agent.definition),true)
+                } else {continue}
             }
             _ => continue,
         };

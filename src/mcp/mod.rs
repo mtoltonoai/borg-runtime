@@ -9,6 +9,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod client;
+pub mod identity_administration;
 pub(crate) mod documents_reviews;
 #[cfg(test)]
 mod instruction_source_tests;
@@ -120,6 +121,9 @@ pub fn catalogue_for_profile(
         tools.extend(documents_reviews::catalogue(limits));
         tools.extend(work::catalogue(limits));
     }
+    if matches!(profile, ExecutionProfile::CollaborationV2 { .. }) {
+        tools.extend(identity_administration::catalogue(limits, limits.execution.collaboration.capabilities.as_ref()));
+    }
     tools
 }
 
@@ -181,6 +185,10 @@ pub fn validate_arguments_for_profile(
     profile: Option<&ExecutionProfile>,
 ) -> Result<(), String> {
     let profile = profile.ok_or("collaboration profile is not configured")?;
+    if identity_administration::handles(tool_name) {
+        if !matches!(profile, ExecutionProfile::CollaborationV2 { .. }) { return Err("identity/task tools require V2".into()); }
+        return identity_administration::validate(tool_name, arguments, limits, limits.execution.collaboration.capabilities.as_ref());
+    }
     if workflow_tool(tool_name) {
         if !matches!(profile, ExecutionProfile::CollaborationV2 { .. }) || limits.workflow.is_none()
         {
@@ -511,7 +519,9 @@ async fn caller_limits(
                 }),
         } => {
             snapshot.global_metadata.validate()?;
-            Ok(snapshot.global_metadata)
+            let mut limits = snapshot.global_metadata;
+            limits.execution.collaboration.capabilities = snapshot.values.collaboration.capabilities;
+            Ok(limits)
         }
         _ => Err("accepted caller limits are unavailable".into()),
     }

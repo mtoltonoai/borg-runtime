@@ -2725,3 +2725,6 @@ mod diagnostic_carrier;
 
 #[path = "native/output_cap.rs"]
 mod output_cap;
+
+#[path = "native/identity_administration.rs"]
+mod identity_administration;

@@ -2,6 +2,8 @@
 //! must already be authenticated by the configured private host/HTTP adapter.
 //! Worker identity strings are correlation data, not authentication credentials.
 mod agents;
+mod identity_administration;
+mod task_creation;
 mod task_submission;
 mod task_handoffs;
 mod definition_updates;
@@ -477,7 +479,7 @@ impl Controller {
         // before this await. A small finite set of tickets can own CPU work.
         let permit = self.inner.validations.try_acquire();
         let proof = if permit.is_ok() {
-            let proof = ticket.execute(&self.inner.validation_host).await;
+            let proof = ticket.execute(&self.inner.validation_host, &self.inner.config.repository_read).await;
             #[cfg(debug_assertions)]
             {
                 let probe = self

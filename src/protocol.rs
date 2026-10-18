@@ -1,9 +1,12 @@
 //! Shared v2 task contract. No executor-owned result is an accepted task result.
+#[path = "protocol_identity.rs"]
+mod identity;
+pub use identity::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use crate::native_loop_contract::NativeRequestEvidence;
 
-pub const WIRE_REVISION: u32 = 23;
+pub const WIRE_REVISION: u32 = 24;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
@@ -623,6 +626,7 @@ pub struct MemoryValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum Operation {
+    AdministerIdentity { operation_id: String, input: IdentityAdministrationRequest },
     /// Private host coordination, never advertised as MCP tools.
     AcquireNativeRequest {
         operation_id: String, caller: crate::mcp::Caller, request_index: u32,
@@ -858,6 +862,7 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Data {
+    IdentityAdministration(Box<IdentityAdministrationOutcome>),
     NativeRequestAdmission(crate::native_retry::NativeRequestAdmission),
     NativeRequestSettlement(crate::native_retry::NativeRequestSettlement),
     NativeRequestReadiness { acquire_operation_id: String, changed: bool },
@@ -933,6 +938,7 @@ impl Operation {
             | Self::MutateReview { operation_id, .. }
             | Self::MutateWork { operation_id, .. }
             | Self::UpdateDefinition { operation_id, .. }
+            | Self::AdministerIdentity { operation_id, .. }
             | Self::RegisterAgent { operation_id, .. }
             | Self::RetireAgent { operation_id, .. }
             | Self::RegisterRepository { operation_id, .. }

@@ -41,7 +41,7 @@ fn identity(tx:&StoreContext<'_>,id:&str)->Result<()> {
 pub(super) fn operator(tx:&StoreContext<'_>)->Result<RecordedActor> {
     // This in-process path is established by the transport dispatcher. It is
     // never parsed from a mutation, model argument, human name or product vote.
-    if tx.invocation_path!=TrustedHostPath::OperatorApi {
+    if tx.bound_actor.is_some() || tx.invocation_path!=TrustedHostPath::OperatorApi {
         return refuse("governance_operator_required","governance control requires the configured operator API path")
     }
     Ok(RecordedActor{principal:PrincipalRef::TrustedHostOperator,
@@ -318,7 +318,8 @@ fn validate_original_detail(tx:&StoreContext<'_>,record:&DecisionRecord,request:
         provenance:ActorProvenance::TrustedHost{path:TrustedHostPath::OperatorApi}};
     let agrees=match &record.detail {
         DecisionDetail::CharterConfiguration(detail)=>{
-            record.actor==admin_actor && record.mode==DecisionMode::Enforcing
+            (record.actor==admin_actor || matches!(&record.actor.provenance,ActorProvenance::BoundAgentSession{..})
+                && super::identity_administration::request(request)?.is_some()) && record.mode==DecisionMode::Enforcing
                 && record.rule==rule_ref("charter-source-binding")
                 && super::charter_definitions::validate_decision(tx,record,detail,request,outcome)?
         }
