@@ -9,6 +9,22 @@ fn depth(value: &Value) -> usize {
     }
 }
 
+// Descriptive size observations of the fixed, source-bound fixture values.
+// They neither alter the selected policy nor replace production admission.
+fn dimensions(value: &Value) -> Value {
+    let mut todo = vec![value];
+    let mut nodes = 0usize;
+    while let Some(value) = todo.pop() {
+        nodes += 1;
+        match value {
+            Value::Array(items) => todo.extend(items),
+            Value::Object(items) => todo.extend(items.values()),
+            _ => {},
+        }
+    }
+    json!({"bytes":serde_json::to_vec(value).unwrap().len(),"nodes":nodes,"depth":depth(value)})
+}
+
 #[test]
 fn exact_candidate_charter_catalogue_and_initial_probe_fit_selected_bounds() {
     // Byte-exact pending activation data. This is not an invented live task;
@@ -34,15 +50,19 @@ fn exact_candidate_charter_catalogue_and_initial_probe_fit_selected_bounds() {
         web_search: None,
     };
     assert_eq!(profile.functions.len(), 73);
-    selected(&profile, policy).unwrap();
     let output_schema = json!({"type":"integer"});
     let validation = serde_json::to_value(ValidationInput {
         schema: output_schema.clone(), profile: profile.clone(),
         output_bytes: limits.task_defaults.output_bytes,
         repair_enabled: limits.native_retry.is_some(), output_prefix: None, joined_charter: false,
     }).unwrap();
-    let validation_size = schema::measure(&validation, policy.schema_bytes, policy, "native_schema_bytes").unwrap();
-    preflight(&validation, policy).unwrap();
+    let profile_value = serde_json::to_value(&profile).unwrap();
+    println!("candidate_activation_inputs {}", json!({
+        "scope":"descriptive exact fixture sizes before admission; not an admission result",
+        "functions":profile.functions.len(),"profile":dimensions(&profile_value),
+        "validation":dimensions(&validation),"selected_schema_bytes":policy.schema_bytes,
+        "selected_json_nodes":policy.json_nodes,"selected_json_depth":policy.json_depth
+    }));
     let inference = definition.required_inference().unwrap();
     let body = json!({
         "model":inference.model,"reasoning":{"effort":inference.reasoning_effort},
@@ -62,13 +82,27 @@ fn exact_candidate_charter_catalogue_and_initial_probe_fit_selected_bounds() {
     let exchange = crate::native::CharterExchange::new(crate::native::CharterInput {
         revision: reference, source: source_json, changed: false,
     }, policy).unwrap();
-    let request = exchange.prepare(&body, policy).unwrap();
+    let prepared = exchange.prepare(&body, policy);
+    println!("candidate_activation_request_preparation {}", json!({
+        "body":dimensions(&body),"refusal":prepared.as_ref().err()
+    }));
+    let request = prepared.unwrap();
+    println!("candidate_activation_request_dimensions {}", json!({
+        "scope":"production CharterExchange rendering with fixed ordinary probe; admission pending",
+        "context":dimensions(&request["input"]),"request":dimensions(&request),
+        "selected_context_bytes":policy.context_bytes,"selected_request_bytes":policy.request_bytes
+    }));
+    // Every original admission predicate remains required. Report actual fixed
+    // values first so a refusal names both its bound and the observed dimensions.
+    selected(&profile, policy).unwrap();
+    let validation_size = schema::measure(&validation, policy.schema_bytes, policy, "native_schema_bytes").unwrap();
+    preflight(&validation, policy).unwrap();
     assert_eq!(request["tools"], body["tools"]);
     assert_eq!(request["input"][1]["content"], "Bound caller fixture");
     assert!(request["input"][0]["content"].as_str().unwrap().contains(&exact_charter));
     let context = schema::measure(&request["input"], policy.context_bytes, policy, "native_context_bytes").unwrap();
     let request_size = schema::measure(&request, policy.request_bytes, policy, "native_request_bytes").unwrap();
-    let profile_size = schema::measure(&serde_json::to_value(&profile).unwrap(), policy.schema_bytes, policy, "native_schema_bytes").unwrap();
+    let profile_size = schema::measure(&profile_value, policy.schema_bytes, policy, "native_schema_bytes").unwrap();
     println!("candidate_activation_admission {}", json!({
         "scope":"exact pending metadata and charter with fixed ordinary probe; no provider or live task",
         "functions":profile.functions.len(),"profile_bytes":profile_size.0,"profile_nodes":profile_size.1,

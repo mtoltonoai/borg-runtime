@@ -691,8 +691,8 @@ async fn execute_with_credentials_collaboration_and_charter(
     completion_scope: Option<&CompletionScope>,
     initial_charter: Option<&InitialCharterScope>,
 ) -> std::result::Result<Result, ExecutionFailure> {
-    execute_observed(binary,cwd,state,registry,inference,limits,instruction,control,events,
-        credentials,inference_key,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default()).await
+    super::boxed_execution(|| execute_observed(binary,cwd,state,registry,inference,limits,instruction,control,events,
+        credentials,inference_key,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default())).await
 }
 
 async fn execute_observed(
@@ -743,7 +743,10 @@ async fn execute_observed(
     let mut initial_dispatch_unknown = false;
     let mut completion_started = false;
     let mut pending_completion_held = false;
-    let result=async {
+    // Keep the sequential executor state machine and its large child futures
+    // out of each caller's polling frame. Construct inside the existing
+    // non-inlined factory; call-site Box::pin still builds a stack temporary.
+    let result=super::boxed_execution(|| async {
         session.initialize(control).await?;
         session.preflight_command(cwd,control).await?;
         //= spec/impl/v2/implementation.md#the-supplied-executor-owns-its-inner-loop
@@ -767,8 +770,8 @@ async fn execute_observed(
         }
         let resume_config=thread_config.clone();
         let thread=match initial_charter {
-            Some(scope)=>charter_delivery::start_thread(&mut session,scope,state,thread_config,
-                inference,control,credentials).await?,
+            Some(scope)=>super::boxed_execution(|| charter_delivery::start_thread(&mut session,scope,state,thread_config,
+                inference,control,credentials)).await?,
             None=>session.request("thread/start",thread_config,control).await?,
         };
         session.process.refresh_ownership()?;
@@ -823,7 +826,7 @@ async fn execute_observed(
         if let Some(owner)=retry_owner.as_mut(){owner.before_send(control)?;}
         let params=json!({"threadId":thread_id,"model":model,"effort":inference.reasoning_effort,"cwd":cwd,"approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true},"input":initial_input});
         let (turn,mut charter_capture)=match initial_charter {
-            Some(scope)=>{let (turn,capture)=charter_turns::start(&mut session,scope,state,1,&thread_id,params,control,credentials).await?;(turn,Some(capture))},
+            Some(scope)=>{let (turn,capture)=super::boxed_execution(|| charter_turns::start(&mut session,scope,state,1,&thread_id,params,control,credentials)).await?;(turn,Some(capture))},
             None=>(session.request("turn/start",params,control).await.map_err(|e|format!("turn start outcome uncertain; never resubmitted: {e}"))?,None),
         };
         let mut turn_id=turn["turn"]["id"].as_str().ok_or("turn start outcome uncertain: missing turn id")?.to_owned();
@@ -942,7 +945,7 @@ async fn execute_observed(
                             "approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true},
                             "input":[{"type":"text","text":"Continue the existing task from the retained conversation and workspace after the provider rate-limit failure. Preserve all prior instructions and unresolved completion obligations."}]});
                         let next=if let Some(scope)=initial_charter {
-                            let (turn,capture)=charter_turns::start(&mut session,scope,state,owner.index(),&thread_id,params,control,credentials).await?;
+                            let (turn,capture)=super::boxed_execution(|| charter_turns::start(&mut session,scope,state,owner.index(),&thread_id,params,control,credentials)).await?;
                             charter_capture=Some(capture);turn
                         } else {session.request("turn/start",params,control).await?};
                         let next_id=next["turn"]["id"].as_str().ok_or("supplied retry start outcome unknown: missing turn ID")?.to_owned();
@@ -959,11 +962,11 @@ async fn execute_observed(
                 if status == "completed" {
                     completion_in_flight = false;
                     if let Some(host) = completion_host.as_ref() {
-                        let advance = advance_completion(
+                        let advance = super::boxed_execution(|| advance_completion(
                             &mut session,host,&mut workflow,&mut pending_completion,&mut paired_workflow_notice,
                             &thread_id,&turn_id,&initial_turn_id,&mut association_committed,&mut completion_in_flight,&mut reserved_completion_turns,
                             cwd,inference,credentials,control,&events,initial_charter,state,&mut charter_capture,&mut retry_owner,
-                        ).await;
+                        )).await;
                         match advance {
                             Ok(CompletionAdvance::Continue(next_turn)) => {
                                 completion_started = true;
@@ -990,7 +993,7 @@ async fn execute_observed(
             }
             // Error notifications include willRetry. They are observations, not a terminal result.
         }
-    }.await;
+    }).await;
     let stopped = session.shutdown().await;
     // Audit after actual process-tree shutdown, including cancellation paths
     // that won before the bridge could persist its static stop marker.

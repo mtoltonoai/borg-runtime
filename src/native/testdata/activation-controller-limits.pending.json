@@ -178,7 +178,7 @@
       "request_bytes": 4294967295,
       "response_wire_bytes": 4294967295,
       "result_bytes": 262144,
-      "schema_bytes": 65536,
+      "schema_bytes": 4294967295,
       "schema_expansion": 512,
       "summary_bytes": 8192,
       "task_tool_identity_bytes": 256,
