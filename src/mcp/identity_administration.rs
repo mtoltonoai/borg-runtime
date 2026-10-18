@@ -53,6 +53,25 @@ fn numeric_group(value: Value) -> Value {
         .collect::<serde_json::Map<_, _>>();
     all(Value::Object(fields))
 }
+fn coding_group(mut value: Value) -> Value {
+    // These DTO fields are optional, regardless of the selected defaults.
+    // Omitting either retains None; a full replacement may explicitly supply
+    // its typed value. Policy ordering/clock checks remain in CodingLimits.
+    let fields = value.as_object_mut().unwrap();
+    fields.remove("rate_limit_retry");
+    fields.remove("model_context_window");
+    let mut schema = numeric_group(value);
+    schema["properties"]["rate_limit_retry"] = nullable(all(json!({
+        "initial_backoff_ms":{"type":"integer","minimum":1,"maximum":u64::MAX},
+        "backoff_multiplier":{"type":"integer","minimum":1,"maximum":u32::MAX},
+        "max_backoff_ms":{"type":"integer","minimum":1,"maximum":u64::MAX},
+        "jitter_ms":{"type":"integer","minimum":1,"maximum":u64::MAX}
+    })));
+    schema["properties"]["model_context_window"] = nullable(json!({
+        "type":"integer","minimum":1,"maximum":crate::limits::SELECTED_MODEL_CONTEXT_TOKENS
+    }));
+    schema
+}
 pub fn catalogue(
     limits: &RuntimeLimits,
     capabilities: Option<&CollaborationCapabilities>,
@@ -76,7 +95,7 @@ pub fn catalogue(
     collaboration["properties"]["capabilities"] = nullable(caps);
     let overrides = all(json!({
         "native":nullable(numeric_group(serde_json::to_value(&limits.execution.native).unwrap())),
-        "coding":nullable(numeric_group(serde_json::to_value(&limits.execution.coding).unwrap())),
+        "coding":nullable(coding_group(serde_json::to_value(&limits.execution.coding).unwrap())),
         "collaboration":nullable(collaboration),
         "memory_notice":nullable(numeric_group(serde_json::to_value(&limits.execution.memory_notice).unwrap()))
     }));
@@ -248,4 +267,126 @@ pub fn parse(name: &str, args: &Value) -> Result<IdentityAdministrationRequest, 
         expected_governance_revision: governance,
         mutation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> Value {
+        json!({"initial_backoff_ms":10,"backoff_multiplier":2,"max_backoff_ms":100,"jitter_ms":5})
+    }
+    fn selected(coding: Value) -> (RuntimeLimits, CollaborationCapabilities) {
+        let mut limits = RuntimeLimits::seed().unwrap();
+        limits.execution.coding = serde_json::from_value(coding).unwrap();
+        limits.identity_administration = Some(crate::limits::IdentityAdministrationPolicy {
+            version: 1,
+            revision: "schema-policy-1".into(),
+            enabled: true,
+            manager_agent_id: "charter".into(),
+            complete_definitions: true,
+        });
+        (limits, CollaborationCapabilities {
+            version: 1,
+            task_creation: false,
+            identity_administration: true,
+        })
+    }
+    fn arguments(tool: &str, coding: Value) -> Value {
+        let mut args = json!({
+            "definition":{
+                "id":"coding-target","revision":"coding-target-2","executor":"coding",
+                "inference":InferenceSettings::selected(),
+                "execution_profile":{"kind":"collaboration_v2","web_search":null},
+                "limit_overrides":{"native":null,"coding":coding,"collaboration":null,"memory_notice":null}
+            },
+            "expected_global_revision":"global-1","expected_policy_revision":"schema-policy-1",
+            "expected_governance_revision":"governance-1"
+        });
+        if tool == "collab_definition_replace" {
+            args["expected_revision"] = json!("coding-target-1");
+        }
+        args
+    }
+    fn decoded(tool: &str, args: &Value) -> Definition {
+        match parse(tool, args).unwrap().mutation {
+            IdentityMutation::Register { definition }
+            | IdentityMutation::Replace { definition, .. } => definition,
+            other => panic!("unexpected mutation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manager_coding_optional_settings_match_typed_definition_roundtrip() {
+        let mut historical = serde_json::to_value(RuntimeLimits::seed().unwrap().execution.coding).unwrap();
+        historical.as_object_mut().unwrap().remove("rate_limit_retry");
+        historical.as_object_mut().unwrap().remove("model_context_window");
+        let mut configured = historical.clone();
+        configured["rate_limit_retry"] = policy();
+        configured["model_context_window"] = json!(crate::limits::SELECTED_MODEL_CONTEXT_TOKENS);
+        let mut explicit_none = historical.clone();
+        explicit_none["rate_limit_retry"] = Value::Null;
+        explicit_none["model_context_window"] = Value::Null;
+        for defaults in [historical.clone(), configured.clone()] {
+            let (limits, capabilities) = selected(defaults);
+            for coding in [historical.clone(), explicit_none.clone(), configured.clone()] {
+                for tool in ["collab_agent_register", "collab_definition_replace"] {
+                    let args = arguments(tool, coding.clone());
+                    validate(tool, &args, &limits, Some(&capabilities)).unwrap();
+                    let definition = decoded(tool, &args);
+                    limits.resolve_definition(&definition).unwrap();
+                    let encoded = serde_json::to_value(&definition).unwrap();
+                    let expected = if coding["rate_limit_retry"].is_null() {
+                        &historical
+                    } else {
+                        &configured
+                    };
+                    assert_eq!(&encoded["limit_overrides"]["coding"], expected);
+                    assert_eq!(serde_json::from_value::<Definition>(encoded).unwrap(), definition);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manager_coding_optional_schema_refuses_invalid_fields_and_retains_policy_checks() {
+        let coding = serde_json::to_value(RuntimeLimits::seed().unwrap().execution.coding).unwrap();
+        let (limits, capabilities) = selected(coding.clone());
+        let mut missing = policy();
+        missing.as_object_mut().unwrap().remove("jitter_ms");
+        let mut extra = policy();
+        extra["permission"] = json!(true);
+        let mut wrong_type = policy();
+        wrong_type["initial_backoff_ms"] = json!("10");
+        let mut negative = policy();
+        negative["initial_backoff_ms"] = json!(-1);
+        let mut zero = policy();
+        zero["jitter_ms"] = json!(0);
+        let mut overflow = policy();
+        overflow["backoff_multiplier"] = json!(u64::from(u32::MAX) + 1);
+        for tool in ["collab_agent_register", "collab_definition_replace"] {
+            for retry in [json!(1), missing.clone(), extra.clone(), wrong_type.clone(), negative.clone(), zero.clone(), overflow.clone()] {
+                let mut candidate = coding.clone();
+                candidate["rate_limit_retry"] = retry;
+                assert!(validate(tool, &arguments(tool, candidate), &limits, Some(&capabilities)).is_err());
+            }
+            for context in [json!(0), json!(crate::limits::SELECTED_MODEL_CONTEXT_TOKENS + 1), json!("1050000")] {
+                let mut candidate = coding.clone();
+                candidate["model_context_window"] = context;
+                assert!(validate(tool, &arguments(tool, candidate), &limits, Some(&capabilities)).is_err());
+            }
+            // Structurally typed policy still needs the existing semantic
+            // admission check; schema acceptance does not authorize a change.
+            for retry in [
+                json!({"initial_backoff_ms":10,"backoff_multiplier":2,"max_backoff_ms":9,"jitter_ms":5}),
+                json!({"initial_backoff_ms":10,"backoff_multiplier":2,"max_backoff_ms":u64::MAX,"jitter_ms":1}),
+            ] {
+                let mut candidate = coding.clone();
+                candidate["rate_limit_retry"] = retry;
+                let args = arguments(tool, candidate);
+                validate(tool, &args, &limits, Some(&capabilities)).unwrap();
+                assert!(limits.resolve_definition(&decoded(tool, &args)).is_err());
+            }
+        }
+    }
 }
