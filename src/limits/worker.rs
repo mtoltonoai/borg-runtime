@@ -733,6 +733,9 @@ impl WorkerLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodingLimits {
+    /// Absent historical policy disables platform outer-turn rate recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_retry: Option<crate::supplied_outer::RetryPolicy>,
     /// None retains the historical executor-selected window; bytes are not tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_window: Option<usize>,
@@ -750,6 +753,7 @@ pub struct CodingLimits {
 }
 impl CodingLimits {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(policy) = &self.rate_limit_retry { policy.validate()?; }
         if self.model_context_window.is_some_and(|n| n == 0 || n > super::SELECTED_MODEL_CONTEXT_TOKENS) {
             return Err("coding.model_context_window exceeds the selected model supported context window".into());
         }

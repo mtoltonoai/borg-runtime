@@ -203,6 +203,11 @@ fn local_ready(
     if std::fs::symlink_metadata(handoff::path(state, attempt)).is_ok() {
         return Ok(false);
     }
+    if !codex::retry::cleanup_ready(&codex::state_path(&state.join("codex"),&attempt.id),
+        &config.workspace_root.join("workspaces").join(component(&attempt.id)),
+        attempt.deadline_unix_ms.min(task.limits.deadline_unix_ms),&config.limits.worker)? {
+        return Ok(false);
+    }
     coding_collaboration_closed(config, task, attempt, state)
 }
 
@@ -270,6 +275,8 @@ async fn canonical(
         return Err(Reason::CanonicalUnavailable);
     };
     terminal(&current, task, attempt)?;
+    if !codex::retry::cleanup_verified(client,&codex::state_path(&state.join("codex"),&attempt.id),task,attempt,timeout_ms)
+        .await.map_err(|_|Reason::CanonicalUnavailable)? {return Err(Reason::LocalRecovery);}
     if !pull_request::cleanup_ready(state, command).map_err(|_| Reason::LocalRecovery)?
         || !pull_request::cleanup_verified(client, state, command).await.map_err(|_| Reason::CanonicalUnavailable)? {
         return Err(Reason::LocalRecovery);

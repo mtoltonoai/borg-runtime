@@ -15,6 +15,8 @@ use std::{
 mod charter_delivery;
 #[path="codex_charter_turns.rs"]
 mod charter_turns;
+#[path="codex_retry.rs"]
+pub(super) mod retry;
 pub use charter_delivery::Scope as InitialCharterScope;
 
 use tokio::{
@@ -94,6 +96,7 @@ impl From<&str> for ExecutionFailure {
 }
 #[derive(Debug)]
 pub enum Event {
+    SuppliedOuter { observation: crate::supplied_outer::Observation, acknowledged: tokio::sync::oneshot::Sender<std::result::Result<Option<crate::supplied_outer::Wait>, String>> },
     Started { thread_id: String, turn_id: String },
     Progress(String),
     ReserveCompletionTurn {
@@ -721,6 +724,9 @@ async fn execute_observed(
             scope.caller.clone(),&scope.session_id,state)?),
         None => None,
     };
+    if retry::read(state,control)?.is_some() {
+        return Err("retained supplied occurrence requires original recovery; no replacement thread or workspace".into());
+    }
     let mut session = Session::start_with_key(
         binary,
         cwd,
@@ -758,6 +764,7 @@ async fn execute_observed(
             if workflow.is_some() {super::codex_mcp::enable_memory_gate(&config)?;}
             session.collaboration=Some(config);
         }
+        let resume_config=thread_config.clone();
         let thread=match initial_charter {
             Some(scope)=>charter_delivery::start_thread(&mut session,scope,state,thread_config,
                 inference,control,credentials).await?,
@@ -806,6 +813,13 @@ async fn execute_observed(
         // Traceability scope: A failed initial turn/start is reported as uncertain and never resubmitted by this adapter; recovery remains fenced by the original command and unresolved execution.
         //= spec/impl/v2/implementation.md#platform-owned-model-retries
         //# Platform recovery of a supplied executor MUST NOT create another session or repeat an uncertain start merely to implement a provider retry.
+        let mut retry_owner=limits.coding.rate_limit_retry.as_ref().map(|policy|retry::Owner::new(state,cwd,&thread_id,policy,json!({
+            "caller":completion_scope.map(|s|&s.caller).or_else(||collaboration.map(|s|&s.caller)),
+            "session_id":completion_scope.map(|s|&s.session_id),
+            "accepted_input_sha256":format!("{}",aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256,
+                &serde_json::to_vec(&(inference,limits,instruction)).map_err(|_|"supplied input identity unavailable")?).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>())
+        }),control)).transpose()?;
+        if let Some(owner)=retry_owner.as_mut(){owner.before_send(control)?;}
         let params=json!({"threadId":thread_id,"model":model,"effort":inference.reasoning_effort,"cwd":cwd,"approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true},"input":initial_input});
         let (turn,mut charter_capture)=match initial_charter {
             Some(scope)=>{let (turn,capture)=charter_turns::start(&mut session,scope,state,1,&thread_id,params,control,credentials).await?;(turn,Some(capture))},
@@ -824,6 +838,11 @@ async fn execute_observed(
         events.send(Event::Started{thread_id:thread_id.clone(),turn_id:turn_id.clone()}).await.map_err(|_|"worker observer closed")?;
         let initial_turn_id = turn_id.clone();
         let mut association_committed = false;
+        if let Some(owner)=retry_owner.as_mut() {
+            association_barrier(&thread_id,&initial_turn_id,control,&events).await?;
+            association_committed=true;
+            owner.acknowledged(&turn_id,control,&events).await?;
+        }
         let mut completion_in_flight = false;
         // Existing coding admission reports no inner request count (baseline
         // zero). Reserve each additional observed outer turn conservatively.
@@ -882,7 +901,58 @@ async fn execute_observed(
                         summary.clear();
                     }
                 }
+                if let Some(owner)=retry_owner.as_mut(){owner.terminal(&message,control,&events,credentials).await?;}
                 completion_started = false;
+                if crate::supplied_outer::rate_limited(&message["params"]["turn"]) {
+                    if let Some(owner)=retry_owner.as_mut() {
+                        let cause=owner.rate_cause(control)?;
+                        events.send(Event::Progress("Supplied executor rate limited; waiting under accepted retry policy".into())).await.map_err(|_|"worker observer closed")?;
+                        reserved_completion_turns=owner.reserve(cause,control,&events).await?;
+                        // Reaping the exact old tree is required before a cold
+                        // app-server may load the same durable thread. A live
+                        // app-server continues without restart or reinjection.
+                        if session.process.try_finish_registered()?.is_some() {
+                            owner.resume_predecessor(control)?;
+                            session.stderr.abort();
+                            let bridge=session.collaboration.clone();
+                            if let Some(config)=bridge.as_ref(){super::codex_mcp::reopen_after_known_stop(config)?;}
+                            session=Session::start_with_key(binary,cwd,state,registry,inference,limits,
+                                control.worker_limits.clone(),inference_key).await?;
+                            session.lifecycle=lifecycle.clone();
+                            session.collaboration=bridge;
+                            session.initialize(control).await?;
+                            session.preflight_command(cwd,control).await?;
+                            let history=session.request("thread/read",json!({"threadId":thread_id,"includeTurns":true}),control).await?;
+                            owner.verify_history(&history["thread"],cwd,control)?;
+                            let mut params=resume_config.clone();
+                            params.as_object_mut().ok_or("supplied resume config invalid")?.remove("ephemeral");
+                            params["threadId"]=json!(thread_id);
+                            let resumed=session.request("thread/resume",params,control).await?;
+                            if resumed["model"]!=inference.model || resumed["reasoningEffort"]!=inference.reasoning_effort {
+                                return Err("resumed supplied settings differ from accepted inference".into());
+                            }
+                            owner.verify_history(&resumed["thread"],cwd,control)?;
+                        }
+                        let _bridge_boundary=session.collaboration.as_ref().map(super::codex_mcp::continuation_boundary).transpose()?;
+                        let previous=turn_id.clone();
+                        owner.before_send(control)?;
+                        let params=json!({"threadId":thread_id,"model":model,"effort":inference.reasoning_effort,"cwd":cwd,
+                            "approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":true},
+                            "input":[{"type":"text","text":"Continue the existing task from the retained conversation and workspace after the provider rate-limit failure. Preserve all prior instructions and unresolved completion obligations."}]});
+                        let next=if let Some(scope)=initial_charter {
+                            let (turn,capture)=charter_turns::start(&mut session,scope,state,owner.index(),&thread_id,params,control,credentials).await?;
+                            charter_capture=Some(capture);turn
+                        } else {session.request("turn/start",params,control).await?};
+                        let next_id=next["turn"]["id"].as_str().ok_or("supplied retry start outcome unknown: missing turn ID")?.to_owned();
+                        check_association_ids(&thread_id,Some(&next_id),credentials)?;
+                        owner.acknowledged(&next_id,control,&events).await?;
+                        if let Some(input)=pending_completion.as_mut() {
+                            input.record_supplied_retry(&thread_id,&previous,&next_id,&control.runtime_limits)?;
+                            completion_started=true;
+                        }
+                        turn_id=next_id;summary.clear();summary_phase=None;continue;
+                    }
+                }
                 if summary.is_empty() {summary=format!("Executor turn {status}");}
                 if status == "completed" {
                     completion_in_flight = false;
@@ -890,7 +960,7 @@ async fn execute_observed(
                         let advance = advance_completion(
                             &mut session,host,&mut workflow,&mut pending_completion,&mut paired_workflow_notice,
                             &thread_id,&turn_id,&initial_turn_id,&mut association_committed,&mut completion_in_flight,&mut reserved_completion_turns,
-                            cwd,inference,credentials,control,&events,initial_charter,state,&mut charter_capture,
+                            cwd,inference,credentials,control,&events,initial_charter,state,&mut charter_capture,&mut retry_owner,
                         ).await;
                         match advance {
                             Ok(CompletionAdvance::Continue(next_turn)) => {
@@ -995,6 +1065,7 @@ async fn advance_completion(
     cwd: &Path, inference: &InferenceSettings, credentials: &[String],
     control: &Control, events: &mpsc::Sender<Event>,
     charter: Option<&InitialCharterScope>, state: &Path, capture: &mut Option<charter_turns::Capture>,
+    retry_owner: &mut Option<retry::Owner>,
 ) -> std::result::Result<CompletionAdvance, String> {
     let boundary = CompletionBoundary::CodexTurn {thread_id:thread_id.into(),turn_id:turn_id.into()};
     if !*association_committed {
@@ -1051,6 +1122,10 @@ async fn advance_completion(
     let mut items = vec![json!({"type":"text","text":input.text()})];
     if let Some(notice) = notice.as_ref() {items.push(json!({"type":"text","text":notice.text}));}
     let next_reservation = reserved_turns.checked_add(1).ok_or("coding outer-turn reservation overflow")?;
+    if let Some(owner)=retry_owner.as_mut() {
+        let reserved=owner.reserve(crate::supplied_outer::Cause::Completion{begin_operation_id:input.feedback().continuation.begin_operation_id.clone()},control,events).await?;
+        if reserved!=next_reservation {return Err("shared supplied outer reservation differs".into());}
+    }else {
     let (acknowledged,received) = tokio::sync::oneshot::channel();
     events.send(Event::ReserveCompletionTurn {begin_operation_id:input.feedback().continuation.begin_operation_id.clone(),
         model_requests:next_reservation,acknowledged}).await.map_err(|_|"worker reservation observer closed")?;
@@ -1060,6 +1135,9 @@ async fn advance_completion(
         result=received=>result.map_err(|_|"worker reservation acknowledgment absent")??,
     }
     *reserved_turns = next_reservation;
+    }
+    *reserved_turns = next_reservation;
+    if let Some(owner)=retry_owner.as_mut(){owner.before_send(control)?;}
     input.mark_dispatch(&control.runtime_limits)?;
     *in_flight = true;
     let params=json!({
@@ -1075,6 +1153,7 @@ async fn advance_completion(
     }else{session.request("turn/start",params,control).await?};
     let next_turn = turn["turn"]["id"].as_str().ok_or("completion turn start outcome uncertain: missing turn id")?.to_owned();
     check_association_ids(thread_id,Some(&next_turn),credentials)?;
+    if let Some(owner)=retry_owner.as_mut(){owner.acknowledged(&next_turn,control,events).await?;}
     input.record_turn_start(CompletionBoundary::CodexTurn {thread_id:thread_id.into(),turn_id:next_turn.clone()},&control.runtime_limits)?;
     // borg-thread.json and Started retain the immutable initial association.
     // Only this exact input journal carries the actual next turn identity.
@@ -1133,10 +1212,17 @@ mod credential_tests {
 
     #[tokio::test]
     async fn completion_continuation_keeps_thread_usage_and_initial_association_without_replay() {
+        completion_journeys(&["continue","exhausted","lost-start","initial","initial-refused","initial-lost"]).await;
+    }
+    #[tokio::test]
+    async fn retry_and_completion_share_monotone_outer_occurrences_and_reservations() {
+        completion_journeys(&["rate-completion"]).await;
+    }
+    async fn completion_journeys(modes:&[&'static str]) {
         use crate::worker::completion::tests as fixture;
         use crate::governance_completion::*;
         use crate::governance::{CompletionDisposition,DecisionPoint,DecisionRef};
-        for mode in ["continue","exhausted","lost-start","initial","initial-refused","initial-lost"] {
+        for &mode in modes {
             let root=area(); let state=root.join("state"); process::private_directory(&state).unwrap();
             let binary=root.join("completion-peer.py");
             std::fs::write(root.join("mode"),mode).unwrap();
@@ -1160,16 +1246,20 @@ for line in sys.stdin:
         turn='turn-'+str(starts)
         emit({'id':request['id'],'result':{'turn':{'id':turn}}})
         emit({'method':'thread/tokenUsage/updated','params':{'threadId':'completion-thread','turnId':turn,'tokenUsage':{'total':{'inputTokens':starts*10,'outputTokens':starts*2}}}})
-        emit({'method':'turn/completed','params':{'threadId':'completion-thread','turn':{'id':turn,'status':'completed'}}})
+        if mode=='rate-completion' and starts==2:
+            emit({'method':'turn/completed','params':{'threadId':'completion-thread','turn':{'id':turn,'status':'failed','error':{'codexErrorInfo':'rateLimitExceeded','message':'controlled rejection'}}}})
+        else:
+            emit({'method':'turn/completed','params':{'threadId':'completion-thread','turn':{'id':turn,'status':'completed'}}})
         continue
     else: result={}
     emit({'id':request['id'],'result':result})
 "#).unwrap();
             std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
             let mut limits=fixture::policy();
+            if mode=="rate-completion" {limits.execution.coding.rate_limit_retry=Some(crate::supplied_outer::RetryPolicy {initial_backoff_ms:1,backoff_multiplier:2,max_backoff_ms:2,jitter_ms:1});}
             if mode=="exhausted" || mode=="initial-refused" {limits.governance.as_mut().unwrap().completion_continuations=0;}
             let first=CompletionBoundary::CodexTurn {thread_id:"completion-thread".into(),turn_id:"turn-1".into()};
-            let second=CompletionBoundary::CodexTurn {thread_id:"completion-thread".into(),turn_id:"turn-2".into()};
+            let second=CompletionBoundary::CodexTurn {thread_id:"completion-thread".into(),turn_id:if mode=="rate-completion" {"turn-3"}else{"turn-2"}.into()};
             let mut feedback=if mode.starts_with("initial") {
                 fixture::feedback(CompletionBoundary::StoppedResult {report_id:"old-final-candidate".into()},
                     CompletionTarget::InitialCodexTurn {thread_id:"completion-thread".into()})
@@ -1181,7 +1271,7 @@ for line in sys.stdin:
                 fixture::initial_begin_receipt(&state,&limits,&feedback,mode!="initial-refused");
                 Some(CompletionResume {evaluation:feedback.evaluation.clone(),reset_event:None})
             } else {fixture::refused_and_begin(&state,&limits,&feedback,mode!="exhausted");None};
-            if mode=="continue" || mode=="initial" {
+            if mode=="continue" || mode=="initial" || mode=="rate-completion" {
                 let completed=if mode=="initial" {first.clone()}else{second.clone()};
                 fixture::acknowledge_receipt(&state,&limits,&feedback,completed.clone());
                 let caller=feedback.continuation.caller.clone();
@@ -1202,7 +1292,7 @@ for line in sys.stdin:
             control.worker_limits=Arc::new(limits.worker.clone());
             let (events,mut received)=mpsc::channel(8);
             let observer=tokio::spawn(async move {
-                let mut started=0; let mut barriers=0;
+                let mut started=0; let mut barriers=0;let mut outer=Vec::new();
                 while let Some(event)=received.recv().await {
                     match event {
                         Event::Started {thread_id,turn_id}=>{assert_eq!(thread_id,"completion-thread");assert_eq!(turn_id,"turn-1");started+=1;},
@@ -1212,9 +1302,21 @@ for line in sys.stdin:
                         Event::ReserveCompletionTurn {model_requests,acknowledged,..}=>{
                             assert_eq!(model_requests,1);acknowledged.send(Ok(())).unwrap();
                         },
+                        Event::SuppliedOuter{observation,acknowledged}=>{
+                            assert_eq!(mode,"rate-completion");
+                            let answer=match &observation {
+                                crate::supplied_outer::Observation::Waiting{index,cause,..}=>{
+                                    assert!(matches!((*index,cause),(2,crate::supplied_outer::Cause::Completion{..})|(3,crate::supplied_outer::Cause::RateLimit{retry_index:1})));
+                                    Some(crate::supplied_outer::Wait{index:*index,rate_failures:if *index==3{1}else{0},admitted_at_ms:process::now_ms(),not_before_ms:process::now_ms()})
+                                },_=>None,
+                            };
+                            outer.push((observation.index(),observation.phase()));
+                            acknowledged.send(Ok(answer)).unwrap();
+                        },
                         Event::Progress(_)=>{},
                     }
                 }
+                if mode=="rate-completion" {assert_eq!(outer,vec![(1,"ack"),(1,"terminal"),(2,"wait"),(2,"dispatch"),(2,"ack"),(2,"terminal"),(3,"wait"),(3,"dispatch"),(3,"ack"),(3,"terminal")]);}
                 (started,barriers)
             });
             let decision_peer=if mode.starts_with("initial") {None}else {
@@ -1243,7 +1345,7 @@ for line in sys.stdin:
             assert_eq!(result.thread_id,"completion-thread");
             let starts=std::fs::read_to_string(root.join("starts.jsonl")).unwrap().lines()
                 .map(|line|serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
-            assert_eq!(starts.len(),if mode=="exhausted" || mode=="initial" {1}else{2});
+            assert_eq!(starts.len(),if mode=="exhausted" || mode=="initial" {1}else if mode=="rate-completion"{3}else{2});
             assert_eq!(starts[0]["input"][0]["text"],"original task");
             if mode=="initial" {
                 assert!(starts[0]["input"].as_array().unwrap().iter().any(|item|
@@ -1252,13 +1354,16 @@ for line in sys.stdin:
                 assert_eq!(starts[1]["threadId"],"completion-thread");
                 assert!(starts[1]["input"][0]["text"].as_str().unwrap().contains("remaining-child"));
             }
-            assert_eq!(result.success,mode=="continue" || mode=="initial");
-            assert_eq!(result.completion_blocked,mode!="continue" && mode!="initial");
+            assert_eq!(result.success,mode=="continue" || mode=="initial" || mode=="rate-completion");
+            assert_eq!(result.completion_blocked,mode!="continue" && mode!="initial" && mode!="rate-completion");
             assert_eq!(result.completion_uncertain,mode=="lost-start");
             assert_eq!(result.observed_usage.model_requests,None);
-            assert_eq!(result.observed_usage.input_tokens,Some(if mode=="continue" {20}else{10}));
+            assert_eq!(result.observed_usage.input_tokens,Some(if mode=="continue" {20}else if mode=="rate-completion"{30}else{10}));
             let original:Value=serde_json::from_slice(&std::fs::read(state.join("borg-thread.json")).unwrap()).unwrap();
             assert_eq!(original["turn_id"],"turn-1");
+            if mode=="rate-completion" {
+                assert!(crate::worker::completion::admit_prior_supplied_inputs(&state,&limits).unwrap_err().contains("worker19"));
+            }
         }
     }
 
@@ -1905,4 +2010,11 @@ for raw in sys.stdin.buffer:
             }
         }
     }
+}
+
+async fn association_barrier(thread:&str,turn:&str,control:&Control,events:&mpsc::Sender<Event>)->std::result::Result<(),String> {
+    let (acknowledged,received)=tokio::sync::oneshot::channel();
+    events.send(Event::AssociationBarrier{thread_id:thread.into(),initial_turn_id:turn.into(),acknowledged}).await.map_err(|_|"worker association observer closed")?;
+    let mut stopped=control.clone();
+    tokio::select!{biased;_=stopped.stopped()=>Err("initial supplied association interrupted".into()),result=received=>result.map_err(|_|"initial supplied association ACK absent")?,}
 }

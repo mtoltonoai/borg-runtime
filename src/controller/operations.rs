@@ -9,6 +9,7 @@ mod native_loop;
 pub(crate) mod native_format;
 pub(crate) mod native_output_cap;
 pub(crate) mod native_retry;
+pub(crate) mod supplied_outer;
 pub(super) use native_loop::{validate_completion_gap, validate_rejection_chain};
 pub(super) mod reconciliation;
 pub(super) mod releases;

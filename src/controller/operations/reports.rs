@@ -53,7 +53,9 @@ pub(super) fn observe(
         return refuse("stale_incarnation", "worker incarnation was superseded");
     }
     super::task_tool::progress(tx, &t.task, r, now)?;
+    let mut supplied_wait=None;
     match &r.observation {
+        Observation::SuppliedOuter { observation } => supplied_wait=super::supplied_outer::observe(tx, &mut t, r, observation, now)?,
         Observation::NativeRequestDiagnostic { .. } =>
             return super::super::native_request_diagnostics::observe(tx, r),
         Observation::NativeOutputCapped { .. } => super::native_output_cap::validate_report(tx, &t.task, r)?,
@@ -376,5 +378,5 @@ pub(super) fn observe(
     }
     save(tx, &mut t, "worker_observation", &r.observation)?;
     settle_parent(tx, &t)?;
-    Ok((Data::Task(Box::new(t.task)), true))
+    Ok((supplied_wait.map(Data::SuppliedOuterWait).unwrap_or_else(||Data::Task(Box::new(t.task))), true))
 }

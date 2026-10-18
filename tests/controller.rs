@@ -6204,3 +6204,5 @@ mod task_handoffs;
 
 #[path = "controller/identity_administration.rs"]
 mod identity_administration;
+#[path = "controller/codex_rate_limit_recovery.rs"]
+mod codex_rate_limit_recovery;

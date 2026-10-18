@@ -37,3 +37,5 @@ pub mod repository_catalogue;
 
 pub mod pull_request;
 pub(crate) mod pull_request_view;
+
+pub mod supplied_outer;

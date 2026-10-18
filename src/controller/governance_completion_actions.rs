@@ -74,7 +74,12 @@ pub(super) fn original_boundary(tx:&StoreContext<'_>,stored:&StoredTask,boundary
             let initial:(Option<String>,Option<String>)=tx.query_row("SELECT thread_id,turn_id FROM attempts WHERE id=?1",[&attempt.id],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let supported=stored.completion_hold.as_ref().and_then(|h|h.continuation.as_ref())
                 .and_then(|c|c.acknowledged.as_ref()).map(|ack|&ack.consumed_at);
-            if supported.map_or_else(||initial.0.as_ref()==Some(thread_id)&&initial.1.as_ref()==Some(turn_id),|actual|actual==boundary)==false {
+            let supplied_retry=task.input.execution_limits().map_err(|e|Fault::Store(e))?.coding.rate_limit_retry.is_some();
+            if supplied_retry {
+                let caller=Caller {task_id:task.id.clone(),attempt_id:attempt.id.clone(),generation:attempt.generation,
+                    worker_id:attempt.worker_id.clone(),incarnation:attempt.worker_incarnation.clone()};
+                super::super::operations::supplied_outer::completed_boundary(tx,&caller,thread_id,turn_id)?;
+            } else if supported.map_or_else(||initial.0.as_ref()==Some(thread_id)&&initial.1.as_ref()==Some(turn_id),|actual|actual==boundary)==false {
                 return refuse("source_mismatch","Codex completion is not the initial or acknowledged continuation turn");
             }
         },
@@ -184,6 +189,10 @@ fn validate_native_ack(tx:&StoreContext<'_>,task:&Task,value:&CompletionContinua
         CompletionTarget::NativeRequest {request_index}|CompletionTarget::InitialNativeRequest {request_index}=>request_index,
         _=>{
             if ack.native_input.is_some() {return refuse("source_mismatch","Codex ACK contains native request evidence")}
+            if task.input.execution_limits().map_err(Fault::Store)?.coding.rate_limit_retry.is_some() {
+                let CompletionBoundary::CodexTurn{thread_id,turn_id}=&ack.consumed_at else{return refuse("source_mismatch","supplied completion boundary absent")};
+                super::super::operations::supplied_outer::completion_consumed(tx,task,value,thread_id,turn_id)?;
+            }
             return Ok(());
         },
     };

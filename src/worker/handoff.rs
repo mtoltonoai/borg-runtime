@@ -66,13 +66,18 @@ fn load(path: &Path, attempt: &Attempt, input: &TaskInput) -> Result<Saved, Stri
 // The original command inventory bounds this scan; load validates the saved
 // operation, accepted input and committed outcome before marker admission.
 pub(super) fn admit_retained_outcomes(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
+    admit_outcomes(state, limits, super::outcome_requires_worker18).map_err(|e| if e=="retained delegation outcome requires its original worker marker" {
+        "pending_assignment or reassignment in retained delegation outcome requires worker18".into()
+    } else {e})
+}
+pub(super) fn admit_outcomes(state: &Path, limits: &RuntimeLimits, rejects:fn(&Outcome)->bool) -> Result<(), String> {
     for (_, receipt) in command_receipts(state, limits)? {
         let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { continue; };
         let path = path(state, attempt);
         if path.exists() {
             let saved = load(&path, attempt, task)?;
-            if saved.outcome.as_ref().is_some_and(super::outcome_requires_worker18) {
-                return Err("pending_assignment or reassignment in retained delegation outcome requires worker18".into());
+            if saved.outcome.as_ref().is_some_and(rejects) {
+                return Err("retained delegation outcome requires its original worker marker".into());
             }
         }
     }
@@ -423,7 +428,7 @@ struct Format {
 // Original absent fields retain exact serialization; no new state namespace.
 // Outer17 fences supplied public outer-turn journals and output manifests.
 // Outer18 carries optional default-assignment metadata in accepted snapshots.
-// Outer19 fences identity/task and machine read vocabulary in retained journals.
+// Outer19 fences identity/task, machine read and supplied retry vocabulary.
 const CURRENT_STATE_FORMAT: u32 = 19;
 const DEFAULT_ASSIGNMENT_STATE_FORMAT: u32 = 18;
 const SUPPLIED_STATE_FORMAT: u32 = 17;
@@ -536,7 +541,8 @@ pub(super) fn finish_state_upgrade(
     crate::worker::admit_default_assignment(state, limits)?;
     crate::worker::admit_identity_administration(state, limits)?;
     crate::worker::machine_resources::admit(state, limits)?;
-    // Also re-persist an observed 19: a prior rename may have succeeded before
+    crate::worker::admit_supplied_retry(state, limits)?;
+    // Also re-persist the observed current marker: a prior rename may have succeeded before
     // its directory sync failed. Visibility alone is not a durable barrier.
     write_current_state_format(state, &limits.worker)
         .map_err(|error| format!("worker state format upgrade failed: {error}"))
@@ -1892,7 +1898,7 @@ mod tests {
         assert_eq!(crate::worker::read_receipt(&command_path, &retained).unwrap().command, command);
         assert!(mutations::read(&await_path, &retained).unwrap().unwrap().outcome.is_some());
         finish_state_upgrade(&state, &retained, &lease).unwrap();
-        assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, 19);
+        assert_eq!(read_state_format(&state, &limits.worker).unwrap().format_revision, CURRENT_STATE_FORMAT);
         assert!(admits_supplied_turn_records(&state, &limits.worker).unwrap());
         assert!(admits_default_assignment(&state, &limits.worker).unwrap());
         for (path, bytes) in originals { assert_eq!(std::fs::read(path).unwrap(), bytes); }
@@ -2190,5 +2196,40 @@ mod tests {
             assert!(!state.join("limits.json").exists());assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);
         }
     }
+    #[test]
+    fn supplied_retry_old_marker_fences_typed_policy_command_await_and_original_journal() {
+        for carrier in ["limits","command","await","journal","absent"] {
+            let (state,marker)=historical_state(&format!("supplied-retry-{carrier}"),18);
+            let old=historical_limits();
+            let mut selected=(*old).clone();
+            selected.execution.coding.rate_limit_retry=Some(crate::supplied_outer::RetryPolicy{initial_backoff_ms:1,backoff_multiplier:2,max_backoff_ms:10,jitter_ms:1});
+            selected.validate().unwrap();
+            let retained=if carrier=="limits"{Arc::new(selected.clone())}else{old.clone()};
+            atomic_json(&state.join("limits.json"),&*retained).unwrap();
+            let command=default_assignment_command(if carrier=="command"||carrier=="await"{&selected}else{&old});
+            let carrier_path=if carrier=="await"{default_assignment_await(&state,&retained,command.clone())}else{
+                let path=state.join("commands/original.json");record_launch(&path,&command).unwrap();path
+            };
+            let WorkerCommand::RunAttempt{attempt,..}=&command else{panic!("run")};
+            let root=codex::state_path(&state.join("codex"),&attempt.id);
+            if carrier=="journal" {
+                process::private_directory(&root).unwrap();
+                atomic_json(&root.join(codex::retry::JOURNAL),&json!({"not":"decoded under old marker"})).unwrap();
+            }
+            let bytes=std::fs::read(&carrier_path).unwrap();
+            let lease=process::WorkerLease::claim(&state.join("worker-owner.json"),&old.worker).unwrap();
+            if carrier=="absent"{
+                finish_state_upgrade(&state,&retained,&lease).unwrap();
+                assert_eq!(read_state_format(&state,&old.worker).unwrap().format_revision,CURRENT_STATE_FORMAT);
+            }else{
+                let error=finish_state_upgrade(&state,&retained,&lease).unwrap_err();
+                assert!(error.contains("worker19"),"{carrier}: {error}");
+                assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);
+            }
+            assert_eq!(std::fs::read(&carrier_path).unwrap(),bytes);
+        }
+    }
 
 }
+
+pub(super) fn admits_supplied_retry(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(read_state_format(state,limits)?.format_revision==CURRENT_STATE_FORMAT)}

@@ -296,3 +296,16 @@ pub(super) fn validate_existing(tx:&Connection<'_>,cfg:&ControllerConfig,version
     if admissions.len()!=original_inputs.len(){return Err(Fault::Store("original accepted input lacks its receipt".into()))}
     Ok(())
 }
+
+// Historical typed assignment operands remain readable, but new retry metadata
+// cannot be admitted under the preceding controller format.
+pub(super) fn admit_prior_supplied_retry(tx:&Connection<'_>,bound:usize)->Result<()> {
+    let mut query=tx.prepare("SELECT operation_id FROM task_assignments ORDER BY operation_id")?;
+    let mut rows=query.query([])?;let mut count=0usize;
+    while let Some(row)=rows.next()? {
+        count+=1;if count>bound{return Err(Fault::Store("supplied assignment inventory exceeds bound".into()))}
+        let id:String=row.get(0)?;let intent=read(tx,&id)?.ok_or_else(||Fault::Store("supplied assignment disappeared".into()))?;
+        if crate::supplied_outer::input_uses(&intent.input)||crate::supplied_outer::definition_uses(&intent.session.definition) {return Err(Fault::Store("supplied retry assignment requires schema25".into()))}
+    }
+    Ok(())
+}

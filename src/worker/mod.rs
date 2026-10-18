@@ -123,6 +123,50 @@ impl Reporter {
         self.send_identified_with_credentials(report_id, observation, &credentials)
             .await
     }
+    async fn supplied_outer(&self,id:String,observation:crate::supplied_outer::Observation,control:&Control)
+        ->Result<Option<crate::supplied_outer::Wait>,String> {
+        let credentials=configured_credentials(&self.config.limits)?;
+        if value_contains_credential(&serde_json::to_value(&observation).map_err(|e|e.to_string())?,&credentials,&control.worker_limits)? {
+            return Err("supplied outer fact contains configured credential; withheld".into());
+        }
+        let original=self.retain_identified_with_credentials(id,Observation::SuppliedOuter{observation:observation.clone()},&credentials)?;
+        let intended=Operation::ObserveWorker{report:original.clone()};
+        let mut stopped=control.clone();
+        let operation=async {
+            loop {
+                control.check()?;
+                match acceptance::lookup_required(&self.client,&original.report_id,&intended).await? {
+                    acceptance::Lookup::Recorded(Outcome::Ok{data:Data::SuppliedOuterWait(wait)},_) if observation.phase()=="wait" && wait.index==observation.index()=>return Ok(Some(wait)),
+                    acceptance::Lookup::Recorded(Outcome::Ok{data:Data::Task(task)},_) if observation.phase()!="wait"
+                        && task.id==self.attempt.task_id && task.attempt.as_ref().is_some_and(|a|a.id==self.attempt.id&&a.generation==self.attempt.generation)=>{
+                        if observation.phase()=="dispatch" {
+                            // A replayed admission is original history. It is
+                            // insufficient alone to launch under changed state.
+                            let current=controller_call(&self.client,Operation::GetTask{task_id:self.attempt.task_id.clone()},control).await?;
+                            let Outcome::Ok{data:Data::Task(current)}=current else{return Err("supplied currentness unavailable".into())};
+                            if current.status!=TaskStatus::Active || current.pending_assignment.is_some()
+                                || current.waiting_child_id.is_some() || current.session_id!=self.attempt.session_id
+                                || !current.attempt.as_ref().is_some_and(|a|a.id==self.attempt.id
+                                    && a.generation==self.attempt.generation && a.worker_id==self.attempt.worker_id
+                                    && a.worker_incarnation==self.attempt.worker_incarnation
+                                    && !a.stopped&&!a.uncertain&&a.phase!=AttemptPhase::StopRequested) {
+                                return Err("supplied dispatch no longer current after original admission".into());
+                            }
+                        }
+                        return Ok(None);
+                    },
+                    acceptance::Lookup::Recorded(_,_)=>return Err("supplied outer original phase refused or mismatched; no dispatch".into()),
+                    acceptance::Lookup::Absent=>{
+                        let (_,saved)=self.send_identified_retained(original.report_id.clone(),original.observation.clone(),&credentials).await?;
+                        if saved!=original{return Err("supplied original normalization changed".into());}
+                    },
+                    acceptance::Lookup::Unavailable=>{},
+                }
+                tokio::time::sleep(Duration::from_millis(control.runtime_limits.execution.collaboration.lookup_backoff_ms)).await;
+            }
+        };
+        tokio::select!{biased;_=stopped.stopped()=>Err("supplied outer original receipt unresolved after cancellation or deadline".into()),result=operation=>result,}
+    }
     // Private seam lets tests use synthetic credentials without mutating process
     // environment. Production reads only the fixed provider/token and proxy names.
     async fn send_identified_with_credentials(
@@ -1620,7 +1664,9 @@ async fn coding(
         control.clone(),
     );
     let coding_limits = execution_limits.coding.clone();
-    let completion_scope = control.runtime_limits.governance.as_ref().map(|_|codex::CompletionScope {
+    // Trusted attempt identity is required even when optional completion policy is absent.
+    // The adapter still gates the completion host on accepted governance metadata.
+    let completion_scope = Some(codex::CompletionScope {
         controller_url:config.controller_url.clone(),caller:collaboration_caller(attempt),session_id:attempt.session_id.clone(),
         resume:match command {WorkerCommand::RunAttempt {completion_continuation,..}=>completion_continuation.clone(),_=>None},
     });
@@ -1659,6 +1705,11 @@ async fn coding(
         tokio::select! {
             result=execution.join_next()=>break result.ok_or("executor task disappeared")?.map_err(|_|"executor task failed; outcome uncertain")?,
             event=received.recv()=>match event {
+                Some(codex::Event::SuppliedOuter{observation,acknowledged})=>{
+                    let id=crate::supplied_outer::id(&attempt.id,observation.index(),observation.phase());
+                    let committed=reporter.supplied_outer(id,observation,&control).await;
+                    let _=acknowledged.send(committed);
+                },
                 Some(codex::Event::Started{thread_id,turn_id})=>reporter.send(Observation::Started{thread_id:Some(thread_id),turn_id:Some(turn_id)}).await?,
                 Some(codex::Event::ReserveCompletionTurn {begin_operation_id,model_requests,acknowledged})=>{
                     let committed = if model_requests > input.limits.model_requests {
@@ -2546,9 +2597,71 @@ fn admit_default_assignment(state: &Path, limits: &RuntimeLimits) -> Result<(), 
     Ok(())
 }
 
+// Admission precedes every old-marker replay and the format rewrite. Only
+// typed retained carriers confer vocabulary; user text never selects a format.
+fn admit_supplied_retry(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
+    if handoff::admits_supplied_retry(state, &limits.worker)? { return Ok(()); }
+    if limits.execution.coding.rate_limit_retry.is_some() {
+        return Err("coding.rate_limit_retry requires worker19".into());
+    }
+    let receipts = command_receipts(state, limits)?;
+    if receipts.iter().any(|(_, r)| crate::supplied_outer::command_uses(&r.command)) {
+        return Err("supplied retry in retained command requires worker19".into());
+    }
+    handoff::admit_outcomes(state, limits, crate::supplied_outer::outcome_uses)?;
+    admit_native_outcomes(state, limits, crate::supplied_outer::outcome_uses)?;
+    if mutations::read(&state.join("mutations/await.json"), limits)?.is_some_and(|j|
+        crate::supplied_outer::operation_uses(&j.request)
+        || j.outcome.as_ref().is_some_and(crate::supplied_outer::outcome_uses)) {
+        return Err("supplied retry in retained await requires worker19".into());
+    }
+    let outbox=match std::fs::read_dir(state.join("outbox")) {
+        Ok(entries)=>Some(entries),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,
+        Err(_)=>return Err("outbox unavailable".into()),
+    };
+    for (index, entry) in outbox.into_iter().flatten().enumerate() {
+        if index >= limits.worker.outbox_records { return Err("outbox inventory exceeds worker.outbox_records".into()); }
+        let path=entry.map_err(|_|"outbox entry unavailable")?.path();
+        if path.extension().is_some_and(|s|s=="json"||s=="refused") {
+            let report=read_report(&path,limits)?;
+            if matches!(report.observation,Observation::SuppliedOuter{..}) {
+                return Err("supplied outer report requires worker19".into());
+            }
+        }
+    }
+    for (_, receipt) in receipts {
+        let WorkerCommand::RunAttempt { attempt, task, .. }=receipt.command else {continue};
+        let root=codex::state_path(&state.join("codex"),&attempt.id);
+        match std::fs::symlink_metadata(root.join(codex::retry::JOURNAL)) {
+            Ok(_)=>return Err("supplied outer journal requires worker19".into()),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(_)=>return Err("supplied outer journal inventory unavailable".into()),
+        }
+        let metadata=&task.resolved_limits.as_ref().ok_or("accepted metadata absent")?.global_metadata;
+        completion::admit_prior_supplied_inputs(&root,metadata)?;
+        if task.definition.executor==ExecutorKind::Coding {
+            let config=codex_mcp::Config {
+                instruction_source:task.instruction_source.clone(),
+                execution_profile:task.definition.execution_profile.as_ref().filter(|p|matches!(p,ExecutionProfile::CollaborationV2{..})).cloned(),
+                controller_url:String::new(), caller:collaboration_caller(&attempt),
+                deadline_unix_ms:attempt.deadline_unix_ms.min(task.limits.deadline_unix_ms),
+                state:root.clone(),runtime_limits:(**metadata).clone(),
+                limits:task.execution_limits()?.collaboration.clone(),worker_limits:limits.worker.clone(),
+            };
+            // The original Config supplies only its endpoint; every authority
+            // and accepted policy field remains reconstructed from the command.
+            codex_mcp::admit_retry_outcomes_from_retained_config(config)?;
+        }
+    }
+    Ok(())
+}
+
 // Same retained-command and accepted per-attempt bounds as native recovery.
 // The journal's own policy never chooses the decoder or grants replay authority.
 fn admit_native_worker18_outcomes(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
+    admit_native_outcomes(state,limits,outcome_requires_worker18)
+}
+fn admit_native_outcomes(state: &Path, limits: &RuntimeLimits,rejects:fn(&Outcome)->bool) -> Result<(), String> {
     for (_, receipt) in command_receipts(state, limits)? {
         let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { continue; };
         if task.definition.executor != ExecutorKind::Native || !crate::execution_profile::collaboration(task) { continue; }
@@ -2569,8 +2682,8 @@ fn admit_native_worker18_outcomes(state: &Path, limits: &RuntimeLimits) -> Resul
             if !matches!(&journal.request, Operation::CallCollaboration { call } if call.caller == collaboration_caller(attempt)) {
                 return Err("collaboration journal caller or operation changed".into());
             }
-            if journal.outcome.as_ref().is_some_and(outcome_requires_worker18) {
-                return Err("pending_assignment or reassignment in retained native outcome requires worker18".into());
+            if journal.outcome.as_ref().is_some_and(rejects) {
+                return Err("retained native outcome requires its original worker marker".into());
             }
         }
     }
@@ -3078,6 +3191,10 @@ fn retained_worker_limits(
             if crate::protocol::policy_requires_wire24(selected)
                 && !handoff::admits_identity_administration(state, &selected.worker)? {
                 return Err("identity/task policy requires worker19 before retaining new limits".into());
+            }
+            if selected.execution.coding.rate_limit_retry.is_some()
+                && !handoff::admits_supplied_retry(state,&selected.worker)? {
+                return Err("coding.rate_limit_retry requires worker19 before retaining new limits".into());
             }
             atomic_json(&path, &**selected)?;
             return Ok(selected.clone());

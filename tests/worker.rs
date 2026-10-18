@@ -2355,3 +2355,5 @@ mod native_retry;
 
 #[path = "worker/host_resources.rs"]
 mod host_resources;
+#[path = "worker/codex_rate_limit_recovery.rs"]
+mod codex_rate_limit_recovery;

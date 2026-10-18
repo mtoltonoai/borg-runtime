@@ -50,7 +50,12 @@ pub(super) fn begin(ctx: &Context<'_, '_>, caller: &Caller, delivery_id: &str, o
         let prior=request_at(ctx.tx,caller,u32::try_from(previous).map_err(|_|corrupt("outer index overflow"))?,ctx.limits)?;
         let value=query(ctx.tx,prior.id(),ctx.limits)?;
         if value.terminal.as_ref().is_none_or(|v|v.status!="completed") {
-            return refuse("reconciliation_required","original supplied turn must finish before another start");
+            let allowed=if let Some(t)=value.terminal.as_ref() {
+                t.status=="failed" && t.error.as_ref().is_some_and(|e|e["codexErrorInfo"]=="rateLimitExceeded")
+                    && current.input.execution_limits().map_err(|e|Fault::Refused("invalid_limits",e))?.coding.rate_limit_retry.is_some()
+                    && super::super::operations::supplied_outer::rate_dispatch(ctx.tx,caller,outer_index,thread_id,&t.turn_id)?
+            }else{false};
+            if !allowed {return refuse("reconciliation_required","original supplied turn must finish before another start");}
         }
     }
     let b=CharterSuppliedBoundary{turn_id:ctx.operation_id.into(),delivery_id:delivery_id.into(),session_id:c.session_id,

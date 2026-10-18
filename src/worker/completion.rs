@@ -41,6 +41,8 @@ struct InputRecord {
     consumed_at: Option<CompletionBoundary>,
     #[serde(default)]
     native_input: Option<NativeCompletionInput>,
+    #[serde(default,skip_serializing_if="Vec::is_empty")]
+    supplied_retries: Vec<CompletionBoundary>,
 }
 
 pub(super) struct Input {
@@ -111,6 +113,16 @@ impl Input {
         self.record.accepted_at = Some(boundary);
         persist_input(&self.directory.join("input.json"),&self.record,limits)
     }
+    pub(super) fn record_supplied_retry(&mut self,thread:&str,previous:&str,next:&str,limits:&RuntimeLimits)->Result<(),String> {
+        let old=CompletionBoundary::CodexTurn{thread_id:thread.into(),turn_id:previous.into()};
+        if !self.record.started || self.record.consumed_at.is_some()
+            || self.record.supplied_retries.last().or(self.record.accepted_at.as_ref())!=Some(&old)
+            || previous==next || self.record.supplied_retries.len()>=limits.governance.as_ref().ok_or("completion policy absent")?.scan_rows {
+            return Err("completion rate continuation differs from original input lineage".into());
+        }
+        self.record.supplied_retries.push(CompletionBoundary::CodexTurn{thread_id:thread.into(),turn_id:next.into()});
+        persist_input(&self.directory.join("input.json"),&self.record,limits)
+    }
     /// This durable before-send barrier can be crossed once by the live owner.
     /// A visible marker after a failed sync is conservatively treated as used.
     pub(super) fn mark_dispatch(&mut self, limits: &RuntimeLimits) -> Result<(), String> {
@@ -163,6 +175,32 @@ fn persist_input(path: &Path, value: &InputRecord, limits: &RuntimeLimits) -> Re
     bounded_json_size(value, limits.worker.mutation_record_bytes)
         .map_err(|_| "completion input exceeds worker.mutation_record_bytes")?;
     atomic_json(path, value)
+}
+
+pub(super) fn admit_prior_supplied_inputs(state:&Path,limits:&RuntimeLimits)->Result<(),String> {
+    let root=state.join("completion");
+    let callers=match std::fs::read_dir(&root) {
+        Ok(rows)=>rows,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(()),
+        Err(_)=>return Err("completion inventory unavailable".into()),
+    };
+    let bound=limits.governance.as_ref().ok_or("retained completion lacks selected policy")?.scan_rows;
+    let mut count=0usize;
+    for caller in callers {
+        count=count.checked_add(1).ok_or("completion inventory overflow")?;
+        if count>bound{return Err("completion inventory exceeds governance.scan_rows".into());}
+        let path=caller.map_err(|_|"completion inventory unavailable")?.path();
+        if !std::fs::symlink_metadata(&path).map_err(|_|"completion inventory unavailable")?.is_dir(){return Err("unexpected completion caller entry".into());}
+        for boundary in std::fs::read_dir(path).map_err(|_|"completion boundary inventory unavailable")? {
+            count=count.checked_add(1).ok_or("completion inventory overflow")?;
+            if count>bound{return Err("completion inventory exceeds governance.scan_rows".into());}
+            let path=boundary.map_err(|_|"completion boundary unavailable")?.path();
+            if !std::fs::symlink_metadata(&path).map_err(|_|"completion boundary unavailable")?.is_dir(){return Err("unexpected completion boundary entry".into());}
+            if read_input(&path.join("input.json"),limits)?.is_some_and(|v|!v.supplied_retries.is_empty()) {
+                return Err("supplied completion lineage requires worker19".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 
@@ -394,7 +432,7 @@ impl Host {
             return Err("completion Begin does not bind this exact eligible decision".into());
         }
         let text = feedback_text(&feedback,self.client.limits())?;
-        let record = InputRecord {revision:1,feedback,text,started:false,accepted_at:None,consumed_at:None,native_input:None};
+        let record = InputRecord {revision:1,feedback,text,started:false,accepted_at:None,consumed_at:None,native_input:None,supplied_retries:Vec::new()};
         let input_path = directory.join("input.json");
         if let Some(old) = read_input(&input_path,self.client.limits())? {
             if old != record {return Err("completion input already dispatched or differs; no resend".into());}
@@ -415,7 +453,7 @@ impl Host {
                 None=>matches!(&boundary,CompletionBoundary::NativeResponse {..})
                     || !consumes(&input.record.feedback.continuation.target,&boundary),
             }
-            || matches!(&boundary,CompletionBoundary::CodexTurn {..}) && input.record.accepted_at.as_ref() != Some(&boundary)
+            || matches!(&boundary,CompletionBoundary::CodexTurn {..}) && input.record.supplied_retries.last().or(input.record.accepted_at.as_ref()) != Some(&boundary)
             || input.record.consumed_at.as_ref().is_some_and(|old|old != &boundary) {
             return Err("completion input lacks its actual consuming boundary".into());
         }

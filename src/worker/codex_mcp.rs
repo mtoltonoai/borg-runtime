@@ -1072,22 +1072,87 @@ pub enum OutcomeDisposition {
     Committed,
     Unresolved,
 }
+/// A host can inspect delivered originals only while no bridge invocation or
+/// pipe delivery owns the boundary. The guard remains held through turn/start.
+pub(super) fn continuation_boundary(config:&Config)->Result<std::fs::File,String> {
+    check_stop(config)?;
+    let lock=outer_boundary_file(config)?;
+    lock.try_lock().map_err(|_|"supplied continuation awaits in-flight MCP call or delivery")?;
+    if let Some(bytes)=read_private(&config.directory().join("calls.json"),config.limits.journal_bytes,"execution.collaboration.journal_bytes")? {
+        let journal:Journal=decode(&bytes,config.limits.journal_bytes)?;
+        if journal.entries.iter().any(|entry|!entry.delivered||entry.outcome.is_none()) {
+            return Err("supplied continuation awaits original MCP outcome and delivery".into());
+        }
+    }
+    if matches!(inspect_retained_outcomes(config,None,false)?,OutcomeDisposition::Unresolved) {
+        return Err("supplied continuation has unresolved MCP outcome".into());
+    }
+    Ok(lock)
+}
+
+// Only the still-owning adapter calls this after its ManagedProcess proves the
+// complete former tree stopped. The static bridge marker is not that proof.
+// Exact original calls/deliveries remain intact; no operation is redispatched.
+pub(super) fn reopen_after_known_stop(config:&Config)->Result<(),String> {
+    let lock=outer_boundary_file(config)?;
+    lock.try_lock().map_err(|_|"old collaboration call remains active")?;
+    inspect_retained_outcomes(config,None,false)?;
+    if super::collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {
+        return Err("supplied resume has an unresolved workflow append".into());
+    }
+    if let Some(bytes)=read_private(&config.directory().join("calls.json"),config.limits.journal_bytes,"execution.collaboration.journal_bytes")? {
+        let journal:Journal=decode(&bytes,config.limits.journal_bytes)?;
+        if journal.entries.iter().any(|entry|entry.outcome.is_none()||!entry.delivered) {
+            return Err("supplied resume has unresolved original tool delivery".into());
+        }
+    }
+    if let Some(bytes)=read_private(&config.stop_path(),config.limits.gate_bytes,"execution.collaboration.gate_bytes")? {
+        let stopped:Stop=decode(&bytes,config.limits.gate_bytes)?;
+        if stopped.revision!=REVISION||stopped.caller!=config.caller {return Err("supplied stopped marker identity differs".into());}
+        std::fs::remove_file(config.stop_path()).map_err(|_|"settled bridge stop marker unavailable")?;
+        std::fs::File::open(config.directory()).and_then(|f|f.sync_all()).map_err(|_|"settled bridge stop marker durability unavailable")?;
+    }
+    Ok(())
+}
+fn outer_boundary_file(config:&Config)->Result<std::fs::File,String> {
+    use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+    process::private_directory(&config.directory())?;
+    let file=std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .mode(0o600).custom_flags(0x20000|0x800).open(config.directory().join("outer-boundary.lock"))
+        .map_err(|_|"supplied outer boundary unavailable")?;
+    let m=file.metadata().map_err(|_|"supplied outer boundary metadata unavailable")?;
+    if !m.is_file()||m.mode()&0o077!=0||m.uid()!=std::fs::metadata("/proc/self").map_err(|_|"owner unavailable")?.uid(){return Err("supplied outer boundary owner/type differs".into());}
+    Ok(file)
+}
+
 pub fn outcome_disposition(config: &Config) -> Result<OutcomeDisposition, String> {
-    inspect_retained_outcomes(config, false, false)
+    inspect_retained_outcomes(config, None, false)
 }
 
 /// Historical outer markers must not silently adopt newly typed Task fields.
 /// Uses the same private bounded reader, identity joins and result validation as
 /// recovery; this function neither rewrites a record nor resolves an outcome.
 pub(super) fn admit_worker18_outcomes(config: &Config) -> Result<(), String> {
-    inspect_retained_outcomes(config, true, false).map(|_| ())
+    inspect_retained_outcomes(config, Some(super::outcome_requires_worker18), false).map(|_| ())
 }
 
+pub(super) fn admit_retry_outcomes(config:&Config)->Result<(),String> {
+    inspect_retained_outcomes(config,Some(crate::supplied_outer::outcome_uses),false).map(|_|())
+}
+pub(super) fn admit_retry_outcomes_from_retained_config(mut config:Config)->Result<(),String> {
+    let Some(bytes)=read_private(&config.state.join("borg-collaboration-config.json"),config.limits.config_bytes,"execution.collaboration.config_bytes")? else {
+        if config.directory().join("calls.json").exists() {return Err("Coding journal lacks its original config".into());}
+        return Ok(());
+    };
+    let retained:Config=decode(&bytes,config.limits.config_bytes)?;
+    config.controller_url=retained.controller_url;
+    admit_retry_outcomes(&config)
+}
 pub(super) fn admit_worker19_outcomes(config:&Config)->Result<(),String> {
     if crate::protocol::policy_requires_wire24(&config.runtime_limits)||config.limits.capabilities.is_some() {return Err("Coding accepted identity/task metadata requires worker19".into())}
-    inspect_retained_outcomes(config,false,true).map(|_|())
+    inspect_retained_outcomes(config,None,true).map(|_|())
 }
-fn inspect_retained_outcomes(config: &Config, historical_marker: bool, historical_worker19:bool) -> Result<OutcomeDisposition, String> {
+fn inspect_retained_outcomes(config: &Config, historical_rejects: Option<fn(&Outcome)->bool>, historical_worker19:bool) -> Result<OutcomeDisposition, String> {
     config.validate()?;
     // The host reconstructs this scope from the original RunAttempt. A retained
     // bridge configuration cannot silently substitute or drop that source.
@@ -1147,8 +1212,8 @@ fn inspect_retained_outcomes(config: &Config, historical_marker: bool, historica
         match &entry.outcome {
             Some(outcome) => {
                 Bridge::<Client>::check_result(&entry.invocation, outcome, config.limits.complete_result_bytes)?;
-                if historical_marker && super::outcome_requires_worker18(&outcome.reply.outcome) {
-                    return Err("pending_assignment or reassignment in retained Coding outcome requires worker18".into());
+                if historical_rejects.is_some_and(|rejects| rejects(&outcome.reply.outcome)) {
+                    return Err("retained Coding outcome requires its original worker marker".into());
                 }
             }
             None => unresolved = true,
@@ -1350,6 +1415,12 @@ pub fn run_stdio_config(path: &Path, config_bytes: usize) -> Result<(), String> 
                 })
                 .cloned()
                 .ok_or("invalid MCP transport correlation")?;
+            // The complete call/result-delivery window excludes host outer continuation.
+            let _outer_boundary = if method == "tools/call" {
+                let lock=outer_boundary_file(&bridge.config)?;
+                lock.lock().map_err(|_|"supplied outer boundary lock unavailable")?;
+                Some(lock)
+            } else {None};
             let (body, delivered) = match method {
                 "initialize" => {
                     if params.get("protocolVersion").and_then(Value::as_str) != Some(mcp::VERSION) {

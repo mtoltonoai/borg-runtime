@@ -463,6 +463,8 @@ pub enum WorkerCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Observation {
+    /// Original supplied outer occurrence facts and fresh continuation admission.
+    SuppliedOuter { observation: crate::supplied_outer::Observation },
     /// Immutable facts for one acknowledged native request reservation. This
     /// report does not authorize retry or change the current attempt's owner.
     NativeRequestDiagnostic {
@@ -867,6 +869,7 @@ pub struct Request {
 pub enum Data {
     IdentityAdministration(Box<IdentityAdministrationOutcome>),
     MachineResourceReport(crate::machine_resources::ReportDisposition),
+    SuppliedOuterWait(crate::supplied_outer::Wait),
     NativeRequestAdmission(crate::native_retry::NativeRequestAdmission),
     NativeRequestSettlement(crate::native_retry::NativeRequestSettlement),
     NativeRequestReadiness { acquire_operation_id: String, changed: bool },
@@ -1019,6 +1022,9 @@ impl Reply {
             let valid = match (operation, data) {
                 (Operation::ReportMachineResources { .. }, Data::MachineResourceReport(_)) => true,
                 (Operation::ReportMachineResources { .. }, _) | (_, Data::MachineResourceReport(_)) => false,
+                (Operation::ObserveWorker { report }, Data::SuppliedOuterWait(wait)) =>
+                    matches!(&report.observation, Observation::SuppliedOuter { observation: crate::supplied_outer::Observation::Waiting { index, .. } } if *index == wait.index),
+                (_, Data::SuppliedOuterWait(_)) => false,
                 (Operation::RegisterAgent { definition, .. }, Data::Agent(agent)) =>
                     agent.id == definition.id && agent.definition == *definition && !agent.retired,
                 (Operation::RetireAgent { agent_id, expected_revision, .. }, Data::Agent(agent)) =>

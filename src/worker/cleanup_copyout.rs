@@ -12,6 +12,7 @@ fn journal(name: &str) -> bool {
     matches!(
         name,
         "borg-thread.json"
+            | "borg-supplied-outer.json"
             | "borg-usage.json"
             | "borg-collaboration-config.json"
             | "collaboration-codex"
@@ -473,6 +474,7 @@ pub(super) async fn compact(
     )?;
     if thread.is_none() {
         for name in [
+            "borg-supplied-outer.json",
             "borg-usage.json",
             "borg-collaboration-config.json",
             "collaboration-codex",

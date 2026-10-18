@@ -434,6 +434,7 @@ impl Database {
         super::compatibility::validate_records(conn)?;
         super::identity_administration::validate_existing(conn, config, stored_version)
             .map_err(|_| "invalid identity/task creation records; original bytes retained".to_string())?;
+        super::operations::supplied_outer::validate_existing(conn,config,stored_version).map_err(|e|format!("supplied retry admission: {e:?}"))?;
         super::task_submission::validate_existing(conn, config, stored_version)
             .map_err(|_| "invalid retained default assignment; original bytes retained".to_string())?;
         super::agents::validate_existing(conn, config, stored_version)

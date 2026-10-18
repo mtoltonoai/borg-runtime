@@ -19,10 +19,11 @@ pub(super) const AGENT_DIRECTORY_VERSION: i64 = 23;
 // Schema24 adds immutable per-session inputs and pending same-task handoffs,
 // and fences root submission drafts/default-routing metadata. Existing row bodies stay exact.
 pub(super) const DEFAULT_ASSIGNMENT_VERSION: i64 = 24;
-// Schema25 jointly fences identity administration and machine read vocabulary.
+// Schema25 jointly fences identity/task, machine read and supplied retry vocabulary.
 // Existing schema24 rows and SQL shape remain byte-exact.
 pub(super) const IDENTITY_ADMINISTRATION_VERSION: i64 = 25;
 pub(super) const MACHINE_RESOURCES_VERSION: i64 = 25;
+pub(super) const SUPPLIED_RETRY_VERSION: i64 = 25;
 pub(super) const VERSION: i64 = 25;
 const SESSION_HANDOFF_DELTA: &str = include_str!("schema24-from23.sql");
 const AGENT_DIRECTORY_DELTA: &str = include_str!("schema23-from22.sql");
