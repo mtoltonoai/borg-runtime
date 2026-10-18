@@ -137,6 +137,13 @@ async fn unknown_throttle_shape_preserves_partial_tool_state_without_retry() {
 async fn exercise_retry(label: &str, refusal: Value, expect_retry: bool) {
     let mut lab = workflow_lab(label);
     let mut policy = (*lab.limits).clone();
+    // The shared workflow fixture predates the two machine-resource tools.
+    // Select the current complete V2 catalogue within explicit local bounds;
+    // production metadata and the original retry/effect oracles stay unchanged.
+    policy.execution.native.function_count = 66;
+    policy.execution.native.schema_bytes = 65_536;
+    assert_eq!(borg_runtime::mcp::catalogue_for_profile(&policy,
+        Some(&ExecutionProfile::CollaborationV2 { web_search: None })).len(), 66);
     // Same explicit bounded local retry selection as charter_retry's peer; no
     // production/default metadata selection or actual provider call is changed.
     policy.native_retry = Some(NativeRetryLimits { initial_backoff_ms: 5, backoff_multiplier: 2,
