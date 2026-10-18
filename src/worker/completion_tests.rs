@@ -268,7 +268,7 @@ async fn blocked_decision_query_rejects_changed_original_revision_or_subject_wit
 fn reason_bounds_and_dispatch_marker_survive_reopen_without_resend() {
     let limits=policy(); let value=feedback(CompletionBoundary::NativeResponse {request_index:1},CompletionTarget::NativeRequest {request_index:2});
     let state=area(); let record=InputRecord {revision:1,feedback:value.clone(),text:feedback_text(&value,&limits).unwrap(),
-        started:false,accepted_at:None,consumed_at:None,native_input:None};
+        started:false,accepted_at:None,consumed_at:None,native_input:None,supplied_retries:Vec::new()};
     persist_input(&state.join("input.json"),&record,&limits).unwrap();
     let mut input=Input {directory:state.clone(),record}; input.mark_dispatch(&limits).unwrap();
     let record=read_input(&state.join("input.json"),&limits).unwrap().unwrap();
@@ -311,7 +311,7 @@ async fn native_ack_keeps_original_target_and_exact_retained_rejection_chain() {
             else {CompletionTarget::NativeRequest {request_index:first}};
         let value=feedback(CompletionBoundary::NativeResponse {request_index:1},target.clone());
         let record=InputRecord {revision:1,feedback:value.clone(),text:feedback_text(&value,&limits).unwrap(),
-            started:false,accepted_at:None,consumed_at:None,native_input:None};
+            started:false,accepted_at:None,consumed_at:None,native_input:None,supplied_retries:Vec::new()};
         let directory=host.directory.join(key(&value.evaluation.boundary).unwrap());
         process::private_directory(&directory).unwrap();
         persist_input(&directory.join("input.json"),&record,&limits).unwrap();
@@ -342,7 +342,7 @@ fn native_retry_rejects_changed_binding_gaps_duplicates_and_limits_without_advan
     let limits=policy();let state=area();
     let value=feedback(CompletionBoundary::NativeResponse {request_index:1},CompletionTarget::NativeRequest {request_index:2});
     let record=InputRecord {revision:1,feedback:value.clone(),text:feedback_text(&value,&limits).unwrap(),
-        started:false,accepted_at:None,consumed_at:None,native_input:None};
+        started:false,accepted_at:None,consumed_at:None,native_input:None,supplied_retries:Vec::new()};
     persist_input(&state.join("input.json"),&record,&limits).unwrap();
     let mut input=Input {directory:state,record};input.mark_dispatch(&limits).unwrap();
     let rejection=|index,id:&str|NativeCompletionRejection {request_index:index,operation_id:id.into()};

@@ -678,8 +678,8 @@ class PrepareReleaseTests(unittest.TestCase):
         original = (self.root / "wire14/prepare-request.json").read_bytes()
         count = len(self.peer.requests)
         with self.assertRaisesRegex(ValueError, "application wire revision"):
-            prepare.execute("reconcile", self.peer.origin, self.root / "lookup24", self.digest, self.commit,
-                            previous=self.root / "wire14", wire_revision=24)
+            prepare.execute("reconcile", self.peer.origin, self.root / "lookup25", self.digest, self.commit,
+                            previous=self.root / "wire14", wire_revision=25)
         self.assertEqual(len(self.peer.requests), count)
         self.peer.mode = "wrong_original"
         with self.assertRaisesRegex(ValueError, "differs from original request"):
@@ -694,10 +694,10 @@ class PrepareReleaseTests(unittest.TestCase):
         self.assertNotIn("candidate", record)
 
     def test_wire_selection_rejects_invalid_types_before_network(self):
-        for i,value in enumerate((True,False,None,"20",20.0,7,24)):
+        for i,value in enumerate((True,False,None,"20",20.0,7,25)):
             with self.subTest(value=value),self.assertRaises(ValueError):
                 prepare.request("get_task",{"task_id":"task-1"},"wire",value)
-        for i,value in enumerate((True,False,"20",20.0,7,24)):
+        for i,value in enumerate((True,False,"20",20.0,7,25)):
             with self.subTest(value=value),self.assertRaises(ValueError):
                 prepare.execute("prepare",self.peer.origin,self.root/("invalid-wire-"+str(i)),self.digest,self.commit,
                                 self.package,"task-1","wire",wire_revision=value)

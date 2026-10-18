@@ -143,7 +143,7 @@ impl Reporter {
                             // A replayed admission is original history. It is
                             // insufficient alone to launch under changed state.
                             let current=controller_call(&self.client,Operation::GetTask{task_id:self.attempt.task_id.clone()},control).await?;
-                            let Outcome::Ok{data:Data::Task(current)}=current else{return Err("supplied currentness unavailable".into())};
+                            let Data::Task(current)=current else{return Err("supplied currentness unavailable".into())};
                             if current.status!=TaskStatus::Active || current.pending_assignment.is_some()
                                 || current.waiting_child_id.is_some() || current.session_id!=self.attempt.session_id
                                 || !current.attempt.as_ref().is_some_and(|a|a.id==self.attempt.id
@@ -1196,6 +1196,11 @@ fn report_contains_credential(
         return Ok(true);
     }
     Ok(match &report.observation {
+        Observation::SuppliedOuter { .. } => {
+            let value = serde_json::to_value(&report.observation)
+                .map_err(|_| "supplied outer report credential projection failed")?;
+            value_contains_credential(&value, credentials, limits)?
+        }
         Observation::NativeLoopCompleted { calls, requests, .. } => calls.iter().any(|c| {
             contains_credential(&c.operation_id, credentials)
                 || contains_credential(&c.logical_call_id, credentials)
