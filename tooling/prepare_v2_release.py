@@ -19,9 +19,9 @@ import time
 import urllib.parse
 
 MAX_BODY = 1_048_576
-WIRE_REVISION = 23
+WIRE_REVISION = 24
 VERIFIER_SHA = "512296740c56d216f8dd2dbe61a05c3aef3749f7aba2630c4ab916ffec02a05b"
-PROTOCOL_SOURCE_SHA = "8ac0c2fe1a18781886cc283e5972f1356670a526769a67969bb0699262dffe3c"
+PROTOCOL_SOURCE_SHA = "f7a9ce3dc6a922d076f82e7926e66852e98a472afdcba2c40fbcae518d962173"
 QUALIFICATION = {"artifact": "claimed", "repository_submission": "unconfigured",
                  "checks": "unconfigured", "human_rollout": "unconfigured"}
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -176,8 +176,8 @@ def endpoint(value: str) -> tuple[str, int]:
 
 
 def selected_wire(value: int) -> int:
-    if type(value) is not int or value not in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23):
-        raise ValueError("explicit application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 or 23")
+    if type(value) is not int or value not in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24):
+        raise ValueError("explicit application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 or 24")
     return value
 
 
@@ -450,7 +450,7 @@ def main() -> int:
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--expect-sha256", required=True)
         p.add_argument("--expect-commit", required=True)
-        p.add_argument("--protocol-revision", type=int, choices=(8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23), help="explicit target application wire; reconcile may use a newer wire without rewriting the original mutation")
+        p.add_argument("--protocol-revision", type=int, choices=(8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24), help="explicit target application wire; reconcile may use a newer wire without rewriting the original mutation")
         if action == "prepare":
             p.add_argument("--package", type=Path, required=True)
             p.add_argument("--task-id", required=True)
