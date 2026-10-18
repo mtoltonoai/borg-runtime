@@ -265,9 +265,9 @@ class Preparation(unittest.TestCase):
         self.assertFalse(receipt['protected_check_emitted'])
         self.assertFalse(receipt['human_rollout_authority'])
 
-    def test_explicit_wire25_is_bound_into_prepared_journey(self):
-        protocol=(ROOT.parent/'src/protocol.rs').read_bytes()
-        self.assertIn(b'pub const WIRE_REVISION: u32 = 25;',protocol)
+    def test_historical_explicit_wire25_is_bound_into_prepared_journey(self):
+        # Explicit wire25 remains a supported historical preparation choice.
+        self.assertEqual(prep.application_wire({'application_wire_revision':25}),25)
         self.r['preparation']['profile']['application_wire_revision']=25
         before=copy.deepcopy(self.r);steps,receipt=self.execute()
         self.assertEqual(self.r,before)

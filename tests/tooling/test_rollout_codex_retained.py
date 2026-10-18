@@ -82,7 +82,7 @@ class CodexRetainedTests(original.NoExternalEffects):
             self.observe(f)
 
     def test_original_home_intact_hold_needs_no_task_authority_or_api(self):
-        for reason in ('uncertain_effect', 'canonical_binding'):
+        for reason in ('uncertain_effect', 'canonical_binding', 'local_recovery'):
             for status, proof in ((None, False), ('failed', True)):
                 with self.subTest(reason=reason, status=status, proof=proof), self.fixture(
                         reason, status=status, proof=proof) as f:
@@ -342,7 +342,7 @@ class CodexRetainedTests(original.NoExternalEffects):
 
     def test_only_selected_actual_hold_reasons_are_eligible(self):
         for reason in ('source_or_path', 'clock', 'filesystem', 'startup', 'complete',
-                       'local_recovery', 'canonical_unavailable', 'not_terminal', 'not_stopped',
+                       'canonical_unavailable', 'not_terminal', 'not_stopped',
                        'checkpoint', 'active', 'cache_dependency', 'unknown'):
             with self.subTest(reason=reason), self.fixture() as f:
                 f.record['reason'] = reason

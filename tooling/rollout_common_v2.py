@@ -161,6 +161,23 @@ def controller_receipt_rows(snapshot, name, bound):
 
 # Immutable e20519 decoder and causal receipt producer family.
 COMPACT_RECEIPT_SOURCES = {'src/controller/application_schema.rs': 'f177e8ca7839e0f9e5130ee0a50ebe7eee78d30c7979e8d930dc9fb10ab7f783', 'src/controller/database.rs': '7a9d59f9b32775d75f754b192fbbd0853ac28da1970b9d42a9f8c849fc3dfb40', 'src/controller/metadata.rs': '126d141f05cf1d74de85008b08b19a79bdc90025c3335f79dd33eab7d42ad532', 'src/controller/operations/effects.rs': 'a818afb64d82048e563599159a7c982e200bd43437c00249d057c4316322e88a', 'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7', 'src/controller/read_retention.rs': '0def3401d029f1b14eab602b3d3f6520862da8ddb7a4022967030fce0d1b72f7', 'src/limits/retention.rs': 'd69614214efd380d62c7a6f5970a46f484b03c54943d8e18dcb0e7b4b972835d', 'src/mcp/mod.rs': '734eb4884aacd34acfb0ea14817d92a9241d11e59c59e4a200529cb2ab4f4d1e', 'src/protocol.rs': '9a04ea9917f388f10f055c1a341872f632da8626abf09092b5182e5edcd58fb6', 'src/read_page.rs': 'd386b2f8a310788e2bfe116878f47892382b5360ea89ca5a713754430c6e9a54', 'src/read_retention.rs': 'c1a069d41f3ff8d133b7929680d2b3f094e4d07a4331e6784427c64d9cc6a811', 'src/repository_view.rs': '08c9a14c273502223bed3888292e38d468280a6474169b00f33838f4ea2bb949'}
+
+
+# Exact current union decoder; the historical recovered family stays intact.
+PUBLICATION_UNION_COMPACT_RECEIPT_SOURCES = {
+    'src/controller/application_schema.rs': '5797006d361ff3370e64f371ec871e2f8226cd0d091bfd42a7226923c3090c45',
+    'src/controller/database.rs': 'fe0e8a880017b5bca70bcd61ec1083f9670d79438350ea9a66dffc33a03755e3',
+    'src/controller/metadata.rs': '0c2edca4afa187de2867b538ce7c15fcf69f6ba948467810356ca572a5e930b2',
+    'src/controller/operations/effects.rs': '9d7647d45f99ebb346a37f2bec0150ec87532f2454d3bd686df3f875d610846d',
+    'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7',
+    'src/controller/read_retention.rs': '22b2eeb67dfb7402a72a97dd1eef9a81d891aea1f2da6446e65d421ee63b155a',
+    'src/limits/retention.rs': 'd69614214efd380d62c7a6f5970a46f484b03c54943d8e18dcb0e7b4b972835d',
+    'src/mcp/mod.rs': '6c1efc59c9cc296c240c7a2b7cece9efb3ae597d8a74b4af960538b84e4bc6d7',
+    'src/protocol.rs': 'b615c7929db85c93c6df32537fb544ec7f9a342f4936aea90dc835dbce0bfaa7',
+    'src/read_page.rs': 'd386b2f8a310788e2bfe116878f47892382b5360ea89ca5a713754430c6e9a54',
+    'src/read_retention.rs': 'c1a069d41f3ff8d133b7929680d2b3f094e4d07a4331e6784427c64d9cc6a811',
+    'src/repository_view.rs': '08c9a14c273502223bed3888292e38d468280a6474169b00f33838f4ea2bb949',
+}
 COMPACT_READ_KINDS = {'collab_read_continue': 'page', 'collab_task_get': 'task', 'collab_memory_get': 'memory', 'collab_agent_get': 'agent', 'collab_tasks_list': 'list', 'collab_agents_list': 'list', 'collab_task_releases_list': 'list', 'collab_repository_tree': 'repository', 'collab_repository_read': 'repository', 'collab_repository_search': 'repository', 'collab_repository_diff': 'repository', 'collab_repository_history': 'repository', 'collab_document_get': 'document', 'collab_documents_list': 'document', 'collab_document_versions_list': 'document', 'collab_comments_list': 'document', 'collab_question_get': 'question', 'collab_questions_list': 'question', 'collab_question_answers': 'question', 'collab_question_actions': 'question', 'collab_decisions_list': 'question', 'collab_review_get': 'review', 'collab_reviews_list': 'review', 'collab_review_target_get': 'review', 'collab_task_coordination_get': 'work', 'collab_task_waits': 'work', 'collab_limits_get': 'collaboration', 'collab_session_get': 'collaboration', 'collab_sessions_list': 'collaboration', 'collab_definition_get': 'collaboration', 'collab_memory_list': 'collaboration', 'collab_task_history_list': 'collaboration', 'collab_workers_list': 'collaboration', 'collab_worker_get': 'collaboration', 'collab_machines_list': 'collaboration', 'collab_machine_get': 'collaboration', 'collab_task_attempts_list': 'collaboration', 'collab_task_checkpoints_list': 'collaboration', 'collab_release_get': 'collaboration', 'collab_release_checks_list': 'collaboration', 'collab_repositories_list': 'collaboration', 'collab_repository_get': 'collaboration'}
 
 
@@ -170,13 +187,18 @@ def compact_receipt_sources(profile, manifest):
     Format numbers alone do not admit a new receipt representation. This reader
     does not enable retention or reconstruct the removed original body.
     """
-    if profile.get('formats', {}).get('after') != {'wire':25,'controller_schema':26,'worker_format':20}:
+    after = profile.get('formats', {}).get('after')
+    if after == {'wire':25,'controller_schema':26,'worker_format':20}:
+        required = COMPACT_RECEIPT_SOURCES
+    elif after == {'wire':27,'controller_schema':28,'worker_format':22}:
+        required = PUBLICATION_UNION_COMPACT_RECEIPT_SOURCES
+    else:
         raise ValueError('compact_receipt_format')
     files = manifest.get('source', {}).get('files', {}) if isinstance(manifest, dict) else {}
     if any(not isinstance(files.get(name), dict) or files[name].get('sha256') != sha
-           for name, sha in COMPACT_RECEIPT_SOURCES.items()):
+           for name, sha in required.items()):
         raise ValueError('compact_receipt_authenticated_sources')
-    return dict(COMPACT_RECEIPT_SOURCES)
+    return dict(required)
 
 
 def _compact_uint(value, label, maximum=(1 << 64) - 1, positive_only=False):
@@ -341,7 +363,8 @@ def controller_receipt_plan(profile, before, restart, *, manifest=None):
         request, outcome = strict(old['request']), strict(old['outcome'])
         compact_record = None
         if isinstance(outcome, dict) and 'committed_read_reference' in outcome:
-            if before['schema'] != 26: raise ValueError('compact_original_schema')
+            allowed_schemas = (26,28) if profile.get('formats', {}).get('after') == {'wire':27,'controller_schema':28,'worker_format':22} else (26,)
+            if before['schema'] not in allowed_schemas: raise ValueError('compact_original_schema')
             compact_receipt_sources(profile, manifest)
             compact_record = _compact_receipt_record(operation_id, old, receipts)
         if operation_id in external: continue
@@ -716,6 +739,26 @@ RECOVERED_SOURCES = COMPOSED_SOURCES | {
 }
 
 
+# The current union admits both schema26 read/identity and schema27 publication
+# vocabulary. Only the actual installed24/25/19 predecessor is selected here;
+# the runtime still owns all typed admission and marker writes. No SQL table,
+# row, worker journal, or original effect rewrite is permitted by this route.
+PUBLICATION_UNION_KIND = 'validated-controller25-worker19-to-wire27-controller28-worker22/1'
+PUBLICATION_UNION_BEFORE = {'wire':24,'controller_schema':25,'worker_format':19}
+PUBLICATION_UNION_AFTER = {'wire':27,'controller_schema':28,'worker_format':22}
+PUBLICATION_UNION_SOURCES = RECOVERED_SOURCES | {
+    'src/mcp/publication.rs',
+    'src/controller/publication_requests.rs',
+    'src/worker/publication_requests.rs',
+    'src/controller/credits.rs',
+}
+
+def publication_union_forward(profile):
+    transition=forward(profile)
+    return transition is not None and transition.get('kind')==PUBLICATION_UNION_KIND
+
+
+
 def recovered_forward(profile):
     transition=forward(profile)
     return transition is not None and transition.get('kind')==RECOVERED_KIND
@@ -732,7 +775,7 @@ def directory_forward(profile):
 
 
 def per_host_forward(profile):
-    return supplied_forward(profile) or directory_forward(profile) or composed_forward(profile) or recovered_forward(profile)
+    return supplied_forward(profile) or directory_forward(profile) or composed_forward(profile) or recovered_forward(profile) or publication_union_forward(profile)
 
 
 def supplied_forward(profile):
@@ -742,7 +785,7 @@ def supplied_forward(profile):
 
 def supplied_before_hosts(profile):
     transition=forward(profile);hosts=profile['hosts'];proofs=transition['before_hosts']
-    before=RECOVERED_BEFORE if recovered_forward(profile) else COMPOSED_BEFORE if composed_forward(profile) else SUPPLIED_TURN_BEFORE
+    before=PUBLICATION_UNION_BEFORE if publication_union_forward(profile) else RECOVERED_BEFORE if recovered_forward(profile) else COMPOSED_BEFORE if composed_forward(profile) else SUPPLIED_TURN_BEFORE
     if (not isinstance(proofs,dict) or not isinstance(hosts,list)
             or len({h['id'] for h in hosts})!=len(hosts)
             or set(proofs)!={h['id'] for h in hosts}):
@@ -791,7 +834,7 @@ def forward(profile):
 def format_sources(profile):
     transition=forward(profile)
     if transition is None:return FORMAT_SOURCES
-    return RECOVERED_SOURCES if recovered_forward(profile) else COMPOSED_SOURCES if composed_forward(profile) else AGENT_DIRECTORY_SOURCES if transition['kind']==AGENT_DIRECTORY_KIND else SUPPLIED_TURN_SOURCES if transition['kind']==SUPPLIED_TURN_KIND else INSTRUCTION_SOURCE_SOURCES if transition['kind']==INSTRUCTION_SOURCE_KIND else PR_PUBLICATION_SOURCES if transition['kind']==PR_PUBLICATION_KIND else MEMORY_NOTICE_REMOVAL_SOURCES if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else CHARTER_ADOPTION_SOURCES if transition['kind']==CHARTER_ADOPTION_KIND else DIAGNOSTIC_SOURCES if transition['kind']==DIAGNOSTIC_KIND else LOSSLESS_SOURCES if transition['kind']==LOSSLESS_KIND else FORWARD_SOURCES
+    return PUBLICATION_UNION_SOURCES if publication_union_forward(profile) else RECOVERED_SOURCES if recovered_forward(profile) else COMPOSED_SOURCES if composed_forward(profile) else AGENT_DIRECTORY_SOURCES if transition['kind']==AGENT_DIRECTORY_KIND else SUPPLIED_TURN_SOURCES if transition['kind']==SUPPLIED_TURN_KIND else INSTRUCTION_SOURCE_SOURCES if transition['kind']==INSTRUCTION_SOURCE_KIND else PR_PUBLICATION_SOURCES if transition['kind']==PR_PUBLICATION_KIND else MEMORY_NOTICE_REMOVAL_SOURCES if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else CHARTER_ADOPTION_SOURCES if transition['kind']==CHARTER_ADOPTION_KIND else DIAGNOSTIC_SOURCES if transition['kind']==DIAGNOSTIC_KIND else LOSSLESS_SOURCES if transition['kind']==LOSSLESS_KIND else FORWARD_SOURCES
 
 
 def format_contract(profile):
@@ -801,8 +844,8 @@ def format_contract(profile):
         if f['before']!=f['after']: raise ValueError('incompatible state formats: qualified forward transition required')
         return
     fields(transition,'kind before_package_sha256 after_package_sha256 evidence'+(' before_hosts' if per_host_forward(profile) else ''),'forward transition')
-    expected=RECOVERED_AFTER if recovered_forward(profile) else COMPOSED_AFTER if composed_forward(profile) else AGENT_DIRECTORY_AFTER if directory_forward(profile) else SUPPLIED_TURN_AFTER if supplied_forward(profile) else FORWARD_AFTER if transition['kind']==FORWARD_KIND else LOSSLESS_AFTER if transition['kind']==LOSSLESS_KIND else DIAGNOSTIC_AFTER if transition['kind']==DIAGNOSTIC_KIND else CHARTER_ADOPTION_AFTER if transition['kind']==CHARTER_ADOPTION_KIND else MEMORY_NOTICE_REMOVAL_AFTER if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else PR_PUBLICATION_AFTER if transition['kind']==PR_PUBLICATION_KIND else INSTRUCTION_SOURCE_AFTER if transition['kind']==INSTRUCTION_SOURCE_KIND else None
-    before=RECOVERED_BEFORE if recovered_forward(profile) else COMPOSED_BEFORE if composed_forward(profile) else AGENT_DIRECTORY_BEFORE if directory_forward(profile) else SUPPLIED_TURN_BEFORE if supplied_forward(profile) else FORWARD_BEFORE
+    expected=PUBLICATION_UNION_AFTER if publication_union_forward(profile) else RECOVERED_AFTER if recovered_forward(profile) else COMPOSED_AFTER if composed_forward(profile) else AGENT_DIRECTORY_AFTER if directory_forward(profile) else SUPPLIED_TURN_AFTER if supplied_forward(profile) else FORWARD_AFTER if transition['kind']==FORWARD_KIND else LOSSLESS_AFTER if transition['kind']==LOSSLESS_KIND else DIAGNOSTIC_AFTER if transition['kind']==DIAGNOSTIC_KIND else CHARTER_ADOPTION_AFTER if transition['kind']==CHARTER_ADOPTION_KIND else MEMORY_NOTICE_REMOVAL_AFTER if transition['kind']==MEMORY_NOTICE_REMOVAL_KIND else PR_PUBLICATION_AFTER if transition['kind']==PR_PUBLICATION_KIND else INSTRUCTION_SOURCE_AFTER if transition['kind']==INSTRUCTION_SOURCE_KIND else None
+    before=PUBLICATION_UNION_BEFORE if publication_union_forward(profile) else RECOVERED_BEFORE if recovered_forward(profile) else COMPOSED_BEFORE if composed_forward(profile) else AGENT_DIRECTORY_BEFORE if directory_forward(profile) else SUPPLIED_TURN_BEFORE if supplied_forward(profile) else FORWARD_BEFORE
     if expected is None or canonical(f['before'])!=canonical(before) or canonical(f['after'])!=canonical(expected):
         raise ValueError('incompatible or unsupported forward transition')
     for key in ('before_package_sha256','after_package_sha256'):

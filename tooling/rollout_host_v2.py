@@ -7,7 +7,7 @@ or uncertain phase replay. Systemd/HTTP are the explicit integration test seam.
 from __future__ import annotations
 import argparse, copy, contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, stat, struct, sys, tarfile, time
 from pathlib import Path
-_COMMON_SHA = '436dd20bfb545383f27c941e48f4e131b0d60e006db0cf4d2c627e3e2cfa39f2'
+_COMMON_SHA = '21c8273a459d37a663cbc5e6bfd31905f3cfe7c9d5f44c0e7c670b89a93f7f52'
 
 def _walk_error(error):
     # An unreadable or vanished inventory is not proof that it is empty.
@@ -119,6 +119,88 @@ _RECOVERED_CODEX_HOME_SOURCES = {
     'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
     'src/worker/publication.rs': '972cda207bf324f5393dbee390b559089ad8798a6c920e00457e09a2dc0e7dc9',
     'src/worker/pull_request.rs': 'f0308a668abbf229851cf0a454570371a3315a32a55a3e60bed8b145eff2ac1b',
+    'src/worker/read_pagination.rs': 'fa638c1d13b8d1c4585b221711ccf6602be9da6b2f4697f8cf81172f17735c6c',
+    'src/worker/read_retention.rs': '1c54c8a127c88859d9cf799884cc9c42e5f303a9e3edfd648c8c8888948ca381',
+}
+
+
+# Exact current union producer family; never mix it with a historical map.
+_PUBLICATION_UNION_CODEX_HOME_FORMATS = {'wire':27,'controller_schema':28,'worker_format':22}
+_PUBLICATION_UNION_CODEX_HOME_SOURCES = {
+    'src/charter.rs': '199b421f562aa86f95a23af8e1443fc68a13cfc2ecbce9e83ae13e601f5eb5c1',
+    'src/controller/agents.rs': 'edb3eab0521f3033eca591a28a9244868dac46d08d1658f43818edc5cfe313d8',
+    'src/controller/application_schema.rs': '5797006d361ff3370e64f371ec871e2f8226cd0d091bfd42a7226923c3090c45',
+    'src/controller/charter_outputs.rs': '625a9e009fe8006533bacae95d7c91b3ef033a9c0a2e5ae1842f2ea8bd727d72',
+    'src/controller/charters.rs': '5e247a63e6e7041b9ce447ae3869ec46d513da926d606af0434ff4e5491299f4',
+    'src/controller/charters_supplied.rs': 'cb1b3b6bd1acd783a81fa447770adbb997539495b7d00788cd495bb85cad14a1',
+    'src/controller/charters_supplied_turns.rs': '116f76f7163e667276e29dc66dbb8f8dbde25da8e856f5ef3059f5ef01aa1135',
+    'src/controller/collaboration_calls.rs': 'e468462e593af93e2ead8da95b85ccd07975115cbe4e87222d8628559e3ab1fd',
+    'src/controller/credits.rs': '8f8a4e9f733a7be2cb134f065cdc9eb90de8ece41580954aa241813aa569b2ec',
+    'src/controller/database.rs': 'fe0e8a880017b5bca70bcd61ec1083f9670d79438350ea9a66dffc33a03755e3',
+    'src/controller/identity_administration.rs': '521c01d2db8419e65fd4c209d61f652c14e248506d02590607156a9b46ed45a4',
+    'src/controller/identity_limit_fields.rs': 'feae44991d67c43b3da5d4a7a03b16daab68e0505fc6be39630e611de2c1d4bd',
+    'src/controller/machine_resources.rs': 'cd2617a4b80d732d4ccbd876dc39761db69046e17c15952d4f9d01cf9cd3d1cd',
+    'src/controller/mod.rs': '399dfaaf3936e0fa4d8bcb4b1d9668ae4648f0bcf740b86dd05e328be4a2d141',
+    'src/controller/operations.rs': '029107bde1780738a3816bda6bd716dbdc30468391c3b3203fe7adecf92222e4',
+    'src/controller/operations/effects.rs': '9d7647d45f99ebb346a37f2bec0150ec87532f2454d3bd686df3f875d610846d',
+    'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7',
+    'src/controller/operations/supplied_outer.rs': 'c51a074820b443b263bc93721c2f6a9fdbe329fb4bcae14e9a767e53d79a87b5',
+    'src/controller/publication_requests.rs': 'bd707c5990774258046bcbf8afdbc24e33d0a64645d01fe444cb4043fef76561',
+    'src/controller/pull_request.rs': '8ed6d5afd654f0046cc6cc9a884d111f2f1b0e3f3da4c799fdf6e3b3f7c394b5',
+    'src/controller/read_pages.rs': '8a9639595f104ab0b680cf706fec072e978bf56a0e1406f0648659e1851faf26',
+    'src/controller/read_pagination.rs': '17be85fdb045bdd18892c1dc051b32f386283edd6468042cf08c00c5b6f922c7',
+    'src/controller/read_retention.rs': '22b2eeb67dfb7402a72a97dd1eef9a81d891aea1f2da6446e65d421ee63b155a',
+    'src/controller/schema23-from22.sql': '95e229e4f9140322e176f7fdec8cb05a010634c0462ed7bb97643025519a2634',
+    'src/controller/schema24-from23.sql': 'f2318a08f58659caa2239149e7e051c63e41219a8f483f1ed5e75383f278ef7c',
+    'src/controller/sessions.rs': '540c0624425b2602dd8f1ecdae6ba3352c3bf6af798936dff492b16eeba0a89e',
+    'src/controller/task_creation.rs': '692580e630fdeb3de80bb78d1b539b120bcede67d9bc3dbafcce3094158df648',
+    'src/controller/task_handoffs.rs': '682ba3b2a2ba95639387628ef8d7a5c8ac13c294b0bbfb37d224727e6bffdd20',
+    'src/controller/task_submission.rs': 'ad337c3ef6c8cfd2ab6f6e8f6a6196ab9f117645883431d34250a396208a85d2',
+    'src/delegation.rs': 'd8c7e1f49f9abf98ca57f3f7a5ecf09c0bcf54fd908345436b5c541450188ebc',
+    'src/lib.rs': 'b9eeb9c686c1531c04b186ad153193f06e5b189c6589afa3f30d258e48bba60e',
+    'src/limits/identity.rs': 'eb5b55eda454c3bd98a81b3c962428c0c02bc650042f7e288e0cd04112292293',
+    'src/limits/mod.rs': '30b4da4cc6b8992603ed88ad5b1accf4a4484a458c01744ea8e87bfc913fc1d3',
+    'src/limits/worker.rs': '6b727ae7279c58fcfc67e7cc43d5990c463104f982943189b8900a1b89fa8b94',
+    'src/machine_resources.rs': 'b98c54d7e79b87a54d0e4e4ce4367c047fe2779efabbbf107fa9d3fbc2a1887e',
+    'src/mcp/identity_administration.rs': '9c9aa2daae61cbcbb208e761310774059393a950d102c387f96d472eb0bdb347',
+    'src/mcp/mod.rs': '6c1efc59c9cc296c240c7a2b7cece9efb3ae597d8a74b4af960538b84e4bc6d7',
+    'src/mcp/publication.rs': 'f106ddb716946ea30a41ffda0a515c298483f5661353f465c96b114c3e8901fe',
+    'src/mcp/read_recovery.rs': '3856ef88f87e04e097b51679eec30d6e6b1c6f89bd704e622cd47dde375b290f',
+    'src/native/loop_step.rs': '438cca78daed2f768b2253ef95b4fd65a0bc4a83034dff23f395c3c78c289bce',
+    'src/protocol.rs': 'b615c7929db85c93c6df32537fb544ec7f9a342f4936aea90dc835dbce0bfaa7',
+    'src/protocol_identity.rs': 'fd7840055bda87c4bd13aa781481d46f986634b34c8c60f73579a1ca970f3a83',
+    'src/protocol_identity_limit_fields.rs': '3d362ab19342ddae26005024230f25646b60df3ed611b9cb7dc806051796d9ed',
+    'src/protocol_read_pagination.rs': 'f467d2875373d2643483ff1580d7726da066ca73055115eb84bd36c0510be91a',
+    'src/pull_request.rs': 'fe10396dc9449b0ddfb944fe13aac3419fef422581c9a5df06af6edc8f0b2bf7',
+    'src/read_page.rs': 'd386b2f8a310788e2bfe116878f47892382b5360ea89ca5a713754430c6e9a54',
+    'src/read_retention.rs': 'c1a069d41f3ff8d133b7929680d2b3f094e4d07a4331e6784427c64d9cc6a811',
+    'src/supplied_outer.rs': '7844aab69b622ffcabe6693930248ec0c94b6fc5c022f151a55e2230bfbf3e91',
+    'src/worker/acceptance.rs': 'edb4a355552c0caeadd5226c9db006649b31e7857eae993041b0831679af1465',
+    'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
+    'src/worker/charter_output.rs': '226a579415f30839889c8f716cecb1a843bffac846bb9361a262fc6be263c88d',
+    'src/worker/cleanup.rs': '54f15913412870da6984ade05477d09004a28ab07cece96931759d2381bba898',
+    'src/worker/cleanup_copyout.rs': '4181eeac29c4869d07fa11ca282e5963259a566240e0cc389d4e4ef2fc0aaa80',
+    'src/worker/cleanup_plugins.rs': '247e6241889e1f58d52172f20ee4359a9f9804af73171e8e42c5e3a7c07a42cd',
+    'src/worker/cleanup_reads.rs': '54940748108c99b7f496ca49f81c21fb5f8eca5f957d1b9d71d50edfc527bdf0',
+    'src/worker/codex.rs': '14057a27f939b0c0e23c300e0044658b2e9fd11228e8eb38cf006763c529af2b',
+    'src/worker/codex_charter.rs': '81c409316aa2cb4b651942c51688bd6c1719588ababed672d0f5b6e7dbef6e58',
+    'src/worker/codex_charter_turns.rs': 'db9798de3c855716f3b6d65df0df2c66ec9dadf3c75e700b4d548aefc85c43c3',
+    'src/worker/codex_mcp.rs': 'eac1790b601efc283028677e6102804c905aba8973bacdb9995fa4848b98ff41',
+    'src/worker/codex_retry.rs': 'ca3e0f8d26a57d6ab8a073b9b90573f781ee521db886446ccd6935820847e5a0',
+    'src/worker/collaboration_notice.rs': 'b6924a898af2dc8990512421819f5d58f1b1cee7eea7d00d899455fa3e3fdc19',
+    'src/worker/completion.rs': '9fde728db6228fe7377137c817390c224d4782ae4c99e070f8eb1cb9a72159a5',
+    'src/worker/git_cleanup.rs': 'c291bc2926daf930e66522e52ea6c0f53199269beced4bce1124f26c08e9fd8c',
+    'src/worker/handoff.rs': 'c37df7598c3a43b955db3ee64f0c0b6c583769c29b810d6ca90639129d350284',
+    'src/worker/identity_limit_fields.rs': '898745126398665a1a1885d4670e2e214533fa74996e2f7bd5fd1d87b949552c',
+    'src/worker/machine_resources.rs': '7e34c7ec3bc87298a88cb42b216584cb16b70e82a14c96b1786e9048aea45775',
+    'src/worker/mod.rs': 'e98160bfee5aa035bbf8ec72706aa4871f9dfef65e9bbe8ef6b4ed60b7af1bed',
+    'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
+    'src/worker/native_loop.rs': 'e28e0d9c37aa48580816681d61bcd2ab23061392a53d1f9582ba9f1a42378edd',
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+    'src/worker/publication.rs': '972cda207bf324f5393dbee390b559089ad8798a6c920e00457e09a2dc0e7dc9',
+    'src/worker/publication_requests.rs': '4c743a5e043ee8188438db7e13192c6abf39bef1fa5bc5f38722a6edcd775214',
+    'src/worker/pull_request.rs': 'e41762ad700819cab5c748b2bee7be6fa92e63f639a8655aeb89220318c82b69',
+    'src/worker/pull_request_provider.rs': 'ca252febb582a64621e327a4d20f97cdd55424795ad11b81a3d7da63719c3f4d',
     'src/worker/read_pagination.rs': 'fa638c1d13b8d1c4585b221711ccf6602be9da6b2f4697f8cf81172f17735c6c',
     'src/worker/read_retention.rs': '1c54c8a127c88859d9cf799884cc9c42e5f303a9e3edfd648c8c8888948ca381',
 }
@@ -1254,6 +1336,13 @@ _RECOVERED_CODEX_RETAINED_SOURCES = {
 }
 
 
+_PUBLICATION_UNION_CODEX_RETAINED_SOURCES = {
+    'src/worker/cleanup.rs': '54f15913412870da6984ade05477d09004a28ab07cece96931759d2381bba898',
+    'src/worker/cleanup_copyout.rs': '4181eeac29c4869d07fa11ca282e5963259a566240e0cc389d4e4ef2fc0aaa80',
+    'src/worker/cleanup_plugins.rs': '247e6241889e1f58d52172f20ee4359a9f9804af73171e8e42c5e3a7c07a42cd',
+}
+
+
 class CodexHomePreservation:
     """Closed proof of original vendor disappearance; no mutable path wildcard.
 
@@ -1450,7 +1539,7 @@ class CodexHomePreservation:
             grace_key={'succeeded':'success_grace_ms','failed':'failed_grace_ms','cancelled':'cancelled_grace_ms'}.get(record['status'])
             if (grace_key is None or type(first) is not int or not 0<=first<=last<due or record['proof'] is None
                     or due!=_add(first,record['policy'][grace_key])):raise ValueError('codex_retained_grace_binding')
-        elif reason in ('uncertain_effect','canonical_binding'):
+        elif reason in ('uncertain_effect','canonical_binding','local_recovery'):
             if first is not None or due!=_add(last,record['policy']['retry_delay_ms']):raise ValueError('codex_retained_hold_binding')
         else:raise ValueError('codex_retained_reason_outside_scope')
         evidence={'progress_sha256':new['sha256'],'original_progress_row':copy.deepcopy(old),
@@ -1513,6 +1602,13 @@ _CHARTER_MANIFEST_SOURCES = {
 }
 
 
+_PUBLICATION_UNION_CHARTER_MANIFEST_SOURCES = {
+    'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
+    'src/worker/charter_output.rs': '226a579415f30839889c8f716cecb1a843bffac846bb9361a262fc6be263c88d',
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+}
+
+
 _CHARTER_JOURNAL_SOURCES = {**_CHARTER_MANIFEST_SOURCES,
     'src/worker/mutations.rs':'e510c3020ca1476ac3d2bda9762b2cee11d2f29d1ac552472d9218b9237e0553'}
 
@@ -1520,6 +1616,14 @@ _CHARTER_JOURNAL_SOURCES = {**_CHARTER_MANIFEST_SOURCES,
 _RECOVERED_CHARTER_JOURNAL_SOURCES = {
     'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
     'src/worker/charter_output.rs': 'b4231b3e24e7933a1e142a187bf6f07ff6d316889aaf2b14354bec2d6fef1900',
+    'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+}
+
+
+_PUBLICATION_UNION_CHARTER_JOURNAL_SOURCES = {
+    'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
+    'src/worker/charter_output.rs': '226a579415f30839889c8f716cecb1a843bffac846bb9361a262fc6be263c88d',
     'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
     'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
 }
@@ -1714,7 +1818,7 @@ class CharterManifestPreservation:
 
     def proof(self):
         return {'status':'SCOPED_ORIGINAL_CHARTER_MANIFEST_OBSERVATIONS','records':len(self.observations),
-                'observations':copy.deepcopy(self.observations),'source_files':_CHARTER_MANIFEST_SOURCES,
+                'observations':copy.deepcopy(self.observations),'source_files':self.host.charter_manifest_sources(),
                 'journal_observations':copy.deepcopy(self.journals),'journal_source_files':self.host.charter_journal_sources(),
                 'other_history_guards_unchanged':True,'host_effects':False,'directory_allowances_added':False,
                 'simultaneous_snapshot':False,'original_content_and_noninode_identity_preserved':True}
@@ -2228,6 +2332,8 @@ class Host:
         if self.h['role']!='worker':return False
         files=getattr(self,'_verified_manifest',{}).get('source',{}).get('files',{})
         exact=lambda family:all(isinstance(files.get(n),dict) and files[n].get('sha256')==sha for n,sha in family.items())
+        if _same(c,self.p.get('formats',{}).get('after'),_PUBLICATION_UNION_CODEX_HOME_FORMATS):
+            return exact(_PUBLICATION_UNION_CODEX_HOME_SOURCES)
         if _same(c,self.p.get('formats',{}).get('after'),_RECOVERED_CODEX_HOME_FORMATS):
             return exact(_RECOVERED_CODEX_HOME_SOURCES)
         if any(exact(family) for family in (_CODEX_HOME_SOURCES,_SUPPLIED_CODEX_HOME_SOURCES,_DIRECTORY_CODEX_HOME_SOURCES,_DEFAULT_ASSIGNMENT_CODEX_HOME_SOURCES)):
@@ -2235,10 +2341,18 @@ class Host:
         return (_same(c,self.p.get('formats',{}).get('after'),_COMPOSED_CODEX_HOME_FORMATS)
                 and exact(_COMPOSED_CODEX_HOME_SOURCES))
     def retained_writer_sources(self):
+        if _same(c,self.p.get('formats',{}).get('after'),_PUBLICATION_UNION_CODEX_HOME_FORMATS):
+            return _PUBLICATION_UNION_CODEX_RETAINED_SOURCES
         if _same(c,self.p.get('formats',{}).get('after'),_RECOVERED_CODEX_HOME_FORMATS):
             return _RECOVERED_CODEX_RETAINED_SOURCES
         return _CODEX_RETAINED_SOURCES
+    def charter_manifest_sources(self):
+        if _same(c,self.p.get('formats',{}).get('after'),_PUBLICATION_UNION_CODEX_HOME_FORMATS):
+            return _PUBLICATION_UNION_CHARTER_MANIFEST_SOURCES
+        return _CHARTER_MANIFEST_SOURCES
     def charter_journal_sources(self):
+        if _same(c,self.p.get('formats',{}).get('after'),_PUBLICATION_UNION_CODEX_HOME_FORMATS):
+            return _PUBLICATION_UNION_CHARTER_JOURNAL_SOURCES
         if _same(c,self.p.get('formats',{}).get('after'),_RECOVERED_CODEX_HOME_FORMATS):
             return _RECOVERED_CHARTER_JOURNAL_SOURCES
         return _CHARTER_JOURNAL_SOURCES
@@ -2300,6 +2414,10 @@ class Host:
             required={name:_RECOVERED_CODEX_HOME_SOURCES[name]
                       for name in ('src/worker/cleanup.rs','src/worker/process.rs')}
             retained_holds=self.selected_writer_sources(required)
+        if _same(c,self.p.get('formats',{}).get('after'),_PUBLICATION_UNION_CODEX_HOME_FORMATS):
+            required={name:_PUBLICATION_UNION_CODEX_HOME_SOURCES[name]
+                      for name in ('src/worker/cleanup.rs','src/worker/process.rs')}
+            retained_holds=self.selected_writer_sources(required)
         return {'original':old,'observed':new,**cleanup_clocks(original,observed,retained_holds=retained_holds)}
     def worker_history(self,stop,current):
         preserved={};observations={};mutable={'mutations/registration.json','mutations/await.json','worker-owner.json'}
@@ -2339,6 +2457,9 @@ class Host:
         if _same(c,formats.get('after'),_RECOVERED_CODEX_HOME_FORMATS):
             selected=_RECOVERED_CODEX_HOME_FORMATS
             required={name:_RECOVERED_CODEX_HOME_SOURCES[name] for name in required}
+        if _same(c,formats.get('after'),_PUBLICATION_UNION_CODEX_HOME_FORMATS):
+            selected=_PUBLICATION_UNION_CODEX_HOME_FORMATS
+            required={name:_PUBLICATION_UNION_CODEX_HOME_SOURCES[name] for name in required}
         if (self.h['role']!='worker' or c.forward(self.p)
                 or not _same(c,formats.get('before'),selected)
                 or not _same(c,formats.get('after'),selected)
@@ -2382,7 +2503,7 @@ class Host:
         return all(isinstance(files.get(name),dict) and files[name].get('sha256')==sha for name,sha in required.items())
     def charter_manifest_observation(self,name,old,new,stop,current):
         if not isinstance(name,str) or re.fullmatch(r'charter-output/[0-9a-f]{64}/manifest\.json',name) is None:return False
-        if not self.selected_writer_sources(_CHARTER_MANIFEST_SOURCES):return False
+        if not self.selected_writer_sources(self.charter_manifest_sources()):return False
         hook=getattr(self,'_charter_manifests',None)
         if hook is None:self._charter_manifests=hook=CharterManifestPreservation(self,stop,current)
         return hook.observe(name,old,new)

@@ -308,3 +308,76 @@ async fn operator_directory_journey() {
     assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"operator-retired-new-task".into(),input}).await,Outcome::Refused{code,..} if code=="agent_retired"));
     assert_eq!(get(&c,&first.id).await.input,first.input,"read and retirement do not alter accepted work");
 }
+
+
+#[tokio::test]
+async fn shared_read_pagination_oversized_accepted_result_survives_restart_exactly() {
+    Box::pin(oversized_accepted_result_journey()).await;
+}
+async fn oversized_accepted_result_journey() {
+    let p=path();let cfg=config();let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
+    let mut input=native("oversized-result");
+    input.output_schema=Some(json!({"type":"object","required":["answer"],
+        "properties":{"answer":{"type":"string"}},"additionalProperties":false}));
+    let output=json!({"answer":"🙂é\\\"\n".repeat(900)});
+    let output_bytes=serde_json::to_vec(&output).unwrap().len();
+    assert!(output_bytes>CAP,"the accepted output itself exceeds one read page");
+    assert!(output_bytes<input.limits.output_bytes,"ordinary admitted output limit suffices");
+    let (submitted,attempt,_)=admitted(&c,"oversized-result",input).await;
+    // Use the canonical completion sequence from finish_native. This is a
+    // controlled worker report fixture, not a provider or seeded Task.result.
+    task(report(&c,&attempt,"large-result-started",Observation::Started{thread_id:None,turn_id:None}).await);
+    controlled_native_request(&c,&attempt,1,Some(4),Some(2)).await;
+    task(report(&c,&attempt,&borg_runtime::native_loop_contract::completion_id(&attempt.id),
+        Observation::NativeLoopCompleted{requests:Vec::new(),final_response_index:None,model_requests:1,calls:vec![]}).await);
+    task(report(&c,&attempt,"large-result-executor",Observation::ExecutorOutcome{
+        success:true,summary:"actual controlled completion".into()}).await);
+    task(report(&c,&attempt,"large-result-stopped",Observation::ProcessTreeStopped).await);
+    let candidate=Observation::ResultCandidate{checks_passed:true,summary:"accepted oversized answer".into(),
+        checkpoint:None,validation:vec![borg_runtime::native_loop_contract::evidence(&attempt.id)],output:Some(output.clone())};
+    let completed=task(report(&c,&attempt,"large-result-accepted",candidate.clone()).await);
+    assert_eq!(completed.status,TaskStatus::Succeeded);
+    assert!(completed.attempt.as_ref().unwrap().stopped);
+    let accepted=completed.result.clone().expect("canonical accepted result");
+    assert_eq!(accepted.attempt_id,attempt.id);assert_eq!(accepted.output,Some(output));
+    let exact=read_page::canonical(&accepted).unwrap();
+    assert!(exact.len()>CAP);assert!(exact.len()<=completed.input.limits.result_bytes);
+    let selection=task_selection(&completed,TaskPart::Result);
+    let first=query(&c,selection.clone(),None).await;
+    assert!(!first.complete);assert_eq!(first.offset,0);assert!(first.next_cursor.is_some());
+    assert_eq!(first.total_bytes,exact.len());assert_eq!(first.subject,selection);
+    assert_eq!(first.encoding,read_page::Encoding::CanonicalJsonUtf8);
+    assert_eq!(first.retained_truncation,None);
+    assert_eq!(first.identity.source,read_page::Source::Task{task_id:submitted.id.clone(),
+        session_id:submitted.session_id.clone(),part:TaskPart::Result,revision:attempt.id.clone()});
+    assert_eq!(first.identity.digest,read_page::digest(exact.as_bytes()));
+    assert!(serde_json::to_vec(&Data::ReadPage(Box::new(first.clone()))).unwrap().len()<=CAP);
+    assert_eq!(get(&c,&completed.id).await,completed);
+    let operation=Operation::GetOperation{operation_id:"large-result-accepted".into()};
+    let receipt=Box::pin(c.handle(Request{protocol_revision:WIRE_REVISION,
+        request_id:"large-result-original-receipt".into(),command:operation.clone()})).await;
+    receipt.validate_for(&operation).unwrap();assert!(receipt.commit.is_some());
+    assert!(matches!(receipt.outcome,Outcome::Ok{data:Data::Operation(_)}));
+    drop(c);controller_owner_released(&p).await;
+    let raw_receipt=|sql:&rusqlite::Connection|->(String,String,u64){
+        sql.query_row("SELECT request,outcome,controller_revision FROM receipts WHERE id='large-result-accepted'",
+            [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+    };
+    let sql=rusqlite::Connection::open(&p).unwrap();let original=raw_receipt(&sql);drop(sql);
+    let c=Controller::open_with_config(&p,cfg).unwrap();
+    // The first fragment/cursor was captured before owner release. Continue it
+    // after reopen; the helper checks every offset, identity, envelope bound,
+    // positive progress, final total and digest rather than only visible links.
+    assert_eq!(query(&c,selection,None).await,first);
+    let reconstructed=reconstruct_operator(&c,first).await;
+    assert_eq!(reconstructed,exact);
+    assert_eq!(serde_json::from_str::<AcceptedResult>(&reconstructed).unwrap(),accepted);
+    assert_eq!(get(&c,&completed.id).await,completed);
+    let replay=Box::pin(c.handle(Request{protocol_revision:WIRE_REVISION,
+        request_id:"large-result-reopened-receipt".into(),command:operation.clone()})).await;
+    replay.validate_for(&operation).unwrap();assert_eq!(replay.outcome,receipt.outcome);assert_eq!(replay.commit,receipt.commit);
+    assert_eq!(task(report(&c,&attempt,"large-result-accepted",candidate).await),completed);
+    assert_eq!(get(&c,&completed.id).await,completed);
+    drop(c);controller_owner_released(&p).await;
+    let sql=rusqlite::Connection::open(&p).unwrap();assert_eq!(raw_receipt(&sql),original);
+}

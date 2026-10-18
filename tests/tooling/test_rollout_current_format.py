@@ -188,18 +188,21 @@ class RecoveredFormatObservationTests(CurrentFormatObservationTests):
     FORMATS=H._RECOVERED_CODEX_HOME_FORMATS
     FAMILY=H._RECOVERED_CODEX_HOME_SOURCES
 
-    def test_selected20_family_exactly_matches_source_and_has_no_historical_fallback(self):
-        root=Path(H.__file__).parents[1]
+    def test_historical_selected20_family_is_immutable_and_has_no_older_fallback(self):
+        # Immutable worker20 anchors, independent of the current source family.
         self.assertEqual(len(self.FAMILY),67)
         self.assertEqual(self.FORMATS,{'wire':25,'controller_schema':26,'worker_format':20})
-        self.assertIn(b'pub const WIRE_REVISION: u32 = 25;',(root/'src/protocol.rs').read_bytes())
-        self.assertIn(b'const VERSION: i64 = 26;',(root/'src/controller/application_schema.rs').read_bytes())
-        self.assertIn(b'const CURRENT_STATE_FORMAT: u32 = 20;',(root/'src/worker/handoff.rs').read_bytes())
-        self.assertIn(b'const JOURNAL: &str = "borg-supplied-outer.json";',
-                      (root/'src/worker/codex_retry.rs').read_bytes())
-        for name,digest in self.FAMILY.items():
+        self.assertEqual(H.c.digest(H.c.canonical(self.FAMILY)),
+                         '660077853f23e38e3d4d79f92266fb52df6aad0e3a99e87bceb40e37eaaa434b')
+        historical_producers={
+            'src/protocol.rs':'9a04ea9917f388f10f055c1a341872f632da8626abf09092b5182e5edcd58fb6',
+            'src/controller/application_schema.rs':'f177e8ca7839e0f9e5130ee0a50ebe7eee78d30c7979e8d930dc9fb10ab7f783',
+            'src/worker/handoff.rs':'d9c2feda72c95868aec915fd19842b918d58272e0e479e5931d9cfa048dbe60e',
+            'src/worker/codex_retry.rs':'ca3e0f8d26a57d6ab8a073b9b90573f781ee521db886446ccd6935820847e5a0',
+        }
+        for name,digest in historical_producers.items():
             with self.subTest(source=name):
-                self.assertEqual(H.c.digest((root/name).read_bytes()),digest)
+                self.assertEqual(self.FAMILY[name],digest)
         saved=copy.deepcopy(self.host._verified_manifest)
         for name in self.FAMILY:
             for change in ('missing','changed'):

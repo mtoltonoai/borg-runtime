@@ -2975,3 +2975,6 @@ mod identity_limit_fields;
 
 #[path = "product/read_pagination.rs"]
 mod read_pagination;
+
+#[path = "product/task_assignment_ui.rs"]
+mod task_assignment_ui;

@@ -1504,7 +1504,7 @@ fn render_task(task: &Task, workflow_enabled: bool) -> UiResponse {
     body.push_str(&escape(&serde_json::to_string_pretty(&task.input).unwrap_or_default()));
     body.push_str("</pre></details>");
     body.push_str("<h2>Task actions</h2>");
-    body.push_str("<p>The task remains bound to its accepted agent definition. Create a new session to choose a different agent.</p>");
+    body.push_str("<p>Each session retains its accepted agent definition. Assigning a different registered agent creates a new session for this same task, preserving its work, deadline and prior sessions.</p>");
     body.push_str("<div class=\"actions\">");
     for (action, label, show) in [
         (
@@ -1528,6 +1528,22 @@ fn render_task(task: &Task, workflow_enabled: bool) -> UiResponse {
         }
     }
     body.push_str("</div><p><small>Cancellation acknowledgment is not proof of stopped execution. The controller checks the displayed revision, current state and safe retry conditions.</small></p>");
+    if let Some(pending) = &task.pending_assignment {
+        body.push_str("<h3>Assignment pending</h3><p>The accepted assignment is waiting for prior execution and unresolved obligations to settle. The task retains its current session until the controller activates its successor.</p><dl>");
+        term(&mut body, "Target agent", &pending.session.agent_id);
+        term(&mut body, "Target revision", &pending.session.definition.revision);
+        let _ = write!(body, "<dt>Original assignment</dt><dd><a href=\"/operations/{}\">{}</a></dd></dl>",
+            encode(&pending.operation_id), escape(&pending.operation_id));
+    } else if matches!(task.status, TaskStatus::Queued | TaskStatus::Active | TaskStatus::Blocked) {
+        // This is the existing operator form route, not a local eligibility or
+        // authority decision. Target compatibility, CAS and stop/effect closure
+        // remain in the canonical AssignTask transaction and original receipt.
+        body.push_str("<h3>Assign task</h3><p>Choose a registered agent from the <a href=\"/agents\">agent directory</a>. The controller checks the target and displayed task revision. An accepted assignment may wait for current execution to stop and unresolved effects to be reconciled.</p>");
+        let _ = write!(body, "<form method=\"post\" action=\"{path}/assign\">{}{}{}<button type=\"submit\">Assign task</button></form>",
+            hidden("operation_id", &identity()),
+            hidden("expected_revision", &task.revision.to_string()),
+            field("agent_id", "Target agent ID", "", "text", true));
+    }
     page(200, &format!("Task {}", task.id), body)
 }
 

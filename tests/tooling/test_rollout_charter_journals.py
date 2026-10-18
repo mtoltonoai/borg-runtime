@@ -192,19 +192,23 @@ def recovered_fixture(*args,**kwargs):
 class RecoveredCharterJournalTests(CharterJournalTests):
     fixture=staticmethod(recovered_fixture)
 
-    def test_selected20_journal_subset_matches_current_sources_and_refuses_drift(self):
-        # Authenticate the secondary journal subset independently of the fixture
-        # helper and of the larger family, so a stale subset cannot be masked.
+    def test_historical_selected20_journal_subset_is_immutable_and_refuses_drift(self):
+        # Authenticate the historical subset independently of the fixture helper
+        # and larger family, without requiring today's source to be worker20.
         required = hostmod._RECOVERED_CHARTER_JOURNAL_SOURCES
         self.assertEqual(set(required), {'src/worker/charter.rs',
             'src/worker/charter_output.rs', 'src/worker/mutations.rs', 'src/worker/process.rs'})
         self.assertEqual(hostmod._RECOVERED_CODEX_HOME_FORMATS,
                          {'wire': 25, 'controller_schema': 26, 'worker_format': 20})
-        root = Path(hostmod.__file__).resolve().parents[1]
+        self.assertEqual(required, {
+            'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
+            'src/worker/charter_output.rs': 'b4231b3e24e7933a1e142a187bf6f07ff6d316889aaf2b14354bec2d6fef1900',
+            'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
+            'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+        })
         for name, expected in required.items():
             with self.subTest(source=name):
                 self.assertEqual(expected, hostmod._RECOVERED_CODEX_HOME_SOURCES[name])
-                self.assertEqual(C.digest((root / name).read_bytes()), expected)
             for changed in (None, '0' * 64):
                 with self.subTest(source=name, pin=changed), self.fixture('supplied_reply') as f:
                     journal, value = original_journal(f, 'supplied_reply')
@@ -218,8 +222,8 @@ class RecoveredCharterJournalTests(CharterJournalTests):
                     self.assertFalse(f.host.selected_writer_sources(required))
                     with self.assertRaisesRegex(ValueError, 'original_worker_history_changed'):
                         f.history()
-        # A complete current family cannot be substituted with its historical
-        # charter-output producer, even when every other selected pin is exact.
+        # A complete worker20 family cannot use the older charter-output
+        # producer, even when every other selected pin is exact.
         with self.fixture('supplied_reply') as f:
             journal, value = original_journal(f, 'supplied_reply')
             baseline(f, journal, value); replace_journal(f, journal)

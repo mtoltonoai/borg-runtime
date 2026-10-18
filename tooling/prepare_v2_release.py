@@ -19,9 +19,9 @@ import time
 import urllib.parse
 
 MAX_BODY = 1_048_576
-WIRE_REVISION = 25
+WIRE_REVISION = 27
 VERIFIER_SHA = "512296740c56d216f8dd2dbe61a05c3aef3749f7aba2630c4ab916ffec02a05b"
-PROTOCOL_SOURCE_SHA = "9a04ea9917f388f10f055c1a341872f632da8626abf09092b5182e5edcd58fb6"
+PROTOCOL_SOURCE_SHA = "b615c7929db85c93c6df32537fb544ec7f9a342f4936aea90dc835dbce0bfaa7"
 QUALIFICATION = {"artifact": "claimed", "repository_submission": "unconfigured",
                  "checks": "unconfigured", "human_rollout": "unconfigured"}
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -176,8 +176,8 @@ def endpoint(value: str) -> tuple[str, int]:
 
 
 def selected_wire(value: int) -> int:
-    if type(value) is not int or value not in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25):
-        raise ValueError("explicit application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 or 25")
+    if type(value) is not int or value not in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27):
+        raise ValueError("explicit application wire revision must be 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 or 27")
     return value
 
 
@@ -450,7 +450,7 @@ def main() -> int:
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--expect-sha256", required=True)
         p.add_argument("--expect-commit", required=True)
-        p.add_argument("--protocol-revision", type=int, choices=(8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25), help="explicit target application wire; reconcile may use a newer wire without rewriting the original mutation")
+        p.add_argument("--protocol-revision", type=int, choices=(8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27), help="explicit target application wire; reconcile may use a newer wire without rewriting the original mutation")
         if action == "prepare":
             p.add_argument("--package", type=Path, required=True)
             p.add_argument("--task-id", required=True)
