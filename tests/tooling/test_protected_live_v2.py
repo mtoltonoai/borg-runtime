@@ -31,6 +31,37 @@ class LiveExecution(old_tests.FixtureExecution):
         self.clean_group(self.cg);self.clean_group(self.ocg)
     def idle_uid(self):pass
 
+class EvidenceExecution(LiveExecution):
+    """Real local locks/children; synthetic cgroup files and no UID isolation."""
+    configured=lambda self:None
+    populated=behavior.Execution.populated
+    current=behavior.Execution.current
+    release=behavior.Execution.release
+    def __init__(self,*args):
+        super().__init__(*args)
+        self.cg=Path(self.recipe['execution_cgroup']);self.ocg=Path(self.recipe['oracle_cgroup'])
+    def idle_uid(self):
+        if any(p.poll() is None for e in self.instances for p in e.candidates):
+            raise ValueError('controlled execution identity is active')
+    def admit(self,work,operation_id,subject_hash):
+        import fcntl
+        root=Path(self.recipe['execution_root'])
+        self.lock=(root/'checker.lock').open('r+b')
+        fcntl.flock(self.lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        if self.lock.read():raise ValueError('unfinished fixture job')
+        self.idle_uid()
+        history=root/'operations';history.mkdir(exist_ok=True,mode=0o700)
+        behavior.saved(history/(hashlib.sha256(operation_id.encode()).hexdigest()+'.json'),
+                       {'operation_id':operation_id,'subject_sha256':subject_hash,'recipe_sha256':self.config['recipe_sha256'],'receipt':str(work)})
+        self.job=root/('job-'+work.name);self.job.mkdir(mode=0o755)
+        self.workspace=self.job/'workspace';self.workspace.mkdir(mode=0o700)
+        self.binding={'revision':1,'receipt':str(work),'recipe_sha256':self.config['recipe_sha256'],
+                      'cgroup':str(self.cg),'cgroup_identity':[self.cg.stat().st_dev,self.cg.stat().st_ino],
+                      'oracle_cgroup':str(self.ocg),'oracle_cgroup_identity':[self.ocg.stat().st_dev,self.ocg.stat().st_ino],
+                      'job':str(self.job)}
+        self.lock.write(behavior.canonical(self.binding));self.lock.flush();os.fsync(self.lock.fileno())
+        self.owns=True;behavior.saved(work/'execution-binding.json',self.binding)
+
 PRELUDE=r"""import hashlib,json,pathlib,sys,time
 c=json.loads(pathlib.Path(sys.argv[1]).read_text());seq=0
 assert c['cleanup_verified'] is False
@@ -55,6 +86,68 @@ class LiveObserverTests(unittest.TestCase):
     write_recipe=old_tests.BehaviorProducerTests.write_recipe
     write_controller=old_tests.BehaviorProducerTests.write_controller
     work=old_tests.BehaviorProducerTests.work
+    setup_reuse=old_tests.BehaviorProducerTests.setup_reuse
+    reusable_run=old_tests.BehaviorProducerTests.reusable_run
+    protected_peer=old_tests.BehaviorProducerTests.protected_peer
+    def test_evidence_reuse_preserves_execution_time_and_fresh_attestation_end_to_end(self):
+        self.setup_reuse();original,old=self.reusable_run()
+        evidence=json.loads((original/'execution-evidence.json').read_bytes())
+        job=Path(evidence['binding']['job']);prepared=job/'prepared';workspace=job/'workspace'
+        journey=(prepared/'journey.json').read_bytes()
+        projection=json.loads((prepared/'cargo-projection.json').read_bytes())
+        source=json.loads((original/'behavior-source-manifest.json').read_bytes())
+        self.assertEqual(source['subject'],self.subject);self.assertEqual(source['candidate'],self.ordinary_candidate)
+        self.assertEqual(source['source_files'],evidence['manifest']['source']['files'])
+        self.assertEqual(source['cargo_profile'],evidence['manifest']['profile'])
+        self.assertNotEqual(projection['source_manifest_sha256'],projection['cache_baseline_manifest_sha256'])
+        self.assertEqual(projection['source_manifest_sha256'],source['cargo_profile']['cargo_manifest_sha256'])
+        self.assertEqual(projection['dependency_policy'],source['cargo_profile']['dependency_policy'])
+        self.assertEqual(evidence['manifest']['source']['commit'],self.subject['artifact']['source_commit'])
+        self.assertEqual(evidence['manifest']['source']['tree'],self.subject['artifact']['source_tree'])
+        self.assertEqual(evidence['recipe']['preparation']['profile']['modules'],source['modules'])
+        for check in ('selected_build','actual_candidate_journey'):
+            live=json.loads((original/(check+'.live-evidence.json')).read_bytes())
+            result=json.loads((original/(check+'.oracle-result.json')).read_bytes())
+            self.assertEqual(live['subject'],self.subject);self.assertTrue(result['passed'])
+            self.assertEqual(live['execution_binding_sha256'],behavior.digest(original/'execution-binding.json'))
+            self.assertTrue(live['supervisor_transcript'][-1]['value']['cleanup_verified'])
+            self.assertTrue(live['observer_result']['passed'])
+            launches=[v['value'] for v in live['supervisor_transcript'] if v['kind']=='supervisor_launch']
+            self.assertEqual(len(launches),1 if check=='selected_build' else 2)
+            for launch in launches:self.assertEqual(launch['artifact_binary_sha256'],self.subject['artifact']['binary_sha256'])
+            for output in live['outputs'].values():
+                self.assertEqual(behavior.digest(output['path']),output['sha256'])
+        # The controlled local service actually settled once across restart and
+        # rejected a stale owner; this is not a deployed/provider behavior claim.
+        state=json.loads((workspace/'fixture-effects.json').read_bytes())
+        self.assertEqual(state,{'count':1,'ops':{'settled-original':{'status':'ok','count':1}}})
+        self.assertTrue(all(p.poll() is not None for e in self.adapter.instances for p in e.processes))
+        self.assertTrue(evidence['closure']['owned_job_closed'])
+        for entries in (evidence['declared_inputs'],evidence['preparation']['prepared_inputs']):
+            self.assertFalse(any(str(workspace) in name for name in entries))
+        logs=json.loads((original/'build-observations.json').read_bytes())
+        for row in logs['files'].values():
+            self.assertEqual(behavior.digest(row['snapshot']),row['sha256'])
+            self.assertEqual(Path(row['snapshot']).stat().st_mode&0o777,0o400)
+        kept=(original/'execution-evidence.json').read_bytes()
+        # Mutating disposable job output/cache cannot mutate protected snapshots.
+        (workspace/'selected-build/build.log').write_text('mutable job output is not retained evidence')
+        (Path(projection['destination'])/'job-cache-change').write_bytes(b'mutable')
+        self.clock_ms=old['valid_until_ms']+5000
+        with patch.object(behavior,'live_step',side_effect=AssertionError('second execution')) as execute:
+            fresh,new=self.reusable_run(original)
+            execute.assert_not_called()
+        attestation=json.loads((fresh/'applicability.json').read_bytes())
+        binding=json.loads((fresh/'evidence-binding.json').read_bytes())
+        self.assertEqual((original/'execution-evidence.json').read_bytes(),kept)
+        self.assertEqual((prepared/'journey.json').read_bytes(),journey)
+        self.assertEqual(attestation['executed_at_ms'],evidence['executed_at_ms'])
+        self.assertGreater(attestation['attested_at_ms'],old['valid_until_ms'])
+        self.assertEqual(new['checked_at_ms'],attestation['attested_at_ms'])
+        self.assertEqual(new['valid_until_ms']-new['checked_at_ms'],600000)
+        self.assertEqual(binding['evidence'],attestation['evidence'])
+        self.assertEqual(binding['request_sha256'],behavior.digest(fresh/'request.json'))
+        for row in logs['files'].values():self.assertEqual(behavior.digest(row['snapshot']),row['sha256'])
     def setup_live(self,body=DEFAULT):
         self.observer=self.root/'observer.py';self.observer.write_text(body);self.observer.chmod(0o600)
         self.oracle.write_text(r"""import hashlib,json,pathlib,sys

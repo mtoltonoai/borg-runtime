@@ -121,3 +121,41 @@ protected job/receipt directories; and exclusive preconfigured candidate/observe
 cgroups with qualified cleanup. This batch provisions none of these. Other
 applicable release checks and the final exact-artifact/target human grant remain
 separate from this component.
+
+## Retaining exact prepared inputs for evidence reuse
+
+Private recipe revision 4 adds the explicitly versioned execution-evidence and
+fresh-applicability path described in [protected release qualification](v2-protected-release.md#execution-evidence-and-fresh-applicability).
+Revision 3 remains an expiring execution path; its historical receipts are not
+promoted. This implementation does not install or activate revision 4.
+
+The candidate's raw Cargo strings, source inventory, commit/tree, complete build
+profile and dependency policy remain distinct from the pinned immutable cache
+baseline. Preparation still creates a fresh independent mutable job-local cache
+for an actual execution. Reuse never reads that mutable cache as evidence, copies
+it to another job, changes Cargo metadata, or acquires dependencies.
+
+Successful revision-4 execution retains the original package snapshot, source
+manifest, generated files, resolved commands, module/toolchain/dependency/limits
+identities, private results/logs and owned process closure. Prepared member checks
+use bounded enumeration without following aliases. Evidence also records exact
+directory membership, including empty directories, and file ownership/modes.
+The files and containing directories are synced before their protected evidence
+reference can be transported.
+
+Every reuse verifies those original prepared members. Their job-specific paths,
+ports, fixture deadline, seed and source object inventory remain unchanged; a
+new invocation of preparation would create a different fixture. Execution
+timestamps remain `started_at_ms`/`executed_at_ms`. A separate fresh protected
+applicability observation supplies `attested_at_ms` and the Check's 600000 ms
+window. The original execution and Check records keep their bytes and times.
+Historical cleanup does not establish current process or lock idleness.
+
+The prospective tests join actual producer request construction, immutable Git
+reads, preparation, local fixture processes, protected observation and retained
+evidence using the existing test adapters. They exercise reuse after expiry,
+independent input corruption, current applicability refusal and original-request
+reconciliation. The fixture build copies an ELF-shaped test image, and its local
+service exercises restart/replay/stale-owner behavior. These are explicitly
+controlled tooling tests, not real Rust compilation, deployed Borg behavior,
+cross-account/cgroup protection or provider qualification.

@@ -35,6 +35,9 @@ def write(path, data, mode=0o444):
     fd=os.open(path, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, mode)
     with os.fdopen(fd,'wb') as f: f.write(raw); f.flush(); os.fsync(f.fileno())
     Path(path).chmod(mode)
+    fd=os.open(Path(path).parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
 
 
 def validate_candidate(candidate, subject):
@@ -372,7 +375,21 @@ def verify_prepared(recipe, receipt, work, protected):
     for path,expected in receipt['prepared_inputs'].items():
         if sha(protected(path))!=expected:raise ValueError('immutable prepared input changed')
     prepared=Path(next(path for path in receipt['prepared_inputs'] if path.endswith('/build.json'))).parent
-    entries=list(prepared.rglob('*'))
-    if any(path.is_symlink() for path in entries):raise ValueError('prepared input alias appeared')
-    actual={str(path) for path in entries if path.is_file()}
+    # Bound enumeration and never descend through an alias. Revision-4 evidence
+    # additionally retains and compares the exact empty-directory inventory.
+    expected=set(receipt['prepared_inputs'])
+    if len(expected)>40000:raise ValueError('prepared input membership bound')
+    pending=[prepared];actual=set();seen=set()
+    while pending:
+        directory=pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path=Path(entry.path);name=str(path)
+                if entry.is_symlink():raise ValueError('prepared input alias appeared')
+                if name in seen or len(seen)>=40000:raise ValueError('prepared input membership bound')
+                seen.add(name)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                elif entry.is_file(follow_symlinks=False):actual.add(name)
+                else:raise ValueError('prepared input membership type')
     if actual!=set(receipt['prepared_inputs']):raise ValueError('prepared input membership changed')

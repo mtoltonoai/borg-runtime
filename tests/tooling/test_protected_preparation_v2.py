@@ -45,6 +45,8 @@ def cargo_fixture(base):
         path=cache/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data);path.chmod(0o444)
         files['cargo/'+name]={'mode':'0o644','size':len(data),'sha256':prep.sha(path),'source':'/unread/historical-origin'}
     link='git/checkouts/fixture/abc/subdir/README';(cache/link).parent.mkdir();(cache/link).symlink_to('../README')
+    for directory in [cache,*sorted(cache.rglob('*'))]:
+        if not directory.is_symlink() and directory.is_dir():directory.chmod(0o755)
     manifest={'files':files,'symlinks':{'cargo/'+link:'../README'},'lock_sha256':package.LOCK_SHA,'manifest_sha256':package.MANIFEST_SHA,'git_revisions':[],'registry_packages':[],'scope':'Private copy fixture; not real Cargo execution.'}
     path=base/'cargo-manifest.json';save(path,manifest);path.chmod(0o444)
     return {'cargo_home':str(cache),'cargo_manifest':{'path':str(path),'sha256':prep.sha(path)}}
@@ -55,7 +57,7 @@ def recipe(base):
     # changing checkout/host modes. Pin an explicitly synthetic archive in the
     # private reader only; production archive checks/pins remain unchanged.
     modules=base/'recipe-modules';modules.mkdir()
-    archive=base/'sqlite-archive.fixture';archive.write_bytes(b'controlled preparation archive; not SQLite or release evidence')
+    archive=base/'sqlite-archive.fixture';archive.write_bytes(b'controlled preparation archive; not SQLite or release evidence');archive.chmod(0o444)
     archive_sha=prep.sha(archive);archive_sha3=hashlib.sha3_256(archive.read_bytes()).hexdigest()
     for name in prep.MODULES:
         data=(ROOT/name).read_bytes()

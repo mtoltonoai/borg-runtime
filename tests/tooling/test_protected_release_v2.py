@@ -1,6 +1,8 @@
 """Fixed-producer input/replay mechanics, not protected production compilation."""
 from pathlib import Path
 import hashlib
+import copy
+import json
 import os
 import types
 import unittest
@@ -66,6 +68,83 @@ class ProtectedProducerTests(unittest.TestCase):
             self.assertEqual(p.stat().st_mode&0o777,0o600)
             self.assertEqual(producer.protected_file(p),p)
         finally:os.umask(old)
+    def test_evidence_reuse_lost_reply_reconciles_original_request(self):
+        import protected_behavior_v2 as behavior
+        import test_protected_behavior_v2 as behavior_tests
+        lab=behavior_tests.BehaviorProducerTests(methodName='runTest');lab.setUp();self.addCleanup(lab.doCleanups)
+        lab.setup_reuse();peer=lab.protected_peer
+        synced=set();fsync=os.fsync
+        def observed_sync(fd):
+            m=os.fstat(fd);fsync(fd);synced.add((m.st_dev,m.st_ino))
+        def durable_before_transport(config,request):
+            if request['command']['operation']=='check':
+                root=lab.last_work
+                self.assertEqual(json.loads((root/'request.json').read_bytes()),request)
+                bound=json.loads((root/'evidence-binding.json').read_bytes())
+                self.assertEqual(bound['request_sha256'],behavior.digest(root/'request.json'))
+                self.assertEqual(bound['operation_id'],request['operation_id'])
+                for name in ('request.json','evidence-binding.json'):
+                    self.assertEqual((root/name).stat().st_mode&0o777,0o600)
+                    self.assertEqual((root/name).stat().st_nlink,1)
+                for name in ('request.json','evidence-binding.json','applicability.json','execution-evidence.json'):
+                    m=(root/name).stat();self.assertIn((m.st_dev,m.st_ino),synced)
+            return peer(config,request)
+        lab.protected_peer=durable_before_transport;lab.drop_reply=True
+        with patch.object(producer.os,'fsync',side_effect=observed_sync):
+            with self.assertRaisesRegex(OSError,'lost response'):lab.reusable_run()
+        original=lab.last_work;raw=(original/'request.json').read_bytes();request=json.loads(raw)
+        kept={p.name:p.read_bytes() for p in original.iterdir() if p.is_file()}
+        self.assertEqual(json.loads(kept['receipt.json'])['status'],'uncertain')
+        count=sum(len(e.processes) for e in lab.adapter.instances)
+        lab.clock_ms=request['command']['input']['valid_until_ms']+1
+        retry=types.SimpleNamespace(mode='retry',config=str(lab.producer_config),original_receipt=str(original),
+                                   operation_id=request['operation_id'],receipt=str(lab.root/'exact-retry'))
+        # Use the normal peer on reconciliation: only the original binding is
+        # relevant, and no new applicability or execution is constructed.
+        with patch.object(producer,'load_behavior',return_value=behavior),patch.object(producer,'exchange',side_effect=peer),\
+             patch.object(behavior,'behavior_check',side_effect=AssertionError('retry executed')) as execute,\
+             patch.object(behavior,'attest_evidence',side_effect=AssertionError('retry renewed')) as attest:
+            self.assertEqual(producer.run(retry),0)
+            lookup=types.SimpleNamespace(mode='lookup',config=str(lab.producer_config),original_receipt=str(original),
+                                         operation_id='lookup-original',receipt=str(lab.root/'exact-lookup'))
+            self.assertEqual(producer.run(lookup),0)
+            execute.assert_not_called();attest.assert_not_called()
+        self.assertEqual((lab.root/'exact-retry/request.json').read_bytes(),raw)
+        self.assertEqual(lab.peer_calls[-1]['command']['input']['operation_id'],request['operation_id'])
+        self.assertEqual(sum(len(e.processes) for e in lab.adapter.instances),count)
+        for name,value in kept.items():self.assertEqual((original/name).read_bytes(),value)
+        wrong=copy.copy(retry);wrong.operation_id='substituted';wrong.receipt=str(lab.root/'wrong-retry')
+        with patch.object(producer,'load_behavior',return_value=behavior),patch.object(producer,'exchange') as transport:
+            with self.assertRaisesRegex(ValueError,'original operation'):producer.run(wrong)
+            transport.assert_not_called()
+        mismatched=copy.deepcopy(lab.peer_records[request['operation_id']]);mismatched['producer']['id']='foreign-checker'
+        lookup.receipt=str(lab.root/'foreign-lookup')
+        with patch.object(producer,'load_behavior',return_value=behavior),patch.object(producer,'exchange',return_value={'status':'ok','data':mismatched,'replayed':False}):
+            with self.assertRaisesRegex(ValueError,'binding differs'):producer.run(lookup)
+        mismatched=copy.deepcopy(lab.peer_records[request['operation_id']])
+        mismatched['reply']['data']['checked_at_ms']=float(mismatched['reply']['data']['checked_at_ms'])
+        lookup.receipt=str(lab.root/'changed-lookup-reply')
+        with patch.object(producer,'load_behavior',return_value=behavior),patch.object(producer,'exchange',return_value={'status':'ok','data':mismatched,'replayed':False}):
+            with self.assertRaisesRegex(ValueError,'Check reply differs'):producer.run(lookup)
+        changed=copy.deepcopy(request['command']['input']);changed['checked_at_ms']+=1
+        retry.receipt=str(lab.root/'changed-retry-reply')
+        with patch.object(producer,'load_behavior',return_value=behavior),patch.object(producer,'exchange',return_value={'status':'ok','data':changed,'replayed':True}):
+            with self.assertRaisesRegex(ValueError,'retry reply differs'):producer.run(retry)
+        # A genuinely new use reconciles that original accepted request first.
+        lab.protected_peer=peer
+        with patch.object(behavior,'live_step',side_effect=AssertionError('reuse executed')):
+            fresh,new=lab.reusable_run(original)
+        self.assertGreater(new['checked_at_ms'],request['command']['input']['valid_until_ms'])
+        self.assertEqual(sum(len(e.processes) for e in lab.adapter.instances),count)
+        # If a later dispatch is unknown and lookup finds no original settlement,
+        # a different operation ID is not a way to bypass reconciliation.
+        lab.clock_ms+=600001;lab.drop_before_commit=True
+        with self.assertRaisesRegex(OSError,'unknown response'):lab.reusable_run(original)
+        uncertain=lab.last_work;unknown=json.loads((uncertain/'request.json').read_bytes())
+        with self.assertRaisesRegex(ValueError,'original receipt unavailable'):lab.reusable_run(original)
+        self.assertFalse((lab.last_work/'request.json').exists())
+        self.assertEqual(lab.peer_calls[-1]['command']['input']['operation_id'],unknown['operation_id'])
+        self.assertEqual(sum(len(e.processes) for e in lab.adapter.instances),count)
 
 
 class ProducerStdioTests(unittest.TestCase):

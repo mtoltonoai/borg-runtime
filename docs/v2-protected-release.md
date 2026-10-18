@@ -363,3 +363,98 @@ This is an operator-owned existing-SSH join. It does not install accounts,
 services, routes, keys or credentials. A worker must not be able to invoke the
 operator's selected transport. A remote error or lost output is an unknown
 outcome, not evidence of refusal before commit.
+
+## Execution evidence and fresh applicability
+
+The successor path is explicitly selected by private recipe revision 4. This
+source implementation does not install that recipe, update an installed producer
+or configuration, activate a policy, or authorize deployment. Recipes 1–3 and
+their existing Check receipts retain their original expiry semantics. They are
+never adapted or promoted into reusable execution evidence.
+
+Revision 4 uses the complete prepared recipe and its existing
+`package_integrity`, `selected_build` and `actual_candidate_journey` checks.
+Changing that recipe, its declared inputs, or the controller's mandatory set
+refuses reuse. There is no cross-recipe projection. The producer's `valid_for_ms`
+must be 600000, within the controller's configured bound. The public Check DTO
+and controller behavior are unchanged.
+
+A successful original execution retains `execution-evidence.json` with private
+format `borg-protected-execution/1`, revision 1. It binds the exact subject and
+ordinary candidate, full recipe and producer configuration, controller
+configuration digest, source inventory/commit/tree, package manifest and candidate
+Cargo profile, dependency policy and immutable cache baseline, toolchain/readers,
+all checker/observer/oracle/helper source, limits, resolved commands, and the
+original generated inputs. The verified package snapshot and executable remain
+available under protected ownership. Exact bounded inventories cover file bytes,
+sizes, modes, owners and directories. Private observations retain actual
+supervisor/oracle results, output, build logs copied after cleanup, and the
+original operation, job and process-domain closure. Candidate-written build logs
+remain observations; their retention does not make them checker verdicts.
+
+`started_at_ms` and `executed_at_ms` describe that original execution.
+`behavior-result.json` keeps its original check-shaped result and timestamps.
+Age alone does not invalidate complete successful format-1 execution evidence.
+Failed, partial, missing, corrupt, foreign, unknown-format or incompletely closed
+evidence refuses. The mutable workspace, publication repository and job-local
+Cargo cache are excluded from protected evidence.
+
+Every new use must produce `applicability.json`, private format
+`borg-protected-applicability/1`, revision 1. Revision 4 adds a closed
+`applicability` entry containing `revision:1`, `installed_package`,
+`installed_configuration`, `installed_profile`, `state_inputs`, and `idle_locks`.
+The first three entries and each state input are exact `{path, sha256}` pins.
+The lock list contains existing private lock paths that must be empty and
+exclusively lockable. State and lock lists explicitly describe the applicable
+local conditions; they are not inferred from historical cleanup. The pinned
+installed profile supplies its existing `limits.clock_uncertainty_ms`.
+
+Fresh applicability rechecks retained execution members and package availability,
+bytes and ownership; exact candidate/target/expected base; the actual local bare
+repository ref and fast-forward predecessor; current recipe, policy, mandatory
+checks and producer roles; the installed package/configuration/profile and
+declared state; and current process-domain identities, emptiness, execution UID
+idleness and locks. Target drift refuses instead of selecting a new base.
+The existing protected `view` and exact original receipt lookups verify the
+candidate and refuse active or uncertain prior dispatches. The operator must
+still supply the actual installed configuration; no new service attests it.
+Bounded wall/monotonic clock comparison and the selected uncertainty allowance
+guard freshness. Historical cleanup only describes the original execution.
+
+After those checks, a distinct bounded Check may be constructed. Its
+`checked_at_ms` is the new `attested_at_ms`; `valid_until_ms` is 600000 ms later.
+The attestation separately retains the unchanged `executed_at_ms`. The producer
+fsyncs the exact original request and private
+`borg-protected-check-binding/1` sidecar before transport. That sidecar binds
+operation ID and request digest to the exact execution-evidence and attestation
+references and checker identity.
+
+An explicitly authorized new attestation uses the original execution receipt:
+
+```sh
+/usr/bin/python3 -I -S -B /protected/tooling/protected_release_v2.py attest-evidence \
+  --config /protected/checker.json --recipe /protected/behavior-recipe.json \
+  --input /protected/exact-subject-and-candidate.json \
+  --original-receipt /protected/original-execution \
+  --package /protected/original-execution/behavior-package.snapshot \
+  --operation-id DISTINCT_ATTESTATION_ID --receipt /protected/fresh-attestation
+```
+
+This mode does not call preparation, build, journey or oracle execution hooks.
+It verifies the original prepared members, including their original ports,
+paths, fixture deadline and seed. Regenerating a fixture is not equality.
+
+A lost or unknown Check response requires its original lookup/retry. Fresh
+attestation reconciles prior requests in the same recorded scope; an unavailable
+original settlement refuses a new identity. Neither `retry` nor `lookup` changes
+Check times, execution timestamps, evidence bytes or the original operation.
+An incomplete or unknown private sidecar refuses; it is not treated as legacy.
+`recover-behavior` retains its original stop-only, unknown-outcome behavior and
+emits no Check or automatic rerun. Raw operator Check remains forbidden.
+
+The controller still enforces Check expiry at use, exact subject/target and CAS,
+separate artifact/target Human Grant, role separation and access controls.
+Expired, revoked or wrong-subject grants cannot be repaired by an attestation.
+Existing per-effect expiry and uncertain-dispatch reconciliation remain required.
+Controlled local Python fixture results do not establish installed-host,
+deployed-runtime or provider qualification.

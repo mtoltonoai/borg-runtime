@@ -94,6 +94,30 @@ originals, fresh receipt preservation and response bounds. They do not compile
 Rust or prove a real controller accepted the fixture. The real packaged binary
 plus controller restart smoke has its own retained execution evidence.
 
+## Protected execution reuse is a separate step
+
+An ordinary prepared candidate remains claimed/unconfigured. If an operator
+separately selects private protected recipe revision 4, the existing protected
+producer can retain complete successful execution evidence and later construct
+a distinct Check after fresh applicability. See the [private evidence and
+attestation contract](v2-protected-release.md#execution-evidence-and-fresh-applicability).
+This source change and its tests do not install or activate that selection.
+
+Execution output reports the original `executed_at_ms`; fresh applicability
+reports its own `attested_at_ms`. The Check carries the latter time and a
+600000 ms validity interval. Reuse requires exact candidate/subject, complete
+recipe and declared-input equality, available protected package bytes, current
+target/base/configuration/roles/mandatory checks, and applicable state/process/lock
+conditions. Legacy receipts retain their original expiry and cannot be promoted.
+
+Retain the protected original request and its evidence-binding sidecar. A lost
+response uses original lookup/retry, with identical original Check times and
+operation identity; an unknown prior dispatch requires reconciliation. A new
+attestation is not a retry, a renewed Human Grant, a merge or rollout instruction,
+or a claim that controlled historical tests exercised a deployed host/provider.
+Separate artifact/target human authorization, current access controls, CAS and
+per-effect expiry remain enforced by their existing paths.
+
 ## Current Local Self-Source Qualification
 
 The [worker-owned delivery receipt](../artifacts/v2/build-60156282/self-delivery-u_45m87n/completion.json) exercises this adapter with an accepted result actually produced by the maintained worker. A controlled stdio executor edits a private copy of the real Borg source; real Cargo build/product checks and Git checkpoint publication precede acceptance. The exact accepted commit is packaged twice with identical bytes, served by the delivered executable, prepared and reconciled across restart. The private fixture commits do not establish a canonical repository remote, protected CI or rollout authority. The selected statuses remain claimed/unconfigured.

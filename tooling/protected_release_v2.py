@@ -10,7 +10,7 @@ import argparse, hashlib, importlib.util, json, os, select, socket, stat, struct
 from pathlib import Path
 MAX=128*1024
 VERIFIER_SHA="512296740c56d216f8dd2dbe61a05c3aef3749f7aba2630c4ab916ffec02a05b"
-BEHAVIOR_SHA='7ed0df87efe47aff54e82ba22bae7861594c82b8c3ab7659fdb04c538c93a3db'
+BEHAVIOR_SHA='755590b533ea2591d17d770bb50f9a8c0b0d499598d39cbae6511247f78ee03b'
 def canonical(v):return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
 def strict(data):
     def pairs(xs):
@@ -29,13 +29,19 @@ def protected_file(path):
     if not stat.S_ISREG(m.st_mode) or m.st_nlink!=1 or m.st_uid not in {0,os.geteuid()} or m.st_mode&0o022:raise ValueError("protected input owner/mode mismatch")
     return p
 def load_config(path):
-    p=protected_file(path);raw=p.read_bytes()
+    p=protected_file(path);fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as f:
+        m=os.fstat(f.fileno())
+        if not stat.S_ISREG(m.st_mode) or m.st_nlink!=1 or m.st_size>MAX:raise ValueError('configuration type/bound')
+        raw=f.read(MAX+1)
     if len(raw)>MAX:raise ValueError("configuration bound")
     return decode_config(raw)
 def decode_config(raw):
     c=strict(raw)
     if set(c)!={"socket","server_uid","producer_uid","policy","recipe_sha256","valid_for_ms"}:raise ValueError("configuration fields")
-    if c['producer_uid']!=os.geteuid() or not 0<c['valid_for_ms']<=86400000:raise ValueError("producer identity/interval")
+    if (type(c['producer_uid']) is not int or c['producer_uid']!=os.geteuid()
+        or type(c['server_uid']) is not int or not 0<=c['server_uid']<2**32
+        or type(c['valid_for_ms']) is not int or not 0<c['valid_for_ms']<=86400000):raise ValueError("producer identity/interval")
     return c
 def exchange(c,request,*,max_bytes=MAX,timeout_ms=65000):
     data=canonical(request)
@@ -159,6 +165,96 @@ def package_check(c,subject,package,work):
     now=time.time_ns()//1_000_000
     return {'subject':subject,'recipe_sha256':c['recipe_sha256'],'checked_at_ms':now,'valid_until_ms':now+c['valid_for_ms'],
             'results':{'package_integrity':True},'cleanup_verified':True}
+
+BINDING_FORMAT='borg-protected-check-binding/1'
+def bound_original(original):
+    """Reconciliation preserves the original request even after its Check expires.
+
+    No execution member is refreshed here. A new-format sidecar is mandatory
+    when new-format evidence/attestation exists; absence is never a legacy adapter.
+    """
+    original=Path(original)
+    p=protected_file(original/'request.json')
+    fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as f:
+        if os.fstat(f.fileno()).st_size>MAX:raise ValueError('original request bound')
+        raw=f.read(MAX+1)
+    if len(raw)>MAX:raise ValueError('original request bound')
+    prior=strict(raw)
+    if not isinstance(prior,dict) or type(prior.get('revision')) is not int or prior['revision']!=1 or set(prior)!={'revision','operation_id','command'}:
+        raise ValueError('original request schema')
+    sidecar=original/'evidence-binding.json'
+    if not sidecar.exists() and not sidecar.is_symlink():
+        if any((original/n).exists() or (original/n).is_symlink() for n in ('execution-evidence.json','applicability.json')):
+            raise ValueError('incomplete original evidence binding; no legacy promotion')
+        return prior,None
+    helper=load_behavior();helper.protected(original,directory=True)
+    if original.stat().st_mode&0o077:raise ValueError('original request/sidecars must remain private')
+    binding,_=helper.read_json(helper.protected(sidecar))
+    helper.fields(binding,'format revision operation_id request_sha256 evidence attestation producer','original evidence binding')
+    if binding['format']!=BINDING_FORMAT or type(binding['revision']) is not int or binding['revision']!=1:
+        raise ValueError('unknown private evidence binding version')
+    if any(helper.member(original/name)['mode']&0o077 for name in ('request.json','applicability.json','evidence-binding.json')):
+        raise ValueError('original request/sidecars must remain private')
+    if binding['operation_id']!=prior['operation_id'] or binding['request_sha256']!=hashlib.sha256(raw).hexdigest() or raw!=canonical(prior):
+        raise ValueError('original request digest/operation binding differs')
+    for name in ('evidence','attestation'):
+        helper.fields(binding[name],'path sha256'+(' operation_id' if name=='evidence' else ''),'original '+name+' reference')
+        sha=binding[name]['sha256'];path=binding[name]['path']
+        if not isinstance(sha,str) or len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):raise ValueError('original reference digest')
+        if not isinstance(path,str) or not Path(path).is_absolute() or '..' in Path(path).parts:raise ValueError('original reference path')
+    ap=original/'applicability.json'
+    if binding['attestation']['path']!=str(ap) or helper.member(ap)['sha256']!=binding['attestation']['sha256']:
+        raise ValueError('original applicability bytes differ')
+    attestation,_=helper.read_json(helper.protected(ap),helper.MAX_EVIDENCE)
+    helper.fields(attestation,'format revision operation_id evidence producer executed_at_ms attested_at_ms clock_uncertainty_ms check current','original applicability')
+    if (attestation['format']!=helper.ATTESTATION_FORMAT or type(attestation['revision']) is not int or attestation['revision']!=1
+        or attestation['operation_id']!=prior['operation_id'] or not helper.exact(attestation['evidence'],binding['evidence'])
+        or not helper.exact(attestation['producer'],binding['producer']) or not helper.exact(prior['command'],{'operation':'check','input':attestation['check']})):
+        raise ValueError('original applicability/request association differs')
+    helper.fields(binding['producer'],'id uid role','original checker identity')
+    if binding['producer']['role']!='checker':raise ValueError('original producer is not a checker')
+    check=attestation['check']
+    helper.fields(check,'subject recipe_sha256 checked_at_ms valid_until_ms results cleanup_verified','original Check')
+    if (not helper.integer(attestation['executed_at_ms'],1,2**63-1)
+        or not helper.integer(attestation['attested_at_ms'],attestation['executed_at_ms'],2**63-1)
+        or not helper.integer(check['checked_at_ms'],1,2**63-1)
+        or not helper.integer(check['valid_until_ms'],1,2**63-1)
+        or not helper.integer(attestation['clock_uncertainty_ms'],0,helper.ATTESTATION_MS-1)
+        or check['checked_at_ms']!=attestation['attested_at_ms']
+        or check['valid_until_ms']!=check['checked_at_ms']+helper.ATTESTATION_MS):
+        raise ValueError('original execution/attestation times differ')
+    return prior,binding
+
+def original_reply(reply,prior,identity):
+    if not isinstance(reply,dict) or set(reply)!={'status','data','replayed'} or reply.get('status')!='ok' or type(reply['replayed']) is not bool:
+        raise ValueError('original receipt unavailable; reconcile original identity')
+    record=reply.get('data')
+    if (not isinstance(record,dict) or set(record)!={'request','producer','reply'} or canonical(record.get('request'))!=canonical(prior) or canonical(record.get('producer'))!=canonical(identity)
+        or not isinstance(record.get('reply'),dict) or set(record['reply'])!={'status','data','replayed'} or type(record['reply']['replayed']) is not bool):
+        raise ValueError('original protected receipt binding differs')
+    if (prior['command'].get('operation')=='check' and record['reply']['status']=='ok'
+        and canonical(record['reply']['data'])!=canonical(prior['command']['input'])):
+        raise ValueError('original protected Check reply differs')
+    return record
+
+def bind_applicability(out,request):
+    helper=load_behavior()
+    path=helper.protected(out/'applicability.json')
+    attestation,_=helper.read_json(path,helper.MAX_EVIDENCE)
+    if attestation['operation_id']!=request['operation_id'] or not helper.exact(request['command'],{'operation':'check','input':attestation['check']}):
+        raise ValueError('applicability does not bind the original Check')
+    value={'format':BINDING_FORMAT,'revision':1,'operation_id':request['operation_id'],
+           'request_sha256':hashlib.sha256((out/'request.json').read_bytes()).hexdigest(),
+           'evidence':attestation['evidence'],'attestation':{'path':str(path),'sha256':helper.digest(path)},
+           'producer':attestation['producer']}
+    helper.saved(out/'evidence-binding.json',value)
+    bound_original(out)
+    check=attestation['check'];now=time.time_ns()//1_000_000
+    if now<check['checked_at_ms'] or now+attestation['clock_uncertainty_ms']>=check['valid_until_ms']:
+        raise ValueError('fresh applicability expired or clock uncertain before transport')
+    return value
+
 def run(args):
     c=load_config(args.config);out=Path(args.receipt);out.mkdir(mode=0o700)
     if args.mode=='recover-behavior':
@@ -166,11 +262,8 @@ def run(args):
         load_behavior().recover(c,args.recipe,Path(args.original_receipt),out)
         return 2 # cleanup observation is not a successful check or retry
     if args.mode in {'retry','lookup'}:
-        original=protected_file(Path(args.original_receipt)/'request.json')
-        with original.open('rb') as f:raw=f.read(MAX+1)
-        if len(raw)>MAX:raise ValueError('original request bound')
-        prior=strict(raw)
-        if prior.get('revision')!=1 or set(prior)!={'revision','operation_id','command'}:raise ValueError('original request schema')
+        prior,binding=bound_original(Path(args.original_receipt))
+        if binding is not None and binding['producer']['uid']!=c['producer_uid']:raise ValueError('original checker identity differs')
         if args.mode=='retry':
             if args.operation_id!=prior['operation_id']:raise ValueError('retry cannot replace the original operation identity')
             request=prior
@@ -180,11 +273,14 @@ def run(args):
         if len(raw)>MAX:raise ValueError('input bound')
         value=strict(raw)
         if args.mode=='check-package':command={'operation':'check','input':package_check(c,value,args.package,out)}
-        elif args.mode in {'check-behavior','check-prepared'}:
+        elif args.mode in {'check-behavior','check-prepared','attest-evidence'}:
             supervisor=load_behavior();supervisor.protected(Path(args.config).absolute())
-            if args.mode=='check-prepared':
+            if args.mode in {'check-prepared','attest-evidence'}:
                 if not isinstance(value,dict) or set(value)!={'subject','candidate'}:raise ValueError('prepared input requires subject and ordinary candidate only')
-                command={'operation':'check','input':supervisor.behavior_check(c,value['subject'],args.package,args.recipe,out,args.operation_id,value['candidate'])}
+                if args.mode=='attest-evidence':
+                    checked=supervisor.attest_evidence(c,value['subject'],value['candidate'],args.package,args.recipe,Path(args.original_receipt),out,args.operation_id)
+                else:checked=supervisor.behavior_check(c,value['subject'],args.package,args.recipe,out,args.operation_id,value['candidate'])
+                command={'operation':'check','input':checked}
             else:command={'operation':'check','input':supervisor.behavior_check(c,value,args.package,args.recipe,out,args.operation_id)}
         else:
             command=value
@@ -193,25 +289,37 @@ def run(args):
     p=out/'request.json'
     with private_create(p) as f:f.write(canonical(request));f.flush();os.fsync(f.fileno())
     sync_directory(out)
+    fresh_binding=bind_applicability(out,request) if (out/'applicability.json').exists() else None
     receipt={'status':'uncertain','request_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'transport':'kernel-peer-uid-unix','automatic_rollout':False}
     try:
         reply=exchange(c,request)
+        receipt['reply']=reply
+        if fresh_binding is not None or (args.mode in {'retry','lookup'} and binding is not None):
+            if not isinstance(reply,dict) or set(reply)!={'status','data','replayed'} or type(reply['replayed']) is not bool or not isinstance(reply['status'],str):
+                raise ValueError('original protected response schema differs; reconcile original request')
         if args.mode=='lookup' and reply.get('status')=='ok':
             record=reply.get('data',{})
-            if record.get('request')!=prior or record.get('producer',{}).get('uid')!=c['producer_uid']:raise ValueError('original protected receipt binding differs')
-        receipt['reply']=reply;receipt['status']='recorded' if reply.get('status')=='ok' else 'refused'
+            if binding is not None:
+                record=original_reply(reply,prior,binding['producer'])
+                receipt['status']='recorded' if record['reply'].get('status')=='ok' else 'refused'
+            elif record.get('request')!=prior or record.get('producer',{}).get('uid')!=c['producer_uid']:raise ValueError('original protected receipt binding differs')
+        if args.mode=='retry' and binding is not None and reply.get('status')=='ok' and canonical(reply.get('data'))!=canonical(prior['command']['input']):
+            raise ValueError('original Check retry reply differs; reconcile original request')
+        if fresh_binding is not None and reply.get('status')=='ok' and (canonical(reply.get('data'))!=canonical(request['command']['input']) or reply.get('replayed') is not False):
+            raise ValueError('new attestation reply differs; reconcile original request')
+        if receipt['status']=='uncertain':receipt['status']='recorded' if reply.get('status')=='ok' else 'refused'
     finally:
         with private_create(out/'receipt.json') as f:f.write(canonical(receipt)+b'\n');f.flush();os.fsync(f.fileno())
         sync_directory(out)
     return 0 if receipt['status']=='recorded' else 2
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('mode',choices=['check-package','check-behavior','check-prepared','recover-behavior','request','lookup','retry','exchange-stdio']);p.add_argument('--config',required=True);p.add_argument('--input');p.add_argument('--original-receipt');p.add_argument('--operation-id');p.add_argument('--receipt');p.add_argument('--package');p.add_argument('--recipe');p.add_argument('--config-sha256');p.add_argument('--module-sha256');p.add_argument('--python-sha256');p.add_argument('--max-bytes',type=int);p.add_argument('--timeout-ms',type=int);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('mode',choices=['check-package','check-behavior','check-prepared','attest-evidence','recover-behavior','request','lookup','retry','exchange-stdio']);p.add_argument('--config',required=True);p.add_argument('--input');p.add_argument('--original-receipt');p.add_argument('--operation-id');p.add_argument('--receipt');p.add_argument('--package');p.add_argument('--recipe');p.add_argument('--config-sha256');p.add_argument('--module-sha256');p.add_argument('--python-sha256');p.add_argument('--max-bytes',type=int);p.add_argument('--timeout-ms',type=int);a=p.parse_args()
     try:
         if a.mode=='exchange-stdio':sys.exit(exchange_stdio(a))
         if not a.operation_id or not a.receipt:raise ValueError('operation identity and receipt directory required')
-        if a.mode in {'lookup','retry','recover-behavior'} and not a.original_receipt:raise ValueError('original receipt required')
-        if a.mode in {'check-package','check-behavior','check-prepared','request'} and not a.input:raise ValueError('input required')
-        if a.mode in {'check-package','check-behavior','check-prepared'} and not a.package:raise ValueError('package required')
-        if a.mode in {'check-behavior','check-prepared','recover-behavior'} and not a.recipe:raise ValueError('protected behavior recipe required')
+        if a.mode in {'lookup','retry','recover-behavior','attest-evidence'} and not a.original_receipt:raise ValueError('original receipt required')
+        if a.mode in {'check-package','check-behavior','check-prepared','attest-evidence','request'} and not a.input:raise ValueError('input required')
+        if a.mode in {'check-package','check-behavior','check-prepared','attest-evidence'} and not a.package:raise ValueError('package required')
+        if a.mode in {'check-behavior','check-prepared','recover-behavior','attest-evidence'} and not a.recipe:raise ValueError('protected behavior recipe required')
         sys.exit(run(a))
     except Exception as e:print('protected release: '+str(e),file=sys.stderr);sys.exit(1)
