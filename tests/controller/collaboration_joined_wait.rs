@@ -103,7 +103,7 @@ async fn mcp_self_wait_commit_cut_retries_one_original_then_answers_and_resumes_
     let mut cfg = joined_config(); cfg.qualification_fail_next_commit = Some(fail.clone());
     let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
     let mut input = native("joined-wait-owner");
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.limits.model_requests = 3;
     let accepted = submit(&c, "joined-wait-submit", input).await;
     let w = worker("joined-wait-worker", "inc", 1, 0); register(&c, &w).await;

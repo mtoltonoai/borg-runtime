@@ -12,7 +12,7 @@ fn definition_update_config() -> ControllerConfig {
 }
 async fn definition_update_fixture(c: &Controller, label: &str) -> (Task, Attempt, Caller) {
     let mut manager = native("charter");
-    manager.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    manager.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None, publication: None });
     let mut collaboration = c.limits().execution.collaboration.clone();
     collaboration.capabilities = Some(borg_runtime::limits::CollaborationCapabilities {
         version: 1, task_creation: false, identity_administration: true,
@@ -350,11 +350,11 @@ enum LegacyData {
 }
 #[tokio::test]
 async fn definition_updates_old_wire_is_refused_before_receipt_or_head_mutation() {
-    assert_eq!(WIRE_REVISION,25);
+    assert_eq!(WIRE_REVISION,27);
     let c=Controller::open_with_config(path(),definition_update_config()).unwrap();
     let (task,_,actor)=definition_update_fixture(&c,"definition-wire").await;
     let req=invocation(&actor,"wire-bound-update","collab_definition_update",definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":c.limits().execution.native.context_bytes+1})));
-    for version in [8,9,10,11,12,13,14,15,16,17,18,24] {
+    for version in [8,9,10,11,12,13,14,15,16,17,18,24,25,26] {
         let old=c.handle(Request{protocol_revision:version,request_id:format!("old-wire-request-{version}"),command:req.operation()}).await;
         assert_eq!(code(old.outcome),"unsupported_version");assert!(old.commit.is_none());
     }

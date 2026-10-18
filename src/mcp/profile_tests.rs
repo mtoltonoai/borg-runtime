@@ -16,7 +16,7 @@ const ADDED: [&str; 31] = [
     "collab_task_waits", "collab_task_wait", "collab_task_unwait", "collab_task_owner",
 ];
 fn v1() -> ExecutionProfile { ExecutionProfile::CollaborationV1 { web_search: None } }
-fn v2() -> ExecutionProfile { ExecutionProfile::CollaborationV2 { web_search: None } }
+fn v2() -> ExecutionProfile { ExecutionProfile::CollaborationV2 { publication: None, web_search: None } }
 
 #[test]
 fn v1_bytes_and_absent_definition_profile_roundtrip_unchanged() {
@@ -70,7 +70,7 @@ fn v1_never_gains_workflow_tools_and_v2_keeps_its_exact_prefix() {
 #[test]
 fn workflow_absence_and_provider_settings_cannot_widen_the_catalogue() {
     let limits = RuntimeLimits::seed().unwrap();
-    let search = ExecutionProfile::CollaborationV2 {
+    let search = ExecutionProfile::CollaborationV2 { publication: None,
         web_search: Some(NativeSearchProfile { max_tool_calls: 3 }),
     };
     assert_eq!(catalogue_for_profile(&limits, Some(&search)), catalogue_for_profile(&limits, Some(&v2())));

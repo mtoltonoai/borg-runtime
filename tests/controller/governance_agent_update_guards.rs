@@ -47,7 +47,7 @@ async fn setup(
     let promotion = governance::promote(&c, &format!("{label}-policy"), allow_widening).await;
     let mut input = native(label);
     input.definition.execution_profile =
-        Some(ExecutionProfile::CollaborationV2 { web_search: None });
+        Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let queued = submit(&c, &format!("{label}-submit"), input).await;
     let worker = worker(&format!("{label}-worker"), "original-incarnation", 1, 0);
     register(&c, &worker).await;

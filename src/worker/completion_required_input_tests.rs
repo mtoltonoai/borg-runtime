@@ -45,7 +45,7 @@ async fn native_reader(f: &ScanFixture) -> (Task, Caller) {
         instruction:"Controlled completion scan; no executor is launched".into(),
         definition:Definition {
             charter:None, limit_overrides:None,
-            execution_profile:Some(ExecutionProfile::CollaborationV2 { web_search:None }),
+            execution_profile:Some(ExecutionProfile::CollaborationV2 { publication: None, web_search:None }),
             inference:Some(InferenceSettings::selected()),
             id:"completion-scan-native-agent".into(), revision:"one".into(), executor:ExecutorKind::Native,
         },

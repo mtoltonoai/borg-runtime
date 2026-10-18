@@ -86,6 +86,10 @@ pub struct Binding {
 #[serde(deny_unknown_fields)]
 pub struct HeadIntent {
     pub binding: Binding,
+    /// New requests retain both actors explicitly. The legacy Binding continues
+    /// to describe the original source attempt, never the requesting attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_publication")]
+    pub publication: Option<Box<crate::mcp::publication::Binding>>,
     pub target: Target,
     pub head_operation_id: String,
     pub head_ref: String,
@@ -159,6 +163,8 @@ pub struct Settlement {
 pub struct NotApplied {
     pub acknowledged: bool,
     pub not_applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_refusal")]
+    pub refusal: Option<crate::mcp::publication::Refusal>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -258,6 +264,10 @@ fn branch(s: &str, b: &Bounds) -> Result<()> {
         return Err(Error::Invalid("branch"));
     }
     Ok(())
+}
+pub fn validate_branch_namespace(s: &str, b: &Bounds) -> Result<()> {
+    branch(s, b)?;
+    text(&format!("refs/heads/{s}/{}", "f".repeat(64)), b.ref_bytes, false, false, "branch_namespace")
 }
 fn endpoint(s: &str, b: &Bounds) -> Result<reqwest::Url> {
     text(s, b.endpoint_bytes, false, false, "endpoint")?;
@@ -410,13 +420,16 @@ pub fn prepare_head(t: &Target, repo: &Repository, a: &Attempt, cp: &Checkpoint,
         registration: cp.registration.clone(), checkpoint: cp.clone() };
     validate_target(t, b)?; validate_binding(&binding, b)?;
     let (head_operation_id, head_ref) = head_identity(&binding, t)?;
-    let intent = HeadIntent { binding, target: t.clone(), head_operation_id, head_ref };
+    let intent = HeadIntent { binding, publication: None, target: t.clone(), head_operation_id, head_ref };
     validate_head_intent(&intent, b)?;
     Ok(intent)
 }
 pub fn validate_head_intent(v: &HeadIntent, b: &Bounds) -> Result<()> {
     validate_target(&v.target, b)?; validate_binding(&v.binding, b)?;
-    let (operation, reference) = head_identity(&v.binding, &v.target)?;
+    let (operation, reference) = match &v.publication {
+        None => head_identity(&v.binding, &v.target)?,
+        Some(publication) => publication_head_identity(publication, &v.binding, &v.target, b)?,
+    };
     if v.head_operation_id != operation || v.head_ref != reference
         || operation == v.binding.operation_id || operation == v.binding.checkpoint.operation_id {
         return Err(Error::Mismatch("head_identity"));
@@ -424,6 +437,41 @@ pub fn validate_head_intent(v: &HeadIntent, b: &Bounds) -> Result<()> {
     id(&v.head_operation_id, b, "head_operation_id")?;
     text(&v.head_ref, b.ref_bytes, false, false, "head_ref")?;
     record_size(v, b)
+}
+fn publication_head_identity(p: &crate::mcp::publication::Binding, legacy: &Binding, t: &Target, b: &Bounds) -> Result<(String, String)> {
+    let source = &p.source;
+    let caller = &p.requester.caller;
+    for (value, name) in [(&p.publication_id, "publication_id"), (&p.admission_operation_id, "admission_operation_id"),
+        (&p.requester.session_id, "requester_session_id"), (&source.session_id, "source_session_id"),
+        (&caller.task_id, "requester_task"), (&caller.attempt_id, "requester_attempt"),
+        (&caller.worker_id, "requester_worker"), (&caller.incarnation, "requester_incarnation")] { id(value, b, name)?; }
+    if caller.generation == 0 || caller.task_id == source.task_id || source.task_revision == 0
+        || p.publication_id != crate::mcp::publication::publication_id(&p.admission_operation_id).map_err(|_| Error::Decode)?
+        || source.accepted_result.task_id != source.task_id || source.accepted_result.checkpoint.as_ref() != Some(&legacy.checkpoint)
+        || source.task_id != legacy.task_id || source.checkpoint_attempt_id != legacy.attempt_id
+        || source.checkpoint_generation != legacy.generation || p.selection.registration() != legacy.registration
+        || source.repository.registration.as_ref() != Some(&legacy.registration)
+        || source.repository.checkpoint_remote != legacy.checkpoint.repository
+        || source.repository.pull_request_target.as_ref() != Some(t)
+        || p.selection.target_revision() != t.revision
+        || !p.selection.permits(crate::mcp::publication::Action::PublishBranch)
+        || source.result_sha256.len() != 64 || !commit(&source.result_sha256) {
+        return Err(Error::Mismatch("publication_source_requester"));
+    }
+    validate_branch_namespace(p.selection.namespace(), b)?;
+    let identity = digest("borg-mcp-publication-head-v1", &(p, legacy, t))?;
+    Ok((format!("pr-head-{identity}"), format!("refs/heads/{}/{identity}", p.selection.namespace())))
+}
+pub fn prepare_publication_head(publication: crate::mcp::publication::Binding, target: Target, b: &Bounds) -> Result<HeadIntent> {
+    let source = &publication.source;
+    let checkpoint = source.accepted_result.checkpoint.clone().ok_or(Error::Mismatch("checkpoint_absent"))?;
+    let binding = Binding { operation_id: format!("pr-create-{}", digest("borg-mcp-publication-create-v1", &publication.publication_id)?),
+        task_id: source.task_id.clone(), attempt_id: source.checkpoint_attempt_id.clone(), generation: source.checkpoint_generation,
+        registration: checkpoint.registration.clone(), checkpoint };
+    let (head_operation_id, head_ref) = publication_head_identity(&publication, &binding, &target, b)?;
+    let head = HeadIntent { binding, publication: Some(Box::new(publication)), target, head_operation_id, head_ref };
+    validate_head_intent(&head, b)?;
+    Ok(head)
 }
 /// Source/current-owner association only. Root separately compares the accepted
 /// immutable target/request and applies currentness/deadline/effect policy.
@@ -449,8 +497,12 @@ pub fn validate_head_proof(v: &HeadIntent, p: &HeadProof, b: &Bounds) -> Result<
     record_size(p, b)
 }
 fn record(v: &HeadIntent, id: &str, kind: &str, intended: Value, b: &Bounds) -> Result<OperationRecord> {
-    let r = OperationRecord { id: id.into(), task_id: v.binding.task_id.clone(),
-        attempt_id: v.binding.attempt_id.clone(), generation: v.binding.generation,
+    let (task_id, attempt_id, generation) = match &v.publication {
+        Some(p) => (&p.requester.caller.task_id, &p.requester.caller.attempt_id, p.requester.caller.generation),
+        None => (&v.binding.task_id, &v.binding.attempt_id, v.binding.generation),
+    };
+    let r = OperationRecord { id: id.into(), task_id: task_id.clone(),
+        attempt_id: attempt_id.clone(), generation,
         kind: kind.into(), intended, state: "pending".into(), outcome: None };
     record_size(&r, b)?; Ok(r)
 }
@@ -459,8 +511,12 @@ pub fn head_record(v: &HeadIntent, b: &Bounds) -> Result<OperationRecord> {
     record(v, &v.head_operation_id, HEAD_KIND, encoded(v, b)?, b)
 }
 fn matches_record(r: &OperationRecord, v: &HeadIntent, id: &str, kind: &str) -> Result<()> {
-    if r.id != id || r.task_id != v.binding.task_id || r.attempt_id != v.binding.attempt_id
-        || r.generation != v.binding.generation || r.kind != kind {
+    let (task, attempt, generation) = match &v.publication {
+        Some(p) => (&p.requester.caller.task_id, &p.requester.caller.attempt_id, p.requester.caller.generation),
+        None => (&v.binding.task_id, &v.binding.attempt_id, v.binding.generation),
+    };
+    if r.id != id || &r.task_id != task || &r.attempt_id != attempt
+        || r.generation != generation || r.kind != kind {
         return Err(Error::Mismatch("operation_record"));
     }
     if r.state != "settled" { return Err(Error::Unsettled("operation_record")); }
@@ -468,6 +524,12 @@ fn matches_record(r: &OperationRecord, v: &HeadIntent, id: &str, kind: &str) -> 
 }
 fn marker(v: &Binding) -> Result<String> {
     Ok(format!("{MARKER_PREFIX}{} -->", digest("borg-pr-create", v)?))
+}
+fn head_marker(v: &HeadIntent) -> Result<String> {
+    match &v.publication {
+        None => marker(&v.binding),
+        Some(p) => Ok(format!("{MARKER_PREFIX}{} -->", digest("borg-mcp-publication-create-marker-v1", &(p, &v.binding, &v.target))?)),
+    }
 }
 fn marked_body(request: &Request, marker: &str, b: &Bounds) -> Result<String> {
     validate_request(request, b)?;
@@ -490,7 +552,7 @@ pub fn prepare_pull_request(head: &HeadIntent, settled: &OperationRecord,
     let outcome: HeadOutcome = value(settled.outcome.as_ref().ok_or(Error::Unsettled("head_outcome"))?, b)?;
     validate_head_outcome(head, &outcome, b)?;
     let HeadOutcome::Applied(outcome) = outcome else { return Err(Error::Unsettled("head_not_applied")); };
-    let marker = marker(&head.binding)?;
+    let marker = head_marker(head)?;
     let intent = Intent { head: head.clone(), head_proof: outcome.proof,
         title: request.title.clone(), body: marked_body(request, &marker, b)?, marker };
     validate_intent(&intent, b)?;
@@ -500,7 +562,7 @@ pub fn validate_intent(v: &Intent, b: &Bounds) -> Result<()> {
     validate_head_proof(&v.head, &v.head_proof, b)?;
     text(&v.title, b.title_bytes, false, false, "title")?;
     text(&v.body, b.body_bytes, false, true, "body")?;
-    if v.marker != marker(&v.head.binding)? || !v.body.ends_with(&v.marker)
+    if v.marker != head_marker(&v.head)? || !v.body.ends_with(&v.marker)
         || v.body.matches(MARKER_PREFIX).count() != 1
         || (v.body != v.marker && !v.body.ends_with(&format!("\n\n{}", v.marker))) {
         return Err(Error::Mismatch("original_marker"));
@@ -627,7 +689,7 @@ pub fn decode_proof(bytes: &[u8], b: &Bounds) -> Result<Proof> {
 
 // Current protocol::Checkpoint predates deny_unknown_fields. This leaf closes
 // that nested boundary without changing shared/historical checkpoint decoding.
-fn strict_checkpoint<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Checkpoint, D::Error> {
+pub(crate) fn strict_checkpoint<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Checkpoint, D::Error> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Fields { registration: Revision, repository: String, commit: String,
@@ -635,6 +697,12 @@ fn strict_checkpoint<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Che
     let f = Fields::deserialize(d)?;
     Ok(Checkpoint { registration: f.registration, repository: f.repository,
         commit: f.commit, remote_ref: f.remote_ref, operation_id: f.operation_id })
+}
+fn present_publication<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Box<crate::mcp::publication::Binding>>, D::Error> {
+    Box::<crate::mcp::publication::Binding>::deserialize(d).map(Some)
+}
+fn present_refusal<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<crate::mcp::publication::Refusal>, D::Error> {
+    crate::mcp::publication::Refusal::deserialize(d).map(Some)
 }
 
 #[cfg(test)]

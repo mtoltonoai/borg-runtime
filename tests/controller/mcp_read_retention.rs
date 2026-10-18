@@ -16,7 +16,7 @@ struct RetainedFixture {
 }
 async fn retained_fixture(label: &str) -> RetainedFixture {
     let mut input=profiled(label);
-    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2 {web_search:None});
+    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2 { web_search: None, publication: None });
     retained_fixture_with(label,input,config(),None).await
 }
 async fn retained_fixture_with(label:&str,input:TaskInput,mut cfg:ControllerConfig,registration:Option<borg_runtime::repository_catalogue::Registration>)->RetainedFixture {
@@ -201,7 +201,16 @@ async fn compact_read_versions_refuse_old_or_malformed_shapes() {
     assert!(Controller::open_with_config(&path,cfg.clone()).is_err());
     let db=rusqlite::Connection::open(&path).unwrap();assert_eq!(db.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0)).unwrap(),25);
     assert_eq!(db.query_row("SELECT outcome FROM receipts WHERE id=?1",[&read.0.operation_id],|row|row.get::<_,String>(0)).unwrap(),before);
-    db.pragma_update(None,"user_version",26).unwrap();
+    db.pragma_update(None,"user_version",27).unwrap();drop(db);
+    assert!(Controller::open_with_config(&path,cfg.clone()).is_err(),"standalone publication schema27 did not produce read references");
+    let db=rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(db.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0)).unwrap(),27);
+    assert_eq!(db.query_row("SELECT outcome FROM receipts WHERE id=?1",[&read.0.operation_id],|row|row.get::<_,String>(0)).unwrap(),before);
+    db.pragma_update(None,"user_version",26).unwrap();drop(db);
+    let c=Controller::open_with_config(&path,cfg.clone()).unwrap();drop(c);controller_owner_released(&path).await;
+    let db=rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(db.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0)).unwrap(),28);
+    assert_eq!(db.query_row("SELECT outcome FROM receipts WHERE id=?1",[&read.0.operation_id],|row|row.get::<_,String>(0)).unwrap(),before);
     let mut malformed:serde_json::Value=serde_json::from_str(&before).unwrap();malformed["committed_read_reference"]["release_operation_id"]=json!("absent-original-release");
     db.execute("UPDATE receipts SET outcome=?1 WHERE id=?2",rusqlite::params![serde_json::to_string(&malformed).unwrap(),read.0.operation_id]).unwrap();drop(db);
     assert!(Controller::open_with_config(&path,cfg).is_err(),"cold scanners cannot treat malformed compact receipts as absent unrelated rows");

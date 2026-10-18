@@ -338,9 +338,10 @@ async fn get_inner(controller:&Controller,path:&str,raw_query:&str)->Result<Opti
             return Ok(Some(page(200,"Request result review",review_request_form(&target))))
         }
         if kind=="document"&&action=="versions" {
-            let f=query_fields(raw_query,&["after"],limits)?;
-            let DocumentQueryResult::Versions(p)=document_query(controller,DocumentQuery::Versions{document_id:id.clone(),after:after(&f),limit:count}).await? else{return Err(error(502,"Unexpected document versions"))};
-            return Ok(Some(versions(&id,&p)))
+            let f=query_fields(raw_query,&["after","cursor","max_bytes"],limits)?;
+            let response=boxed_route(||super::read_pages::public_list(controller,crate::read_page::ReadTool::Versions,
+                serde_json::json!({"document_id":id,"cursor":after(&f),"limit":count}),&f)).await?;
+            return Ok(Some(response))
         }
         if kind=="document"&&action.is_empty() {
             let f=query_fields(raw_query,&["version","part","cursor","max_bytes"],limits)?;

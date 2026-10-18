@@ -415,6 +415,9 @@ pub(super) fn apply(
     now: u64,
     validation: &Context<'_>,
 ) -> Result<(Data, bool)> {
+    if call.tool == "collab_publication_get" {
+        return bounded(tx.limits, super::publication_requests::get(tx, call)?);
+    }
     let original = caller(tx, &call.caller, now)?;
     original.task.input.execution_limits().map_err(|reason| Fault::Store(reason))?;
     let selected = original.task.input.resolved_limits.as_ref().ok_or_else(|| Fault::Store("accepted caller limits absent".into()))?;
@@ -453,6 +456,9 @@ pub(super) fn apply_inner(
     let original = caller(tx, &call.caller, now)?;
     let actor = &call.caller;
     let id = call.operation_id.clone();
+    if crate::mcp::publication::handles(&call.tool) {
+        return super::publication_requests::apply(tx, call, cfg, now);
+    }
     if crate::mcp::identity_administration::handles(&call.tool) {
         call.validate(limits).map_err(|e|Fault::Refused("invalid_input",e))?;
         crate::mcp::validate_arguments_for_profile(&call.tool,&call.arguments,limits,original.task.input.definition.execution_profile.as_ref()).map_err(|e|Fault::Refused("invalid_input",e))?;
@@ -830,6 +836,27 @@ pub(super) fn task_page(
         Data::CollaborationPage(page) => Ok(page),
         _ => Err(Fault::Store("task page shape".into())),
     }
+}
+/// Browser fallback keeps the original legacy after identity as a bounded key
+/// lookup, then uses the same scoped cursor and projection as the shared read.
+/// Native/supplied callers never enter this legacy-route conversion.
+pub(super) fn operator_list_cursor(tx:&Connection,kind:&str,scope:&Value,after:&Option<String>,cfg:&ControllerConfig,now:u64)->Result<Option<String>> {
+    let Some(raw)=after else{return Ok(None)};
+    if serde_json::from_str::<Cursor>(raw).is_ok() {return Ok(Some(raw.clone()));}
+    if !valid_id(tx.limits,raw) {return refuse("invalid_input","invalid legacy page cursor");}
+    let position=match kind {
+        "tasks" if *scope==json!([null,null])=>tx.query_row("SELECT seq FROM tasks WHERE id=?1",[raw],|r|r.get::<_,i64>(0)).optional()?
+            .filter(|seq|*seq>0).ok_or_else(||Fault::Refused("invalid_input","unknown page cursor".into()))?.to_string(),
+        "agents"=>{
+            super::agents::apply(tx,&Operation::GetAgent{agent_id:raw.clone()},cfg,now)?;
+            raw.clone()
+        },
+        _=>return refuse("invalid_input","cursor differs from query scope"),
+    };
+    Ok(Some(encode(&Cursor{kind:kind.into(),scope:scope.clone(),position})?))
+}
+pub(super) fn agent_page(tx:&Connection,after:&Option<String>,limit:usize,cfg:&ControllerConfig,now:u64)->Result<(Data,bool)> {
+    list(tx,"agents",&Value::Null,after.clone(),limit,cfg,now)
 }
 fn list(
     tx: &Connection,

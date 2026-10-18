@@ -24,10 +24,16 @@ pub(super) const DEFAULT_ASSIGNMENT_VERSION: i64 = 24;
 pub(super) const IDENTITY_ADMINISTRATION_VERSION: i64 = 25;
 pub(super) const MACHINE_RESOURCES_VERSION: i64 = 25;
 pub(super) const SUPPLIED_RETRY_VERSION: i64 = 25;
-// One vocabulary generation contains identity fields, paginated reads and read retention.
+// Schema26 identity fields, paginated reads and retained-read references remain admitted.
 pub(super) const IDENTITY_LIMIT_FIELDS_VERSION: i64 = 26;
 pub(super) const READ_PAGINATION_VERSION: i64 = 26;
-pub(super) const VERSION: i64 = 26;
+// Schema27 is the captured publication-only predecessor. Schema28 is the
+// explicit union of that vocabulary and the schema26 read/identity generation.
+pub(super) const PUBLICATION_VERSION: i64 = 27;
+pub(super) const VERSION: i64 = 28;
+pub(super) fn admits_read_generation(version: i64) -> bool {
+    matches!(version, READ_PAGINATION_VERSION | VERSION)
+}
 const SESSION_HANDOFF_DELTA: &str = include_str!("schema24-from23.sql");
 const AGENT_DIRECTORY_DELTA: &str = include_str!("schema23-from22.sql");
 const DELTA: &str = include_str!("schema14-from13.sql");
@@ -69,7 +75,7 @@ pub(super) fn install_checked(conn: &Connection) -> super::database::Result<()> 
 
 pub(super) fn upgrade_checked(conn: &Connection, expected_old: i64) -> super::database::Result<()> {
     use super::database::Fault;
-    if conn.is_autocommit() || !matches!(expected_old, 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25) || expected_old >= VERSION {
+    if conn.is_autocommit() || !matches!(expected_old, 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27) || expected_old >= VERSION {
         return Err(Fault::Store("application migration requires an owned validated historical transaction".into()));
     }
     let actual: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -95,7 +101,7 @@ pub(super) fn upgrade_validated(conn: &Connection) -> Result<(), String> {
 /// The normal startup path uses one transaction for every necessary additive
 /// step. In particular, schema12 cannot be left at schema13 if COMMIT fails.
 pub(super) fn upgrade_from_validated(conn: &Connection, expected_old: i64) -> Result<(), String> {
-    if !conn.is_autocommit() || !matches!(expected_old, 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25)
+    if !conn.is_autocommit() || !matches!(expected_old, 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27)
         || expected_old >= VERSION {
         return Err("application migration requires an unnested validated historical store".into());
     }
@@ -172,6 +178,14 @@ pub(super) fn expected_schema(conn: &Connection, version: i64) -> Result<(), Str
             expected_schema(conn, DEFAULT_ASSIGNMENT_VERSION)?;
             conn.pragma_update(None, "user_version", 25).map_err(|e| e.to_string())
         }
+        READ_PAGINATION_VERSION => {
+            expected_schema(conn, IDENTITY_ADMINISTRATION_VERSION)?;
+            conn.pragma_update(None, "user_version", READ_PAGINATION_VERSION).map_err(|e| e.to_string())
+        }
+        PUBLICATION_VERSION => {
+            expected_schema(conn, IDENTITY_ADMINISTRATION_VERSION)?;
+            conn.pragma_update(None, "user_version", PUBLICATION_VERSION).map_err(|e| e.to_string())
+        }
         VERSION => {
             super::workflow_schema::expected_schema(conn, super::workflow_schema::VERSION)?;
             upgrade_validated(conn)
@@ -232,7 +246,7 @@ mod tests {
 
     #[test]
     fn complete_historical_upgrade_is_atomic_for_all_supported_inputs() {
-        for version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25].into_iter().filter(|version| *version < VERSION) {
+        for version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27].into_iter().filter(|version| *version < VERSION) {
             let conn=Connection::open_in_memory().unwrap();
             expected_schema(&conn,version).unwrap();
             assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),version);

@@ -7,7 +7,7 @@ async fn ordinary_charter_head_selection_reaches_current_native_constructor_for_
     let (old, new) = policies();
     for (label, selected_profile) in [
         ("v1", ExecutionProfile::CollaborationV1 { web_search: None }),
-        ("v2", ExecutionProfile::CollaborationV2 { web_search: None }),
+        ("v2", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
     ] {
         // Existing head uses the selected global capacities before charter
         // activation. This does not upgrade a historical V1 capability set.

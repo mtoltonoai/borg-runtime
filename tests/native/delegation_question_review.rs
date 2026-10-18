@@ -127,7 +127,7 @@ async fn journey() {
     }).await.unwrap();
     assert!(matches!(registered.outcome, Outcome::Ok { data: Data::RepositoryRegistration(_) }));
     let mut input = lab.input(7);
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.definition.revision = "delegation-question-review-v2".into();
     input.instruction = "Delegate the configured source correction. After its accepted checkpoint, ask the operator whether to review it, wait, then create its review document and request review; return seven.".into();
     input.native_workflow = Some(Box::new(NativeWorkflow::CodingThenContinue {

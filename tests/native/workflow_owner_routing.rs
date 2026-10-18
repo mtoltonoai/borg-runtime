@@ -131,7 +131,7 @@ fn owner_input(lab: &Lab, agent: &str) -> TaskInput {
     let mut input = lab.input(2);
     input.definition.id = agent.into();
     input.definition.revision = "document-owner-native-v2".into();
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input
 }
 async fn call_ok(api: &ApiClient, operation: Operation) -> Reply {

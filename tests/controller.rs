@@ -4433,7 +4433,8 @@ async fn release_uses_original_checkpoint_publication_after_successful_recovery_
         .map(|command| match command {
             WorkerCommand::RunAttempt { command_id, .. }
             | WorkerCommand::StopAttempt { command_id, .. }
-                    | WorkerCommand::CollaborationReady { command_id, .. } => command_id.clone(),
+                    | WorkerCommand::CollaborationReady { command_id, .. }
+                    | WorkerCommand::PublishRepository { command_id, .. } => command_id.clone(),
         })
         .collect();
     let accepting = run(&commands(&c, &w, ack).await);
@@ -6211,3 +6212,6 @@ mod codex_rate_limit_recovery;
 
 #[path = "controller/identity_limit_fields_compatibility.rs"]
 mod identity_limit_fields_compatibility;
+
+#[path = "controller/publication_mcp.rs"]
+mod publication_mcp;

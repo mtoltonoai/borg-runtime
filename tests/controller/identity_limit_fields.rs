@@ -167,7 +167,7 @@ async fn identity_limit_fields_touched_groups_inherit_current_retry_and_preserve
 async fn identity_limit_fields_full_replace_still_requires_widening_rule_for_decrease() {
     let h = fixture("conservative-rule").await;
     let mut subject = super::native("identity-limit-fields-narrowing-subject");
-    subject.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    subject.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None, publication: None });
     subject.definition.charter = Some(charter("identity-limit-fields-narrowing-subject"));
     let selection = super::governance::promote_with_subject(&h.c, "identity-limit-fields-narrowing", false, subject).await.configuration;
     let before = selected(&h.c, "charter").await.definition;

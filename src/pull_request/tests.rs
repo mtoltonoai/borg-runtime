@@ -184,7 +184,7 @@ fn accepted_checkpoint_transport_does_not_expand_configured_head_authority() {
 
 #[test]
 fn definite_not_applied_closes_effect_but_never_supplies_requested_result() {
-    let b = limits(); let h = head(); let negative = NotApplied { acknowledged: true, not_applied: true };
+    let b = limits(); let h = head(); let negative = NotApplied { refusal: None, acknowledged: true, not_applied: true };
     let head_outcome = HeadOutcome::NotApplied(negative.clone());
     assert_eq!(serde_json::to_value(&head_outcome).unwrap(), json!({"acknowledged":true,"not_applied":true}));
     assert!(validate_head_outcome(&h, &head_outcome, &b).is_ok());
@@ -200,8 +200,8 @@ fn definite_not_applied_closes_effect_but_never_supplies_requested_result() {
         assert!(serde_json::from_value::<CreateOutcome>(bad).is_err());
     }
     for (acknowledged, not_applied) in [(false, true), (true, false), (false, false)] {
-        assert!(validate_head_outcome(&h, &HeadOutcome::NotApplied(NotApplied { acknowledged, not_applied }), &b).is_err());
-        assert!(validate_outcome(&i, &CreateOutcome::NotApplied(NotApplied { acknowledged, not_applied }), &b).is_err());
+        assert!(validate_head_outcome(&h, &HeadOutcome::NotApplied(NotApplied { refusal: None, acknowledged, not_applied }), &b).is_err());
+        assert!(validate_outcome(&i, &CreateOutcome::NotApplied(NotApplied { refusal: None, acknowledged, not_applied }), &b).is_err());
     }
 }
 

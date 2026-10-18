@@ -1240,6 +1240,17 @@ pub(super) fn admit_worker19_outcomes(config:&Config)->Result<(),String> {
     if crate::protocol::policy_requires_wire24(&config.runtime_limits)||config.limits.capabilities.is_some() {return Err("Coding accepted identity/task metadata requires worker19".into())}
     inspect_retained_outcomes(config,None,true,None,false).map(|_|())
 }
+pub(super) fn admit_worker21_outcomes(config: &Config) -> Result<(), String> {
+    if mcp::publication::selection(config.execution_profile.as_ref()).is_some() { return Err("Coding publication capability requires worker21".into()); }
+    inspect_retained_outcomes(config, Some(crate::protocol::outcome_requires_publication), false, None, false)?;
+    if let Some(bytes) = read_private(&config.directory().join("calls.json"), config.limits.journal_bytes, "execution.collaboration.journal_bytes")? {
+        let journal: Journal = decode(&bytes, config.limits.journal_bytes)?;
+        if journal.entries.iter().any(|e| crate::protocol::requires_publication(&Operation::CallCollaboration { call: e.invocation.clone() })) {
+            return Err("original Coding publication call requires worker21, including refusals".into());
+        }
+    }
+    Ok(())
+}
 pub(super) fn admit_identity_limit_fields_outcomes(config: &Config) -> Result<(), String> {
     use crate::protocol::identity_limit_fields as vocabulary;
     if vocabulary::metadata_uses(&config.runtime_limits) {
@@ -1293,7 +1304,7 @@ fn inspect_retained_outcomes(config: &Config, historical_rejects: Option<fn(&Out
     if let Some(bytes) = read_private(&config.state.join("borg-collaboration-config.json"),
         config.limits.config_bytes, "execution.collaboration.config_bytes")? {
         let retained: Config = decode(&bytes, config.limits.config_bytes)?;
-        if retained.instruction_source != config.instruction_source {
+        if retained.instruction_source != config.instruction_source || retained.execution_profile != config.execution_profile {
             return Err("retained instruction source differs from accepted command".into());
         }
     }

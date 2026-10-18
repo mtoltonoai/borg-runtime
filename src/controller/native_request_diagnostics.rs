@@ -55,7 +55,7 @@ fn table_available(tx: &Connection<'_>) -> Result<bool> {
     // The database owner separately validates each complete schema's shape.
     match (version, present) {
         (12..=17, false) => Ok(false),
-        (18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26, true) => Ok(true),
+        (18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28, true) => Ok(true),
         _ => Err(Fault::Store("native diagnostic credit table differs from original schema".into())),
     }
 }
@@ -661,13 +661,13 @@ mod tests {
     }
 
     #[test]
-    fn identity_limit_fields_only_explicit_schema18_through26_accept_the_retained_credit_table() {
+    fn publication_only_explicit_schema18_through28_accept_the_retained_credit_table() {
         let limits=RuntimeLimits::seed().unwrap();
-        for version in [17,18,19,20,21,22,23,24,25,26,27] {
+        for version in [17,18,19,20,21,22,23,24,25,26,27,28,29] {
             let sql=legacy();sql.execute_batch(include_str!("schema18-from17.sql")).unwrap();
             sql.pragma_update(None,"user_version",version).unwrap();
             let tx=Connection::new(&sql,&limits);
-            let supported=matches!(version,18|19|20|21|22|23|24|25|26);
+            let supported=matches!(version,18|19|20|21|22|23|24|25|26|27|28);
             assert_eq!(table_available(&tx).is_ok(),supported);
             assert_eq!(validate_existing(&tx,true).is_ok(),supported);
             if supported {
@@ -679,7 +679,7 @@ mod tests {
             }
             assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),version);
         }
-        for version in [18,19,20,21,22,23,24,25,26,27] {
+        for version in [18,19,20,21,22,23,24,25,26,27,28] {
             let sql=legacy();sql.pragma_update(None,"user_version",version).unwrap();
             assert!(table_available(&Connection::new(&sql,&limits)).is_err());
         }

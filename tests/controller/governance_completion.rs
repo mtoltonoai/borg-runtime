@@ -42,7 +42,7 @@ async fn reserve(c: &Controller, a: &Attempt, index: u32) {
 }
 async fn active(c: &Controller, label: &str) -> (Task, Attempt, Caller, Worker) {
     let mut input = native(&id(label));
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let queued = submit(c, &id("submit"), input).await;
     let worker = worker(&id("worker"), "inc", 1, 0);
     register(c, &worker).await;
@@ -1060,7 +1060,7 @@ async fn codex_completion_ack_uses_no_native_request_evidence() {
         let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
         promote(&c, "codex-ack-policy", true).await;
         let mut input = coding(&id("codex-ack-agent"));
-        input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+        input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
         let accepted = submit(&c, &id("codex-ack-submit"), input).await;
         let w = worker(&id("codex-ack-worker"), "inc", 0, 1); register(&c, &w).await;
         let a = run(&commands(&c, &w, vec![]).await); assert_eq!(a.task_id, accepted.id);

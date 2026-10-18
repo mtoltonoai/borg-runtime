@@ -44,7 +44,7 @@ async fn native_self_wait_stops_then_answers_into_one_exact_fresh_attempt_input(
     let mut controller = lab.controller("controller").await;
     let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
     let mut input = lab.input(2);
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.definition.revision = "workflow-self-wait-v2".into();
     let task = submit(&api, input).await;
     assert_eq!(task.input.resolved_limits.as_ref().unwrap().global_metadata.workflow.as_ref(),

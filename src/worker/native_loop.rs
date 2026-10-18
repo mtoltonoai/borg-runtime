@@ -678,7 +678,7 @@ pub(super) async fn execute(
     //# An agent definition MUST explicitly configure its native provider-tool capabilities.
     let Some(
         ExecutionProfile::CollaborationV1 { web_search }
-        | ExecutionProfile::CollaborationV2 { web_search },
+        | ExecutionProfile::CollaborationV2 { web_search , .. },
     ) = &input.definition.execution_profile
     else {
         return Err("collaboration profile absent".into());

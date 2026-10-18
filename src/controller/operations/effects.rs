@@ -117,7 +117,13 @@ pub(super) fn apply(
             }
             //= spec/impl/v2/implementation.md#checkpoint-publication-is-reconciled
             //# A superseded attempt's publication MUST NOT advance the task's selected checkpoint.
-            let mut t = owned(tx, task_id, attempt_id, *generation, false)?;
+            // A new publication binds its current requester separately from the
+            // succeeded source. Late facts remain recordable after requester
+            // replacement; they never authorize another effect or select source.
+            let publication = super::super::publication_requests::typed(&record);
+            let mut t = if publication { load(tx, task_id)? } else { owned(tx, task_id, attempt_id, *generation, false)? };
+            let current = t.task.attempt.as_ref().is_some_and(|a| a.id == *attempt_id && a.generation == *generation);
+            if publication && checkpoint.is_some() { return refuse("invalid_input", "publication cannot select a task checkpoint"); }
             let acknowledged = outcome.get("acknowledged").and_then(Value::as_bool) == Some(true);
             //= spec/impl/v2/implementation.md#work-starts-from-a-durable-source
             //# A checkpoint MUST NOT be reported durable before its external storage acknowledges it.
@@ -137,8 +143,10 @@ pub(super) fn apply(
                     "UPDATE external_operations SET body=?2 WHERE id=?1",
                     params![operation_id, encode(&record)?],
                 )?;
-                t.task.attempt.as_mut().unwrap().uncertain = true;
-                save(tx, &mut t, "external_uncertain", operation_id)?;
+                if current {
+                    t.task.attempt.as_mut().unwrap().uncertain = true;
+                    save(tx, &mut t, "external_uncertain", operation_id)?;
+                } else { history(tx, &t.task, "external_uncertain", &record)?; }
                 return Ok((Data::Operation(record), true));
             }
             super::super::pull_request::settle(tx, &t.task, &record, outcome)?;
@@ -172,9 +180,10 @@ pub(super) fn apply(
                 "UPDATE external_operations SET body=?2,settlement=?3 WHERE id=?1",
                 params![operation_id, encode(&record)?, encode(op)?],
             )?;
-            t.task.attempt.as_mut().unwrap().uncertain =
-                t.unresolved_execution || pending_effects(tx, task_id)? > 0;
-            save(tx, &mut t, "external_settled", operation_id)?;
+            if current {
+                t.task.attempt.as_mut().unwrap().uncertain = t.unresolved_execution || pending_effects(tx, task_id)? > 0;
+                save(tx, &mut t, "external_settled", operation_id)?;
+            } else { history(tx, &t.task, "external_settled", &record)?; }
             Ok((Data::Operation(record), true))
         }
         Operation::GetOperation { operation_id } => {

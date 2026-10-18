@@ -11,7 +11,7 @@ fn limits()->RuntimeLimits {
 }
 fn config(p:RuntimeLimits)->ControllerConfig{ControllerConfig{limits:Arc::new(p),validation_executable:PathBuf::from(env!("CARGO_BIN_EXE_borg-runtime")),..ControllerConfig::default()}}
 fn input(agent:&str)->TaskInput {
-    TaskInput{ instruction_source: None, pull_request: None, instruction:"Return a bounded structured value".into(),definition:Definition{charter: None, id:agent.into(),revision:"v1".into(),executor:ExecutorKind::Native,inference:Some(InferenceSettings::selected()),execution_profile:Some(ExecutionProfile::CollaborationV2{web_search:None}),limit_overrides:None},repository:None,repository_read:None,acceptance_commands:vec![],output_schema:Some(json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false})),limits:Limits{deadline_unix_ms:SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()as u64+600_000,model_requests:32,output_bytes:16_384,result_bytes:RuntimeLimits::seed().unwrap().task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None,resolved_limits:None}
+    TaskInput{ instruction_source: None, pull_request: None, instruction:"Return a bounded structured value".into(),definition:Definition{charter: None, id:agent.into(),revision:"v1".into(),executor:ExecutorKind::Native,inference:Some(InferenceSettings::selected()),execution_profile:Some(ExecutionProfile::CollaborationV2{ publication: None,web_search:None}),limit_overrides:None},repository:None,repository_read:None,acceptance_commands:vec![],output_schema:Some(json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false})),limits:Limits{deadline_unix_ms:SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()as u64+600_000,model_requests:32,output_bytes:16_384,result_bytes:RuntimeLimits::seed().unwrap().task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None,resolved_limits:None}
 }
 struct Lab{root:PathBuf,c:Controller,config:ControllerConfig}
 impl Lab{fn new()->Self{Self::with(limits())}fn with(p:RuntimeLimits)->Self{let root=std::env::temp_dir().join(unique());std::fs::create_dir(&root).unwrap();let config=config(p);let c=Controller::open_with_config(&root.join("tasks.sqlite"),config.clone()).unwrap();Self{root,c,config}}async fn restart(self)->Self{let Self{root,c,config}=self;drop(c);released(&root.join("tasks.sqlite")).await;let c=Controller::open_with_config(&root.join("tasks.sqlite"),config.clone()).unwrap();Self{root,c,config}}}
@@ -28,7 +28,7 @@ fn pose_for(record:RecordRef,recipient:PrincipalRef)->PoseQuestion{PoseQuestion{
 async fn pose(c:&Controller,task:&Task,recipient:PrincipalRef)->Question{changed(&mutate(c,&unique(),QuestionMutation::Pose{question:pose_for(RecordRef::Task{task_id:task.id.clone()},recipient)}).await).question.question}
 fn answer(q:&Question,option:&str)->QuestionMutation{QuestionMutation::Answer{question_id:q.id.clone(),expected_revision:q.revision,answer:QuestionAnswer{option_id:option.into(),explanation:"Explicit decision".into()}}}
 async fn queue(c:&Controller,viewer:PrincipalRef,after:Option<String>,limit:usize)->DecisionQueuePage{match query(c,QuestionQuery::DecisionQueue{viewer,after,limit}).await{QuestionQueryResult::DecisionQueue(v)=>v,x=>panic!("{x:?}")}}
-async fn actor(c:&Controller,agent:&str)->(Task,Caller){actor_profile(c,agent,ExecutionProfile::CollaborationV2{web_search:None}).await}
+async fn actor(c:&Controller,agent:&str)->(Task,Caller){actor_profile(c,agent,ExecutionProfile::CollaborationV2{ publication: None,web_search:None}).await}
 async fn actor_profile(c:&Controller,agent:&str,profile:ExecutionProfile)->(Task,Caller){
     let mut data=input(agent);data.definition.execution_profile=Some(profile);let t=task(call(c,Operation::SubmitTask{operation_id:unique(),input:data}).await);let w=Worker{id:unique(),incarnation:"inc".into(),coding_capacity:0,native_capacity:1};
     assert!(matches!(call(c,Operation::RegisterWorker{operation_id:unique(),worker:w.clone()}).await.outcome,Outcome::Ok{..}));
@@ -394,7 +394,7 @@ async fn oversized_first_queue_item_refuses_instead_of_hiding_an_owed_decision()
 
 #[tokio::test]
 async fn question_tools_are_closed_and_disabled_without_explicit_workflow_metadata(){
-    let v2=ExecutionProfile::CollaborationV2{web_search:None};
+    let v2=ExecutionProfile::CollaborationV2{ publication: None,web_search:None};
     let mut p=limits();p.workflow=None;let lab=Lab::with(p);let t=submit(&lab.c,"owner").await;
     // Test the explicit V2 projection: absence of workflow metadata must still
     // withhold added tools. catalogue() alone deliberately remains V1-only.
@@ -465,7 +465,7 @@ async fn v1_never_gains_question_tools_when_workflow_metadata_is_enabled(){
         ("collab_question_actions",json!({"question_id":q.id,"after":null,"limit":1})),
         ("collab_decisions_list",json!({"after":null,"limit":1})),
     ];
-    let v2=ExecutionProfile::CollaborationV2{web_search:None};
+    let v2=ExecutionProfile::CollaborationV2{ publication: None,web_search:None};
     for(index,(name,args))in cases.into_iter().enumerate(){
         // Every argument object is structurally valid for V2. The exact V1
         // refusal must precede domain lookup/mutation, even for absent answers.

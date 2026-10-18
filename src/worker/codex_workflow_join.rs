@@ -115,7 +115,7 @@ fn accepted_input(runtime: &RuntimeLimits, v2: bool) -> TaskInput {
             id: AGENT.into(), revision: "one".into(), executor: ExecutorKind::Coding,
             inference: Some(InferenceSettings::selected()), limit_overrides: None,
             execution_profile: Some(if v2 {
-                ExecutionProfile::CollaborationV2 { web_search: None }
+                ExecutionProfile::CollaborationV2 { publication: None, web_search: None }
             } else {
                 ExecutionProfile::CollaborationV1 { web_search: None }
             }),

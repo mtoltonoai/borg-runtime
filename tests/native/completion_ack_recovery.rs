@@ -135,7 +135,7 @@ async fn ok(api: &ApiClient, operation: Operation) -> Reply {
 fn native_input(lab: &Lab, agent: &str, requests: u32) -> TaskInput {
     let mut value = input(lab, requests);
     value.definition.id = agent.into(); value.definition.revision = "completion-ack-v2".into();
-    value.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None }); value
+    value.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None }); value
 }
 fn charter_tool(mut reply: Value, declaration: &Value) -> Value {
     reply["output"].as_array_mut().unwrap().insert(0, json!({"id":"asker-charter", "type":"message", "role":"assistant", "status":"completed", "phase":"commentary",

@@ -144,6 +144,7 @@ fn validate_candidate(
         );
     }
     super::charters::validate_definition(tx, d)?;
+    super::publication_requests::validate_definition(tx, d)?;
     super::bounded_json_size(d, tx.limits.controller.max_task_input_bytes).map_err(|_| {
         Fault::Refused(
             "capacity",

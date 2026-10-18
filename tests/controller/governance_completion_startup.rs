@@ -27,7 +27,7 @@ struct Held {
 // intentionally retain their historical unmarked Usage vocabulary.
 async fn current_active(c:&Controller,label:&str)->(Task,Attempt,Caller,Worker) {
     let mut input=native(&id(label));
-    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2 {web_search:None});
+    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2 { publication: None,web_search:None});
     let queued=Box::pin(submit(c,&id("submit"),input)).await;
     let w=worker(&id("worker"),"inc",1,0);
     Box::pin(register(c,&w)).await;

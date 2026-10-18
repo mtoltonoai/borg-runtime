@@ -719,7 +719,7 @@ async fn bounded_completion_evaluator_failure_still_delivers_stop_to_the_live_wo
     let policy = qualify(&lab, "bounded-evaluator-policy").await;
     assert_eq!(state(&lab).await.selected_revision, policy.revision);
     let mut input = lab.input("bounded-evaluator-agent");
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let accepted = task(request(&lab, Operation::SubmitTask {
         operation_id: "bounded-evaluator-submit".into(), input,
     }).await);
@@ -912,7 +912,7 @@ async fn qualify(lab: &Lab, label: &str) -> ConfigurationVersion {
     let mut input = lab.input(&format!("{label}-policy-subject"));
     input.definition.executor = ExecutorKind::Native;
     input.definition.execution_profile =
-        Some(ExecutionProfile::CollaborationV2 { web_search: None });
+        Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.repository = None;
     input.acceptance_commands.clear();
     input.output_schema = Some(

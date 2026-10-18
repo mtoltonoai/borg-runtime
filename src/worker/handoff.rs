@@ -96,6 +96,18 @@ pub(super) fn admit_retained_identity(state:&Path,limits:&RuntimeLimits)->Result
     Ok(())
 }
 
+pub(super) fn admit_retained_publication(state:&Path,limits:&RuntimeLimits)->Result<(),String> {
+    for (_,receipt) in command_receipts(state,limits)? {
+        let WorkerCommand::RunAttempt{attempt,task,..}=&receipt.command else{continue};
+        let path=path(state,attempt);
+        if path.exists() {
+            let saved=load(&path,attempt,task)?;
+            if crate::protocol::requires_publication(&saved.request)||saved.outcome.as_ref().is_some_and(crate::protocol::outcome_requires_publication) {return Err("retained handoff publication vocabulary requires worker21".into())}
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn admit_machine_outcomes(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
     for (_, receipt) in command_receipts(state, limits)? {
         let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { continue; };
@@ -429,8 +441,11 @@ struct Format {
 // Outer17 fences supplied public outer-turn journals and output manifests.
 // Outer18 carries optional default-assignment metadata in accepted snapshots.
 // Outer19 fences identity/task, machine read and supplied retry vocabulary.
-// Outer20 jointly fences identity fields, paginated reads and retained-read references.
-const CURRENT_STATE_FORMAT: u32 = 20;
+// Outer22 is the union. Outer20 reads/identity fields and standalone outer21
+// publication keep separate historical vocabulary admission sets.
+const CURRENT_STATE_FORMAT: u32 = 22;
+const PUBLICATION_STATE_FORMAT: u32 = 21;
+const READ_STATE_FORMAT: u32 = 20;
 const IDENTITY_STATE_FORMAT: u32 = 19;
 const DEFAULT_ASSIGNMENT_STATE_FORMAT: u32 = 18;
 const SUPPLIED_STATE_FORMAT: u32 = 17;
@@ -467,34 +482,34 @@ fn read_state_format(state: &Path, limits: &WorkerLimits) -> Result<Format, Stri
     }
     let format: Format =
         serde_json::from_slice(&bytes).map_err(|_| "unsupported worker state format")?;
-    if !matches!(format.format_revision, INSTALLED_STATE_FORMAT | EARLIER_STATE_FORMAT | PREVIOUS_STATE_FORMAT | OUTPUT_CAP_STATE_FORMAT | OUTPUT_RETENTION_STATE_FORMAT | DIAGNOSTIC_STATE_FORMAT | PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT) {
+    if !matches!(format.format_revision, INSTALLED_STATE_FORMAT | EARLIER_STATE_FORMAT | PREVIOUS_STATE_FORMAT | OUTPUT_CAP_STATE_FORMAT | OUTPUT_RETENTION_STATE_FORMAT | DIAGNOSTIC_STATE_FORMAT | PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT) {
         return Err("unsupported worker state format; no migration performed".into());
     }
     Ok(format)
 }
 
 pub(super) fn admits_instruction_sources(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admits_supplied_turn_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admits_default_assignment(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
-pub(super) fn admits_read_pagination(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(read_state_format(state,limits)?.format_revision==CURRENT_STATE_FORMAT)}
+pub(super) fn admits_read_pagination(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(matches!(read_state_format(state,limits)?.format_revision,READ_STATE_FORMAT | CURRENT_STATE_FORMAT))}
 
 pub(super) fn admits_machine_resources(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
-pub(super) fn admits_identity_administration(state:&Path,limits:&WorkerLimits)->Result<bool,String> { Ok(matches!(read_state_format(state,limits)?.format_revision, IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT)) }
+pub(super) fn admits_identity_administration(state:&Path,limits:&WorkerLimits)->Result<bool,String> { Ok(matches!(read_state_format(state,limits)?.format_revision, IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT)) }
 
 pub(super) fn admits_identity_limit_fields(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(read_state_format(state, limits)?.format_revision == CURRENT_STATE_FORMAT)
+    Ok(matches!(read_state_format(state, limits)?.format_revision, READ_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admit_retained_identity_limit_fields(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
@@ -513,11 +528,15 @@ pub(super) fn admit_retained_identity_limit_fields(state: &Path, limits: &Runtim
 }
 
 pub(super) fn admits_pull_request_records(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(matches!(read_state_format(state, limits)?.format_revision, PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))
+    Ok(matches!(read_state_format(state, limits)?.format_revision, PULL_REQUEST_STATE_FORMAT | INSTRUCTION_SOURCE_STATE_FORMAT | SUPPLIED_STATE_FORMAT | DEFAULT_ASSIGNMENT_STATE_FORMAT | IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn admits_read_references(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
-    Ok(read_state_format(state, limits)?.format_revision == CURRENT_STATE_FORMAT)
+    Ok(matches!(read_state_format(state, limits)?.format_revision, READ_STATE_FORMAT | CURRENT_STATE_FORMAT))
+}
+
+pub(super) fn admits_publication_requests(state: &Path, limits: &WorkerLimits) -> Result<bool, String> {
+    Ok(matches!(read_state_format(state, limits)?.format_revision, PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT))
 }
 
 pub(super) fn initialize_state(state: &Path, limits: &WorkerLimits) -> Result<(), String> {
@@ -572,6 +591,7 @@ pub(super) fn finish_state_upgrade(
     crate::worker::admit_supplied_retry(state, limits)?;
     crate::worker::identity_limit_fields::admit(state, limits)?;
     crate::worker::read_pagination::admit(state, limits)?;
+    crate::worker::admit_publication_vocabulary(state, limits)?;
     // Also re-persist the observed current marker: a prior rename may have succeeded before
     // its directory sync failed. Visibility alone is not a durable barrier.
     write_current_state_format(state, &limits.worker)
@@ -1577,7 +1597,7 @@ mod tests {
 
     #[test]
     fn historical_format_inspection_is_read_only_and_owned_upgrade_preserves_records() {
-        for revision in [9, 10, 11, 12, 13, 14, 15, 16, 17] {
+        for revision in [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
             let (state, original_marker) = historical_state(&format!("format-{revision}-upgrade"), revision);
             let limits = historical_limits();
             process::private_directory(&state.join("commands")).unwrap();
@@ -1615,6 +1635,20 @@ mod tests {
     }
 
     #[test]
+    fn publication_union_keeps_predecessor_vocabulary_sets_distinct() {
+        let limits = historical_limits();
+        for (revision, reads, publication) in [(19,false,false),(20,true,false),(21,false,true),(22,true,true)] {
+            let (state, marker) = historical_state("publication-union-sets", revision);
+            assert_eq!(admits_identity_limit_fields(&state,&limits.worker).unwrap(),reads);
+            assert_eq!(admits_read_pagination(&state,&limits.worker).unwrap(),reads);
+            assert_eq!(admits_read_references(&state,&limits.worker).unwrap(),reads);
+            assert_eq!(admits_publication_requests(&state,&limits.worker).unwrap(),publication);
+            assert!(admits_identity_administration(&state,&limits.worker).unwrap());
+            assert_eq!(std::fs::read(state.join("format.json")).unwrap(),marker);
+        }
+    }
+
+    #[test]
     fn invalid_or_unowned_state_cannot_cross_the_upgrade_boundary() {
         let (state, original_marker) = historical_state("format-lock", 10);
         let mut limits = test_limits().worker.clone();
@@ -1628,7 +1662,7 @@ mod tests {
             b"{\"format_revision\":10,\"extra\":true}".to_vec(),
             b"{\"format_revision\":10,\"format_revision\":10}".to_vec(),
             b"{\"format_revision\":8}".to_vec(),
-            b"{\"format_revision\":21}".to_vec(),
+            b"{\"format_revision\":23}".to_vec(),
             vec![b' '; limits.state_format_bytes + 1],
         ].into_iter().enumerate() {
             let state = area(&format!("invalid-format-{i}"));
@@ -1652,7 +1686,7 @@ mod tests {
     #[test]
     fn state_upgrade_faults_do_not_claim_durability_and_visible_fourteen_is_resynced() {
         use crate::worker::process::storage_tests::{Point, inject};
-        for revision in [9, 10, 11, 12, 13, 14, 15, 16, 17] {
+        for revision in [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
             for point in [Point::Create, Point::Write, Point::FileSync, Point::Rename, Point::DirectorySync] {
                 let (state, original) = historical_state(&format!("format-{revision}-upgrade-{point:?}"), revision);
                 let marker = state.join("format.json");
@@ -2305,11 +2339,11 @@ mod tests {
     }
 
     #[test]
-    fn identity_limit_fields_policy_command_and_await_refuse19_without_rewriting_originals() {
+    fn identity_limit_fields_policy_command_and_await_refuse19_and21_without_rewriting_originals() {
         use crate::limits::DefinitionLimitField::{CodingFrameBytes, CollaborationJournalBytes};
-        for field in [CodingFrameBytes, CollaborationJournalBytes] {
+        for revision in [19, 21] { for field in [CodingFrameBytes, CollaborationJournalBytes] {
             for carrier in ["policy", "command", "await"] {
-                let (state, marker) = historical_state("identity-fields-policy", 19);
+                let (state, marker) = historical_state("identity-fields-policy", revision);
                 let old = historical_limits();
                 let mut new = (*old).clone();
                 new.definition_updates.as_mut().unwrap().allowed_fields.push(field);
@@ -2334,6 +2368,7 @@ mod tests {
                 finish_state_upgrade(&state, limits, &lease).unwrap();
                 for (p,b) in originals { assert_eq!(std::fs::read(p).unwrap(), b); }
             }
+        }
         }
     }
 
@@ -2416,4 +2451,4 @@ mod tests {
 
 }
 
-pub(super) fn admits_supplied_retry(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(matches!(read_state_format(state,limits)?.format_revision, IDENTITY_STATE_FORMAT | CURRENT_STATE_FORMAT))}
+pub(super) fn admits_supplied_retry(state:&Path,limits:&WorkerLimits)->Result<bool,String>{Ok(matches!(read_state_format(state,limits)?.format_revision, IDENTITY_STATE_FORMAT | READ_STATE_FORMAT | PUBLICATION_STATE_FORMAT | CURRENT_STATE_FORMAT))}

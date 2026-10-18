@@ -199,7 +199,7 @@ async fn promote(api: &ApiClient, lab: &Lab) {
     let mut setup = input(lab, 2);
     setup.definition.id = "policy-bootstrap-subject".into();
     setup.definition.execution_profile =
-        Some(ExecutionProfile::CollaborationV2 { web_search: None });
+        Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let task = submit_identified(api, setup, "bootstrap-submit").await;
     let worker = Worker {
         id: "policy-bootstrap-worker".into(),
@@ -500,7 +500,7 @@ async fn scenario(continue_work: bool) {
     ));
     let mut accepted = input(&lab, if continue_work { 7 } else { 5 });
     accepted.definition.execution_profile =
-        Some(ExecutionProfile::CollaborationV2 { web_search: None });
+        Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let task = submit(&api, accepted).await;
     let subject = task.id.clone();
     let posed = Arc::new(Mutex::new(None::<Question>));

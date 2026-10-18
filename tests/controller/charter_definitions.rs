@@ -472,7 +472,7 @@ async fn browser(c: &Controller, method: &str, path: &str, body: String) -> prod
 async fn charter_browser_selected_v1_and_v2_project_exact_definition_and_replay_original_task() {
     for profile in [
         plain(),
-        ExecutionProfile::CollaborationV2 { web_search: None },
+        ExecutionProfile::CollaborationV2 { publication: None, web_search: None },
     ] {
         let (_, c, old, head) = setup(profile.clone()).await;
         let published = outcome(

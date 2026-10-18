@@ -83,7 +83,8 @@ fn command_ids(outcome: &Outcome) -> Vec<String> {
             .map(|c| match c {
                 WorkerCommand::RunAttempt { command_id, .. }
                 | WorkerCommand::StopAttempt { command_id, .. }
-                    | WorkerCommand::CollaborationReady { command_id, .. } => command_id.clone(),
+                    | WorkerCommand::CollaborationReady { command_id, .. }
+                    | WorkerCommand::PublishRepository { command_id, .. } => command_id.clone(),
             })
             .collect(),
         other => panic!("expected recorded command response: {other:?}"),

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod client;
 pub mod identity_administration;
+pub mod publication;
 pub(crate) mod documents_reviews;
 #[cfg(test)]
 mod instruction_source_tests;
@@ -121,6 +122,7 @@ fn read_schemas(tools:&mut [Tool],limits:&RuntimeLimits) {
 pub fn catalogue(limits: &RuntimeLimits) -> Vec<Tool> {
     let mut tools: Vec<Tool> = serde_json::from_str(include_str!("catalogue.json"))
         .expect("fixed MCP catalogue mechanisms");
+    tools.retain(|tool| !publication::handles(&tool.name));
     for tool in &mut tools {
         let repository = repository_query(&tool.name);
         let properties = tool.input_schema["properties"]
@@ -170,6 +172,7 @@ pub fn catalogue_for_profile(
     }
     if matches!(profile, ExecutionProfile::CollaborationV2 { .. }) {
         tools.extend(identity_administration::catalogue(limits, limits.execution.collaboration.capabilities.as_ref()));
+        tools.extend(publication::catalogue(limits, publication::selection(Some(profile))));
     }
     read_schemas(&mut tools,limits);
     tools
@@ -233,6 +236,9 @@ pub fn validate_arguments_for_profile(
     profile: Option<&ExecutionProfile>,
 ) -> Result<(), String> {
     let profile = profile.ok_or("collaboration profile is not configured")?;
+    if publication::handles(tool_name) {
+        return publication::validate(tool_name, arguments, limits, publication::selection(Some(profile)));
+    }
     if identity_administration::handles(tool_name) {
         if !matches!(profile, ExecutionProfile::CollaborationV2 { .. }) { return Err("identity/task tools require V2".into()); }
         return identity_administration::validate(tool_name, arguments, limits, limits.execution.collaboration.capabilities.as_ref());

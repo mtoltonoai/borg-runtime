@@ -7,33 +7,72 @@ use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Effect {
-    intended: OperationRecord,
-    prepare_commit: Option<MutationCommit>,
-    prepare_refusal: Option<String>, // SHA256 of the exact original refusal, not arbitrary provider/controller text
-    may_have_started: bool,
-    outcome: Option<serde_json::Value>,
-    settlement_id: String,
-    settled: Option<OperationRecord>,
+pub(super) struct Effect {
+    pub(super) intended: OperationRecord,
+    pub(super) prepare_commit: Option<MutationCommit>,
+    pub(super) prepare_refusal: Option<String>, // SHA256 of the exact original refusal, not arbitrary provider/controller text
+    pub(super) may_have_started: bool,
+    pub(super) outcome: Option<serde_json::Value>,
+    pub(super) settlement_id: String,
+    pub(super) settled: Option<OperationRecord>,
 }
 impl Effect {
-    fn new(intended: OperationRecord) -> Result<Self, String> {
+    pub(super) fn begin(&mut self) -> Result<(), String> {
+        if self.closed() || self.prepare_commit.is_none() || self.may_have_started || self.outcome.is_some() {
+            return Err("original publication cannot be dispatched again".into());
+        }
+        self.may_have_started = true;
+        Ok(())
+    }
+    pub(super) fn new(intended: OperationRecord) -> Result<Self, String> {
         let settlement_id = format!("pr-settle-{}", digest(&intended.id)?);
         Ok(Self { intended, prepare_commit: None, prepare_refusal:None, may_have_started: false,
             outcome: None, settlement_id, settled: None })
     }
-    fn request(&self) -> Operation {
+    pub(super) fn request(&self) -> Operation {
         Operation::PrepareOperation { operation_id: self.intended.id.clone(), task_id: self.intended.task_id.clone(),
             attempt_id: self.intended.attempt_id.clone(), generation: self.intended.generation,
             kind: self.intended.kind.clone(), intended: self.intended.intended.clone() }
     }
-    fn settlement(&self) -> Result<Operation, String> {
+    pub(super) fn settlement(&self) -> Result<Operation, String> {
         Ok(Operation::SettleOperation { settlement_id: self.settlement_id.clone(), operation_id: self.intended.id.clone(),
             task_id: self.intended.task_id.clone(), attempt_id: self.intended.attempt_id.clone(), generation: self.intended.generation,
             outcome: self.outcome.clone().ok_or("PR original outcome is unresolved")?, checkpoint: None })
     }
-    fn applied(&self) -> bool { self.settled.as_ref().is_some_and(|r| r.outcome.as_ref().is_some_and(|v| v.get("proof").is_some())) }
-    fn closed(&self) -> bool { self.settled.is_some() || self.prepare_refusal.is_some() }
+    pub(super) fn applied(&self) -> bool { self.settled.as_ref().is_some_and(|r| r.outcome.as_ref().is_some_and(|v| v.get("proof").is_some())) }
+    pub(super) fn closed(&self) -> bool { self.settled.is_some() || self.prepare_refusal.is_some() }
+}
+
+/// Shared effect implementation for requested Coding completion and the owned
+/// MCP command. Both callers persist Effect::begin before entering these paths.
+pub(super) async fn dispatch_head(head: &HeadIntent, workspace: &Path, registry: &Path, control: &Control) -> Result<serde_json::Value, String> {
+    git::publish(workspace, &head_checkpoint(head), registry, control).await?;
+    head_outcome(head)
+}
+pub(super) async fn dispatch_create(provider: &pull_request_provider::Provider, intent: &Intent, control: &Control) -> Result<serde_json::Value, String> {
+    let proof = match provider.create(intent, control).await {
+        Ok(proof) => proof,
+        Err(_) => match provider.reconcile(intent, control).await? {
+            contract::Reconciliation::Observed(proof) => proof,
+            contract::Reconciliation::Unknown => return Err("PR original create outcome remains unresolved".into()),
+        },
+    };
+    serde_json::to_value(contract::Settlement { acknowledged: true, proof }).map_err(|_| "PR proof encoding failed".into())
+}
+pub(super) async fn readback(head: &HeadIntent, intent: Option<&Intent>, directory: &Path, registry: &Path, control: &Control) -> Result<serde_json::Value, String> {
+    if let Some(intent) = intent {
+        let provider = pull_request_provider::Provider::configured(&head.target, control.runtime_limits.clone())?;
+        let contract::Reconciliation::Observed(proof) = provider.reconcile(intent, control).await? else {
+            return Err("PR original create remains unresolved; no repeat is permitted".into());
+        };
+        serde_json::to_value(contract::Settlement { acknowledged: true, proof }).map_err(|_| "PR recovered proof encoding failed".into())
+    } else {
+        match git::remote_commit(directory, &head_checkpoint(head), registry, control).await? {
+            Some(commit) if commit == head.binding.checkpoint.commit => head_outcome(head),
+            Some(_) => Err("PR original head has different content; no overwrite is permitted".into()),
+            None => Err("PR original head may have been sent; empty lookup remains unresolved".into()),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -68,11 +107,11 @@ fn context(command: &WorkerCommand) -> Result<(&Attempt, &TaskInput, &RuntimeLim
 pub(super) fn path(state: &Path, attempt: &Attempt) -> PathBuf {
     state.join("pull-requests").join(format!("{}.json", component(&attempt.id)))
 }
-fn same_intent(a: &OperationRecord, b: &OperationRecord) -> bool {
+pub(super) fn same_intent(a: &OperationRecord, b: &OperationRecord) -> bool {
     a.id == b.id && a.task_id == b.task_id && a.attempt_id == b.attempt_id && a.generation == b.generation
         && a.kind == b.kind && a.intended == b.intended
 }
-fn validate_effect(effect: &Effect, expected: &OperationRecord, bounds: &Bounds) -> Result<(), String> {
+pub(super) fn validate_effect(effect: &Effect, expected: &OperationRecord, bounds: &Bounds) -> Result<(), String> {
     if &effect.intended != expected || effect.settlement_id != format!("pr-settle-{}", digest(&expected.id)?)
         || effect.prepare_commit.as_ref().is_some_and(|c| c.operation_id != expected.id || c.controller_revision == 0)
         || effect.may_have_started && (effect.prepare_commit.is_none() || effect.prepare_refusal.is_some())
@@ -213,7 +252,7 @@ pub(super) fn read(state: &Path, command: &WorkerCommand) -> Result<Option<Phase
     Ok(Some(phase))
 }
 
-async fn call(client: &ApiClient, operation: Operation, control: &Control) -> Result<Reply, String> {
+pub(super) async fn call(client: &ApiClient, operation: Operation, control: &Control) -> Result<Reply, String> {
     control.check()?;
     let mut stopped = control.clone();
     tokio::select! {
@@ -222,7 +261,7 @@ async fn call(client: &ApiClient, operation: Operation, control: &Control) -> Re
         _=stopped.stopped()=>Err("PR controller call interrupted".into()),
     }
 }
-async fn prepare_effect(client: &ApiClient, effect: &mut Effect, control: &Control) -> Result<(), String> {
+pub(super) async fn prepare_effect(client: &ApiClient, effect: &mut Effect, control: &Control) -> Result<(), String> {
     // The Phase containing this exact request already exists durably. Replaying
     // the same controller mutation ID is not an external publication retry.
     let request = effect.request();
@@ -248,7 +287,7 @@ async fn prepare_effect(client: &ApiClient, effect: &mut Effect, control: &Contr
     effect.prepare_commit = Some(commit);
     Ok(())
 }
-async fn settle_effect(client: &ApiClient, state: &Path, effect: &mut Effect, control: &Control) -> Result<(), String> {
+pub(super) async fn settle_effect(client: &ApiClient, state: &Path, effect: &mut Effect, control: &Control) -> Result<(), String> {
     let request = effect.settlement()?;
     let data = mutations::settle(client, state, request, control).await?;
     let Data::Operation(record) = data else { return Err("PR settlement returned wrong kind".into()); };
@@ -259,17 +298,17 @@ async fn settle_effect(client: &ApiClient, state: &Path, effect: &mut Effect, co
     effect.settled = Some(record);
     Ok(())
 }
-fn head_checkpoint(head: &HeadIntent) -> Checkpoint {
+pub(super) fn head_checkpoint(head: &HeadIntent) -> Checkpoint {
     Checkpoint { registration:head.binding.registration.clone(), repository:head.target.head_remote.clone(),
         commit:head.binding.checkpoint.commit.clone(), remote_ref:head.head_ref.clone(), operation_id:head.head_operation_id.clone() }
 }
-fn head_outcome(head: &HeadIntent) -> Result<serde_json::Value, String> {
+pub(super) fn head_outcome(head: &HeadIntent) -> Result<serde_json::Value, String> {
     serde_json::to_value(contract::HeadSettlement { acknowledged:true,
         proof:contract::HeadProof { operation_id:head.head_operation_id.clone(), target_revision:head.target.revision.clone(),
             remote:head.target.head_remote.clone(), remote_ref:head.head_ref.clone(), commit:head.binding.checkpoint.commit.clone() } })
         .map_err(|_| "PR head proof encoding failed".into())
 }
-fn receipt_preflight(limits:&RuntimeLimits, request:&Operation, outcome:Outcome) -> Result<(),String> {
+pub(super) fn receipt_preflight(limits:&RuntimeLimits, request:&Operation, outcome:Outcome) -> Result<(),String> {
     let id=request.mutation_id().ok_or("PR mutation identity missing")?;
     let lookup=Outcome::Ok{data:Data::Operation(OperationRecord{id:id.into(),task_id:String::new(),attempt_id:String::new(),generation:0,
         kind:"application_mutation".into(),intended:serde_json::to_value(request).map_err(|_| "PR request encoding failed")?,state:"settled".into(),
@@ -386,10 +425,9 @@ pub(super) async fn publish(state: &Path, command: &WorkerCommand, reporter: &Re
         return boxed_execution(|| finish(state,command,reporter,&mut phase)).await;
     }
     control.check()?; resource::verify(&reporter.resource)?;
-    phase.head_effect.may_have_started = true;
+    phase.head_effect.begin()?;
     phase.save(state, command)?;
-    git::publish(workspace, &head_checkpoint(&phase.head), registry, control).await?;
-    phase.head_effect.outcome = Some(head_outcome(&phase.head)?);
+    phase.head_effect.outcome = Some(dispatch_head(&phase.head, workspace, registry, control).await?);
     phase.save(state, command)?;
     settle_effect(&reporter.client, state, &mut phase.head_effect, control).await?;
     phase.save(state, command)?;
@@ -405,17 +443,9 @@ pub(super) async fn publish(state: &Path, command: &WorkerCommand, reporter: &Re
     }
     provider.preflight(&intent, control).await?;
     control.check()?; resource::verify(&reporter.resource)?;
-    phase.create_effect.as_mut().unwrap().may_have_started = true;
+    phase.create_effect.as_mut().unwrap().begin()?;
     phase.save(state, command)?;
-    let proof = match provider.create(&intent, control).await {
-        Ok(proof) => proof,
-        Err(_) => match provider.reconcile(&intent, control).await? {
-            contract::Reconciliation::Observed(proof) => proof,
-            contract::Reconciliation::Unknown => return Err("PR original create outcome remains unresolved".into()),
-        },
-    };
-    phase.create_effect.as_mut().unwrap().outcome = Some(serde_json::to_value(contract::Settlement { acknowledged:true, proof })
-        .map_err(|_| "PR proof encoding failed")?);
+    phase.create_effect.as_mut().unwrap().outcome = Some(dispatch_create(&provider, &intent, control).await?);
     phase.save(state, command)?;
     settle_effect(&reporter.client, state, phase.create_effect.as_mut().unwrap(), control).await?;
     phase.final_observation = Some(phase.candidate.clone());
@@ -525,6 +555,7 @@ pub(super) fn admit(state: &Path, limits: &RuntimeLimits, worker_id: &str) -> Re
 pub(super) fn validate_saved_settlement(state: &Path, command: &WorkerCommand, request: &Operation) -> Result<(), String> {
     let Operation::SettleOperation { operation_id, .. } = request else { return Err("PR settlement operation differs".into()); };
     let Some(phase) = read(state, command)? else {
+        if super::publication_requests::validate_saved_settlement(state, command, request)? { return Ok(()); }
         if operation_id.starts_with("pr-") { return Err("PR settlement has no original phase".into()); }
         return Ok(());
     };
@@ -537,6 +568,10 @@ pub(super) fn validate_saved_settlement(state: &Path, command: &WorkerCommand, r
             return Ok(());
         }
     }
+    // A Coding attempt may retain its legacy result phase and independently
+    // own an MCP publication. Only the exact retained MCP command/phase can
+    // account for a settlement which did not match either legacy effect.
+    if super::publication_requests::validate_saved_settlement(state, command, request)? { return Ok(()); }
     if operation_id.starts_with("pr-") { return Err("PR settlement identity differs from original phase".into()); }
     Ok(())
 }
@@ -570,7 +605,7 @@ pub(super) async fn cleanup_verified(client: &ApiClient, state: &Path, command: 
     Ok(true)
 }
 
-async fn lookup_effect(client: &ApiClient, effect: &Effect, control: &Control) -> Result<OperationRecord, String> {
+pub(super) async fn lookup_effect(client: &ApiClient, effect: &Effect, control: &Control) -> Result<OperationRecord, String> {
     let reply = call(client, Operation::GetOperation { operation_id:effect.intended.id.clone() }, control).await?;
     let Outcome::Ok { data:Data::Operation(record) } = reply.outcome else { return Err("PR original effect is unavailable".into()); };
     if !same_intent(&record, &effect.intended) || !matches!(record.state.as_str(), "pending"|"uncertain"|"settled") {
@@ -599,24 +634,13 @@ async fn recover_effect(client: &ApiClient, state: &Path, command: &WorkerComman
     } else if effect.outcome.is_none() {
         if !effect.may_have_started {
             effect.outcome = Some(json!({"acknowledged":true,"not_applied":true}));
-        } else if create {
-            let intent = phase.create.as_ref().ok_or("PR create intent missing")?;
-            let provider = pull_request_provider::Provider::configured(&phase.head.target, Arc::new(client.limits().clone()))?;
-            let contract::Reconciliation::Observed(proof) = provider.reconcile(intent, control).await? else {
-                return Err("PR original create remains unresolved; no repeat is permitted".into());
-            };
-            effect.outcome = Some(serde_json::to_value(contract::Settlement { acknowledged:true, proof })
-                .map_err(|_| "PR recovered proof encoding failed")?);
         } else {
             let directory = state.join("publication-readback");
             process::private_directory(&directory)?;
             let (attempt, _, _) = context(command)?;
             let registry = state.join("processes").join(component(&attempt.id));
-            match git::remote_commit(&directory, &head_checkpoint(&phase.head), &registry, control).await? {
-                Some(commit) if commit == phase.head.binding.checkpoint.commit => effect.outcome = Some(head_outcome(&phase.head)?),
-                Some(_) => return Err("PR original head has different content; no overwrite is permitted".into()),
-                None => return Err("PR original head may have been sent; empty lookup remains unresolved".into()),
-            }
+            let intent = if create { Some(phase.create.as_ref().ok_or("PR create intent missing")?) } else { None };
+            effect.outcome = Some(readback(&phase.head, intent, &directory, &registry, control).await?);
         }
     }
     if create { phase.create_effect = Some(effect.clone()); } else { phase.head_effect = effect.clone(); }

@@ -44,9 +44,9 @@ struct Fixture {
 impl Drop for Fixture { fn drop(&mut self) { self.server.abort(); } }
 impl Fixture {
     async fn new() -> Self {
-        Self::with_output_limit(4096).await
+        Self::with_output_limit(4096,false).await
     }
-    async fn with_output_limit(output_bytes:usize) -> Self {
+    async fn with_output_limit(output_bytes:usize, publication:bool) -> Self {
         let limits=selected_limits();
         let root=std::env::temp_dir().join(fresh_id("borg-pr-worker").unwrap());
         process::private_directory(&root).unwrap();
@@ -69,7 +69,9 @@ impl Fixture {
         }};
         let input=TaskInput { instruction_source: None, pull_request:Some(contract::Request{title:"Controlled change".into(),body:"Original requested body".into()}),resolved_limits:None,repository_read:None,
             instruction:"Controlled coding execution".into(),definition:Definition{id:"fixture-agent".into(),revision:"r1".into(),executor:ExecutorKind::Coding,
-                inference:Some(InferenceSettings::selected()),execution_profile:Some(ExecutionProfile::CollaborationV1{web_search:None}),charter:Some(charter),limit_overrides:None},
+                inference:Some(InferenceSettings::selected()),execution_profile:Some(if publication {ExecutionProfile::CollaborationV2{web_search:None,publication:Some(crate::mcp::publication::Selection::V1{
+                    repository_id:registration.repository_id.clone(),registration_revision:registration.registration_revision.clone(),target_revision:target().revision,
+                    actions:vec![crate::mcp::publication::Action::PublishBranch],branch_namespace:"borg/mcp-fixture".into()})}}else{ExecutionProfile::CollaborationV1{web_search:None}}),charter:Some(charter),limit_overrides:None},
             repository:Some(Repository{registration:Some(registration.binding()),url:String::new(),checkpoint_remote:String::new(),start_commit:"a".repeat(40),pull_request_target:None}),
             acceptance_commands:vec![vec!["controlled-check".into()]],output_schema:None,
             limits:Limits{deadline_unix_ms:10_000,model_requests:2,output_bytes,result_bytes:limits.task_defaults.result_bytes,max_delegation_depth:1},dependencies:vec![],native_workflow:None };
@@ -277,7 +279,7 @@ async fn selected_phase_reservation_is_complete_typed_size_not_http_response_cei
 #[tokio::test]
 async fn normalized_success_and_abort_reports_survive_final_ack_loss_under_small_accepted_output_limit() {
     for success in [false,true] {
-        let f=Fixture::with_output_limit(64).await;let mut phase=f.phase.clone();
+        let f=Fixture::with_output_limit(64,false).await;let mut phase=f.phase.clone();
         if let Observation::ResultCandidate{summary,..}=&mut phase.candidate { *summary="original successful summary ".repeat(12); }
         if success { f.commit_create(&mut phase).await; } else { phase.save(&f.state,&f.command).unwrap(); }
         f.probe.lock().unwrap().drop_final=Some(phase.final_report_id.clone());
@@ -305,4 +307,54 @@ async fn normalized_success_and_abort_reports_survive_final_ack_loss_under_small
         assert!(cleanup_verified(&f.client,&f.state,&f.command).await.unwrap());
         assert_eq!(f.current().await,current);
     }
+}
+
+#[tokio::test]
+async fn publication_mcp_settlement_coexists_with_legacy_phase_without_accepting_foreign_or_changed_facts() {
+    use crate::mcp::{publication as p, Caller, Invocation};
+    let f=Fixture::with_output_limit(4096,true).await;
+    let mut legacy=f.phase.clone();
+    legacy.head_effect.prepare_commit=Some(MutationCommit{operation_id:legacy.head_effect.intended.id.clone(),controller_revision:1});
+    legacy.head_effect.outcome=Some(json!({"acknowledged":true,"not_applied":true}));
+    legacy.save(&f.state,&f.command).unwrap();
+    let WorkerCommand::RunAttempt{attempt,task,session,..}=&f.command else{unreachable!()};
+    let caller=Caller{task_id:attempt.task_id.clone(),attempt_id:attempt.id.clone(),generation:attempt.generation,worker_id:attempt.worker_id.clone(),incarnation:attempt.worker_incarnation.clone()};
+    let selected=p::selection(task.definition.execution_profile.as_ref()).unwrap().clone();
+    // This fixture tests strict local retained-record association only. The
+    // synthetic accepted-source reference is not a canonical acceptance claim
+    // or permission to execute a provider operation.
+    let repository=task.repository.as_ref().unwrap().clone();
+    let checkpoint=git::checkpoint(&repository,"controlled-source","controlled-source-attempt","d".repeat(40)).unwrap();
+    let source=p::Source{task_id:"controlled-source".into(),session_id:"controlled-source-session".into(),task_revision:9,
+        accepted_result:crate::collaboration::workflow::AcceptedResultRef{task_id:"controlled-source".into(),attempt_id:"controlled-source-attempt".into(),terminal_task_revision:9,acceptance_history_sequence:11,checkpoint:Some(checkpoint.clone())},
+        result_sha256:"b".repeat(64),checkpoint_attempt_id:"controlled-source-attempt".into(),checkpoint_generation:1,repository};
+    let invocation=Invocation{operation_id:"coexisting-publication".into(),logical_call_id:"coexisting-call".into(),caller:caller.clone(),tool:"collab_repository_publish".into(),arguments:json!({
+        "source_task_id":source.task_id,"expected_source_revision":source.task_revision,"checkpoint_operation_id":checkpoint.operation_id,
+        "repository_id":selected.registration().repository_id,"registration_revision":selected.registration().registration_revision,"target_revision":selected.target_revision()})};
+    let id=p::publication_id(&invocation.operation_id).unwrap();
+    let head=contract::prepare_publication_head(p::Binding{publication_id:id.clone(),admission_operation_id:invocation.operation_id.clone(),
+        requester:p::Requester{caller,session_id:session.id.clone()},source,selection:selected},target(),&Bounds::from_limits(&f.limits)).unwrap();
+    let request=p::Command{invocation,session:session.clone(),attempt:attempt.clone(),input:task.clone(),head,create:None};
+    request.validate(&id).unwrap();
+    let mut effect=Effect::new(request.effect(&f.limits).unwrap()).unwrap();
+    effect.prepare_commit=Some(MutationCommit{operation_id:effect.intended.id.clone(),controller_revision:2});
+    effect.outcome=Some(json!({"acknowledged":true,"not_applied":true}));
+    let operation=effect.settlement().unwrap();
+    let command=WorkerCommand::PublishRepository{command_id:id.clone(),request:Box::new(request)};
+    let command_path=f.state.join("commands").join(format!("{}.json",component(&id)));
+    record_launch(&command_path,&command,&f.limits).unwrap();
+    process::private_directory(&f.state.join("publication-requests")).unwrap();
+    let phase_path=f.state.join("publication-requests").join(format!("{}.json",component(&id)));
+    atomic_json(&phase_path,&json!({"revision":1,"command_sha256":p::digest(&command).unwrap(),"effect":effect,"unknown_recorded":false,"retired":false})).unwrap();
+    let original=std::fs::read(&phase_path).unwrap();
+    validate_saved_settlement(&f.state,&f.command,&operation).unwrap();
+    let mut changed=operation.clone();let Operation::SettleOperation{outcome,..}=&mut changed else{unreachable!()};*outcome=json!({"acknowledged":false});
+    assert!(validate_saved_settlement(&f.state,&f.command,&changed).unwrap_err().contains("publication original settlement changed"));
+    let mut foreign=operation.clone();let Operation::SettleOperation{operation_id,..}=&mut foreign else{unreachable!()};*operation_id="pr-foreign".into();
+    assert!(validate_saved_settlement(&f.state,&f.command,&foreign).unwrap_err().contains("identity differs"));
+    let mut legacy_changed=legacy.head_effect.settlement().unwrap();let Operation::SettleOperation{outcome,..}=&mut legacy_changed else{unreachable!()};*outcome=json!({"acknowledged":false});
+    assert_eq!(validate_saved_settlement(&f.state,&f.command,&legacy_changed).unwrap_err(),"PR saved settlement changed");
+    assert_eq!(std::fs::read(&phase_path).unwrap(),original);
+    std::fs::remove_file(&phase_path).unwrap();
+    assert!(validate_saved_settlement(&f.state,&f.command,&operation).unwrap_err().contains("publication settlement phase absent"));
 }

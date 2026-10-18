@@ -119,7 +119,7 @@ pub fn definition(
         revision: "1".into(),
         executor,
         inference: Some(InferenceSettings::selected()),
-        execution_profile: Some(ExecutionProfile::CollaborationV2 { web_search: None }),
+        execution_profile: Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
         charter: Some(charter(name)),
         limit_overrides: Some(Box::new(ExecutionLimitOverrides {
             native: None,

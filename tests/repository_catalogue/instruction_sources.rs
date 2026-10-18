@@ -198,7 +198,7 @@ fn database_bytes(path: &Path) -> BTreeMap<String, Vec<u8>> {
 async fn coding_dual_source_profiles_read_exact_objects_and_replay_after_cancel_reopen() {
     for profile in [
         ExecutionProfile::CollaborationV1 { web_search: None },
-        ExecutionProfile::CollaborationV2 { web_search: None },
+        ExecutionProfile::CollaborationV2 { publication: None, web_search: None },
     ] {
         let root = root();
         let db = root.join("task.db");

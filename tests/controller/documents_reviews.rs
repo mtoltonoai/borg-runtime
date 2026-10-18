@@ -361,7 +361,7 @@ async fn real_commit_failure_rolls_back_document_and_review_outcome_before_same_
 
 async fn mcp_actor(c:&Controller,label:&str,v2:bool)->(Task,Attempt,borg_runtime::mcp::Caller) {
     let mut input=native(label);
-    input.definition.execution_profile=Some(if v2{ExecutionProfile::CollaborationV2{web_search:None}}else{ExecutionProfile::CollaborationV1{web_search:None}});
+    input.definition.execution_profile=Some(if v2{ExecutionProfile::CollaborationV2{ publication: None,web_search:None}}else{ExecutionProfile::CollaborationV1{web_search:None}});
     let t=submit(c,&format!("{label}-task"),input).await;
     let w=worker(&format!("{label}-worker"),"one",1,0);register(c,&w).await;
     let a=run(&commands(c,&w,vec![]).await);
@@ -1760,7 +1760,7 @@ async fn successful_question_and_review_preserve_owned_access_configuration() {
     let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
     let mut input = coding("owned-access-source");
     input.definition.execution_profile =
-        Some(ExecutionProfile::CollaborationV2 { web_search: None });
+        Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let submitted = submit(&c, "owned-access-submit", input).await;
     let worker = worker("owned-access-worker", "owned-access-incarnation", 0, 1);
     register(&c, &worker).await;

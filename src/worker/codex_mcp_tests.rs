@@ -746,7 +746,7 @@ async fn repository_write_and_coding_delegation_are_rejected_before_dispatch() {
 }
 
 fn workflow_config(mut cfg: Config) -> Config {
-    cfg.execution_profile=Some(ExecutionProfile::CollaborationV2 {web_search:None});
+    cfg.execution_profile=Some(ExecutionProfile::CollaborationV2 { publication: None,web_search:None});
     cfg.runtime_limits.workflow=Some(crate::limits::WorkflowLimits {
         record_bytes:65_536,text_bytes:4096,options:8,records:128,revisions:1024,
         page_items:8,page_bytes:65_536,waits_per_task:8,graph_scan_nodes:256,
@@ -1250,7 +1250,7 @@ fn historical_bridge_config_is_byte_equivalent_and_v2_catalogue_is_explicit() {
     let decoded:Config=serde_json::from_value(historical.clone()).unwrap();
     assert_eq!(serde_json::to_value(&decoded).unwrap(),historical);
     assert!(!decoded.catalogue().iter().any(|tool|tool.name=="collab_task_wait"));
-    config.execution_profile=Some(ExecutionProfile::CollaborationV2{web_search:None});
+    config.execution_profile=Some(ExecutionProfile::CollaborationV2{ publication: None,web_search:None});
     config.runtime_limits.workflow=None;
     config.validate().unwrap();
     assert!(!config.catalogue().iter().any(|tool|tool.name=="collab_task_wait"));

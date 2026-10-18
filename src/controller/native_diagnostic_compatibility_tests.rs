@@ -163,8 +163,8 @@ fn validate_logical(conn: &Connection, config: &ControllerConfig) -> Result<(), 
     let version = conn
         .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
         .map_err(|e| e.to_string())?;
-    if !matches!(version, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26) {
-        return Err("fixture requires schema17,18,19,20,21,22,23,24,25 or26".into());
+    if !matches!(version, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28) {
+        return Err("fixture requires schema17 through28".into());
     }
     super::compatibility::validate_shape(conn, version)?;
     super::compatibility::validate_records(conn)?;

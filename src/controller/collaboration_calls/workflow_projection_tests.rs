@@ -8,7 +8,7 @@ fn sample() -> WorkView {
         charter: None,
         id: "projection-agent".into(), revision: "r1".into(), executor: ExecutorKind::Native,
         inference: Some(InferenceSettings::selected()), limit_overrides: None,
-        execution_profile: Some(ExecutionProfile::CollaborationV2 { web_search: None }),
+        execution_profile: Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
     };
     let limits = Limits { deadline_unix_ms: 999_999, model_requests: 2, output_bytes: 1024, result_bytes: 4096, max_delegation_depth: 1 };
     let task = Task {

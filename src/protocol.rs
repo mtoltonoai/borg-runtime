@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use crate::native_loop_contract::NativeRequestEvidence;
 
-// Shared identity-field, paginated-read and read-retention vocabulary generation.
-pub const WIRE_REVISION: u32 = 25;
+// Shared publication extends the retained identity-field, pagination and read-reference generation.
+pub const WIRE_REVISION: u32 = 27;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
@@ -440,6 +440,10 @@ pub struct Worker {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerCommand {
+    PublishRepository {
+        command_id: String,
+        request: Box<crate::mcp::publication::Command>,
+    },
     RunAttempt {
         command_id: String,
         session: Session,
@@ -882,6 +886,7 @@ pub enum Data {
     TerminalReadRelease(crate::read_retention::ReleaseResult),
     /// Host-authored fact about an original receipt, never its removed Outcome.
     OriginalReadBodyUnavailable(Box<crate::read_retention::ReleasedRead>),
+    Publication(Box<crate::mcp::publication::View>),
     IdentityAdministration(Box<IdentityAdministrationOutcome>),
     MachineResourceReport(crate::machine_resources::ReportDisposition),
     SuppliedOuterWait(crate::supplied_outer::Wait),
@@ -1552,6 +1557,8 @@ pub enum ExecutionProfile {
     CollaborationV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         web_search: Option<NativeSearchProfile>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::mcp::publication::present_selection")]
+        publication: Option<crate::mcp::publication::Selection>,
     },
 }
 

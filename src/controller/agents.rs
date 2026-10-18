@@ -215,6 +215,7 @@ pub(super) fn register(tx: &Connection<'_>, definition: &Definition, cfg: &Contr
     super::operations::require_definition(definition)?;
     crate::execution_profile::validate_definition(definition)
         .map_err(|e| Fault::Refused("invalid_input", e))?;
+    super::publication_requests::validate_definition(tx, definition)?;
     cfg.limits
         .resolve_definition(definition)
         .map_err(|e| Fault::Refused("invalid_limits", e))?;

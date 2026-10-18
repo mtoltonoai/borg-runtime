@@ -28,7 +28,7 @@ fn input(agent: &str, v2: bool) -> TaskInput {
     TaskInput { instruction_source: None, pull_request: None,  instruction: "Return a bounded integer".into(),
         definition: Definition { id: agent.into(), revision: if v2 { "completion-v2" } else { "completion-v1" }.into(),
             executor: ExecutorKind::Native, inference: Some(InferenceSettings::selected()), limit_overrides: None, charter: None,
-            execution_profile: Some(if v2 { ExecutionProfile::CollaborationV2 { web_search: None } }
+            execution_profile: Some(if v2 { ExecutionProfile::CollaborationV2 { publication: None, web_search: None } }
                 else { ExecutionProfile::CollaborationV1 { web_search: None } }) },
         repository: None, repository_read: None, acceptance_commands: vec![], output_schema: Some(json!({"type":"integer"})),
         limits: Limits { deadline_unix_ms: now() + 600_000, model_requests: 32, output_bytes: 16_384,

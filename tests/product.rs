@@ -1277,7 +1277,8 @@ async fn failed_task_retry_and_active_cancellation_use_real_controller_transitio
                 .map(|c| match c {
                     WorkerCommand::RunAttempt { command_id, .. }
                     | WorkerCommand::StopAttempt { command_id, .. }
-                    | WorkerCommand::CollaborationReady { command_id, .. } => command_id.clone(),
+                    | WorkerCommand::CollaborationReady { command_id, .. }
+                    | WorkerCommand::PublishRepository { command_id, .. } => command_id.clone(),
                 })
                 .collect(),
         },

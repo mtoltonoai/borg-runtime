@@ -16,6 +16,10 @@ pub(super) mod releases;
 mod reports;
 mod task_tool;
 
+pub(super) fn publication_effect(tx: &Connection, op: &Operation, cfg: &ControllerConfig, now: u64) -> Result<(Data, bool)> {
+    effects::apply(tx, op, cfg, now)
+}
+
 pub(crate) fn apply(
     tx: &Connection,
     op: &Operation,
@@ -367,7 +371,14 @@ pub(crate) fn apply(
         Operation::AwaitCommands { .. } => Err(Fault::Store(
             "command request missed receipt boundary".into(),
         )),
-        Operation::ObserveWorker { report } => reports::observe(tx, report, cfg, now, validation),
+        Operation::ObserveWorker { report } => {
+            let pending = super::publication_requests::unacknowledged(tx, report)?;
+            let result = reports::observe(tx, report, cfg, now, validation)?;
+            // Stopping the reasoning attempt cannot acknowledge an independent
+            // owned publication command it has never received.
+            for id in pending { tx.execute("UPDATE commands SET acknowledged=0 WHERE id=?1", [id])?; }
+            Ok(result)
+        },
         Operation::PrepareOperation { .. }
         | Operation::SettleOperation { .. }
         | Operation::GetOperation { .. }
@@ -666,6 +677,7 @@ pub(super) fn configured_sources(
     validate(&child, cfg, now)?;
     super::identity_administration::admit_definition(tx, &child.definition, None)?;
     super::charters::validate_definition(&tx.with_limits(selected), &child.definition)?;
+    super::publication_requests::validate_definition(&tx.with_limits(selected), &child.definition)?;
     for dependency in &child.dependencies {
         load(tx, dependency)?;
         // For a new delegated native task, check its prospective waiting
@@ -774,6 +786,7 @@ pub(super) fn submit(
     let input = &accepted;
     validate(input, cfg, now)?;
     super::charters::validate_definition(&repository_context, &input.definition)?;
+    super::publication_requests::validate_definition(&repository_context, &input.definition)?;
     configured_sources(
         tx,
         input,
@@ -1240,7 +1253,7 @@ pub(crate) fn await_request(
     cfg: &ControllerConfig,
     now: u64,
     maintenance_pending: bool,
-) -> Result<(Data, bool, Option<String>)> {
+) -> Result<(Data, bool, Option<super::publication_requests::CommandCredit>)> {
     let Operation::AwaitCommands {
         operation_id,
         worker_id: id,
@@ -1300,12 +1313,16 @@ pub(crate) fn await_request(
                 WorkerCommand::StopAttempt { command_id, .. } if command_id == command);
         }
         if !owner.1 && !ordinary && credit.is_none() {
+            if super::publication_requests::is_command(tx, command)? {
+                credit = Some(super::publication_requests::CommandCredit::Publication);
+            } else {
             if !super::credits::control_available(tx, &owner.0)? {
                 return Err(Fault::Store(
                     "unacknowledged command lacks reserved credit".into(),
                 ));
             }
-            credit = Some(owner.0);
+            credit = Some(super::publication_requests::CommandCredit::Attempt(owner.0));
+            }
         }
         changed |= tx.execute(
             "UPDATE commands SET acknowledged=1 WHERE id=?1 AND acknowledged=0",
@@ -1335,6 +1352,7 @@ pub(crate) fn await_request(
         Vec::new()
     };
     let mut commands = if control_exchange { stop_commands }
+        else if !ordinary { super::publication_requests::pending_delivery(tx, id, inc, cfg)? }
         else { delivery_snapshot(tx, id, inc, cfg, ordinary)? };
     // Existing commands remain backed by their original delivery receipts.
     // This exchange must also fit its full ACK/input lookup representation.
@@ -1485,6 +1503,8 @@ pub(crate) fn await_request(
             } => (command_id, attempt_id, true),
             WorkerCommand::CollaborationReady { command_id, caller, .. } =>
                 (command_id, &caller.attempt_id, false),
+            WorkerCommand::PublishRepository { command_id, request } =>
+                (command_id, &request.attempt.id, false),
         };
         let delivered: Option<String> = tx.query_row(
             "SELECT delivery_operation_id FROM commands WHERE id=?1",
@@ -1492,11 +1512,14 @@ pub(crate) fn await_request(
             |r| r.get(0),
         )?;
         if delivered.is_none() {
+            if !ordinary && credit.is_none() && matches!(command, WorkerCommand::PublishRepository { .. }) {
+                credit = Some(super::publication_requests::CommandCredit::Publication);
+            }
             if !ordinary && is_stop && credit.is_none() {
                 if !super::credits::control_available(tx, attempt)? {
                     return Err(Fault::Store("Stop delivery lacks reserved credit".into()));
                 }
-                credit = Some(attempt.clone());
+                credit = Some(super::publication_requests::CommandCredit::Attempt(attempt.clone()));
             }
             tx.execute("UPDATE commands SET delivery_operation_id=?2 WHERE id=?1 AND delivery_operation_id IS NULL", params![command_id, operation_id])?;
             changed = true;

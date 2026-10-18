@@ -29,7 +29,7 @@ impl Fixture {
             definition: Definition {
                 charter: None,
                 limit_overrides: None,
-                execution_profile: Some(ExecutionProfile::CollaborationV2 { web_search: None }),
+                execution_profile: Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
                 inference: Some(InferenceSettings::selected()),
                 id: "agent-1".into(), revision: "agent-revision-1".into(),
                 executor: ExecutorKind::Native,

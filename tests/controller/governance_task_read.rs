@@ -33,7 +33,7 @@ async fn held_fixture(p: &std::path::Path) -> HeldFixture {
     // bootstrap deliberately observes completion without enforcing a hold.
     promote(&controller, "locator-policy", true).await;
     let mut input = coding(&id("locator-codex"));
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let accepted = submit(&controller, &id("locator-submit"), input).await;
     let worker = worker(&id("locator-worker"), "inc-1", 0, 1);
     register(&controller, &worker).await;

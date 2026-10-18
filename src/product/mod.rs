@@ -786,7 +786,7 @@ fn task_input(fields: &Form, metadata: &RuntimeLimits) -> Result<TaskInput, Stri
     let inference = Some(InferenceSettings::selected());
     let execution_profile = Some(match required(fields, "execution_profile")? {
         "collaboration_v1" => ExecutionProfile::CollaborationV1 { web_search },
-        "collaboration_v2" => ExecutionProfile::CollaborationV2 { web_search },
+        "collaboration_v2" => ExecutionProfile::CollaborationV2 { publication: None, web_search },
         _ => unreachable!("validated closed profile"),
     });
     // Preserve the original submitted body on replay. Current-policy admission
@@ -1623,7 +1623,7 @@ async fn get_other(controller: &Controller, path: &str, query: &str) -> UiRespon
             };
             let (profile_name, web_search) = match &definition.execution_profile {
                 Some(ExecutionProfile::CollaborationV1 { web_search }) => ("collaboration_v1",web_search),
-                Some(ExecutionProfile::CollaborationV2 { web_search }) => ("collaboration_v2",web_search),
+                Some(ExecutionProfile::CollaborationV2 { web_search , .. }) => ("collaboration_v2",web_search),
                 None => return error(409,"Agent definition has no collaboration profile"),
             };
             let mut draft = match create_defaults(definition.executor, controller.limits()) {
@@ -1670,8 +1670,13 @@ async fn get_other(controller: &Controller, path: &str, query: &str) -> UiRespon
             Ok(f) => f,
             Err(e) => return error(400, &e),
         };
-        if let Err(e) = fields_only(&fields, &["after"]) {
+        if let Err(e) = fields_only(&fields, &["after","page_cursor","cursor","max_bytes"]) {
             return error(400, &e);
+        }
+        let scoped = match read_pages::list_cursor(&fields) {Ok(cursor)=>cursor,Err(response)=>return response};
+        if fields.contains_key("page_cursor") || fields.contains_key("cursor") || fields.contains_key("max_bytes") {
+            return match boxed_route(||read_pages::public_list(controller,crate::read_page::ReadTool::Tasks,
+                serde_json::json!({"cursor":scoped,"limit":controller.limits().product.page_items,"agent_id":null,"parent_task_id":null}),&fields)).await {Ok(response)|Err(response)=>response};
         }
         let reply = boxed_route(|| call(
             controller,
@@ -1685,6 +1690,14 @@ async fn get_other(controller: &Controller, path: &str, query: &str) -> UiRespon
             Outcome::Ok {
                 data: Data::Tasks(tasks),
             } => {
+                // Preserve the normal full-task/progress view. An empty legacy
+                // result may instead mean its first record exceeded the old
+                // whole-record cap; the shared projection distinguishes that
+                // from exhaustion without skipping the original keyset item.
+                if tasks.is_empty() {
+                    return match boxed_route(||read_pages::public_list(controller,crate::read_page::ReadTool::Tasks,
+                        serde_json::json!({"cursor":scoped,"limit":controller.limits().product.page_items,"agent_id":null,"parent_task_id":null}),&fields)).await {Ok(response)|Err(response)=>response};
+                }
                 let mut body = "<p><a href=\"/tasks/new\">Create a task</a> | <a href=\"/tasks\">Refresh</a></p><p>Recorded task status and progress update automatically while this page is visible.</p><form method=\"get\" action=\"/tasks\"><label>Agent<input name=\"agent_id\"></label><label>Parent task<input name=\"parent_task_id\"></label><button>Filter tasks</button></form><table><thead><tr><th>Task</th><th>Agent</th><th>Status</th><th>Progress or blocker</th></tr></thead><tbody>".to_string();
                 for task in &tasks {
                     let _ = write!(

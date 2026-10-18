@@ -61,7 +61,7 @@ async fn attempts(c: &Controller, task_id: &str) -> Vec<AttemptView> {
 }
 async fn active_admitted(c: &Controller) -> (Task, Attempt, Worker, Question, Operation, Reply) {
     let mut input = native(&id("agent"));
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let queued = submit(c, &id("submit"), input).await;
     let w = worker(&id("worker"), "inc", 1, 0); register(c, &w).await;
     let issued = commands(c, &w, vec![]).await;

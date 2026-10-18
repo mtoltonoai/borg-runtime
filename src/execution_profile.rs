@@ -11,7 +11,7 @@ pub fn collaboration(input: &TaskInput) -> bool {
 fn selected(profile: Option<&ExecutionProfile>, executor: ExecutorKind) -> Result<(), String> {
     match profile {
         None => Ok(()),
-        Some(ExecutionProfile::CollaborationV1 { web_search } | ExecutionProfile::CollaborationV2 { web_search }) => {
+        Some(ExecutionProfile::CollaborationV1 { web_search } | ExecutionProfile::CollaborationV2 { web_search , .. }) => {
             if web_search.as_ref().is_some_and(|s| s.max_tool_calls == 0) {
                 return Err("native_web_search_limit_invalid".into());
             }
@@ -30,6 +30,20 @@ pub fn validate(input: &TaskInput) -> Result<(), String> {
         input.definition.execution_profile.as_ref(),
         input.definition.executor,
     )?;
+    if input.definition.executor == ExecutorKind::Native
+        && crate::mcp::publication::selection(input.definition.execution_profile.as_ref()).is_some()
+    {
+        let execution = input.execution_limits()?;
+        let mut policy = *input.resolved_limits.as_ref().ok_or("publication policy unbound")?.global_metadata.clone();
+        policy.execution.collaboration.capabilities = execution.collaboration.capabilities.clone();
+        let tools = crate::mcp::catalogue_for_task(&policy, input.definition.execution_profile.as_ref(), input.instruction_source.as_ref());
+        let web_search = match input.definition.execution_profile.as_ref() {
+            Some(ExecutionProfile::CollaborationV2 { web_search, .. }) => web_search.as_ref().map(|p| crate::native::NativeWebSearch { max_tool_calls: p.max_tool_calls }),
+            _ => None,
+        };
+        crate::native::NativeLoopProfile { functions: tools.into_iter().map(|tool| crate::native::NativeFunction { name: tool.name, description: tool.description, parameters: tool.input_schema }).collect(), web_search }
+            .validate_selection(input)?;
+    }
     if input.instruction_source.is_some()
         && (input.definition.executor != ExecutorKind::Coding || !collaboration(input))
     {
@@ -72,21 +86,21 @@ mod tests {
     fn v2_keeps_native_search_and_coding_restrictions() {
         for profile in [
             ExecutionProfile::CollaborationV1 { web_search: None },
-            ExecutionProfile::CollaborationV2 { web_search: None },
+            ExecutionProfile::CollaborationV2 { publication: None, web_search: None },
         ] {
             assert!(selected(Some(&profile), ExecutorKind::Native).is_ok());
             assert!(selected(Some(&profile), ExecutorKind::Coding).is_ok());
         }
         for profile in [
             ExecutionProfile::CollaborationV1 { web_search: Some(NativeSearchProfile { max_tool_calls: 1 }) },
-            ExecutionProfile::CollaborationV2 { web_search: Some(NativeSearchProfile { max_tool_calls: 1 }) },
+            ExecutionProfile::CollaborationV2 { publication: None, web_search: Some(NativeSearchProfile { max_tool_calls: 1 }) },
         ] {
             assert!(selected(Some(&profile), ExecutorKind::Native).is_ok());
             assert_eq!(selected(Some(&profile), ExecutorKind::Coding).unwrap_err(), "coding_profile_has_native_provider_settings");
         }
         for profile in [
             ExecutionProfile::CollaborationV1 { web_search: Some(NativeSearchProfile { max_tool_calls: 0 }) },
-            ExecutionProfile::CollaborationV2 { web_search: Some(NativeSearchProfile { max_tool_calls: 0 }) },
+            ExecutionProfile::CollaborationV2 { publication: None, web_search: Some(NativeSearchProfile { max_tool_calls: 0 }) },
         ] {
             assert_eq!(selected(Some(&profile), ExecutorKind::Native).unwrap_err(), "native_web_search_limit_invalid");
         }

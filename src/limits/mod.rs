@@ -313,6 +313,7 @@ impl RuntimeLimits {
     }
     /// Complete validation for a future definition without inventing a task.
     pub fn resolve_definition(&self, definition: &crate::protocol::Definition) -> Result<ExecutionLimits, String> {
+        if let Some(publication) = crate::mcp::publication::selection(definition.execution_profile.as_ref()) { publication.validate(self)?; }
         let mut v = self.execution.clone();
         if let Some(o) = &definition.limit_overrides {
             if let Some(x) = &o.native {

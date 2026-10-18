@@ -28,7 +28,7 @@ fn scan<T: serde::de::DeserializeOwned + serde::Serialize>(
 }
 
 pub(super) fn validate_existing(tx: &StoreContext<'_>, cfg: &ControllerConfig, version: i64) -> Result<()> {
-    if version >= super::application_schema::IDENTITY_LIMIT_FIELDS_VERSION { return Ok(()); }
+    if super::application_schema::admits_read_generation(version) { return Ok(()); }
     let receipts = cfg.max_receipts.checked_add(cfg.max_cleanup_receipts).ok_or_else(invalid)?;
     let commands = receipts.checked_add(cfg.max_tasks).and_then(|n| n.checked_mul(2)).ok_or_else(invalid)?;
     let bytes = tx.limits.transport.body_bytes;

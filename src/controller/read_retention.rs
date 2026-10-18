@@ -176,7 +176,7 @@ pub(super) fn validate_origin(tx:&StoreContext<'_>,id:&str,operation:&Operation,
 }
 
 pub(super) fn admit(tx:&StoreContext<'_>,version:i64)->Result<()> {
-    if version>=26{return Ok(())}
+    if super::application_schema::admits_read_generation(version){return Ok(())}
     // All retained carriers are already bounded by their ordinary readers. A
     // new release request/refusal is vocabulary even before it removes bytes.
     let found:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM receipts WHERE (json_extract(request,'$.operation')='release_terminal_reads' OR json_extract(request,'$.input.report.observation.kind')='read_transcript_custody') OR json_type(outcome,'$.committed_read_reference') IS NOT NULL OR json_extract(outcome,'$.data.kind') IN ('original_read_body_unavailable','terminal_read_release'))",[],|r|r.get(0))?;

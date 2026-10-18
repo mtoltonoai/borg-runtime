@@ -1126,5 +1126,109 @@
       "idempotentHint": false,
       "openWorldHint": false
     }
+  },
+  {
+    "name": "collab_repository_publish",
+    "description": "Admit publication of one exact succeeded accepted dependency or completed owned child checkpoint. Admission is pending, not branch creation. Read original status with collab_publication_get.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_source_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "checkpoint_operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "registration_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_revision": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "source_task_id",
+        "expected_source_revision",
+        "checkpoint_operation_id",
+        "repository_id",
+        "registration_revision",
+        "target_revision"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "collab_pull_request_open",
+    "description": "Admit one original pull request for a completed branch publication. The configured target and original marker are retained; unknown creation is reconciled without another create.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "publication_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "publication_id",
+        "title",
+        "body"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "collab_publication_get",
+    "description": "Read bounded pending/completed/refused/unknown state and exact original head/provider/base evidence for an owned publication. This grants no new effect.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "publication_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "publication_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   }
 ]

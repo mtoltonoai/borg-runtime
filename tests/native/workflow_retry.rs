@@ -143,9 +143,9 @@ async fn exercise_retry(label: &str, refusal: Value, expect_retry: bool) {
     policy.execution.native.function_count = 67;
     policy.execution.native.schema_bytes = 65_536;
     assert_eq!(borg_runtime::mcp::catalogue_for_profile(&policy,
-        Some(&ExecutionProfile::CollaborationV2 { web_search: None })).len(), 67);
+        Some(&ExecutionProfile::CollaborationV2 { publication: None, web_search: None })).len(), 67);
     assert_eq!(borg_runtime::mcp::catalogue_for_profile(&policy,
-        Some(&ExecutionProfile::CollaborationV2 { web_search: None })).iter()
+        Some(&ExecutionProfile::CollaborationV2 { publication: None, web_search: None })).iter()
         .filter(|tool| tool.name == "collab_read_continue").count(), 1);
     // Same explicit bounded local retry selection as charter_retry's peer; no
     // production/default metadata selection or actual provider call is changed.
@@ -158,7 +158,7 @@ async fn exercise_retry(label: &str, refusal: Value, expect_retry: bool) {
     let mut controller = lab.controller("workflow-retry-controller").await;
     let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
     let mut input = lab.input(3);
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.definition.revision = "workflow-retry-v2".into();
     let task = submit(&api, input).await;
     assert_eq!(task.input.resolved_limits.as_ref().unwrap().global_metadata.native_retry, lab.limits.native_retry);

@@ -44,7 +44,7 @@ pub(super) fn validate_input(input: &TaskInput, limits: &crate::limits::RuntimeL
 
 /// Retrieve the original committed intent and settlement, not a supplied record.
 /// Existing checkpoint receipts remain their original representation.
-fn original(tx: &StoreContext<'_>, id: &str) -> Result<(OperationRecord, Option<Operation>)> {
+pub(super) fn original(tx: &StoreContext<'_>, id: &str) -> Result<(OperationRecord, Option<Operation>)> {
     let row: Option<(String, String, Option<String>)> = tx.query_row(
         "SELECT body,prepare,settlement FROM external_operations WHERE id=?1", [id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
@@ -74,7 +74,7 @@ fn original(tx: &StoreContext<'_>, id: &str) -> Result<(OperationRecord, Option<
     Ok((record, settlement))
 }
 
-fn checkpoint(tx: &StoreContext<'_>, head: &pr::HeadIntent) -> Result<()> {
+pub(super) fn checkpoint(tx: &StoreContext<'_>, head: &pr::HeadIntent) -> Result<()> {
     let cp = &head.binding.checkpoint;
     let (record, settlement) = original(tx, &cp.operation_id)?;
     if record.kind != "checkpoint" || record.state != "settled"
@@ -95,6 +95,10 @@ fn checkpoint(tx: &StoreContext<'_>, head: &pr::HeadIntent) -> Result<()> {
 
 fn head_context(tx: &StoreContext<'_>, task: &Task, head: &pr::HeadIntent,
     require_selected: bool, b: &pr::Bounds) -> Result<()> {
+    if head.publication.is_some() {
+        checked(pr::validate_head_intent(head, b))?;
+        return super::publication_requests::validate_head(tx, head);
+    }
     if task.input.definition.executor != ExecutorKind::Coding || task.input.pull_request.is_none()
         || task.input.repository.as_ref().and_then(|r| r.pull_request_target.as_ref()) != Some(&head.target) {
         return refuse("pull_request_invalid", "publication differs from accepted request/target");
@@ -122,7 +126,8 @@ fn create_context(tx: &StoreContext<'_>, task: &Task, record: &OperationRecord,
     same_identity(record, checked(pr::intent_record(&intent, b))?)?;
     head_context(tx, task, &intent.head, require_selected, b)?;
     let (head, _) = original(tx, &intent.head.head_operation_id)?;
-    let request = task.input.pull_request.as_ref().ok_or_else(|| {
+    let publication_request = if intent.head.publication.is_some() { Some(super::publication_requests::create_request(tx, &intent.head)?) } else { None };
+    let request = publication_request.as_ref().or(task.input.pull_request.as_ref()).ok_or_else(|| {
         Fault::Refused("pull_request_invalid", "accepted publication request missing".into())
     })?;
     let expected = checked(pr::prepare_pull_request(&intent.head, &head, request, b))?;
@@ -146,7 +151,7 @@ pub(super) fn prepare(tx: &StoreContext<'_>, task: &Task, record: &OperationReco
             params![task.id, record.attempt_id], |r| r.get(0))?;
         let used: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM external_operations WHERE id=?1)",
             [&head.binding.operation_id], |r| r.get(0))?;
-        if exists || used {
+        if (exists && head.publication.is_none()) || used {
             return refuse("operation_conflict", "attempt already has an original publication identity");
         }
     } else {
@@ -226,6 +231,7 @@ fn original_receipts(tx: &StoreContext<'_>, record: &OperationRecord) -> Result<
 }
 
 fn legacy(tx: &StoreContext<'_>, task: &Task, record: &OperationRecord) -> Result<bool> {
+    if super::publication_requests::typed(record) { return Ok(false); }
     if record.kind != pr::CREATE_KIND || task.input.pull_request.is_some() { return Ok(false); }
     original_receipts(tx, record)?;
     Ok(true)
@@ -286,6 +292,7 @@ fn historical_subject(tx: &StoreContext<'_>, record: &OperationRecord) -> Result
 
 fn retained_record(tx: &StoreContext<'_>, record: &OperationRecord, version: i64) -> Result<()> {
     if !matches!(record.kind.as_str(), pr::HEAD_KIND | pr::CREATE_KIND) { return Ok(()); }
+    if super::publication_requests::typed(record) && version < 27 { return Err(invalid("shared publication requires schema27")); }
     let task = historical_subject(tx, record)?;
     original_receipts(tx, record)?;
     if legacy(tx, &task, record)? { return Ok(()); }

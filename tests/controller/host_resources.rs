@@ -177,7 +177,7 @@ async fn host_resources_prior_schema_new_vocabulary_refused() {
     let sql=Connection::open(&p).unwrap();sql.pragma_update(None,"user_version",24).unwrap();drop(sql);
     let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
     drop(c);controller_owner_released(&p).await;
-    let sql=Connection::open(&p).unwrap();assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),26);assert_eq!(receipts(&sql),originals);assert_eq!(shape(&sql),shape(&prior24()));drop(sql);
+    let sql=Connection::open(&p).unwrap();assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),28);assert_eq!(receipts(&sql),originals);assert_eq!(shape(&sql),shape(&prior24()));drop(sql);
     let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
     let caller=actor(&c,"historical-telemetry-read",false).await;
     let result=mcp(&c,&caller,"new-machine-outcome","collab_machines_list",json!({"cursor":null,"limit":4})).await;assert!(matches!(result.reply.outcome,Outcome::Ok{..}));

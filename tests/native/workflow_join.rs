@@ -164,7 +164,7 @@ async fn native_join(mode: ReplyMode) {
     let mut controller = lab.controller("controller").await;
     let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
     let mut input = lab.input(2);
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.definition.revision = "workflow-consumer-v2".into();
     let task = submit(&api, input).await;
     let accepted = task.input.resolved_limits.as_ref().expect("actual controller acceptance snapshot");
@@ -367,7 +367,7 @@ async fn native_workflow_unrelated_scan_prefix_defers_without_failing_required_r
     let mut controller=lab.controller("controller").await;
     let api=ApiClient::new(&lab.url,lab.limits.clone()).unwrap();
     let mut foreign_input=lab.input(1);
-    foreign_input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{web_search:None});
+    foreign_input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{ publication: None,web_search:None});
     foreign_input.definition.revision="workflow-unrelated-v2".into();
     let foreign=submit_identified(&api,foreign_input,"submit-unrelated-workflow-task").await;
     for index in 0..2 {
@@ -397,7 +397,7 @@ async fn native_workflow_unrelated_scan_prefix_defers_without_failing_required_r
     let first=events.items[0].id.clone();
     let second=events.items[1].id.clone();
     let mut input=lab.input(1);
-    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{web_search:None});
+    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{ publication: None,web_search:None});
     input.definition.revision="workflow-required-request-v2".into();
     let task=submit_identified(&api,input,"submit-required-after-unrelated-prefix").await;
     assert_eq!(task.input.resolved_limits.as_ref().unwrap().global_metadata.workflow.as_ref().unwrap().delivery_scan_rows,1);
@@ -449,7 +449,7 @@ async fn native_workflow_routes_terminal_event_behind_prefix_at_next_required_bo
     let mut controller = lab.controller("controller").await;
     let api = ApiClient::new(&lab.url, lab.limits.clone()).unwrap();
     let mut input = lab.input(3);
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input.definition.revision = "workflow-native-routed-v2".into();
     let task = submit(&api, input).await;
     let first_entered = Arc::new(tokio::sync::Notify::new());

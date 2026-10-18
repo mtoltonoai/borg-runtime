@@ -93,7 +93,7 @@ fn changed(reply: &Reply) -> QuestionMutationOutcome {
     match &reply.outcome { Outcome::Ok { data: Data::QuestionMutation(v) } => v.clone(), other => panic!("question: {other:?}") }
 }
 async fn actor(c: &Controller, agent: &str) -> (Task, Caller) {
-    actor_profile(c, agent, ExecutionProfile::CollaborationV2 { web_search: None }).await
+    actor_profile(c, agent, ExecutionProfile::CollaborationV2 { publication: None, web_search: None }).await
 }
 async fn actor_profile(c: &Controller, agent: &str, profile: ExecutionProfile) -> (Task, Caller) {
     let t = task(call(c, Operation::SubmitTask { operation_id: unique(), input: input(agent, profile) }).await);
@@ -550,7 +550,7 @@ async fn routing_retains_exact_previously_acknowledged_work_input_without_second
     let doc = document(&lab.c, "initial-ineligible-owner").await;
     let q = question(&lab.c, &doc, None).await;
     let waiting = task(call(&lab.c, Operation::SubmitTask { operation_id: unique(),
-        input: input("work-recipient", ExecutionProfile::CollaborationV2 { web_search: None }) }).await);
+        input: input("work-recipient", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }) }).await);
     assert!(waiting.attempt.is_none());
     let added = call(&lab.c, Operation::MutateWork { operation_id: unique(), mutation: WorkMutation::AddWait {
         task_id: waiting.id.clone(), expected_revision: 0, resolver: ResolverRef::Question { question_id: q.id.clone() },
@@ -671,7 +671,7 @@ mod terminal_payload_corruption {
     async fn cancelled_task(lab: &Lab) -> (Task, Operation, Reply, WorkflowActivity) {
         let submitted = task(call(&lab.c, Operation::SubmitTask {
             operation_id: unique(),
-            input: input("terminal-payload-owner", ExecutionProfile::CollaborationV2 { web_search: None }),
+            input: input("terminal-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
         }).await);
         assert!(submitted.attempt.is_none(), "queued fixture needs no worker or executor");
         let operation = Operation::CancelTask {
@@ -788,7 +788,7 @@ mod terminal_payload_corruption {
         // this queued fixture never creates a worker or performs execution.
         task(call(&lab.c, Operation::SubmitTask {
             operation_id: unique(),
-            input: input("question-payload-owner", ExecutionProfile::CollaborationV2 { web_search: None }),
+            input: input("question-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
         }).await);
         let doc = document(&lab.c, "question-payload-owner").await;
         let q = question(&lab.c, &doc, None).await;
@@ -810,7 +810,7 @@ mod terminal_payload_corruption {
         let lab = Lab::new();
         task(call(&lab.c, Operation::SubmitTask {
             operation_id: unique(),
-            input: input("review-payload-owner", ExecutionProfile::CollaborationV2 { web_search: None }),
+            input: input("review-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
         }).await);
         let doc = document(&lab.c, "review-payload-owner").await;
         let target = ReviewTarget::DocumentVersion { version: doc.version.reference.clone() };

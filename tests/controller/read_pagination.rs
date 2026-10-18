@@ -109,7 +109,7 @@ async fn shared_read_pagination_document_version_and_scope() {
 async fn shared_read_pagination_oversized_first_list_item_is_reachable() {
     let mut cfg=config();Arc::make_mut(&mut cfg.limits).controller.collaboration_item_bytes=4096;
     let c=Controller::open_with_config(path(),cfg).unwrap();let mut input=native("pagination-list");
-    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{web_search:None});
+    input.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{web_search:None,publication:None});
     let (t,_,actor)=admitted(&c,"list",input).await;
     let first_doc=document(&c,"list-document",&text()).await;
     let second=call(&c,Operation::MutateDocument{operation_id:"list-version-two".into(),mutation:DocumentMutation::AppendVersion{document_id:first_doc.document.id.clone(),expected_revision:first_doc.document.revision,content:DocumentContent{title:"Small second version".into(),body:"second".into()},supplied_content_id:None}}).await;
@@ -182,10 +182,129 @@ async fn shared_read_pagination_previous_schema_receipts_upgrade_or_refuse() {
     let receipts=|sql:&rusqlite::Connection|->Vec<(String,String,String)>{let mut q=sql.prepare("SELECT id,request,outcome FROM receipts ORDER BY id").unwrap();q.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().map(Result::unwrap).collect()};
     let sql=rusqlite::Connection::open(&p).unwrap();sql.pragma_update(None,"user_version",25).unwrap();let original=receipts(&sql);drop(sql);
     let c=Controller::open_with_config(&p,cfg.clone()).unwrap();let replay=invoke(&c,&old).await;assert!(matches!(replay.outcome,Outcome::Ok{..}));
-    drop(c);controller_owner_released(&p).await;let sql=rusqlite::Connection::open(&p).unwrap();assert_eq!(receipts(&sql),original);assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),26);drop(sql);
+    drop(c);controller_owner_released(&p).await;let sql=rusqlite::Connection::open(&p).unwrap();assert_eq!(receipts(&sql),original);assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),28);drop(sql);
     let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
     let _=read_task(&c,&actor,"new-typed-page",&t,"instruction").await;
     drop(c);controller_owner_released(&p).await;let sql=rusqlite::Connection::open(&p).unwrap();sql.pragma_update(None,"user_version",25).unwrap();let original=receipts(&sql);drop(sql);let bytes=std::fs::read(&p).unwrap();
     let failed=Controller::open_with_config(&p,cfg);assert!(matches!(failed,Err(ref e) if e.contains("schema26")));
     assert_eq!(std::fs::read(&p).unwrap(),bytes);let sql=rusqlite::Connection::open(&p).unwrap();assert_eq!(receipts(&sql),original);assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),25);
+}
+
+
+// Operator reads use the same closed projection/fitter, with no fabricated task caller.
+fn operator_selection(tool:read_page::ReadTool,arguments:serde_json::Value)->Selection {
+    Selection::Public{tool,arguments,item:false,caller_task_id:None}
+}
+async fn operator_read(c:&Controller,selection:Selection,cursor:Option<String>)->Outcome {
+    call(c,Operation::QueryCollaboration{query:Query::Read(read_page::Request{selection,cursor,max_bytes:Some(CAP)})}).await
+}
+fn operator_data(outcome:Outcome)->Data {
+    match outcome {Outcome::Ok{data:Data::Collaboration(QueryResult::Read(value))}=>*value,x=>panic!("operator read: {x:?}")}
+}
+async fn reconstruct_operator(c:&Controller,mut p:ReadPage)->String {
+    let original=p.clone();let mut body=String::new();let mut pages=0;
+    loop {
+        assert_eq!(p.subject,original.subject);assert_eq!(p.identity,original.identity);
+        assert_eq!(p.offset,body.len());assert_eq!(p.returned_bytes,p.content.len());
+        assert_eq!(p.complete,p.offset+p.returned_bytes==p.total_bytes);
+        assert!(p.returned_bytes>0);assert!(serde_json::to_vec(&Data::ReadPage(Box::new(p.clone()))).unwrap().len()<=CAP);
+        body.push_str(&p.content);pages+=1;assert!(pages<500,"finite admitted source");
+        if p.complete {assert!(p.next_cursor.is_none());break;}
+        let next=operator_data(operator_read(c,p.subject.clone(),p.next_cursor.clone()).await);
+        let Data::ReadPage(next)=next else{panic!("content continuation is a page")};p=*next;
+    }
+    assert_eq!(body.len(),original.total_bytes);assert_eq!(read_page::digest(body.as_bytes()),original.identity.digest);body
+}
+#[tokio::test]
+async fn shared_read_pagination_operator_versions_preserves_partial_source_and_scope() {
+    Box::pin(operator_versions_journey()).await;
+}
+async fn operator_versions_journey() {
+    let mut cfg=config();let limits=Arc::make_mut(&mut cfg.limits);
+    limits.workflow.as_mut().unwrap().page_bytes=CAP;
+    limits.controller.collaboration_item_bytes=4096;limits.validate().unwrap();
+    let c=Controller::open_with_config(path(),cfg).unwrap();
+    let first=document(&c,"operator-version-one",&text()).await;
+    assert!(serde_json::to_vec(&first.version).unwrap().len()>CAP,"admitted body genuinely exceeds page budget");
+    let appended=call(&c,Operation::MutateDocument{operation_id:"operator-version-two".into(),mutation:DocumentMutation::AppendVersion{
+        document_id:first.document.id.clone(),expected_revision:first.document.revision,
+        content:DocumentContent{title:"Small successor".into(),body:"second exact body".into()},supplied_content_id:None}}).await;
+    let Outcome::Ok{data:Data::DocumentMutation(DocumentMutationOutcome::Document{view:second})}=appended else{panic!("{appended:?}")};
+    let legacy=call(&c,Operation::QueryDocument{query:DocumentQuery::Versions{document_id:first.document.id.clone(),after:None,limit:2}}).await;
+    assert!(matches!(legacy,Outcome::Refused{ref code,..} if code=="response_bound"),"{legacy:?}");
+    let selected=operator_selection(read_page::ReadTool::Versions, json!({"document_id":first.document.id,"cursor":null,"limit":2}));
+    let data=operator_data(operator_read(&c,selected.clone(),None).await);
+    assert!(serde_json::to_vec(&data).unwrap().len()<=CAP);
+    let Data::ReadList(list)=data else{panic!("oversized first item must remain reachable")};
+    assert_eq!(list.items.len(),1);assert!(!list.complete);
+    let list_cursor=list.next_cursor.clone().unwrap();
+    let read_page::PagedItem::Partial{content_complete,page:first_page}=&list.items[0] else{panic!("genuine partial item required")};
+    assert!(!*content_complete);assert!(!first_page.complete);
+    assert_eq!(first_page.subject,Selection::Public{tool:read_page::ReadTool::Versions,
+        arguments:json!({"document_id":first.document.id,"cursor":null,"limit":1}),item:true,caller_task_id:None});
+    assert!(serde_json::to_vec(&list.items[0]).unwrap().len()<=4096);
+    assert_ne!(first_page.next_cursor.as_ref().unwrap(),&list_cursor,"content and list positions are distinct");
+    // An unrelated new head cannot retarget the selected immutable first version.
+    let appended=call(&c,Operation::MutateDocument{operation_id:"operator-version-three".into(),mutation:DocumentMutation::AppendVersion{
+        document_id:first.document.id.clone(),expected_revision:second.document.revision,
+        content:DocumentContent{title:"Newest".into(),body:"third exact body".into()},supplied_content_id:None}}).await;
+    assert!(matches!(appended,Outcome::Ok{..}));
+    let body=reconstruct_operator(&c,first_page.clone()).await;
+    assert_eq!(serde_json::from_str::<DocumentVersion>(&body).unwrap(),first.version);
+    let next=operator_data(operator_read(&c,operator_selection(read_page::ReadTool::Versions,
+        json!({"document_id":first.document.id,"cursor":list_cursor,"limit":1})),None).await);
+    let Data::DocumentQuery(DocumentQueryOutcome::Versions(next))=next else{panic!("small complete successor uses original projection")};
+    assert_eq!(next.items,vec![second.version.clone()]);
+    let other=document(&c,"operator-other-document","other body").await;
+    let mut foreign=first_page.subject.clone();if let Selection::Public{arguments,..}=&mut foreign {arguments["document_id"]=json!(other.document.id);}
+    assert!(matches!(operator_read(&c,foreign,first_page.next_cursor.clone()).await,Outcome::Refused{code,..} if code=="invalid_read_cursor"));
+    let mut forged=read_page::Cursor::decode(first_page.next_cursor.as_ref().unwrap(),c.limits().controller.collaboration_cursor_bytes).unwrap();
+    forged.identity.digest=read_page::digest(b"different original source");
+    assert!(matches!(operator_read(&c,first_page.subject.clone(),Some(forged.encode(c.limits().controller.collaboration_cursor_bytes).unwrap())).await,Outcome::Refused{code,..} if code=="stale_read"));
+    let mut caller=selected.clone();if let Selection::Public{caller_task_id,..}=&mut caller {*caller_task_id=Some("task-1".into());}
+    let mut extra=selected.clone();if let Selection::Public{arguments,..}=&mut extra {arguments["unexpected"]=json!(true);}
+    let unknown=operator_selection(read_page::ReadTool::Task,json!({"task_id":"task-1"}));
+    for invalid in [caller,extra,unknown] {assert!(matches!(operator_read(&c,invalid,None).await,Outcome::Refused{..}));}
+    let tiny=call(&c,Operation::QueryCollaboration{query:Query::Read(read_page::Request{selection:selected,cursor:None,max_bytes:Some(1)})}).await;
+    assert!(matches!(tiny,Outcome::Refused{code,..} if code=="response_bound"));
+}
+#[tokio::test]
+async fn shared_read_pagination_operator_tasks_agents_keep_keysets_and_retirement() {
+    Box::pin(operator_directory_journey()).await;
+}
+async fn operator_directory_journey() {
+    let mut cfg=config();Arc::make_mut(&mut cfg.limits).controller.list_page_bytes=64;cfg.limits.validate().unwrap();
+    let c=Controller::open_with_config(path(),cfg).unwrap();
+    let mut input=native("adapter-a");input.instruction=text();let first=submit(&c,"operator-task-a",input).await;
+    let second=submit(&c,"operator-task-b",native("adapter-b")).await;
+    assert!(serde_json::to_vec(&first).unwrap().len()>c.limits().controller.list_page_bytes);
+    assert!(matches!(call(&c,Operation::ListTasks{after:None,limit:1}).await,Outcome::Ok{data:Data::Tasks(v)} if v.is_empty()));
+    assert!(matches!(call(&c,Operation::ListAgents{after:None,limit:1}).await,Outcome::Ok{data:Data::Agents(v)} if v.is_empty()));
+    let args=|cursor:Option<String>,agent:Option<String>|json!({"cursor":cursor,"limit":1,"agent_id":agent,"parent_task_id":null});
+    let Data::CollaborationPage(tasks)=operator_data(operator_read(&c,operator_selection(read_page::ReadTool::Tasks,args(None,None)),None).await) else{panic!("bounded task summaries")};
+    assert_eq!(tasks.items.len(),1);assert_eq!(tasks.items[0]["id"],json!(first.id));
+    assert!(tasks.items[0].get("instruction").is_none());assert!(serde_json::to_vec(&tasks).unwrap().len()<=CAP);
+    let Data::CollaborationPage(next)=operator_data(operator_read(&c,operator_selection(read_page::ReadTool::Tasks,args(Some(first.id.clone()),None)),None).await) else{panic!("legacy after identity converted")};
+    assert_eq!(next.items[0]["id"],json!(second.id));
+    let Data::CollaborationPage(filtered)=operator_data(operator_read(&c,operator_selection(read_page::ReadTool::Tasks,args(None,Some("adapter-b".into()))),None).await) else{panic!("agent filter")};
+    assert_eq!(filtered.items.len(),1);assert_eq!(filtered.items[0]["id"],json!(second.id));
+    let parent_args=|cursor:Option<String>|json!({"cursor":cursor,"limit":1,"agent_id":null,"parent_task_id":first.id});
+    let Data::CollaborationPage(empty)=operator_data(operator_read(&c,operator_selection(read_page::ReadTool::Tasks,parent_args(None)),None).await) else{panic!("filtered page")};
+    assert!(empty.items.is_empty());let cursor=empty.next_cursor.unwrap();
+    let Data::CollaborationPage(end)=operator_data(operator_read(&c,operator_selection(read_page::ReadTool::Tasks,parent_args(Some(cursor.clone()))),None).await) else{panic!("filtered continuation")};
+    assert!(end.items.is_empty());assert!(end.next_cursor.is_none());
+    assert!(matches!(operator_read(&c,operator_selection(read_page::ReadTool::Tasks,args(Some(cursor),None)),None).await,Outcome::Refused{..}));
+    let agents=|cursor:Option<String>|operator_selection(read_page::ReadTool::Agents,json!({"cursor":cursor,"limit":1}));
+    let Data::CollaborationPage(active)=operator_data(operator_read(&c,agents(None),None).await) else{panic!("bounded directory")};
+    let selected:AgentSummary=serde_json::from_value(active.items[0].clone()).unwrap();assert_eq!(selected.id,"adapter-a");assert!(!selected.retired);
+    assert!(serde_json::to_vec(&selected).unwrap().len()>c.limits().controller.list_page_bytes);
+    let retirement=call(&c,Operation::RetireAgent{operation_id:"operator-retire-a".into(),agent_id:selected.id.clone(),expected_revision:selected.definition.revision.clone()}).await;
+    assert!(matches!(retirement,Outcome::Ok{data:Data::Agent(ref a)} if a.retired));
+    for cursor in [None,Some(selected.id.clone()),active.next_cursor.clone()] {
+        let Data::CollaborationPage(page)=operator_data(operator_read(&c,agents(cursor),None).await) else{panic!("retained cursor remains usable")};
+        let value:AgentSummary=serde_json::from_value(page.items[0].clone()).unwrap();assert_eq!(value.id,"adapter-b");assert!(!value.retired);
+    }
+    assert!(matches!(call(&c,Operation::GetAgent{agent_id:selected.id.clone()}).await,Outcome::Ok{data:Data::Agent(a)} if a.retired));
+    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"operator-retired-new-task".into(),input:first.input.clone()}).await,Outcome::Refused{code,..} if code=="agent_retired"));
+    assert_eq!(get(&c,&first.id).await.input,first.input,"read and retirement do not alter accepted work");
 }

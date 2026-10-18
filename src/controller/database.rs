@@ -344,7 +344,7 @@ impl Database {
         }
         //= spec/impl/v2/implementation.md#durable-commands-have-stable-identity
         //# An unsupported stored schema version MUST be refused without rewriting its data.
-        if !fresh && (app != APPLICATION || ![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, SCHEMA].contains(&version)) {
+        if !fresh && (app != APPLICATION || ![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, SCHEMA].contains(&version)) {
             return Err("unsupported controller database schema; clean development reset required; original data retained".into());
         }
         // The OS owner lock also excludes validators whose original DB thread
@@ -457,6 +457,8 @@ impl Database {
         }
         super::sessions::validate_existing(conn, config, stored_version >= super::workflow_schema::VERSION)?;
         super::task_handoffs::validate_existing(conn, config, stored_version).map_err(|_| "invalid task handoff lineage; original bytes retained".to_string())?;
+        super::publication_requests::validate_existing(conn, config, stored_version)
+            .map_err(|e| format!("invalid retained shared publication: {e:?}; original bytes retained"))?;
         super::pull_request::validate_existing(conn, config, stored_version)
             .map_err(|_| "invalid retained PR publication; original bytes retained".to_string())?;
         // Root's composed schema14 has all additive governance structures.
@@ -907,7 +909,11 @@ impl Database {
                 )?;
             }
             if control_cleanup {
-                super::credits::debit_control(&tx, control_credit.as_deref().unwrap())?;
+                if let Some(super::publication_requests::CommandCredit::Attempt(attempt)) = &control_credit {
+                    super::credits::debit_control(&tx, attempt)?;
+                }
+                // Publication delivery/ACK credits are consumed by their exact
+                // existing command flags in this same receipt transaction.
             }
             if effect_cleanup {
                 super::credits::debit_effect(&tx, final_credit.as_deref().unwrap())?;
@@ -1007,11 +1013,13 @@ pub(crate) fn cleanup_available(
         |r| r.get(0),
     )?;
     let diagnostics = super::native_request_diagnostics::outstanding_credits(tx)?;
+    let publication_commands = super::publication_requests::command_credits(tx)?;
     let total = unsigned(used)?
         .checked_add(unsigned(reserved)?)
         .and_then(|n| n.checked_add(u64::try_from(control).ok()?))
         .and_then(|n| n.checked_add(u64::try_from(effects).ok()?))
         .and_then(|n| n.checked_add(diagnostics))
+        .and_then(|n| n.checked_add(publication_commands))
         .and_then(|n| n.checked_add(u64::from(extra)));
     Ok(total.is_some_and(|n| n <= cfg.max_cleanup_receipts as u64))
 }

@@ -116,7 +116,7 @@ pub(super) fn validate_existing(tx: &Connection, cfg: &ControllerConfig) -> Resu
             || owner.worker_id != worker
             || owner.worker_incarnation != inc
             || owner.generation != generation
-            || (owner.stopped && ack != 1)
+            || (owner.stopped && ack != 1 && !matches!(&command, WorkerCommand::PublishRepository { .. }))
         {
             return Err(Fault::Store("command owner/index differs".into()));
         }
@@ -149,6 +149,13 @@ pub(super) fn validate_existing(tx: &Connection, cfg: &ControllerConfig) -> Resu
                     && attempt_id == &attempt
                     && *g == generation
                     && incarnation == &inc
+            }
+            WorkerCommand::PublishRepository { command_id, request } => {
+                command_id == &id && request.validate(command_id).is_ok()
+                    && request.attempt.id == attempt && request.attempt.task_id == task
+                    && request.attempt.generation == generation
+                    && request.attempt.worker_id == worker && request.attempt.worker_incarnation == inc
+                    && request.session == super::sessions::get(tx, &request.attempt.session_id)?
             }
             // Reserved wake hints are not produced by the current controller.
             // Refuse an injected durable command rather than treating it as

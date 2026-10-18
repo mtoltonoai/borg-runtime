@@ -25,11 +25,17 @@ pub(super) async fn get(controller: &Controller, route: &str, query: &str) -> Ui
         Ok(fields) => fields,
         Err(message) => return error(400, &message),
     };
-    if let Err(message) = fields_only(&fields, &["after"]) {
+    let allowed:&[&str]=if route=="/agents" {&["after","page_cursor","cursor","max_bytes"]}else{&["after"]};
+    if let Err(message) = fields_only(&fields, allowed) {
         return error(400, &message);
     }
     let after = fields.get("after").filter(|s| !s.is_empty()).cloned();
     if route == "/agents" {
+        let scoped=match super::read_pages::list_cursor(&fields) {Ok(cursor)=>cursor,Err(response)=>return response};
+        if fields.contains_key("page_cursor") || fields.contains_key("cursor") || fields.contains_key("max_bytes") {
+            return match boxed_route(||super::read_pages::public_list(controller,crate::read_page::ReadTool::Agents,
+                serde_json::json!({"cursor":scoped,"limit":controller.limits().product.page_items}),&fields)).await {Ok(response)|Err(response)=>response};
+        }
         let reply = call(
             controller,
             Operation::ListAgents {
@@ -42,6 +48,12 @@ pub(super) async fn get(controller: &Controller, route: &str, query: &str) -> Ui
             Outcome::Ok {
                 data: Data::Agents(agents),
             } => {
+                // Empty legacy output can mean an oversized first definition;
+                // preserve its identity through the same bounded directory read.
+                if agents.is_empty() {
+                    return match boxed_route(||super::read_pages::public_list(controller,crate::read_page::ReadTool::Agents,
+                        serde_json::json!({"cursor":scoped,"limit":controller.limits().product.page_items}),&fields)).await {Ok(response)|Err(response)=>response};
+                }
                 let mut body = String::from("<p><a href=\"/agents\">Refresh agents</a></p>");
                 if agents.is_empty() {
                     body.push_str("<p>No agents found.</p>");

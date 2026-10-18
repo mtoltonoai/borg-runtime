@@ -115,7 +115,7 @@ fn pr_operation_view_uses_typed_original_identity_and_omits_private_target_and_h
         registration: crate::repository_catalogue::Revision { repository_id: "repo".into(), registration_revision: "one".into() },
         checkpoint: Checkpoint { registration: crate::repository_catalogue::Revision { repository_id: "repo".into(), registration_revision: "one".into() },
             repository: "public-checkpoint".into(), commit: "a".repeat(40), remote_ref: "refs/checkpoints/one".into(), operation_id: "checkpoint-original".into() } };
-    let intent = pr::HeadIntent { binding, target: target(), head_operation_id: "head-original".into(), head_ref: "refs/heads/pr-one".into() };
+    let intent = pr::HeadIntent { binding, publication: None, target: target(), head_operation_id: "head-original".into(), head_ref: "refs/heads/pr-one".into() };
     let proof = pr::HeadProof { operation_id: "head-original".into(), target_revision: "target-one".into(), remote: target().head_remote,
         remote_ref: intent.head_ref.clone(), commit: "a".repeat(40) };
     let record = OperationRecord { id: "head-original".into(), task_id: "task".into(), attempt_id: "attempt".into(), generation: 1,

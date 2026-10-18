@@ -29,6 +29,21 @@ pub struct NativeLoopProfile {
     pub functions: Vec<NativeFunction>,
     pub web_search: Option<NativeWebSearch>,
 }
+impl NativeLoopProfile {
+    /// Same pure carrier validation used before helper/provider dispatch.
+    pub(crate) fn validate_selection(&self, input: &TaskInput) -> Result<(), String> {
+        let policy = &input.execution_limits()?.native;
+        selected(self, policy)?;
+        let schema = input.output_schema.as_ref().ok_or("native_output_schema_missing")?;
+        let validation = serde_json::to_value(ValidationInput {
+            schema: schema.clone(), profile: self.clone(), output_bytes: input.limits.output_bytes,
+            repair_enabled: input.resolved_limits.as_ref().is_some_and(|v| v.global_metadata.native_retry.is_some()),
+            output_prefix: None, joined_charter: false,
+        }).map_err(|_| "native_request_encoding")?;
+        schema::measure(&validation, policy.schema_bytes, policy, "native_schema_bytes")?;
+        Ok(())
+    }
+}
 
 // Responses accepts a smaller generation-schema language than the accepted
 // Draft202012 contract. Only the closed conditional-allOf form is projected;

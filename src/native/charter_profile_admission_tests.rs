@@ -116,7 +116,7 @@ async fn global_v2_maximum_charter_reuse_admits_and_preflights_without_changing_
     assert!(matches!(rejected.outcome,Outcome::Refused{ref code,..} if code=="charter_required"));
     let source=maximum_source(&new);let mut seed=input("charter-source",&new);seed.definition.charter=Some(DefinitionCharter::Inline{source:source.clone()});
     let seed=submit(&c,"source-submit",seed).await;let original=effective(&c,&seed).await;
-    let mut next=input("global-v2-charter",&new);next.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{web_search:None});next.definition.charter=Some(DefinitionCharter::Reference{source:original.charter.reference.clone()});
+    let mut next=input("global-v2-charter",&new);next.definition.execution_profile=Some(ExecutionProfile::CollaborationV2{ publication: None,web_search:None});next.definition.charter=Some(DefinitionCharter::Reference{source:original.charter.reference.clone()});
     let t=submit(&c,"global-submit",next.clone()).await;let accepted=get(&c,&t.id).await;let bound=effective(&c,&t).await;
     assert_eq!(bound.charter,original.charter);assert_eq!(bound.session.initial,original.charter.reference);assert_eq!(bound.session.revision,1);
     assert_eq!(t.input.definition,next.definition);assert_eq!(t.input.execution_limits().unwrap().native,new.execution.native);

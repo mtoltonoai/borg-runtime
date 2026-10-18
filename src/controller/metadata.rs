@@ -126,7 +126,7 @@ pub(super) fn read_retained(tx: &Connection, id: &str) -> Result<Option<Retained
         }
         RetainedOutcome::ReadReference(reference) => {
             let version:i64=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-            if version<26 {return Err(Fault::Store("compact read vocabulary requires schema26".into()))}
+            if !super::application_schema::admits_read_generation(version) {return Err(Fault::Store("compact read vocabulary requires schema26 or the explicit union".into()))}
             reference.validate(&request).map_err(Fault::Store)?;
             super::read_retention::validate_origin(tx,id,&request,reference,revision as u64)?;
         }

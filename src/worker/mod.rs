@@ -22,6 +22,7 @@ mod native_request_diagnostics;
 mod native_tool;
 pub mod process;
 mod publication;
+pub(crate) mod publication_requests;
 mod pull_request;
 mod pull_request_provider;
 mod resource;
@@ -1688,8 +1689,9 @@ async fn coding(
     });
     let lifecycle = codex::ExecutionLifecycle::default();
     let observed_lifecycle = lifecycle.clone();
+    let accepted_profile = input.definition.execution_profile.clone();
     execution.spawn(async move {
-        boxed_execution(|| codex::execute_with_charter_observed(
+        boxed_execution(|| codex::execute_with_profile_observed(
             &binary,
             &work,
             &state_dir,
@@ -1703,6 +1705,7 @@ async fn coding(
             completion_scope.as_ref(),
             initial_charter.as_ref(),
             observed_lifecycle,
+            accepted_profile.as_ref(),
         ))
         .await
     });
@@ -2053,6 +2056,7 @@ struct Receipt {
     effects_started: bool,
 }
 fn validate_command_session(command: &WorkerCommand) -> Result<(), String> {
+    if let WorkerCommand::PublishRepository { command_id, request } = command { request.validate(command_id)?; }
     if let WorkerCommand::RunAttempt {
         session,
         attempt,
@@ -2077,7 +2081,17 @@ fn read_receipt(path: &Path, limits: &RuntimeLimits) -> Result<Receipt, String> 
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|_| "invalid command receipt")?;
     validate_command_session(&receipt.command)?;
+    validate_publication_receipt_encoding(&bytes, &receipt)?;
     Ok(receipt)
+}
+fn validate_publication_receipt_encoding(bytes: &[u8], receipt: &Receipt) -> Result<(), String> {
+    let requires = matches!(&receipt.command, WorkerCommand::PublishRepository { .. })
+        || matches!(&receipt.command, WorkerCommand::RunAttempt { task, .. } if crate::protocol::input_requires_publication(task));
+    if requires && serde_json::to_value(receipt).map_err(|_| "publication command encoding failed")?
+        != serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_| "publication command JSON invalid")? {
+        return Err("publication command contains unsupported nested fields".into());
+    }
+    Ok(())
 }
 
 struct Active {
@@ -2143,6 +2157,7 @@ fn command_receipts(
         let receipt: Receipt =
             serde_json::from_slice(&bytes).map_err(|_| "invalid command receipt")?;
         validate_command_session(&receipt.command)?;
+        validate_publication_receipt_encoding(&bytes, &receipt)?;
         records.push((path, receipt));
     }
     records.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2162,6 +2177,7 @@ fn command_identity(command: &WorkerCommand) -> (&str, &str) {
             ..
         } => (command_id, incarnation),
         WorkerCommand::CollaborationReady {command_id,caller,..} => (command_id,&caller.incarnation),
+        WorkerCommand::PublishRepository { command_id, request } => (command_id, &request.caller().incarnation),
     }
 }
 
@@ -2251,6 +2267,7 @@ async fn recover_wait(client: &ApiClient, state: &Path, worker: &str) -> Result<
             for command in commands {
                 if matches!(&command, WorkerCommand::RunAttempt { attempt, .. } if attempt.worker_id != worker)
                     || matches!(&command, WorkerCommand::CollaborationReady {caller,..} if caller.worker_id != worker)
+                    || matches!(&command, WorkerCommand::PublishRepository {request,..} if request.caller().worker_id != worker)
                 {
                     return Err("saved command belongs to another worker".into());
                 }
@@ -2584,6 +2601,32 @@ fn admit_identity_administration(state:&Path,limits:&RuntimeLimits)->Result<(),S
     Ok(())
 }
 
+fn admit_publication_vocabulary(state:&Path,limits:&RuntimeLimits)->Result<(),String> {
+    if handoff::admits_publication_requests(state,&limits.worker)? {return Ok(())}
+    handoff::admit_retained_publication(state,limits)?;
+    if command_receipts(state, limits)?.iter().any(|(_,r)| matches!(r.command, WorkerCommand::PublishRepository { .. })) { return Err("publication commands require worker21".into()); }
+    for (_,receipt) in command_receipts(state,limits)? {
+        let WorkerCommand::RunAttempt{task,attempt,..}=&receipt.command else{continue};
+        if crate::protocol::input_requires_publication(task){return Err("accepted publication capability requires worker21".into())}
+        let directory=state.join("collaboration").join(component(&attempt.id));
+        let entries=match std::fs::read_dir(&directory){Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,Err(_)=>return Err("native call inventory unavailable".into())};
+        let maximum=(task.limits.model_requests as usize).checked_mul(task.execution_limits()?.native.function_calls_per_response).ok_or("native call inventory overflow")?;
+        for (index,entry) in entries.enumerate() {
+            if index>=maximum {return Err("native call inventory exceeds accepted bounds".into())}
+            let path=entry.map_err(|e|e.to_string())?.path();
+            let snapshot=task.resolved_limits.as_ref().ok_or("accepted metadata absent")?;
+            let journal=mutations::read(&path,&snapshot.global_metadata)?.ok_or("native call journal absent")?;
+            if crate::protocol::requires_publication(&journal.request)||journal.outcome.as_ref().is_some_and(crate::protocol::outcome_requires_publication) {
+                return Err("original native publication call requires worker21, including refusals".into());
+            }
+        }
+    }
+    if mutations::read(&state.join("mutations/await.json"),limits)?.is_some_and(|j|crate::protocol::requires_publication(&j.request)||j.outcome.as_ref().is_some_and(crate::protocol::outcome_requires_publication)) {
+        return Err("retained task creation command/outcome requires worker21".into());
+    }
+    Ok(())
+}
+
 fn admit_default_assignment(state: &Path, limits: &RuntimeLimits) -> Result<(), String> {
     if handoff::admits_default_assignment(state, &limits.worker)? { return Ok(()); }
     if limits.task_defaults.agent_id.is_some() {
@@ -2752,6 +2795,9 @@ fn coding_collaboration_closed(
     }
     if !handoff::admits_read_pagination(state,&config.worker_limits)? {
         codex_mcp::admit_read_pagination(&config)?;
+    }
+    if !handoff::admits_publication_requests(state, &config.worker_limits)? {
+        codex_mcp::admit_worker21_outcomes(&config)?;
     }
     if collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {
         return Ok(false);
@@ -3181,6 +3227,7 @@ fn retained_worker_limits(
                 "native-tracking",
                 "publications",
                 "pull-requests",
+        "publication-requests",
             ] {
                 // The pre-created settlement directory itself carries no evidence.
                 let entries = std::fs::read_dir(state.join(name)).map_err(|e| e.to_string())?;
@@ -3332,6 +3379,7 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
         "native-tracking",
         "publications",
         "pull-requests",
+        "publication-requests",
         "mutations",
         "mutations/settlements",
     ] {
@@ -3429,6 +3477,7 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                     if !state_format_ready {
                         charter::admit(&state,&config.limits,&config.id)?;
                         pull_request::admit(&state, &config.limits, &config.id)?;
+                        publication_requests::admit(&state, &config.limits, &config.id)?;
                         if let Err(error) = handoff::finish_state_upgrade(
                             &state, &config.limits, &_lease,
                         ) {
@@ -3467,6 +3516,7 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                             )
                             .await?;
                             boxed_execution(|| pull_request::recover(&config, &state, &envelope, &outbox_lock, &validation_runtime)).await?;
+                            boxed_execution(|| publication_requests::recover(&config, &state, &envelope, &validation_runtime)).await?;
                             mutations::recover_settlements(
                                 &client, &state, &config.controller_url, &config.id,
                             ).await?;
@@ -3703,6 +3753,7 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                     WorkerCommand::StopAttempt{..}=>0,
                     WorkerCommand::CollaborationReady{..}=>1,
                     WorkerCommand::RunAttempt{..}=>2,
+                    WorkerCommand::PublishRepository{..}=>3,
                 });
                 for command in commands {
                     match command.clone() {
@@ -3750,7 +3801,7 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                                 ExecutorKind::Coding => config.coding_capacity,
                                 ExecutorKind::Native => config.native_capacity,
                             };
-                            if active.values().filter(|a| a.executor == executor).count()
+                            if active.iter().filter(|(id, a)| !id.starts_with("publication-") && a.executor == executor).count()
                                 >= capacity
                             {
                                 continue;
@@ -3933,6 +3984,29 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                                 },
                             );
                         }
+                        WorkerCommand::PublishRepository { command_id, request } => {
+                            if request.caller().worker_id != config.id || request.caller().incarnation != config.incarnation { continue; }
+                            request.validate(&command_id)?;
+                            let receipt_path = state.join("commands").join(format!("{}.json", component(&command_id)));
+                            if !record_launch(&receipt_path, &command, &config.limits)? { continue; }
+                            let (cancel, cancelled) = watch::channel(false);
+                            let metadata = request.input.resolved_limits.as_ref().ok_or("publication command policy absent")?.global_metadata.clone();
+                            let control = Control { deadline_ms: request.input.limits.deadline_unix_ms.min(request.attempt.deadline_unix_ms),
+                                worker_limits: Arc::new(metadata.worker.clone()), runtime_limits: Arc::new((*metadata).clone()),
+                                validation_runtime: validation_runtime.clone(), cancel: cancelled };
+                            let (cfg, root, resource, done, id) = (config.clone(), state.clone(), envelope.clone(), finished.clone(), command_id.clone());
+                            let task_id = request.caller().task_id.clone();
+                            let generation = request.caller().generation;
+                            let executor = request.input.definition.executor;
+                            let join = tokio::spawn(async move {
+                                // An error retains the exact command/phase. No model
+                                // continuation or fresh effect is used to discover it.
+                                let _ = boxed_execution(|| publication_requests::execute(&cfg, &root, &command, &resource, &control, false)).await;
+                                let _ = process::reconcile_processes(&root.join("processes").join(format!("publication-{}", component(&id))), &cfg.limits.worker).await;
+                                let _ = done.send(id).await;
+                            });
+                            active.insert(command_id, Active { task_id, generation, executor, cancel, join });
+                        }
                         WorkerCommand::StopAttempt {
                             command_id,
                             task_id,
@@ -3946,6 +4020,9 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                             record_launch(&receipt_path, &command, &config.limits)?;
                             if incarnation != config.incarnation {
                                 continue;
+                            }
+                            for running in active.iter().filter(|(id, a)| id.starts_with("publication-") && a.task_id == task_id && a.generation == generation).map(|(_, a)| a) {
+                                let _ = running.cancel.send(true);
                             }
                             if let Some(running) = active.get(&attempt_id) {
                                 if running.task_id == task_id && running.generation == generation {
@@ -5159,6 +5236,7 @@ mod limits_policy_tests {
                 "native-tracking",
                 "publications",
                 "pull-requests",
+        "publication-requests",
             ] {
                 std::fs::create_dir_all(root.join(name)).unwrap();
             }

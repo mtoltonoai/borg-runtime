@@ -119,67 +119,13 @@ async fn route(
     if path == "/tasks"
         && (raw_query.contains("agent_id=") || raw_query.contains("parent_task_id="))
     {
-        let f = fields(
-            raw_query,
-            &["agent_id", "parent_task_id", "after"],
-            controller.limits(),
-        )
-        .map_err(|e| error(400, &e))?;
-        let agent_id = f.get("agent_id").filter(|x| !x.is_empty()).cloned();
-        let parent_task_id = f.get("parent_task_id").filter(|x| !x.is_empty()).cloned();
-        let QueryResult::Tasks(tasks) = query(
-            controller,
-            Query::Tasks {
-                agent_id: agent_id.clone(),
-                parent_task_id: parent_task_id.clone(),
-                after: after(&f),
-                limit: controller.limits().product.page_items,
-            },
-        )
-        .await?
-        else {
-            return Err(error(502, "Unexpected task summary projection"));
-        };
-        let mut body = String::from(
-            "<p><a href=\"/tasks\">All tasks</a></p><p>Filtered committed tasks. A page can contain no matches while later pages remain.</p><table><thead><tr><th>Task</th><th>Agent</th><th>Status</th></tr></thead><tbody>",
-        );
-        for item in &tasks.items {
-            let id = item
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| error(502, "Task summary has no identity"))?;
-            let agent = item
-                .get("assigned_agent_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| error(502, "Task summary has no agent"))?;
-            let status = item
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| error(502, "Task summary has no status"))?;
-            let _ = write!(
-                body,
-                "<tr><td><a href=\"{}\">{}</a></td><td><a href=\"{}\">{}</a></td><td>{}</td></tr>",
-                task_path(id),
-                escape(id),
-                agents::path(agent),
-                escape(agent),
-                escape(status)
-            );
-        }
-        body.push_str("</tbody></table>");
-        if tasks.items.is_empty() {
-            body.push_str("<p>No matching tasks on this page.</p>");
-        }
-        if let Some(cursor) = tasks.next_cursor {
-            let _ = write!(
-                body,
-                "<p><a href=\"/tasks?agent_id={}&amp;parent_task_id={}&amp;after={}\">Next filtered page</a></p>",
-                encode(agent_id.as_deref().unwrap_or("")),
-                encode(parent_task_id.as_deref().unwrap_or("")),
-                encode(&cursor)
-            );
-        }
-        return Ok(Some(page(200, "Filtered tasks", body)));
+        let f=fields(raw_query,&["agent_id","parent_task_id","after","page_cursor","cursor","max_bytes"],controller.limits()).map_err(|e|error(400,&e))?;
+        let agent_id=f.get("agent_id").filter(|x|!x.is_empty()).cloned();
+        let parent_task_id=f.get("parent_task_id").filter(|x|!x.is_empty()).cloned();
+        let cursor=super::read_pages::list_cursor(&f)?;
+        let response=boxed_route(||super::read_pages::public_list(controller,crate::read_page::ReadTool::Tasks,
+            serde_json::json!({"cursor":cursor,"limit":controller.limits().product.page_items,"agent_id":agent_id,"parent_task_id":parent_task_id}),&f)).await?;
+        return Ok(Some(response));
     }
     if path == "/workers" {
         let f = fields(raw_query, &["after"], controller.limits()).map_err(|e| error(400, &e))?;

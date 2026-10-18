@@ -17,7 +17,7 @@ fn instruction_source_catalogue_preserves_every_unbound_profile_byte() {
     let source = source();
     for profile in [
         ExecutionProfile::CollaborationV1 { web_search: None },
-        ExecutionProfile::CollaborationV2 { web_search: None },
+        ExecutionProfile::CollaborationV2 { publication: None, web_search: None },
     ] {
         let old = catalogue_for_profile(&limits, Some(&profile));
         assert_eq!(

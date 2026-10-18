@@ -2,7 +2,7 @@
 use super::{database::*,ControllerConfig};
 use crate::protocol::*;
 pub(super) fn validate_existing(tx:&StoreContext<'_>,cfg:&ControllerConfig,version:i64)->Result<()> {
-    if version>=super::application_schema::READ_PAGINATION_VERSION{return Ok(());}
+    if super::application_schema::admits_read_generation(version){return Ok(());}
     let maximum=cfg.max_receipts.checked_add(cfg.max_cleanup_receipts).ok_or_else(||Fault::Store("pagination inventory overflow".into()))?;
     let mut q=tx.prepare("SELECT id FROM receipts ORDER BY id")?;
     let mut rows=q.query([])?;

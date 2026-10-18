@@ -4,7 +4,7 @@ use crate::{limits::RuntimeLimits, mcp, protocol::ExecutionProfile};
 #[test]
 fn closed_read_list_matches_current_canonical_adapters_and_never_name_shapes() {
     let limits = RuntimeLimits::seed().unwrap();
-    let profile = ExecutionProfile::CollaborationV2 { web_search: None };
+    let profile = ExecutionProfile::CollaborationV2 { publication: None, web_search: None };
     let tools = mcp::catalogue_for_profile(&limits, Some(&profile));
     let mut reads = 0;
     for tool in tools {

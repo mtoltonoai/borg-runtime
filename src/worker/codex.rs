@@ -625,6 +625,18 @@ pub(super) async fn execute_with_charter_observed(
     collaboration: Option<&Collaboration>, completion_scope: Option<&CompletionScope>,
     initial_charter: Option<&InitialCharterScope>, lifecycle: ExecutionLifecycle,
 ) -> std::result::Result<Result, ExecutionFailure> {
+    super::boxed_execution(|| execute_with_profile_observed(binary, cwd, state, registry, inference, limits, instruction,
+        control, events, collaboration, completion_scope, initial_charter, lifecycle, None)).await
+}
+
+pub(super) async fn execute_with_profile_observed(
+    binary: &Path, cwd: &Path, state: &Path, registry: &Path,
+    inference: &InferenceSettings, limits: &ExecutionLimits, instruction: &str,
+    control: &Control, events: mpsc::Sender<Event>,
+    collaboration: Option<&Collaboration>, completion_scope: Option<&CompletionScope>,
+    initial_charter: Option<&InitialCharterScope>, lifecycle: ExecutionLifecycle,
+    accepted_profile: Option<&ExecutionProfile>,
+) -> std::result::Result<Result, ExecutionFailure> {
     let result = async {
         validate_inference(inference)?;
         let credentials = super::configured_credentials(&control.runtime_limits)?;
@@ -645,6 +657,7 @@ pub(super) async fn execute_with_charter_observed(
             completion_scope,
             initial_charter,
             lifecycle,
+            accepted_profile,
         )
         .await
     }
@@ -654,7 +667,7 @@ pub(super) async fn execute_with_charter_observed(
         if let Some(host) = collaboration {
             let config = super::codex_mcp::Config {
                 instruction_source: host.instruction_source.clone(),
-                execution_profile: host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2{web_search:None}),
+                execution_profile: accepted_profile.cloned().filter(|p| matches!(p, ExecutionProfile::CollaborationV2 { .. })).or_else(|| host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None })),
                 controller_url: host.controller_url.clone(),
                 caller: host.caller.clone(),
                 deadline_unix_ms: control.deadline_ms,
@@ -783,7 +796,7 @@ async fn execute_with_credentials_collaboration_and_charter(
     initial_charter: Option<&InitialCharterScope>,
 ) -> std::result::Result<Result, ExecutionFailure> {
     super::boxed_execution(|| execute_observed(binary,cwd,state,registry,inference,limits,instruction,control,events,
-        credentials,inference_key,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default())).await
+        credentials,inference_key,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default(),None)).await
 }
 
 async fn execute_observed(
@@ -793,6 +806,7 @@ async fn execute_observed(
     inference_key: Option<&str>, collaboration: Option<&Collaboration>,
     completion_scope: Option<&CompletionScope>, initial_charter: Option<&InitialCharterScope>,
     lifecycle: ExecutionLifecycle,
+    accepted_profile: Option<&ExecutionProfile>,
 ) -> std::result::Result<Result, ExecutionFailure> {
     validate_inference(inference)?;
     if initial_charter.is_some() && control.runtime_limits.charter.is_none() {
@@ -848,7 +862,7 @@ async fn execute_observed(
         context_config(&mut thread_config, &limits.coding);
         if let Some(host)=collaboration {
             if !host.bridge_binary.is_absolute() {return Err("collaboration bridge executable must be host absolute path".into());}
-            let config=super::codex_mcp::Config{instruction_source:host.instruction_source.clone(),execution_profile:host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2{web_search:None}),controller_url:host.controller_url.clone(),caller:host.caller.clone(),deadline_unix_ms:control.deadline_ms,state:state.to_owned(),runtime_limits:(*control.runtime_limits).clone(),limits:limits.collaboration.clone(),worker_limits:(*control.worker_limits).clone()};
+            let config=super::codex_mcp::Config{instruction_source:host.instruction_source.clone(),execution_profile:accepted_profile.cloned().filter(|p| matches!(p, ExecutionProfile::CollaborationV2 { .. })).or_else(|| host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None })),controller_url:host.controller_url.clone(),caller:host.caller.clone(),deadline_unix_ms:control.deadline_ms,state:state.to_owned(),runtime_limits:(*control.runtime_limits).clone(),limits:limits.collaboration.clone(),worker_limits:(*control.worker_limits).clone()};
             config.validate()?;super::codex_mcp::check_stop(&config)?;
             if super::value_contains_credential(&serde_json::to_value(&config).map_err(|_|"bridge configuration encoding failed")?,credentials, &control.worker_limits)? {return Err("bridge identity contains configured credential".into());}
             let config_path=state.join("borg-collaboration-config.json");
@@ -1094,7 +1108,7 @@ async fn execute_observed(
     let collaboration_uncertain = collaboration.is_some_and(|host| {
         let config = super::codex_mcp::Config {
                 instruction_source: host.instruction_source.clone(),
-                execution_profile: host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2{web_search:None}),
+                execution_profile: accepted_profile.cloned().filter(|p| matches!(p, ExecutionProfile::CollaborationV2 { .. })).or_else(|| host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None })),
             controller_url: host.controller_url.clone(),
             caller: host.caller.clone(),
             deadline_unix_ms: control.deadline_ms,

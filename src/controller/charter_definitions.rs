@@ -130,6 +130,7 @@ fn candidate(
         );
     }
     charters::validate_definition(tx, &d)?;
+    super::publication_requests::validate_definition(tx, &d)?;
     let before_limits = tx
         .limits
         .resolve_definition(before)
@@ -527,7 +528,7 @@ mod tests {
         // Publication/selection are not part of either model-writable catalogue.
         for profile in [
             ExecutionProfile::CollaborationV1 { web_search: None },
-            ExecutionProfile::CollaborationV2 { web_search: None },
+            ExecutionProfile::CollaborationV2 { publication: None, web_search: None },
         ] {
             let catalogue = crate::mcp::catalogue_for_profile(c.limits(), Some(&profile));
             assert!(!catalogue.iter().any(|tool| tool.name.contains("charter")));

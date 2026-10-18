@@ -78,8 +78,11 @@ impl Fixture {
         // Native task admission invokes the real helper. The library test
         // harness cannot implement its protocol; bind the same-build runtime
         // explicitly, as in the existing native Controller fixtures.
-        let executable = PathBuf::from(std::env::var_os("BORG_TEST_RUNTIME")
-            .expect("explicit library-test runtime binding"));
+        let executable = std::env::var_os("BORG_TEST_RUNTIME").map(PathBuf::from).unwrap_or_else(|| {
+            // The declared --no-run command builds the ordinary binary beside
+            // Cargo's deps directory before this library filter executes.
+            std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("borg-runtime")
+        });
         assert!(executable.is_absolute() && executable.is_file());
         Self::with_validation(label, 1_000_000, Some(executable)).await
     }

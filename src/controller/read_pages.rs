@@ -40,12 +40,8 @@ impl Bounds<'_> {
         }
         if self.repository { check(data,l.repository.output_bytes,"repository.output_bytes")?; }
         if let Some(max) = self.max_bytes { check(data,max,"requested max_bytes")?; }
-        if self.browser {
-            if let Data::ReadPage(page)=data {
-                if crate::product::read_pages::render(page).body.len()>l.product.response_bytes {
-                    return Err(Error::bound("product.response_bytes"));
-                }
-            }
+        if self.browser && !crate::product::read_pages::fits(data,l) {
+            return Err(Error::bound("product.response_bytes"));
         }
         let outcome = Outcome::Ok { data:data.clone() };
         bounded_json_size(&outcome,l.controller.outcome_bytes).map_err(|_|Error::bound("controller.outcome_bytes"))?;
@@ -169,6 +165,12 @@ fn finish(mut value: Projection, cursor: Option<&Cursor>, bounds: &Bounds<'_>, f
 pub(super) fn query(tx:&StoreContext<'_>,request:&ReadRequest,cfg:&ControllerConfig) -> Result<Data> {
     let now=(cfg.clock)();
     let (selection,cursor,max_bytes)=resolve_request(request,tx.limits)?;
+    if let Selection::Public{tool,caller_task_id,..}=&selection {
+        if caller_task_id.is_some() || !matches!(tool,ReadTool::Tasks|ReadTool::Agents|ReadTool::Versions) {
+            return Err(invalid("operator list selector is outside its closed domain"));
+        }
+        return operator_list(tx,selection,cursor.as_ref(),max_bytes,cfg,now);
+    }
     let (value,workflow)=match &selection {
         Selection::Task{..}=>(task(tx,&selection,cfg,now)?,false),
         Selection::Document{..}=>(document(tx,&selection,now)?,true),
@@ -176,6 +178,61 @@ pub(super) fn query(tx:&StoreContext<'_>,request:&ReadRequest,cfg:&ControllerCon
     };
     let bounds=Bounds {limits:tx.limits,call:None,max_bytes,workflow,repository:false,browser:true};
     finish(value,cursor.as_ref(),&bounds,true)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskListArgs { cursor:Option<String>, limit:usize, agent_id:Option<String>, parent_task_id:Option<String> }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentListArgs { cursor:Option<String>, limit:usize }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionListArgs { document_id:String, cursor:Option<String>, limit:usize }
+fn list_args<T:serde::de::DeserializeOwned>(args:&Value,keys:&[&str])->Result<T> {
+    if args.as_object().is_none_or(|o|o.len()!=keys.len() || keys.iter().any(|k|!o.contains_key(*k))) {
+        return Err(invalid("operator list arguments differ from their closed schema"));
+    }
+    serde_json::from_value(args.clone()).map_err(|_|invalid("operator list arguments differ from their closed schema"))
+}
+fn operator_list(tx:&StoreContext<'_>,mut selection:Selection,cursor:Option<&Cursor>,max_bytes:Option<usize>,cfg:&ControllerConfig,now:u64)->Result<Data> {
+    let Selection::Public{tool,arguments,item,caller_task_id:None}=&mut selection else{return Err(invalid("operator list scope differs"))};
+    let tool=*tool;
+    if *item && (cursor.is_none() || arguments.get("limit").and_then(Value::as_u64)!=Some(1)) {
+        return Err(invalid("item continuation requires its original single-item cursor"));
+    }
+    // Only the original unfiltered browser routes accepted raw after identities.
+    // Convert once before fitting so retained content uses the canonical cursor.
+    match tool {
+        ReadTool::Tasks=>{
+            let a:TaskListArgs=list_args(arguments,&["cursor","limit","agent_id","parent_task_id"])?;
+            arguments["cursor"]=json!(super::collaboration_calls::operator_list_cursor(tx,"tasks",&json!([a.agent_id,a.parent_task_id]),&a.cursor,cfg,now)?);
+        },
+        ReadTool::Agents=>{
+            let a:AgentListArgs=list_args(arguments,&["cursor","limit"])?;
+            arguments["cursor"]=json!(super::collaboration_calls::operator_list_cursor(tx,"agents",&Value::Null,&a.cursor,cfg,now)?);
+        },
+        ReadTool::Versions=>{let _:VersionListArgs=list_args(arguments,&["document_id","cursor","limit"])?;},
+        _=>return Err(invalid("operator list selector is outside its closed domain")),
+    }
+    let args=arguments.clone();
+    let mut raw_tx=tx.with_limits(tx.limits);raw_tx.fitting_read=true;
+    let bounds=Bounds{limits:tx.limits,call:None,max_bytes,workflow:tool==ReadTool::Versions,repository:false,browser:true};
+    public_projection(&raw_tx,tool,args,None,selection,cursor,&bounds,|args|match tool {
+        ReadTool::Tasks=>{
+            let a:TaskListArgs=list_args(args,&["cursor","limit","agent_id","parent_task_id"])?;
+            Ok((Data::CollaborationPage(super::collaboration_calls::task_page(&raw_tx,cfg,&a.agent_id,&a.parent_task_id,&a.cursor,a.limit)?),false))
+        },
+        ReadTool::Agents=>{
+            let a:AgentListArgs=list_args(args,&["cursor","limit"])?;
+            super::collaboration_calls::agent_page(&raw_tx,&a.cursor,a.limit,cfg,now)
+        },
+        ReadTool::Versions=>{
+            let a:VersionListArgs=list_args(args,&["document_id","cursor","limit"])?;
+            super::collaboration_routing::direct(&raw_tx,&Operation::QueryDocument{query:crate::collaboration::documents::DocumentQuery::Versions{document_id:a.document_id,after:a.cursor,limit:a.limit}},now)
+        },
+        _=>unreachable!(),
+    })
 }
 
 fn selection(call:&Invocation) -> Result<ReadRequest> {
@@ -266,12 +323,23 @@ fn public(tx:&StoreContext<'_>,call:&Invocation,selection:Selection,cursor:Optio
     let (tool,_)=arguments_for(&selection)?;
     if tool==ReadTool::RepositoryRead {return repository_agent(tx,call,&selection,cursor,bounds,cfg,now,validation);}
     let mut raw=call.clone();
+    public_projection(tx,tool,raw.arguments.clone(),Some(call.caller.task_id.clone()),selection,cursor,bounds,|args|{
+        raw.arguments=args.clone();
+        super::collaboration_calls::apply_inner(tx,&raw,cfg,now,validation)
+    })
+}
+
+// Both entry points use this one fitter. The callback retains its original
+// domain/caller checks; it cannot grant authority or request a mutation.
+fn public_projection<F>(tx:&StoreContext<'_>,tool:ReadTool,mut arguments:Value,caller_task_id:Option<String>,selection:Selection,cursor:Option<&Cursor>,bounds:&Bounds<'_>,mut read:F)->Result<Data>
+where F:FnMut(&Value)->Result<(Data,bool)> {
     loop {
-        let (value,changed)=super::collaboration_calls::apply_inner(tx,&raw,cfg,now,validation)?;
+        let (value,changed)=read(&arguments)?;
         if changed {return Err(stored("closed read unexpectedly changed state"));}
         let (value,_)=super::collaboration_calls::safe(tx.limits,(value,false))?;
         let item=matches!(&selection,Selection::Public{item:true,..});
-        if !item && cursor.is_none() && bounds.check(&value).is_ok() {return Ok(value);}
+        if !item && cursor.is_none() && bounds.check(&value).is_ok()
+            && (!bounds.browser || crate::product::read_pages::list_fits(&selection,&value,tx.limits)) {return Ok(value);}
         if let Some((items,next))=list(&value) {
             if item {
                 if items.len()!=1 {return Err(fault(Error::stale()));}
@@ -282,11 +350,11 @@ fn public(tx:&StoreContext<'_>,call:&Invocation,selection:Selection,cursor:Optio
             // Re-evaluate a smaller bounded keyset prefix in this same database
             // observation. Filtered rows still advance under the old semantics.
             // There is no network/model continuation and no page concatenation.
-            let n=raw.arguments.get("limit").and_then(Value::as_u64).unwrap_or(1);
-            if n>1 {raw.arguments["limit"]=json!(n/2);continue;}
-            if items.is_empty() {return Err(bounds.check(&value).unwrap_err()).map_err(fault);}
+            let n=arguments.get("limit").and_then(Value::as_u64).unwrap_or(1);
+            if n>1 {arguments["limit"]=json!(n/2);continue;}
+            if items.is_empty() {return Err(fault(bounds.check(&value).err().unwrap_or_else(||Error::bound("product.response_bytes"))));}
             if items.len()!=1 {return Err(stored("one-row query returned multiple items"));}
-            let selected=Selection::Public {tool,arguments:raw.arguments.clone(),item:true,caller_task_id:Some(call.caller.task_id.clone())};
+            let selected=Selection::Public {tool,arguments:arguments.clone(),item:true,caller_task_id:caller_task_id.clone()};
             let source=item_source(tool,&items[0]);
             let text=canonical(&items[0]).map_err(stored_error)?;
             let p=projection(selected,source,Summary::Public{tool},Encoding::CanonicalJsonUtf8,text,value,None);

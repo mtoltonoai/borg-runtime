@@ -2905,3 +2905,6 @@ mod pull_request_publication;
 
 #[path = "recovery/instruction_source.rs"]
 mod instruction_source;
+
+#[path = "recovery/publication_mcp.rs"]
+mod publication_mcp;

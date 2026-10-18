@@ -28,7 +28,7 @@ pub(super) fn governance_config() -> ControllerConfig {
 }
 fn governance_native(agent: &str) -> TaskInput {
     let mut input = native(agent);
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input
 }
 pub(super) async fn governance_reply(c: &Controller, command: Operation) -> Reply {

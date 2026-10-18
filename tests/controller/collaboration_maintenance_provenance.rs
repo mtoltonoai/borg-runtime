@@ -19,7 +19,7 @@ fn workflow_config() -> ControllerConfig {
 }
 fn workflow_native(agent: &str) -> TaskInput {
     let mut input = native(agent);
-    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     input
 }
 fn request(command: Operation) -> Request {

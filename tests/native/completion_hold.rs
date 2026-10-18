@@ -59,7 +59,7 @@ async fn scenario(evaluator_failure: bool) {
     promote(&api, &lab).await;
     let mut accepted = input(&lab, 3);
     accepted.definition.execution_profile =
-        Some(ExecutionProfile::CollaborationV2 { web_search: None });
+        Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let task = submit_identified(&api, accepted, "submit-native-completion-hold").await;
     let required_count = if evaluator_failure { 2 } else { 1 };
     let subject = task.id.clone();

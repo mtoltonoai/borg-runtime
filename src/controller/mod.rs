@@ -36,6 +36,7 @@ pub use store_phase::StartupCancellation;
 mod database;
 pub mod machine_resources;
 mod pull_request;
+mod publication_requests;
 #[cfg(test)]
 mod pull_request_tests;
 mod governance_completion;

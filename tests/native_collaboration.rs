@@ -824,7 +824,7 @@ fn assert_fixture_native_profile_fits(
     assert!(input.definition.charter.is_none());
     assert!(matches!(&input.definition.execution_profile,
         Some(ExecutionProfile::CollaborationV1 { web_search: None }
-            | ExecutionProfile::CollaborationV2 { web_search: None })));
+            | ExecutionProfile::CollaborationV2 { web_search: None, publication: None })));
     let profile = borg_runtime::native::NativeLoopProfile {
         functions: borg_runtime::mcp::catalogue_for_profile(
             limits, input.definition.execution_profile.as_ref(),
@@ -1137,7 +1137,7 @@ fn native_collaboration_profile_absence_roundtrips_and_ambiguities_refuse() {
     // The original unknown-kind specimen is now an explicitly supported profile.
     let current_value = json!({"kind":"collaboration_v2"});
     let current: ExecutionProfile = serde_json::from_value(current_value.clone()).unwrap();
-    assert_eq!(current, ExecutionProfile::CollaborationV2 { web_search: None });
+    assert_eq!(current, ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     assert_eq!(serde_json::to_value(current).unwrap(), current_value);
     for value in [
         json!({"kind":"unsupported_profile_fixture"}),

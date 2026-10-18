@@ -198,3 +198,64 @@ pub fn outcome_requires_wire24(outcome: &Outcome) -> bool {
         _ => false,
     }
 }
+
+/// Explicit publication vocabulary barriers. Retained read bodies remain ordinary
+/// original operations in this source; no compact-reference variant is admitted.
+pub fn definition_requires_publication(d: &Definition) -> bool {
+    crate::mcp::publication::selection(d.execution_profile.as_ref()).is_some()
+}
+pub fn input_requires_publication(t: &TaskInput) -> bool {
+    definition_requires_publication(&t.definition)
+        || crate::delegation::configured_template(t).is_some_and(|c| definition_requires_publication(&c.definition))
+}
+fn publication_effect(kind: &str, value: &Value) -> bool {
+    (kind == crate::pull_request::HEAD_KIND && value.get("publication").is_some())
+        || (kind == crate::pull_request::CREATE_KIND && value.get("head").is_some_and(|h| h.get("publication").is_some()))
+}
+pub fn requires_publication(op: &Operation) -> bool {
+    match op {
+        Operation::CallCollaboration { call } => crate::mcp::publication::handles(&call.tool)
+            || crate::mcp::identity_administration::parse(&call.tool, &call.arguments).is_ok_and(|r| identity_requires_publication(&r)),
+        Operation::AdministerIdentity { input, .. } => identity_requires_publication(input),
+        Operation::RegisterAgent { definition, .. } => definition_requires_publication(definition),
+        Operation::SubmitTask { input, .. } | Operation::DelegateTask { child: input, .. } => input_requires_publication(input),
+        Operation::SubmitTaskDraft { input, .. } => input.definition.as_ref().is_some_and(definition_requires_publication),
+        Operation::PrepareOperation { kind, intended, .. } => publication_effect(kind, intended),
+        _ => false,
+    }
+}
+fn identity_requires_publication(input: &IdentityAdministrationRequest) -> bool {
+    match &input.mutation {
+        IdentityMutation::Register { definition } | IdentityMutation::Replace { definition, .. } => definition_requires_publication(definition),
+        _ => false,
+    }
+}
+pub fn outcome_requires_publication(outcome: &Outcome) -> bool {
+    let Outcome::Ok { data } = outcome else { return false; };
+    match data {
+        Data::Publication(_) => true,
+        Data::Task(t) => input_requires_publication(&t.input),
+        Data::Tasks(ts) => ts.iter().any(|t| input_requires_publication(&t.input)),
+        Data::Agent(a) => definition_requires_publication(&a.definition),
+        Data::Agents(a) => a.iter().any(|a| definition_requires_publication(&a.definition)),
+        Data::DefinitionUpdate(v) => definition_requires_publication(&v.selected_definition),
+        Data::Charter(crate::charter::CharterOutcome::Definition(v)) => definition_requires_publication(&v.definition),
+        Data::IdentityAdministration(v) => v.before.as_ref().is_some_and(definition_requires_publication)
+            || match &v.effect { IdentityEffect::Registered(a) | IdentityEffect::Retired(a) | IdentityEffect::Replaced(a) => definition_requires_publication(&a.definition), IdentityEffect::Charter(crate::charter::CharterOutcome::Definition(v)) => definition_requires_publication(&v.definition), _ => false },
+        Data::Commands(cs) => cs.iter().any(|c| match c {
+            WorkerCommand::PublishRepository { .. } => true,
+            WorkerCommand::RunAttempt { task, .. } => input_requires_publication(task), _ => false }),
+        Data::Operation(v) => publication_effect(&v.kind, &v.intended)
+            || serde_json::from_value::<Operation>(v.intended.clone()).is_ok_and(|o| requires_publication(&o))
+            || v.outcome.as_ref().is_some_and(|v| serde_json::from_value::<Outcome>(v.clone()).is_ok_and(|o| outcome_requires_publication(&o))),
+        Data::Collaboration(crate::collaboration::QueryResult::Call(v)) => outcome_requires_publication(&v.result.reply.outcome),
+        Data::Collaboration(crate::collaboration::QueryResult::Definition(d)) => definition_requires_publication(d),
+        Data::Collaboration(crate::collaboration::QueryResult::Session(s)) => definition_requires_publication(&s.definition),
+        Data::Collaboration(crate::collaboration::QueryResult::SessionInput { session, input, .. }) => definition_requires_publication(&session.definition) || input_requires_publication(input),
+        Data::Collaboration(crate::collaboration::QueryResult::Sessions(page)) => page.items.iter().any(|s| definition_requires_publication(&s.definition)),
+        Data::CollaborationPage(page) => page.items.iter().any(|item| item.get("definition").is_some_and(|d| serde_json::from_value::<Definition>(d.clone()).is_ok_and(|d| definition_requires_publication(&d)))),
+        Data::WorkMutation(v) => input_requires_publication(&v.view.task.input),
+        Data::WorkQuery(crate::collaboration::work::WorkQueryResult::Task(v)) => input_requires_publication(&v.task.input),
+        _ => false,
+    }
+}
