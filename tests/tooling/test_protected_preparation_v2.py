@@ -55,7 +55,7 @@ def recipe(base):
     # changing checkout/host modes. Pin an explicitly synthetic archive in the
     # private reader only; production archive checks/pins remain unchanged.
     modules=base/'recipe-modules';modules.mkdir()
-    archive=base/'sqlite-archive.fixture';archive.write_bytes(b'controlled preparation archive; not SQLite or release evidence')
+    archive=base/'sqlite-archive.fixture';archive.write_bytes(b'controlled preparation archive; not SQLite or release evidence');archive.chmod(0o444)
     archive_sha=prep.sha(archive);archive_sha3=hashlib.sha3_256(archive.read_bytes()).hexdigest()
     for name in prep.MODULES:
         data=(ROOT/name).read_bytes()
