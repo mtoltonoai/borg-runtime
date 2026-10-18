@@ -1146,6 +1146,12 @@ def codex_home_snapshot(host,state):
     return out
 
 
+_CODEX_RETAINED_SOURCES = {
+    'src/worker/cleanup_plugins.rs':'c1b9a658179748c196f3b855b26e08a1528162240820015b562f8e3ce1223be0',
+    'src/worker/cleanup.rs':'4b0e33c95ae3f0d1c37a4a8f6af8dab9838ec7661c162824d7983b857242d3ea',
+    'src/worker/cleanup_copyout.rs':'d1925748bfcf7bbc5415f8e0c1d1bbd05c86681d62afdb5b2d8efa1581648b69'}
+
+
 class CodexHomePreservation:
     """Closed proof of original vendor disappearance; no mutable path wildcard.
 
@@ -1155,7 +1161,7 @@ class CodexHomePreservation:
     Racing/incomplete progress refuses; no live directory relaxation is added.
     """
     def __init__(self,host,stop,current):
-        self.host,self.stop,self.current=host,stop,current;self.checked={};self.observations={}
+        self.host,self.stop,self.current=host,stop,current;self.checked={};self.observations={};self.retained={}
         self.saved=stop.get('codex_homes',{})
 
     def validate(self,key):
@@ -1267,6 +1273,97 @@ class CodexHomePreservation:
                            'authority_binding':authority['binding'],'current_content_verified':True}
         return self.checked[key]
 
+    def observe_retained(self,name,old,new):
+        """Current no-removal proof; the old progress body was not captured."""
+        if re.fullmatch(r'cleanup-codex/(?:[0-9a-f]{2})+\.json',name) is None:return False
+        h=self.host
+        if not h.selected_writer_sources(_CODEX_RETAINED_SOURCES):return False
+        _codex_deadline(h)
+        key=Path(name).stem;original=self.saved.get(key);dirs=h.inventory_directories
+        if original is None:raise ValueError('codex_retained_unbound_original_home')
+        if (not isinstance(old,dict) or not isinstance(new,dict) or set(old)!={'sha256','identity'} or set(new)!={'sha256','identity'}):
+            raise ValueError('codex_retained_original_row_missing')
+        a,b=old['identity'],new['identity']
+        if (not isinstance(a,list) or not isinstance(b,list) or len(a)!=5 or len(b)!=5
+                or any(type(v) is not int or v<0 for v in a+b) or a[:1]+a[2:]!=b[:1]+b[2:]
+                or a[2]!=h.h['service_uid'] or a[4]!=0o600):raise ValueError('codex_retained_owner_mode_device')
+        policy=h.cleanup_policy()
+        if policy is None:raise ValueError('codex_retained_policy_unselected')
+        record=c.strict(_codex_read(h,name,self.current,policy['retention']['worker']['record_bytes']))
+        c.fields(record,'format_revision command_id attempt_id policy policy_revision status checkpoint first_safe_ms last_observed_ms next_due_ms proof archive exports transcript_expected transcript_sources removing started done reason','codex retained progress')
+        # Preserve the original completed-copyout reader for all actual removal
+        # states. No failed proof is converted to an observational allowance.
+        if record['started'] is not False or record['done'] is not False:return False
+        if any(record[k] is not None for k in ('archive','exports','transcript_expected','transcript_sources','removing')):
+            raise ValueError('codex_retained_copyout_material_present')
+        if record['status'] not in (None,'succeeded','failed','cancelled'):raise ValueError('codex_retained_status_shape')
+        command_path=original['command'];command_row=self.stop['state'].get(command_path)
+        if command_row is None or self.current.get(command_path)!=command_row:raise ValueError('codex_retained_original_command_changed')
+        receipt=c.strict(_codex_read(h,command_path,self.current));c.fields(receipt,'command completed effects_started','codex retained command')
+        command=receipt['command'];attempt=command.get('attempt',{})
+        if (receipt['completed'] is not True or type(receipt['effects_started']) is not bool
+                or command.get('kind')!='run_attempt' or command.get('task',{}).get('definition',{}).get('executor')!='coding'
+                or command_path!='commands/'+command['command_id'].encode().hex()+'.json'
+                or attempt.get('worker_id')!=h.h['api']['worker_id'] or key!=attempt['id'].encode().hex()
+                or type(record['format_revision']) is not int or record['format_revision']!=1
+                or record['command_id']!=command['command_id'] or record['attempt_id']!=attempt['id']
+                or not _same(c,record['policy'],policy['retention']['worker']) or record['policy_revision']!=policy['revision']):
+            raise ValueError('codex_retained_command_policy_binding')
+        if record['checkpoint'] is not None:
+            # The original workspace sidecar was captured in full, unlike this
+            # progress sidecar. Bind a retained checkpoint to those exact old
+            # bytes; this does not assert current canonical task settlement.
+            workspace='cleanup/'+key+'.json';saved=self.stop.get('cleanup_records',{}).get(workspace)
+            if not isinstance(saved,str):raise ValueError('codex_retained_checkpoint_source_absent')
+            workspace_raw=saved.encode();workspace_row=self.stop['state'].get(workspace)
+            if (workspace_row is None or len(workspace_raw)>policy['retention']['worker']['record_bytes']
+                    or c.digest(workspace_raw)!=workspace_row['sha256']):raise ValueError('codex_retained_checkpoint_source_changed')
+            workspace_record=cleanup_record(workspace_raw,workspace,policy)
+            if (workspace_record['command_id']!=command['command_id'] or workspace_record['attempt_id']!=attempt['id']
+                    or not _same(c,record['checkpoint'],workspace_record['checkpoint'])):
+                raise ValueError('codex_retained_checkpoint_binding')
+        base='codex/'+key;root=Path(h.h['state']['root'])
+        proof={'path':str(root/base),'parents':original['parents'],'directory':original['home']}
+        if record['proof'] is not None and not _same(c,record['proof'],proof):raise ValueError('codex_retained_home_proof')
+        for rel,expected,metadata in zip(('.', 'codex', base),original['parents']+[original['home']],original['parent_metadata']+[original['home_metadata']]):
+            meta=dirs.get(rel)
+            if meta is None or _codex_id(meta)!=expected or list(meta[:5])!=metadata or meta[2]!=h.h['service_uid'] or stat.S_IMODE(meta[4])&0o022:
+                raise ValueError('codex_retained_home_replaced')
+        old_home={n:v for n,v in self.stop['state'].items() if n.startswith(base+'/')}
+        current_home={n:v for n,v in self.current.items() if n.startswith(base+'/')}
+        if current_home!=old_home:raise ValueError('codex_retained_original_home_rows_changed')
+        journal_dirs={n:list(m) for n,m in dirs.items() if n.startswith(base+'/') and n[len(base)+1:].split('/')[0] in _CODEX_JOURNALS}
+        if journal_dirs!=original['journal_directories']:raise ValueError('codex_retained_journal_directories_changed')
+        for source in original['transcript_sources']:
+            rel=base+'/'+source['name'];row=self.current.get(rel);directory=dirs.get(rel);entry=None
+            if directory is not None:entry={'name':source['name'],**_codex_id(directory),'kind':'directory'}
+            elif row is not None:entry={'name':source['name'],'device':row['identity'][0],'inode':row['identity'][1],'kind':'file'}
+            if entry!=source['entry'] or _codex_signature(h,base,source['name'],self.current,dirs)!=source['signature']:
+                raise ValueError('codex_retained_original_transcripts_changed')
+        first,last,due=record['first_safe_ms'],record['last_observed_ms'],record['next_due_ms']
+        if (type(last) is not int or not 0<=last<=min(c.now_ms(),2**64-1)
+                or type(due) is not int or not 0<=due<=2**64-1):raise ValueError('codex_retained_clock_shape')
+        reason=record['reason']
+        if reason=='grace':
+            grace_key={'succeeded':'success_grace_ms','failed':'failed_grace_ms','cancelled':'cancelled_grace_ms'}.get(record['status'])
+            if (grace_key is None or type(first) is not int or not 0<=first<=last<due or record['proof'] is None
+                    or due!=_add(first,record['policy'][grace_key])):raise ValueError('codex_retained_grace_binding')
+        elif reason in ('uncertain_effect','canonical_binding'):
+            if first is not None or due!=_add(last,record['policy']['retry_delay_ms']):raise ValueError('codex_retained_hold_binding')
+        else:raise ValueError('codex_retained_reason_outside_scope')
+        evidence={'progress_sha256':new['sha256'],'original_progress_row':copy.deepcopy(old),
+            'sampled_progress_row':copy.deepcopy(new),'original_command_row':copy.deepcopy(command_row),
+            'original_home_rows':len(old_home),'original_home_rows_sha256':c.digest(c.canonical(old_home)),
+            'original_stopped_home':original,'current_reason':reason,'last_observed_ms':last,'next_due_ms':due,
+            'current_not_started':True,'current_not_done':True,'original_home_file_rows_exact':True,
+            'old_progress_body_available':False,'unchanged_progress_fields_claimed':False,
+            'canonical_settlement_claimed':False,'reclamation_claimed':False,'simultaneous_snapshot':False}
+        self.retained[key]=evidence
+        if len(self.retained)>h.l['state_entries'] or len(c.canonical(self.retained))>h.l['receipt_bytes']:raise ValueError('codex_retained_proof_bound')
+        self.observations[name]={'original':old,'observed':new,'retained_home_proof_sha256':c.digest(c.canonical(evidence)),
+                                 'original_home_file_rows_exact':True,'reclamation_claimed':False}
+        return True
+
     def observe(self,name,old,new):
         parts=Path(name).parts
         if len(parts)>=3 and parts[0]=='codex' and re.fullmatch(r'(?:[0-9a-f]{2})+',parts[1]) and parts[2] not in _CODEX_JOURNALS:
@@ -1274,6 +1371,7 @@ class CodexHomePreservation:
             key=parts[1]
         elif len(parts)==2 and parts[0]=='cleanup-codex' and re.fullmatch(r'(?:[0-9a-f]{2})+\.json',parts[1]):
             if new is None:raise ValueError('codex_copyout_progress_removed')
+            if self.observe_retained(name,old,new):return True
             key=parts[1][:-5]
         else:return False
         proof=self.validate(key)
@@ -1285,7 +1383,10 @@ class CodexHomePreservation:
         for name,row in self.current.items():
             if name.startswith('cleanup-codex/') and self.stop['state'].get(name)!=row:
                 if re.fullmatch(r'cleanup-codex/(?:[0-9a-f]{2})+\.json',name) is None:raise ValueError('codex_copyout_progress_path')
-                self.validate(Path(name).stem)
+                key=Path(name).stem
+                if key not in self.retained:self.validate(key)
+        for key in self.retained:
+            _codex_read(self.host,'cleanup-codex/'+key+'.json',self.current)
         # A readback claims a stable sample, never synchronization with a writer.
         # Recheck all validated proof bodies against the sampled inventory.
         for key in self.checked:
@@ -1295,9 +1396,218 @@ class CodexHomePreservation:
                     raise ValueError('codex_copyout_archive_changed_after_read')
 
     def proof(self):
-        return {'status':'SCOPED_COMPLETED_CODEX_HOME_PRESERVATION','attempts':self.checked,
+        return {'status':'SCOPED_CODEX_HOME_PRESERVATION' if self.retained else 'SCOPED_COMPLETED_CODEX_HOME_PRESERVATION','attempts':self.checked,
+                **({'retained_attempts':self.retained,'retained_source_files':_CODEX_RETAINED_SOURCES} if self.retained else {}),
                 'observed_changes':len(self.observations),'same_format_contract_changed':False,
                 'other_original_rows_exact':True,'host_effects':False,'simultaneous_snapshot':False}
+
+
+# This current writer deliberately re-establishes manifest durability during
+# recovery. Its immutable chunks and original command remain separate records.
+_CHARTER_MANIFEST_SOURCES = {
+    'src/worker/charter_output.rs': '77ee76cbb97a69fdd08b510ff3b9404afc64caa02a9fd6db350eba7a4403635b',
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+    'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
+}
+
+
+_CHARTER_JOURNAL_SOURCES = {**_CHARTER_MANIFEST_SOURCES,
+    'src/worker/mutations.rs':'e510c3020ca1476ac3d2bda9762b2cee11d2f29d1ac552472d9218b9237e0553'}
+
+
+class CharterManifestPreservation:
+    """Same-byte atomic manifest replacement; no new output or task authority."""
+    def __init__(self,host,stop,current):
+        self.host,self.stop,self.current=host,stop,current
+        self.observations={};self.journals={};self.commands=None
+        retained=host.retained_policy()
+        self.bound=min(host.l['state_bytes'],host.l['receipt_bytes'],retained['worker']['command_record_bytes'])
+
+    def deadline(self):
+        if c.now_ms()>=self.host.r['deadline_ms']:raise ValueError('charter_manifest_deadline')
+
+    def original_commands(self):
+        if self.commands is not None:return self.commands
+        values=[];total=0
+        for name,expected in self.stop['state'].items():
+            self.deadline()
+            if not name.startswith('commands/'):continue
+            if re.fullmatch(r'commands/(?:[0-9a-f]{2})+\.json',name) is None:raise ValueError('charter_manifest_command_path')
+            if self.current.get(name)!=expected:raise ValueError('charter_manifest_original_command_changed')
+            raw,identity=_file(Path(self.host.h['state']['root'])/name,self.bound,self.host.h['service_uid'])
+            if {'sha256':c.digest(raw),'identity':identity}!=expected:raise ValueError('charter_manifest_command_sample_changed')
+            total+=len(raw)
+            if total>self.host.l['state_bytes']:raise ValueError('charter_manifest_command_bytes')
+            record=c.strict(raw);command=record.get('command')
+            if not isinstance(command,dict):raise ValueError('charter_manifest_command_shape')
+            if command.get('kind')!='run_attempt':continue
+            if record.get('completed') is not True or name!='commands/'+command['command_id'].encode().hex()+'.json':raise ValueError('charter_manifest_command_identity')
+            attempt=command['attempt']
+            caller={'task_id':attempt['task_id'],'attempt_id':attempt['id'],'generation':attempt['generation'],
+                    'worker_id':attempt['worker_id'],'incarnation':attempt['worker_incarnation']}
+            if caller['worker_id']!=self.host.h['api']['worker_id']:raise ValueError('charter_manifest_command_worker')
+            values.append((caller,command,name,expected))
+            if len(values)>self.host.l['state_entries']:raise ValueError('charter_manifest_command_count')
+        self.commands=values
+        return values
+
+    def observe(self,name,old,new):
+        if not isinstance(name,str) or re.fullmatch(r'charter-output/[0-9a-f]{64}/manifest\.json',name) is None:return False
+        self.deadline()
+        if (not isinstance(old,dict) or not isinstance(new,dict) or set(old)!={'sha256','identity'}
+                or set(new)!={'sha256','identity'} or old['sha256']!=new['sha256']):
+            raise ValueError('charter_manifest_content_or_presence_changed')
+        a,b=old['identity'],new['identity']
+        if (not isinstance(a,list) or not isinstance(b,list) or len(a)!=5 or len(b)!=5
+                or any(type(v) is not int or v<0 for v in a+b)
+                or a[:1]+a[2:]!=b[:1]+b[2:] or a[2]!=self.host.h['service_uid'] or a[4]!=0o600):
+            raise ValueError('charter_manifest_identity_changed')
+        raw,identity=_file(Path(self.host.h['state']['root'])/name,self.bound,self.host.h['service_uid'])
+        if {'sha256':c.digest(raw),'identity':identity}!=new:raise ValueError('charter_manifest_sample_changed')
+        manifest=c.strict(raw);c.fields(manifest,'revision caller operation_id observation','charter manifest')
+        caller=manifest['caller'];c.fields(caller,'task_id attempt_id generation worker_id incarnation','charter manifest caller')
+        if (type(manifest['revision']) is not int or manifest['revision']!=1
+                or type(caller['generation']) is not int or not 0<=caller['generation']<=2**64-1
+                or any(not isinstance(caller[k],str) or not caller[k] for k in ('task_id','attempt_id','worker_id','incarnation'))):
+            raise ValueError('charter_manifest_revision_or_caller')
+        observation=manifest['observation'];kind=observation.get('kind') if isinstance(observation,dict) else None
+        fields={'reply':'kind turn_id reply','supplied_reply':'kind turn_id terminal reply','compaction_reply':'kind run_id reply summary'}
+        if kind not in fields:raise ValueError('charter_manifest_observation_kind')
+        c.fields(observation,fields[kind],'charter manifest observation')
+        occurrence=observation['run_id' if kind=='compaction_reply' else 'turn_id']
+        if not isinstance(occurrence,str) or not occurrence or manifest['operation_id']!=occurrence+'-reply':raise ValueError('charter_manifest_operation_identity')
+        directory='charter-output/'+c.digest(manifest['operation_id'].encode())
+        if name!=directory+'/manifest.json':raise ValueError('charter_manifest_directory_identity')
+        reply=observation['reply']
+        if not isinstance(reply,dict) or 'output' in reply:raise ValueError('charter_manifest_inline_output')
+        matches=[row for row in self.original_commands() if c.canonical(row[0])==c.canonical(caller)]
+        if len(matches)!=1:raise ValueError('charter_manifest_unique_original_command')
+        _,command,command_name,command_row=matches[0]
+        accepted=command['task']['resolved_limits']['global_metadata']
+        policy=accepted.get('charter')
+        if not isinstance(policy,dict) or type(policy.get('record_bytes')) is not int or not 0<len(raw)<=policy['record_bytes']:
+            raise ValueError('charter_manifest_accepted_record_bound')
+        reference=reply.get('output_reference');expected_chunks=set()
+        if reference is not None:
+            c.fields(reference,'request_id bytes sha256 chunk_bytes chunks','charter output reference')
+            if (reference['request_id']!=occurrence or any(type(reference[k]) is not int or not 0<reference[k]<=2**32-1 for k in ('chunk_bytes','chunks'))
+                    or type(reference['bytes']) is not int or reference['bytes']<=0
+                    or type(policy.get('records')) is not int or not 0<reference['chunks']<=min(policy['records'],self.host.l['state_entries'])
+                    or reference['chunks']!=(reference['bytes']+reference['chunk_bytes']-1)//reference['chunk_bytes']
+                    or not isinstance(reference['sha256'],str) or re.fullmatch('[0-9a-f]{64}',reference['sha256']) is None):
+                raise ValueError('charter_manifest_output_reference')
+            expected_chunks={directory+'/'+format(i,'010d')+'.chunk' for i in range(reference['chunks'])}
+        original_names={n for n in self.stop['state'] if n.startswith(directory+'/')}
+        current_names={n for n in self.current if n.startswith(directory+'/')}
+        if original_names!={name}|expected_chunks or current_names!=original_names:raise ValueError('charter_manifest_original_chunk_membership')
+        if any(self.current[n]!=self.stop['state'][n] for n in expected_chunks):raise ValueError('charter_manifest_original_chunk_changed')
+        key=c.digest(name.encode())
+        proof={'relative_sha256':key,'original':copy.deepcopy(old),'sampled':copy.deepcopy(new),
+               'manifest_sha256':c.digest(raw),'operation_id_sha256':c.digest(manifest['operation_id'].encode()),
+               'caller_sha256':c.digest(c.canonical(caller)),'observation_kind':kind,
+               'command_relative_sha256':c.digest(command_name.encode()),'original_command_row':copy.deepcopy(command_row),
+               'original_chunk_rows':len(expected_chunks),'original_chunk_rows_sha256':c.digest(c.canonical({n:self.stop['state'][n] for n in sorted(expected_chunks)})),
+               'original_content_exact':True,'inode_only':True,'inode_changed':a[1]!=b[1],'original_command_caller_join':True,
+               'source_writer_may_replace_inode':True,'actual_writer_attributed':False,'new_output_authority':False}
+        self.observations[key]=proof
+        if len(self.observations)>self.host.l['state_entries'] or len(c.canonical(self.observations))>self.host.l['receipt_bytes']:raise ValueError('charter_manifest_observation_bound')
+        return True
+
+    def observe_journal(self,name,old,new):
+        if not isinstance(name,str) or re.fullmatch(r'charter/(?:[0-9a-f]{2})+\.json',name) is None:return False
+        self.deadline()
+        if (not isinstance(old,dict) or not isinstance(new,dict) or set(old)!={'sha256','identity'}
+                or set(new)!={'sha256','identity'} or old['sha256']!=new['sha256']):
+            raise ValueError('charter_journal_content_or_presence_changed')
+        a,b=old['identity'],new['identity']
+        if (not isinstance(a,list) or not isinstance(b,list) or len(a)!=5 or len(b)!=5
+                or any(type(v) is not int or v<0 for v in a+b)
+                or a[:1]+a[2:]!=b[:1]+b[2:] or a[2]!=self.host.h['service_uid'] or a[4]!=0o600):
+            raise ValueError('charter_journal_identity_changed')
+        bound=min(self.host.l['state_bytes'],self.host.l['receipt_bytes'],self.host.retained_policy()['worker']['mutation_record_bytes'])
+        raw,identity=_file(Path(self.host.h['state']['root'])/name,bound,self.host.h['service_uid'])
+        if {'sha256':c.digest(raw),'identity':identity}!=new:raise ValueError('charter_journal_sample_changed')
+        journal=c.strict(raw);c.fields(journal,'limits revision request outcome outcome_context consumed recovery_epoch','charter journal')
+        if (type(journal['revision']) is not int or journal['revision']!=3 or journal['consumed'] is not True
+                or type(journal['recovery_epoch']) is not int or journal['recovery_epoch']!=0):
+            raise ValueError('charter_journal_original_settled_scope')
+        request=journal['request'];c.fields(request,'operation input','charter journal request')
+        body=request['input'];c.fields(body,'operation_id caller observation','charter journal input')
+        operation=body['operation_id']
+        if (request['operation']!='observe_charter' or not isinstance(operation,str) or not operation
+                or name!='charter/'+operation.encode().hex()+'.json'):
+            raise ValueError('charter_journal_request_identity')
+        observation=body['observation'];kind=observation.get('kind') if isinstance(observation,dict) else None
+        if kind not in ('reply','supplied_reply','compaction_reply','output_chunk'):raise ValueError('charter_journal_observation_kind')
+        if kind=='output_chunk':
+            c.fields(observation,'kind chunk','charter chunk observation')
+            chunk=observation['chunk'];c.fields(chunk,'reference index data','charter chunk')
+            reference=chunk['reference'];occurrence=reference.get('request_id') if isinstance(reference,dict) else None
+        else:occurrence=observation.get('run_id' if kind=='compaction_reply' else 'turn_id')
+        if not isinstance(occurrence,str) or not occurrence:raise ValueError('charter_journal_occurrence')
+        manifest_name='charter-output/'+c.digest((occurrence+'-reply').encode())+'/manifest.json'
+        manifest_old=self.stop['state'].get(manifest_name);manifest_new=self.current.get(manifest_name)
+        # The paired original manifest proves caller, operation, accepted command
+        # and unchanged complete chunk membership before a journal is admitted.
+        self.observe(manifest_name,manifest_old,manifest_new)
+        manifest_raw,manifest_identity=_file(Path(self.host.h['state']['root'])/manifest_name,self.bound,self.host.h['service_uid'])
+        if {'sha256':c.digest(manifest_raw),'identity':manifest_identity}!=manifest_new:raise ValueError('charter_journal_manifest_changed')
+        manifest=c.strict(manifest_raw)
+        if not _same(c,body['caller'],manifest['caller']):raise ValueError('charter_journal_caller_changed')
+        matches=[row for row in self.original_commands() if _same(c,row[0],body['caller'])]
+        if len(matches)!=1:raise ValueError('charter_journal_unique_original_command')
+        _,command,command_name,command_row=matches[0];accepted=command['task']['resolved_limits']['global_metadata']
+        if (not _same(c,journal['limits'],accepted) or len(raw)>accepted['worker']['mutation_record_bytes']
+                or len(c.canonical(request))>accepted['transport']['body_bytes']):
+            raise ValueError('charter_journal_accepted_limits')
+        outcome=journal['outcome'];c.fields(outcome,'status data','charter journal outcome')
+        data=outcome['data'];c.fields(data,'kind value','charter journal data')
+        result=data['value'];c.fields(result,'kind value','charter journal result')
+        if outcome['status']!='ok' or data['kind']!='charter' or len(c.canonical(outcome))>accepted['transport']['body_bytes']:
+            raise ValueError('charter_journal_original_outcome')
+        if kind=='output_chunk':
+            expected_ref=manifest['observation']['reply'].get('output_reference');index=chunk['index'];encoded=chunk['data']
+            if (expected_ref is None or not _same(c,reference,expected_ref) or type(index) is not int or not 0<=index<reference['chunks']
+                    or operation!='charter-output-'+c.digest(occurrence.encode())+'-'+str(index)
+                    or not isinstance(encoded,str) or re.fullmatch(r'(?:[0-9a-f]{2})+',encoded) is None):
+                raise ValueError('charter_journal_chunk_identity')
+            chunk_raw=bytes.fromhex(encoded);chunk_name=str(Path(manifest_name).parent)+'/'+format(index,'010d')+'.chunk'
+            expected_size=min(reference['chunk_bytes'],reference['bytes']-index*reference['chunk_bytes'])
+            expected={'reference':reference,'index':index,'sha256':c.digest(chunk_raw),'bytes':len(chunk_raw)}
+            if (len(chunk_raw)!=expected_size or self.stop['state'][chunk_name]['sha256']!=expected['sha256']
+                    or result['kind']!='output_chunk' or not _same(c,result['value'],expected)):
+                raise ValueError('charter_journal_chunk_receipt')
+        else:
+            if operation!=manifest['operation_id'] or not _same(c,observation,manifest['observation']):raise ValueError('charter_journal_manifest_request')
+            value=result['value']
+            if kind=='compaction_reply':
+                if result['kind']!='compaction' or not isinstance(value,dict) or value.get('run_id')!=occurrence or not _same(c,value.get('caller'),body['caller']):raise ValueError('charter_journal_compaction_result')
+                value=value.get('reply')
+            elif result['kind']!='reply':raise ValueError('charter_journal_reply_result')
+            c.fields(value,'reply_id turn_id effective observation audit','charter journal reply')
+            if value['reply_id']!=operation or value['turn_id']!=occurrence or not _same(c,value['observation'],observation['reply']):raise ValueError('charter_journal_reply_identity')
+        context=journal['outcome_context'];c.fields(context,'commit observed_controller_revision','charter journal context')
+        commit=context['commit'];c.fields(commit,'operation_id controller_revision','charter journal commit')
+        revision,observed=commit['controller_revision'],context['observed_controller_revision']
+        if (commit['operation_id']!=operation or type(revision) is not int or type(observed) is not int
+                or not 0<revision<=observed<=2**63-1):raise ValueError('charter_journal_original_commit')
+        key=c.digest(name.encode())
+        self.journals[key]={'relative_sha256':key,'original':copy.deepcopy(old),'sampled':copy.deepcopy(new),
+            'original_content_exact':True,'inode_only':True,'inode_changed':a[1]!=b[1],
+            'manifest_relative_sha256':c.digest(manifest_name.encode()),'manifest_sha256':manifest_old['sha256'],
+            'command_relative_sha256':c.digest(command_name.encode()),'original_command_row':copy.deepcopy(command_row),
+            'observation_kind':kind,'original_context_sha256':c.digest(c.canonical(context)),
+            'original_request_sha256':c.digest(c.canonical(request)),'original_outcome_sha256':c.digest(c.canonical(outcome)),
+            'source_writer_may_replace_inode':True,'actual_writer_attributed':False,'new_operation_authority':False}
+        if len(self.journals)>self.host.l['state_entries'] or len(c.canonical(self.journals))>self.host.l['receipt_bytes']:raise ValueError('charter_journal_observation_bound')
+        return True
+
+    def proof(self):
+        return {'status':'SCOPED_ORIGINAL_CHARTER_MANIFEST_OBSERVATIONS','records':len(self.observations),
+                'observations':copy.deepcopy(self.observations),'source_files':_CHARTER_MANIFEST_SOURCES,
+                'journal_observations':copy.deepcopy(self.journals),'journal_source_files':_CHARTER_JOURNAL_SOURCES,
+                'other_history_guards_unchanged':True,'host_effects':False,'directory_allowances_added':False,
+                'simultaneous_snapshot':False,'original_content_and_noninode_identity_preserved':True}
 
 
 class StopMarkers:
@@ -1873,6 +2183,10 @@ class Host:
                 observations[name]=home_proof.observations[name]
             elif name.startswith('cleanup/'):
                 observations[name]=self.cleanup_observation(name,value,current.get(name),stop.get('cleanup_records',{}))
+            elif self.charter_manifest_observation(name,value,current.get(name),stop,current):
+                observations[name]=self._charter_manifests.observations[c.digest(name.encode())]
+            elif self.charter_journal_observation(name,value,current.get(name),stop,current):
+                observations[name]=self._charter_manifests.journals[c.digest(name.encode())]
             elif self.stop_marker_observation(name,value,current.get(name),stop,current):preserved[name]=value
             else:raise history_refusal('worker_history.original_row',name,value,current.get(name))
         if home_proof is not None:
@@ -1889,6 +2203,18 @@ class Host:
         if not isinstance(manifest,dict):return False
         files=manifest.get('source',{}).get('files',{})
         return all(isinstance(files.get(name),dict) and files[name].get('sha256')==sha for name,sha in required.items())
+    def charter_manifest_observation(self,name,old,new,stop,current):
+        if not isinstance(name,str) or re.fullmatch(r'charter-output/[0-9a-f]{64}/manifest\.json',name) is None:return False
+        if not self.selected_writer_sources(_CHARTER_MANIFEST_SOURCES):return False
+        hook=getattr(self,'_charter_manifests',None)
+        if hook is None:self._charter_manifests=hook=CharterManifestPreservation(self,stop,current)
+        return hook.observe(name,old,new)
+    def charter_journal_observation(self,name,old,new,stop,current):
+        if not isinstance(name,str) or re.fullmatch(r'charter/(?:[0-9a-f]{2})+\.json',name) is None:return False
+        if not self.selected_writer_sources(_CHARTER_JOURNAL_SOURCES):return False
+        hook=getattr(self,'_charter_manifests',None)
+        if hook is None:self._charter_manifests=hook=CharterManifestPreservation(self,stop,current)
+        return hook.observe_journal(name,old,new)
     def stop_marker_observation(self,name,old,new,stop,current):
         if not (self.codex_home_scope() or self.selected_writer_sources({'src/worker/mod.rs':_STOP_SOURCE_SHA,'src/worker/process.rs':_PROCESS_SOURCE_SHA})):return False
         if not isinstance(name,str) or re.fullmatch(r'stops/(?:[0-9a-f]{2})+',name) is None:return False
@@ -2198,6 +2524,7 @@ class Host:
                 if capture:extra['cleanup_capture_proof']=capture.proof()
                 if getattr(self,'_cleanup_transitions',None):extra['cleanup_transition_proof']=self._cleanup_transitions.proof()
                 if getattr(self,'_stop_markers',None):extra['stop_marker_proof']=self._stop_markers.proof()
+                if getattr(self,'_charter_manifests',None):extra['charter_manifest_proof']=self._charter_manifests.proof()
             receipt_ids=[]
             if self.h['role']=='controller':
                 receipts=verify_controller_receipts(self)
