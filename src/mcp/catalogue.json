@@ -1065,6 +1065,7 @@
     },
     "annotations": {
       "readOnlyHint": true,
+      "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
     }
@@ -1087,6 +1088,7 @@
     },
     "annotations": {
       "readOnlyHint": true,
+      "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
     }
