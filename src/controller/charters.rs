@@ -331,11 +331,16 @@ fn results(tx:&StoreContext<'_>,r:&RequestRecord,v:&CharterReplyRecord,values:&[
         CharterResultReceipt::Collaboration{call_id,operation_id}=>{
             let ordinal=u32::try_from(position).ok().and_then(|i|i.checked_add(1)).ok_or_else(||corrupt("tool ordinal overflow"))?;
             if *operation_id!=crate::native_loop_contract::call_operation_id(&r.caller().attempt_id,r.index(),ordinal){return refuse("invalid_input","tool operation differs from original request/ordinal");}
-            let original=receipt(tx,operation_id)?;if original.commit.controller_revision<=boundary_commit||original.commit.controller_revision<=reply_commit{return refuse("reconciliation_required","tool receipt preceded durable original reply");}
+            let original=metadata::read_retained(tx,operation_id)?.ok_or_else(||corrupt("original tool receipt missing"))?;if original.commit.controller_revision<=boundary_commit||original.commit.controller_revision<=reply_commit{return refuse("reconciliation_required","tool receipt preceded durable original reply");}
             let Operation::CallCollaboration{call}=original.request else{return refuse("invalid_input","evidence is not original collaboration operation")};
             if call.caller!=*r.caller()||call.logical_call_id!=*call_id{return refuse("caller_mismatch","tool receipt belongs to another occurrence");}
-            if !matches!(&original.outcome,Outcome::Ok{..}|Outcome::Refused{..}){return refuse("reconciliation_required","tool outcome unresolved");}
-            if call.tool=="collab_task_delegate"&&matches!(&original.outcome,Outcome::Ok{..}){delegated_result(tx,r,operation_id,&original.outcome,delivered_by)?;child_delivered=true;}
+            match &original.outcome {
+                metadata::RetainedOutcome::Inline(outcome @ (Outcome::Ok{..}|Outcome::Refused{..}))=>{
+                    if call.tool=="collab_task_delegate"&&matches!(outcome,Outcome::Ok{..}){delegated_result(tx,r,operation_id,outcome,delivered_by)?;child_delivered=true;}
+                }
+                metadata::RetainedOutcome::ReadReference(_)=>{}, // validated successful read; owner/ordinal/commit order above remain exact
+                _=>return refuse("reconciliation_required","tool outcome unresolved"),
+            }
         }
         CharterResultReceipt::CurrentTask{call_id,report_id}=>{
             let original=receipt(tx,report_id)?;if original.commit.controller_revision<=boundary_commit||original.commit.controller_revision<=reply_commit{return refuse("reconciliation_required","current-task result preceded durable original reply");}
@@ -675,7 +680,7 @@ fn validate_closure_receipt_for_turn(tx:&StoreContext<'_>,id:&str,l:&CharterLimi
     }
     for result in &c.results {
         let id=match result{CharterResultReceipt::Collaboration{operation_id,..}=>operation_id,CharterResultReceipt::CurrentTask{report_id,..}=>report_id};
-        if receipt(tx,id)?.commit.controller_revision>=original.commit.controller_revision{return Err(corrupt("closure preceded committed result"));}
+        if metadata::read_retained(tx,id)?.ok_or_else(||corrupt("closure original result missing"))?.commit.controller_revision>=original.commit.controller_revision{return Err(corrupt("closure preceded committed result"));}
     }
     let valid=match (&original.request,charter_outcome(&original)?) {
         (Operation::ObserveCharter{caller,observation:CharterObservation::CompleteTurn{turn_id,results},..},CharterOutcome::Turn(record))=>caller==&c.caller&&turn_id==id&&results==&c.results&&record==value,
@@ -838,7 +843,7 @@ fn validate_receipt_membership(tx:&StoreContext<'_>,l:Option<&CharterLimits>)->R
     while let Some(row)=rows.next()?{let id:String=row.get(0)?;
         identity(tx,&id).map_err(|_|corrupt("stored receipt identity exceeds bound"))?;
         // receipt() checks request/outcome lengths before metadata::read decodes.
-        let original=receipt(tx,&id)?;
+        let Some(original)=metadata::scan_inline(tx,&id)? else {continue};
         if let Some(l)=l {validate_original_membership(tx,&original,l)?;}
         else {validate_request_vocabulary(tx,&original.request)?;}
     }

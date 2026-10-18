@@ -439,3 +439,20 @@ pub(super) async fn attempt_at(
     save(state, &record)?;
     Ok(None)
 }
+
+/// The existing copyout verifier, not a caller-supplied positive hash, produces
+/// custody. Original transcripts and the copyout record remain unchanged.
+pub(super) async fn read_custody(state:&Path,attempt:&Attempt,policy:&WorkerRetentionLimits,revision:&str,control:&Control)
+    ->Result<crate::read_retention::TranscriptCustody,String> {
+    let directory=sidecars(state)?;
+    let record:Progress=read_record(&fd_path(&directory).join(format!("{}.json",component(&attempt.id))),policy.record_bytes)?.ok_or("verified transcript cleanup record missing")?;
+    if !record.done || record.attempt_id!=attempt.id || record.policy!=*policy || record.policy_revision!=revision {
+        return Err("transcript cleanup provenance differs".into());
+    }
+    copyout::verify_completed(state,&record,control).await?;
+    let exports=record.exports.as_ref().ok_or("copyout exports absent")?;
+    let (bytes,files)=copyout::custody_counts(exports)?;
+    Ok(crate::read_retention::TranscriptCustody::CodingCopy {
+        manifest_sha256:crate::read_retention::digest(&serde_json::to_vec(exports).map_err(|_|"copyout manifest encoding")?),bytes,files,
+    })
+}

@@ -14,8 +14,8 @@ fn closed_read_list_matches_current_canonical_adapters_and_never_name_shapes() {
         assert_eq!(retryable_read_tool(&tool.name), read, "{}", tool.name);
         reads += usize::from(read);
     }
-    assert_eq!(reads, 42);
-    for name in ["collab_machines_list", "collab_machine_get"] {
+    assert_eq!(reads, 43);
+    for name in ["collab_machines_list", "collab_machine_get", "collab_read_continue"] {
         assert!(retryable_read_tool(name), "machine observations use the canonical read recovery path: {name}");
         let tool = mcp::catalogue_for_profile(&limits, Some(&profile)).into_iter()
             .find(|tool| tool.name == name).expect("machine read is in the selected catalogue");

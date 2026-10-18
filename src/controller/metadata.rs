@@ -11,6 +11,41 @@ pub(super) struct Recorded {
     pub commit: MutationCommit,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(super) enum RetainedOutcome {
+    Inline(Outcome),
+    ReadReference(crate::read_retention::CompactOutcome),
+}
+pub(super) struct Retained {
+    pub request:Operation,
+    pub outcome:RetainedOutcome,
+    pub commit:MutationCommit,
+}
+impl Retained {
+    pub fn lookup(&self) -> Result<OperationRecord> {
+        match &self.outcome {
+            RetainedOutcome::Inline(outcome) => lookup_record(&self.commit.operation_id,&self.request,outcome),
+            RetainedOutcome::ReadReference(reference) => {
+                let Operation::CallCollaboration { call }=&self.request else {return Err(Fault::Store("compact read request differs".into()))};
+                Ok(OperationRecord { id:self.commit.operation_id.clone(), task_id:call.caller.task_id.clone(),
+                    attempt_id:call.caller.attempt_id.clone(), generation:call.caller.generation,
+                    kind:"committed_read_reference".into(), intended:serde_json::to_value(&self.request)?,
+                    state:crate::read_retention::UNAVAILABLE.into(), outcome:Some(serde_json::to_value(reference)?) })
+            }
+        }
+    }
+    pub fn replay(self) -> Result<Outcome> {
+        match self.outcome {
+            RetainedOutcome::Inline(outcome)=>Ok(outcome),
+            RetainedOutcome::ReadReference(record)=> {
+                let Operation::CallCollaboration { call:invocation }=self.request else {return Err(Fault::Store("compact read request differs".into()))};
+                Ok(Outcome::Ok {data:Data::OriginalReadBodyUnavailable(Box::new(crate::read_retention::ReleasedRead {invocation,original_commit:self.commit,record}))})
+            }
+        }
+    }
+}
+
 pub(super) fn current(tx: &Connection) -> Result<u64> {
     let value: Option<i64> = tx
         .query_row(
@@ -42,6 +77,24 @@ pub(super) fn advance(tx: &Connection) -> Result<u64> {
 }
 
 pub(super) fn read(tx: &Connection, id: &str) -> Result<Option<Recorded>> {
+    let Some(value)=read_retained(tx,id)? else {return Ok(None)};
+    match value.outcome {
+        RetainedOutcome::Inline(outcome)=>Ok(Some(Recorded {request:value.request,outcome,commit:value.commit})),
+        RetainedOutcome::ReadReference(_)=>Err(Fault::Store(crate::read_retention::UNAVAILABLE.into())),
+    }
+}
+
+/// Inventory scanners that inspect write/control families explicitly skip an
+/// already validated compact read. This is not an original-operation lookup.
+pub(super) fn scan_inline(tx:&Connection,id:&str)->Result<Option<Recorded>> {
+    let value=read_retained(tx,id)?.ok_or_else(||Fault::Store("receipt inventory changed".into()))?;
+    Ok(match value.outcome {
+        RetainedOutcome::Inline(outcome)=>Some(Recorded {request:value.request,outcome,commit:value.commit}),
+        RetainedOutcome::ReadReference(_)=>None,
+    })
+}
+
+pub(super) fn read_retained(tx: &Connection, id: &str) -> Result<Option<Retained>> {
     let limits = tx.limits;
     let row: Option<(String, String, i64)> = tx
         .query_row(
@@ -59,16 +112,26 @@ pub(super) fn read(tx: &Connection, id: &str) -> Result<Option<Recorded>> {
         ));
     }
     let request: Operation = decode(&request)?;
-    let outcome: Outcome = decode(&outcome)?;
+    let outcome: RetainedOutcome = decode(&outcome)?;
     if request.mutation_id() != Some(id)
         || revision <= 0
         || revision as u64 > current(tx)?
-        || !matches!(&outcome, Outcome::Ok { .. } | Outcome::Refused { .. })
     {
         return Err(Fault::Store("invalid committed mutation receipt".into()));
     }
-    receipt_bound(limits, &request, &outcome)?;
-    Ok(Some(Recorded {
+    match &outcome {
+        RetainedOutcome::Inline(outcome) => {
+            if !matches!(outcome,Outcome::Ok {..}|Outcome::Refused {..}) {return Err(Fault::Store("invalid committed outcome".into()))}
+            receipt_bound(limits,&request,outcome)?;
+        }
+        RetainedOutcome::ReadReference(reference) => {
+            let version:i64=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+            if version<26 {return Err(Fault::Store("compact read vocabulary requires schema26".into()))}
+            reference.validate(&request).map_err(Fault::Store)?;
+            super::read_retention::validate_origin(tx,id,&request,reference,revision as u64)?;
+        }
+    }
+    Ok(Some(Retained {
         request,
         outcome,
         commit: MutationCommit {
@@ -111,7 +174,7 @@ pub(super) fn validate_existing(tx: &Connection, cfg: &ControllerConfig) -> Resu
                 "invalid receipt revision order or capacity".into(),
             ));
         }
-        read(tx, &id)?
+        read_retained(tx, &id)?
             .ok_or_else(|| Fault::Store("receipt disappeared during validation".into()))?;
         previous = revision;
     }

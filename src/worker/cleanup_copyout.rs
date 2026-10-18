@@ -747,3 +747,7 @@ pub(super) async fn verify_completed(
     }
     Ok(())
 }
+
+pub(super) fn custody_counts(exports:&[Export])->Result<(u64,u64),String> {
+    exports.iter().try_fold((0u64,0u64),|(bytes,files),entry|Ok((bytes.checked_add(entry.bytes).ok_or("transcript bytes overflow")?,files.checked_add(entry.files).ok_or("transcript files overflow")?)))
+}

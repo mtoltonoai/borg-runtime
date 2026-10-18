@@ -92,16 +92,18 @@ async fn route(
                 },
             )
             .await;
-            let Outcome::Ok {
-                data: Data::Collaboration(QueryResult::Call(record)),
-            } = reply.outcome
-            else {
-                return Err(not_task(reply));
-            };
-            body.push_str(&format!(
-                "<h2>Original call and recorded outcome</h2><pre>{}</pre>",
-                escape(&serde_json::to_string_pretty(&record).unwrap_or_default())
-            ));
+            match &reply.outcome {
+                Outcome::Ok {data:Data::Collaboration(QueryResult::Call(record))} => {
+                    body.push_str(&format!("<h2>Original call and recorded outcome</h2><pre>{}</pre>",
+                        escape(&serde_json::to_string_pretty(record).unwrap_or_default())));
+                }
+                Outcome::Ok {data:Data::Collaboration(QueryResult::RetainedCall(record))} => {
+                    body.push_str(&format!("<h2>Original read body unavailable</h2><p>The retained reference describes the earlier observation. Its body was released after terminal custody; the digest is not a replacement body.</p><pre>{}</pre><p>A fresh observation uses a new occurrence and current admission. It does not change this original call.</p>",
+                        escape(&serde_json::to_string_pretty(record).unwrap_or_default())));
+                    let _ = write!(body, "<p><a href=\"{base}\">Fresh task observation</a> · <a href=\"{base}/repository\">Fresh accepted-source observation</a></p>");
+                }
+                _ => return Err(not_task(reply)),
+            }
             let _ = write!(body, "<p><a href=\"/operations/{}\">Original operation receipt</a></p>", encode(op));
         }
         return Ok(page(200, "Collaboration call outcome", body));
@@ -117,7 +119,7 @@ async fn route(
             "limit",
             "start_line",
             "max_lines",
-            "needle",
+            "needle", "cursor", "max_bytes",
         ],
     )
     .map_err(invalid)?;
@@ -135,7 +137,9 @@ async fn route(
             limit: amount(&f, "limit", controller.limits().repository.default_entries)
                 .map_err(invalid)?,
         },
-        "read" => Request::ReadFile {
+        "read" => Request::ReadPage {
+            cursor: super::read_pages::options(&f)?.0,
+            max_bytes: super::read_pages::options(&f)?.1,
             source: selector,
             path: repo_path.clone(),
             start_line: amount(
@@ -293,6 +297,8 @@ async fn route(
     }
     body.push_str("</dl>");
     match &output.data {
+        crate::repository_view::Data::ReadPage(value)=>return Ok(super::read_pages::render(value)),
+        crate::repository_view::Data::FileSlice {..}=>return Err(error(502,"Unprojected repository helper result")),
         crate::repository_view::Data::Tree {
             entries,
             next_after,

@@ -1,17 +1,20 @@
 //! Coding worker for the task-boundary v2 profile.
 mod acceptance;
 mod cleanup;
+mod read_retention;
 mod charter;
 pub mod codex;
 pub mod codex_mcp;
 pub mod git;
 mod handoff;
+mod identity_limit_fields;
 // Historical mirror decoder and shared local fixtures; no production delivery.
 #[cfg(test)]
 mod memory_notice;
 mod collaboration_notice;
 mod mutations;
 pub mod machine_resources;
+mod read_pagination;
 mod completion;
 mod native_loop;
 mod native_retry;
@@ -1199,7 +1202,7 @@ fn report_contains_credential(
         return Ok(true);
     }
     Ok(match &report.observation {
-        Observation::SuppliedOuter { .. } => {
+        Observation::ReadTranscriptCustody { .. } | Observation::SuppliedOuter { .. } => {
             let value = serde_json::to_value(&report.observation)
                 .map_err(|_| "supplied outer report credential projection failed")?;
             value_contains_credential(&value, credentials, limits)?
@@ -2670,6 +2673,9 @@ fn admit_native_worker18_outcomes(state: &Path, limits: &RuntimeLimits) -> Resul
     admit_native_outcomes(state,limits,outcome_requires_worker18)
 }
 fn admit_native_outcomes(state: &Path, limits: &RuntimeLimits,rejects:fn(&Outcome)->bool) -> Result<(), String> {
+    admit_native_journals(state, limits, |journal| journal.outcome.as_ref().is_some_and(rejects))
+}
+fn admit_native_journals(state: &Path, limits: &RuntimeLimits, rejects: impl Fn(&mutations::Journal)->bool) -> Result<(), String> {
     for (_, receipt) in command_receipts(state, limits)? {
         let WorkerCommand::RunAttempt { attempt, task, .. } = &receipt.command else { continue; };
         if task.definition.executor != ExecutorKind::Native || !crate::execution_profile::collaboration(task) { continue; }
@@ -2690,7 +2696,7 @@ fn admit_native_outcomes(state: &Path, limits: &RuntimeLimits,rejects:fn(&Outcom
             if !matches!(&journal.request, Operation::CallCollaboration { call } if call.caller == collaboration_caller(attempt)) {
                 return Err("collaboration journal caller or operation changed".into());
             }
-            if journal.outcome.as_ref().is_some_and(rejects) {
+            if rejects(&journal) {
                 return Err("retained native outcome requires its original worker marker".into());
             }
         }
@@ -2740,6 +2746,12 @@ fn coding_collaboration_closed(
         || !handoff::admits_machine_resources(state, &config.worker_limits)?
     {
         codex_mcp::admit_worker19_outcomes(&config)?;
+    }
+    if !handoff::admits_identity_limit_fields(state, &config.worker_limits)? {
+        codex_mcp::admit_identity_limit_fields_outcomes(&config)?;
+    }
+    if !handoff::admits_read_pagination(state,&config.worker_limits)? {
+        codex_mcp::admit_read_pagination(&config)?;
     }
     if collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {
         return Ok(false);
@@ -3203,6 +3215,10 @@ fn retained_worker_limits(
             if selected.execution.coding.rate_limit_retry.is_some()
                 && !handoff::admits_supplied_retry(state,&selected.worker)? {
                 return Err("coding.rate_limit_retry requires worker19 before retaining new limits".into());
+            }
+            if crate::protocol::identity_limit_fields::metadata_uses(selected)
+                && !handoff::admits_identity_limit_fields(state, &selected.worker)? {
+                return Err("identity limit field policy requires worker20 before retaining new limits".into());
             }
             atomic_json(&path, &**selected)?;
             return Ok(selected.clone());

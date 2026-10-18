@@ -119,6 +119,66 @@ class RetainedHoldTests(NoExternalEffects):
                     host.cleanup_clocks(before,tick(before),retained_holds=True)
 
 
+    def select_recovered(self,h):
+        h.p['formats']={'before':dict(host._RECOVERED_CODEX_HOME_FORMATS),
+                        'after':dict(host._RECOVERED_CODEX_HOME_FORMATS),'source_files':{}}
+        h._verified_manifest={'source':{'files':{name:{'sha256':digest}
+            for name,digest in host._RECOVERED_CODEX_HOME_SOURCES.items()}}}
+
+    def test_selected20_workspace_hold_ticks_keep_original_material_and_no_reclaim(self):
+        # This is cleanup/, not the independent cleanup-codex/ sidecar reader.
+        for reason in ('uncertain_effect','canonical_binding'):
+            with self.subTest(reason=reason),transition_fixture('clock') as x:
+                x.original=hold(x.original,reason);x.observed=tick(x.original)
+                x.task.update(status='failed',selected_checkpoint=None)
+                x.task['attempt']['uncertain']=True
+                x.baseline();x.install();self.select_recovered(x.host)
+                original=copy.deepcopy(x.original)
+                with mock.patch.object(host,'validate_transition',side_effect=AssertionError('hold cannot reclaim')):
+                    current,preserved,observed=x.observe()
+                self.assertEqual(preserved[x.f.command],x.before[x.f.command])
+                row=observed[x.f.name]
+                self.assertEqual(set(row),{'original','observed','last_observed_ms_before','last_observed_ms_after',
+                    'next_due_ms_before','next_due_ms_after','unchanged_record_sha256'})
+                self.assertEqual(row['original'],x.before[x.f.name])
+                self.assertEqual(row['observed'],current[x.f.name])
+                self.assertEqual(row['last_observed_ms_before'],original['last_observed_ms'])
+                self.assertEqual(row['next_due_ms_after'],x.observed['last_observed_ms']+original['policy']['retry_delay_ms'])
+                self.assertEqual(x.hook.proof()['records'],0)
+                self.assertEqual(x.capture.proof()['records'],1)
+                self.assertEqual(C.strict(x.host.cleanup_bytes(x.f.name,current[x.f.name],1048576)),x.observed)
+                self.assertEqual(x.original,original)
+
+    def test_selected20_workspace_holds_refuse_missing_mixed_or_unselected_writer(self):
+        for change in ('missing_cleanup','changed_cleanup','missing_process','changed_process',
+                       'mixed19_cleanup','historical_family','unrelated_family_pin'):
+            with self.subTest(change=change),cleanup_fixture() as f:
+                f.record=hold(f.record);f.write(f.name,f.record);f.refresh()
+                self.select_recovered(f.host)
+                # Exact historical profile pins cannot rescue a failed20 family.
+                select(f.host)
+                files=f.host._verified_manifest['source']['files']
+                if change.startswith('missing_'):del files['src/worker/'+change[8:]+'.rs']
+                elif change.startswith('changed_'):files['src/worker/'+change[8:]+'.rs']['sha256']='0'*64
+                elif change=='mixed19_cleanup':files['src/worker/cleanup.rs']['sha256']=host._RETAINED_HOLD_SOURCE_SHA
+                elif change=='historical_family':
+                    f.host._verified_manifest={'source':{'files':{n:{'sha256':v} for n,v in host._COMPOSED_CODEX_HOME_SOURCES.items()}}}
+                else:del files['src/worker/read_retention.rs']
+                f.write(f.name,tick(f.record));current=f.host.state_files()
+                with self.assertRaisesRegex(ValueError,'outside observation-only'):
+                    f.host.cleanup_clock_observation(f.name,f.before[f.name],current[f.name],f.stop['cleanup_records'])
+
+    def test_selected20_workspace_hold_material_and_backward_clock_still_refuse(self):
+        changes=[lambda x:x.update(reason='canonical_binding'),lambda x:x.update(status='failed'),
+                 lambda x:x.update(last_observed_ms=1),lambda x:x.update(cache_started=True)]
+        for index,change in enumerate(changes):
+            with self.subTest(change=index),cleanup_fixture() as f:
+                f.record=hold(f.record);f.write(f.name,f.record);f.refresh();self.select_recovered(f.host)
+                after=tick(f.record);change(after);f.write(f.name,after);current=f.host.state_files()
+                with self.assertRaises(ValueError):
+                    f.host.cleanup_clock_observation(f.name,f.before[f.name],current[f.name],f.stop['cleanup_records'])
+
+
 class HostObservationEntryTests(NoExternalEffects):
     def test_partial_binding_and_every_noninspect_phase_refuse_before_read_or_dispatch(self):
         profile={'limits':{'module_bytes':1000}}

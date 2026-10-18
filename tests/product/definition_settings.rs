@@ -1,6 +1,8 @@
 //! Product tests for the operator's definition-limit form. Include as a child
 //! module of tests/product.rs. All effects and receipts come from Controller;
-//! there is no model, worker caller, remote service or fabricated commit proof.
+//! mutations use the real local operator HTTP route; there is no model, worker
+//! caller, external service or fabricated commit proof. Client JavaScript is
+//! qualified separately by definition_settings_operator.cjs.
 use super::*;
 use borg_runtime::limits::{DefinitionLimitField, DefinitionUpdatePolicy};
 use std::sync::Arc;
@@ -112,7 +114,35 @@ fn settings_submission_input(task: &Task, definition: Definition) -> TaskInput {
     input
 }
 
+// Same actual HTTP boundary as governance controls. This helper does not
+// manufacture Browser authority or mock the controller/transport.
+pub(super) async fn operator_reply(controller: &Controller, operation_id: &str, update: &DefinitionUpdate) -> Reply {
+    let listener = borg_runtime::server::listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(borg_runtime::server::serve(controller.clone(), listener, origin.clone()));
+    let request = Request { protocol_revision: WIRE_REVISION,
+        request_id: format!("settings-operator-request-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+        command: Operation::UpdateDefinition { operation_id: operation_id.into(), update: update.clone() } };
+    let response = reqwest::Client::builder().no_proxy().build().unwrap()
+        .post(format!("{origin}/api/operations")).header("Origin", &origin)
+        .header("Content-Type", "application/json").body(serde_json::to_vec(&request).unwrap())
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let reply: Reply = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(reply.request_id, request.request_id);
+    reply.validate_for(&request.command).unwrap();
+    server.abort(); let _ = server.await;
+    reply
+}
+pub(super) async fn operator_post(controller: &Controller, operation_id: &str, update: &DefinitionUpdate) -> UiResponse {
+    let reply = operator_reply(controller, operation_id, update).await;
+    assert!(reply.commit.is_some(), "no committed receipt: inspect original API reply without presenting a different stored outcome: {reply:?}");
+    ui(controller, "GET", &format!("/operations/{}", encode(operation_id)), vec![]).await
+}
 async fn settings_post(controller: &Controller, operation_id: &str, update: &DefinitionUpdate) -> UiResponse {
+    operator_post(controller, operation_id, update).await
+}
+async fn settings_browser_post(controller: &Controller, operation_id: &str, update: &DefinitionUpdate) -> UiResponse {
     ui(controller, "POST", &settings_route(&update.agent_id), settings_body(operation_id, update)).await
 }
 
@@ -174,7 +204,7 @@ async fn settings_form_displays_active_policy_selected_revision_and_only_allowed
     let definition = &accepted.input.definition;
     let page = ui(&f.controller, "GET", &settings_route(&definition.id), vec![]).await;
     assert_eq!(page.status, 200, "{}", page.body);
-    assert!(page.body.contains("data-live-refresh=\"true\""));
+    assert!(page.body.contains("data-live-refresh=\"false\""));
     for (name, value) in [
         ("expected_revision", definition.revision.as_str()),
         ("expected_global_revision", f.controller.limits().revision.as_str()),
@@ -324,7 +354,13 @@ async fn settings_refuse_disallowed_zero_invalid_unknown_and_authority_fields_wi
     ];
     for (name, field, raw, status, code) in cases {
         let body = settings_replace(settings_body(&format!("settings-invalid-{name}"), &update), field, Some(raw));
-        let response = ui(&f.controller, "POST", &route, body).await;
+        let response = if status == 400 {
+            ui(&f.controller, "POST", &route, body).await
+        } else {
+            let mut selected = update.clone();
+            selected.changes.insert(serde_json::from_value(serde_json::json!(field)).unwrap(), raw.parse().unwrap());
+            settings_post(&f.controller, &format!("settings-invalid-{name}"), &selected).await
+        };
         assert_eq!(response.status, status, "{name}: {}", response.body);
         if !code.is_empty() { assert!(response.body.contains(code), "{name}: {}", response.body); }
         assert_eq!(settings_selected(&f.controller, &before.id).await, before, "{name}");
@@ -361,8 +397,10 @@ async fn settings_refuse_stale_global_policy_and_head_revisions() {
     let value = f.controller.limits().resolve_definition(&before).unwrap().native.context_bytes + 1;
     let update = settings_update(&f.controller, &before, value);
     for field in ["expected_global_revision", "expected_policy_revision"] {
-        let body = settings_replace(settings_body(&format!("settings-stale-{field}"), &update), field, Some("obsolete-revision"));
-        let response = ui(&f.controller, "POST", &settings_route(&before.id), body).await;
+        let mut stale = update.clone();
+        match field { "expected_global_revision" => stale.expected_global_revision = "obsolete-revision".into(),
+            "expected_policy_revision" => stale.expected_policy_revision = "obsolete-revision".into(), _ => unreachable!() }
+        let response = settings_post(&f.controller, &format!("settings-stale-{field}"), &stale).await;
         assert_eq!(response.status, 409, "{}", response.body);
         assert!(response.body.contains("configuration_conflict"), "{}", response.body);
         assert_eq!(settings_selected(&f.controller, &before.id).await, before);
@@ -409,9 +447,12 @@ async fn settings_exact_replay_and_lookup_keep_original_outcome_after_head_advan
 
     let mut different = update.clone();
     different.changes.insert(DefinitionLimitField::NativeContextBytes, value + 3);
-    let conflict = settings_post(&f.controller, "settings-original", &different).await;
-    assert_eq!(conflict.status, 409, "{}", conflict.body);
-    assert!(conflict.body.contains("operation_conflict"), "{}", conflict.body);
+    let conflict = operator_reply(&f.controller, "settings-original", &different).await;
+    assert!(conflict.commit.is_none());
+    assert!(matches!(conflict.outcome, Outcome::Refused { ref code, .. } if code == "operation_conflict"));
+    let conflict_page = settings_browser_post(&f.controller, "settings-original", &different).await;
+    assert_eq!(conflict_page.status, 409, "{}", conflict_page.body);
+    assert!(conflict_page.body.contains("operation_conflict"));
     assert_eq!(settings_selected(&f.controller, &old.input.definition.id).await, selected);
     assert_eq!(task(&f.controller, &old.id).await.input, old.input);
     let lookup_after_conflict = ui(&f.controller, "GET", "/operations/settings-original", vec![]).await;
@@ -528,7 +569,7 @@ async fn settings_commit_wakes_live_changes_without_fabricating_task_activity() 
     assert_eq!(task(&f.controller, &old.id).await, old);
     let page = ui(&f.controller, "GET", &settings_route(&update.agent_id), vec![]).await;
     assert_eq!(page.status, 200, "{}", page.body);
-    assert!(page.body.contains("data-live-refresh=\"true\""));
+    assert!(page.body.contains("data-live-refresh=\"false\""));
     assert!(page.body.contains("aria-label=\"Borg activity\""));
 }
 
@@ -601,7 +642,7 @@ async fn unresolved_settings_receipt_keeps_original_identity_and_does_not_refres
         old.input.resolved_limits.as_ref().unwrap().values.native.context_bytes + 1);
     // The fixture registration and original submission filled ordinary receipt
     // capacity. The real controller retains no commit for this new operation.
-    let response = settings_post(&f.controller, "settings-pending-original", &update).await;
+    let response = settings_browser_post(&f.controller, "settings-pending-original", &update).await;
     // Receipt-capacity refusal has no committed stamp. The browser treats this
     // uncommitted refusal as unresolved (503), distinct from Pending (202).
     assert_eq!(response.status, 503, "{}", response.body);
@@ -652,8 +693,16 @@ async fn oversized_browser_receipt_preserves_operation_identity_after_the_actual
     // receipt. A different stale identity records a final refusal of its own.
     let mut conflict = update.clone();
     *conflict.changes.get_mut(&DefinitionLimitField::NativeContextBytes).unwrap() += 1;
-    let response = settings_post(&f.controller, "settings-small-render", &conflict).await;
-    super::response_bounds::assert_compact(&response, bound, 409, Some("settings-small-render"), None);
+    let response = operator_reply(&f.controller, "settings-small-render", &conflict).await;
+    assert!(response.commit.is_none());
+    assert!(matches!(response.outcome, Outcome::Refused { ref code, .. } if code == "operation_conflict"));
+    // Explicitly exercise the old raw-form correlation rendering too. This is
+    // a changed-body refusal against an existing original, never a new grant.
+    let conflict_page = settings_browser_post(&f.controller, "settings-small-render", &conflict).await;
+    super::response_bounds::assert_compact(&conflict_page, bound, 409, Some("settings-small-render"), None);
+    // The original successful receipt still renders with the same bound.
+    let original_page = ui(&f.controller, "GET", "/operations/settings-small-render", vec![]).await;
+    super::response_bounds::assert_compact(&original_page, bound, 502, Some("settings-small-render"), None);
     let rejected = settings_replay(&f.controller, "settings-small-render", &conflict).await;
     assert!(matches!(rejected.outcome, Outcome::Refused { ref code, .. } if code == "operation_conflict"));
     assert!(rejected.commit.is_none());
@@ -688,7 +737,7 @@ async fn compact_uncommitted_capacity_keeps_503_and_original_identity_without_a_
     let update = settings_update(&f.controller, &old.input.definition,
         old.input.resolved_limits.as_ref().unwrap().values.native.context_bytes + 1);
     for _ in 0..2 {
-        let response = settings_post(&f.controller, "small-pending-original", &update).await;
+        let response = settings_browser_post(&f.controller, "small-pending-original", &update).await;
         super::response_bounds::assert_compact(&response, bound, 503, Some("small-pending-original"), None);
         let actual = settings_replay(&f.controller, "small-pending-original", &update).await;
         assert!(actual.commit.is_none());
@@ -799,8 +848,7 @@ async fn settings_optional_coding_window_shows_units_and_preserves_unspecified_a
 
     let mut update = settings_update(&f.controller, &old.input.definition, prior.native.context_bytes);
     update.changes = [(DefinitionLimitField::CodingModelContextWindow, 131_072)].into_iter().collect();
-    let body = settings_replace(settings_body("settings-window-apply", &update), "coding.model_context_window", Some("131072"));
-    let response = ui(&f.controller, "POST", &route, body).await;
+    let response = settings_post(&f.controller, "settings-window-apply", &update).await;
     let page = settings_receipt_page(&f.controller, response).await;
     let recorded = settings_replay(&f.controller, "settings-window-apply", &update).await;
     let outcome = settings_outcome(&recorded);
@@ -821,4 +869,63 @@ async fn settings_optional_coding_window_shows_units_and_preserves_unspecified_a
     let after = ui(&f.controller, "GET", &route, vec![]).await;
     assert_eq!(after.status, 200, "{}", after.body);
     assert!(label(&after.body, "coding.model_context_window").contains("Current effective value: 131072 · tokens"));
+}
+
+#[tokio::test]
+async fn settings_operator_http_preserves_browser_refusal_origin_and_original_governance_subject() {
+    use borg_runtime::collaboration::workflow::{ActorProvenance, PrincipalRef, TrustedHostPath};
+    use borg_runtime::governance::{DecisionPoint, DecisionRef, GovernanceQuery, GovernanceResult};
+    let mut cfg = settings_config();
+    Arc::make_mut(&mut cfg.limits).governance = Some(borg_runtime::limits::GovernanceLimits {
+        record_bytes: 65_536, reason_items: 16, reason_bytes: 4_096, scan_rows: 512,
+        rule_versions: 16, configuration_versions: 16, shadow_evidence_items: 16,
+        completion_continuations: 2, override_max_ms: 10_000,
+    });
+    cfg.limits.validate().unwrap();
+    let f = settings_fixture(cfg).await;
+    let old = settings_seed(&f.controller, "settings-operator-boundary-seed").await;
+    let update = settings_update(&f.controller, &old.input.definition,
+        f.controller.limits().resolve_definition(&old.input.definition).unwrap().native.context_bytes + 1);
+    let browser = settings_browser_post(&f.controller, "settings-browser-not-operator", &update).await;
+    assert_eq!(browser.status, 409);
+    assert!(browser.body.contains("governance_operator_required"));
+    assert_eq!(settings_selected(&f.controller, &old.assigned_agent_id).await, old.input.definition);
+
+    let listener = borg_runtime::server::listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(borg_runtime::server::serve(f.controller.clone(), listener, origin.clone()));
+    let forbidden = Request { protocol_revision: WIRE_REVISION, request_id: "settings-cross-origin-request".into(),
+        command: Operation::UpdateDefinition { operation_id: "settings-cross-origin".into(), update: update.clone() } };
+    let response = reqwest::Client::builder().no_proxy().build().unwrap().post(format!("{origin}/api/operations"))
+        .header("Origin", "http://untrusted.invalid").header("Content-Type", "application/json")
+        .body(serde_json::to_vec(&forbidden).unwrap()).send().await.unwrap();
+    assert_eq!(response.status(), 403);
+    server.abort(); let _ = server.await;
+    let absent = f.controller.handle(Request { protocol_revision: WIRE_REVISION,
+        request_id: "settings-cross-origin-lookup".into(),
+        command: Operation::GetOperation { operation_id: "settings-cross-origin".into() } }).await;
+    assert!(matches!(absent.outcome, Outcome::Refused { ref code, .. } if code == "not_found"));
+    assert_eq!(settings_selected(&f.controller, &old.assigned_agent_id).await, old.input.definition);
+
+    let applied = operator_reply(&f.controller, "settings-real-operator", &update).await;
+    settings_outcome(&applied);
+    let Data::Governance(result) = call(&f.controller, Operation::QueryGovernance { query: GovernanceQuery::Decision {
+        decision: DecisionRef { operation_id: "settings-real-operator".into(), point: DecisionPoint::DefinitionLimits }
+    }}).await else { panic!("original governance decision") };
+    let GovernanceResult::Decision(decision) = *result else { panic!("original subject") };
+    assert_eq!(decision.actor.principal, PrincipalRef::TrustedHostOperator);
+    assert_eq!(decision.actor.provenance, ActorProvenance::TrustedHost { path: TrustedHostPath::OperatorApi });
+    assert_eq!(decision.controller_revision, applied.commit.as_ref().unwrap().controller_revision);
+    let original = ui(&f.controller, "GET", "/operations/settings-real-operator", vec![]).await;
+    settings_assert_receipt(&original, "settings-real-operator", settings_outcome(&applied));
+    let retained = ui(&f.controller, "GET", &format!("{}?original_operation=settings-real-operator", settings_route(&old.assigned_agent_id)), vec![]).await;
+    assert_eq!(retained.status, 200);
+    assert!(retained.body.contains("/operations/settings-real-operator"));
+    assert!(retained.body.contains("data-live-refresh=\"false\""));
+    assert!(!retained.body.contains("method=\"post\""));
+    let script = ui(&f.controller, "GET", "/ui/definition-settings.js", vec![]).await;
+    assert_eq!(script.status, 200);
+    assert!(script.content_type.starts_with("text/javascript"));
+    assert_eq!(script.body, include_str!("../../src/product/definition_settings.js"));
+    assert_eq!(task(&f.controller, &old.id).await.input, old.input);
 }

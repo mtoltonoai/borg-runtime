@@ -7,7 +7,7 @@ or uncertain phase replay. Systemd/HTTP are the explicit integration test seam.
 from __future__ import annotations
 import argparse, copy, contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, stat, struct, sys, tarfile, time
 from pathlib import Path
-_COMMON_SHA = 'deed09974a62ca4b4d94892850d2eccc9006426f16a73f533618b24660911f21'
+_COMMON_SHA = '436dd20bfb545383f27c941e48f4e131b0d60e006db0cf4d2c627e3e2cfa39f2'
 
 def _walk_error(error):
     # An unreadable or vanished inventory is not proof that it is empty.
@@ -51,6 +51,78 @@ _COMPOSED_CODEX_HOME_FORMATS = {'wire':24,'controller_schema':25,'worker_format'
 _COMPOSED_CODEX_HOME_SOURCES = {'src/charter.rs': '199b421f562aa86f95a23af8e1443fc68a13cfc2ecbce9e83ae13e601f5eb5c1', 'src/controller/agents.rs': '2a0fe3acbc7eaf188623eb56e45a13f041e6c95d6b5d8320a99870169a87459e', 'src/controller/application_schema.rs': '64b349c9d28839bf843841f55ebff03601a5eb6185fa32e4ff23bf90a45a5416', 'src/controller/charter_outputs.rs': '625a9e009fe8006533bacae95d7c91b3ef033a9c0a2e5ae1842f2ea8bd727d72', 'src/controller/charters.rs': 'dd310eadd153049ab1a90765cb37a23fdccfb134325c1d86263aedc5200c263f', 'src/controller/charters_supplied.rs': 'cb1b3b6bd1acd783a81fa447770adbb997539495b7d00788cd495bb85cad14a1', 'src/controller/charters_supplied_turns.rs': '116f76f7163e667276e29dc66dbb8f8dbde25da8e856f5ef3059f5ef01aa1135', 'src/controller/database.rs': '2faa5c0d449a52bf944668db6423b7dc7f87bca307a0f0cbd3b65b3b0c28b919', 'src/controller/identity_administration.rs': 'ba0b287a140fdf07e3ca37d7287f30f39717360aab36abb160a9a557ae579289', 'src/controller/machine_resources.rs': 'dfe38310e7b21d3a1e5bdeb05e3fac086d210b743b90c5dbfa8e43f4d0a54663', 'src/controller/mod.rs': '7dd6400fbfc9d9821eed52d321fc5eb872d89c11956c89f1c49afb3848f0bfba', 'src/controller/operations.rs': '2ed6b2ba2755cdb010952490f83003fc6d1c7fb7e8dec1da427cfbda12b38c3e', 'src/controller/operations/reports.rs': 'be8cf79f44ee2831398d74e0b542e40ab997220552f3259c5af5bffa1bf401ef', 'src/controller/operations/supplied_outer.rs': '0e1b828463a3a10b7780cf88629dbc82ab653304159a8d847baedf7bfb28cda5', 'src/controller/schema23-from22.sql': '95e229e4f9140322e176f7fdec8cb05a010634c0462ed7bb97643025519a2634', 'src/controller/schema24-from23.sql': 'f2318a08f58659caa2239149e7e051c63e41219a8f483f1ed5e75383f278ef7c', 'src/controller/sessions.rs': '540c0624425b2602dd8f1ecdae6ba3352c3bf6af798936dff492b16eeba0a89e', 'src/controller/task_creation.rs': '692580e630fdeb3de80bb78d1b539b120bcede67d9bc3dbafcce3094158df648', 'src/controller/task_handoffs.rs': '46423fb94cb1eb7f2a88682a551fad513e0f46b2c799c2a02f8e37133b36c7f9', 'src/controller/task_submission.rs': '742e36501ab4fe7069bb3322290653bc42816aadfa3f945137d44bf38a163592', 'src/delegation.rs': 'd8c7e1f49f9abf98ca57f3f7a5ecf09c0bcf54fd908345436b5c541450188ebc', 'src/lib.rs': 'f94c8e6892fe762de03b64f4a02973ef78c22c8702e426d0b1d68ed19148b8a2', 'src/limits/identity.rs': 'eb5b55eda454c3bd98a81b3c962428c0c02bc650042f7e288e0cd04112292293', 'src/limits/mod.rs': '1785dc591b79a85ded3e1f45e3bbebbad97740d5f105c33626de9ab503afbf71', 'src/limits/worker.rs': '6b727ae7279c58fcfc67e7cc43d5990c463104f982943189b8900a1b89fa8b94', 'src/machine_resources.rs': 'b98c54d7e79b87a54d0e4e4ce4367c047fe2779efabbbf107fa9d3fbc2a1887e', 'src/mcp/identity_administration.rs': '9c9aa2daae61cbcbb208e761310774059393a950d102c387f96d472eb0bdb347', 'src/mcp/mod.rs': '25fefff1d0e668ea724ed4708877440b02e16691c47b38fd9c672cd7f12a8310', 'src/native/loop_step.rs': 'b3e944f86359f41bc0959c8a689ea3dbbf251ed93ac1f9a23f82f29e2043695f', 'src/protocol.rs': 'f7a9ce3dc6a922d076f82e7926e66852e98a472afdcba2c40fbcae518d962173', 'src/protocol_identity.rs': '7a1fbda7127bb73950110d0c5bbdce5bc5394857bbc21846779cf0eb37af3281', 'src/supplied_outer.rs': '7844aab69b622ffcabe6693930248ec0c94b6fc5c022f151a55e2230bfbf3e91', 'src/worker/acceptance.rs': 'edb4a355552c0caeadd5226c9db006649b31e7857eae993041b0831679af1465', 'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516', 'src/worker/charter_output.rs': '77ee76cbb97a69fdd08b510ff3b9404afc64caa02a9fd6db350eba7a4403635b', 'src/worker/cleanup.rs': '4b0e33c95ae3f0d1c37a4a8f6af8dab9838ec7661c162824d7983b857242d3ea', 'src/worker/cleanup_copyout.rs': 'd1925748bfcf7bbc5415f8e0c1d1bbd05c86681d62afdb5b2d8efa1581648b69', 'src/worker/cleanup_plugins.rs': 'c1b9a658179748c196f3b855b26e08a1528162240820015b562f8e3ce1223be0', 'src/worker/codex.rs': 'd7e0e6923561c698c2ef68c8b57838f40430cbd802a57eb03d23df03f2fee0e5', 'src/worker/codex_charter.rs': '81c409316aa2cb4b651942c51688bd6c1719588ababed672d0f5b6e7dbef6e58', 'src/worker/codex_charter_turns.rs': 'db9798de3c855716f3b6d65df0df2c66ec9dadf3c75e700b4d548aefc85c43c3', 'src/worker/codex_mcp.rs': '935fc27ecbab0ef1399dc58ab4826f1d8ae79ae3842f1cf4bff9ff136e7e9ff1', 'src/worker/codex_retry.rs': 'ca3e0f8d26a57d6ab8a073b9b90573f781ee521db886446ccd6935820847e5a0', 'src/worker/collaboration_notice.rs': 'b6924a898af2dc8990512421819f5d58f1b1cee7eea7d00d899455fa3e3fdc19', 'src/worker/completion.rs': '9fde728db6228fe7377137c817390c224d4782ae4c99e070f8eb1cb9a72159a5', 'src/worker/git_cleanup.rs': 'c291bc2926daf930e66522e52ea6c0f53199269beced4bce1124f26c08e9fd8c', 'src/worker/handoff.rs': '2d7be98666db4fe56debc5d91e90553050dbe195f4b6ec2a4592cdf88e505c75', 'src/worker/machine_resources.rs': '7e34c7ec3bc87298a88cb42b216584cb16b70e82a14c96b1786e9048aea45775', 'src/worker/mod.rs': 'bced916dd3dbb0572f4955d0f65641f491b90ab80cf2ac84f76d89fe68da621a', 'src/worker/native_loop.rs': '78108dbb1d06b545d9684d35fff6e7d3e2ebaa237170a44d3abcdc2caf360657', 'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb', 'src/worker/publication.rs': '972cda207bf324f5393dbee390b559089ad8798a6c920e00457e09a2dc0e7dc9', 'src/worker/pull_request.rs': 'f0308a668abbf229851cf0a454570371a3315a32a55a3e60bed8b145eff2ac1b'}
 _CODEX_JOURNALS = frozenset(("borg-thread.json", "borg-supplied-outer.json", "borg-usage.json", "borg-collaboration-config.json", "collaboration-codex", "collaboration-notices", "memory-notices", "supplied-charter", "completion"))
 _CODEX_TRANSCRIPTS = ("sessions", "archived_sessions", "history.jsonl")
+# Exact recovered worker20 writer family; historical families remain separate.
+_RECOVERED_CODEX_HOME_FORMATS = {'wire':25,'controller_schema':26,'worker_format':20}
+_RECOVERED_CODEX_HOME_SOURCES = {
+    'src/charter.rs': '199b421f562aa86f95a23af8e1443fc68a13cfc2ecbce9e83ae13e601f5eb5c1',
+    'src/controller/agents.rs': 'd3c607b7c194ae4892c343e11e48293b3e09b39f5a00d0cfe9e4d3ab98d6a04e',
+    'src/controller/application_schema.rs': 'f177e8ca7839e0f9e5130ee0a50ebe7eee78d30c7979e8d930dc9fb10ab7f783',
+    'src/controller/charter_outputs.rs': '625a9e009fe8006533bacae95d7c91b3ef033a9c0a2e5ae1842f2ea8bd727d72',
+    'src/controller/charters.rs': '5e247a63e6e7041b9ce447ae3869ec46d513da926d606af0434ff4e5491299f4',
+    'src/controller/charters_supplied.rs': 'cb1b3b6bd1acd783a81fa447770adbb997539495b7d00788cd495bb85cad14a1',
+    'src/controller/charters_supplied_turns.rs': '116f76f7163e667276e29dc66dbb8f8dbde25da8e856f5ef3059f5ef01aa1135',
+    'src/controller/database.rs': '7a9d59f9b32775d75f754b192fbbd0853ac28da1970b9d42a9f8c849fc3dfb40',
+    'src/controller/identity_administration.rs': '4de92f2b656b360d9465604744e42c2a380a80e3596eba5db50df6cd2c37b254',
+    'src/controller/identity_limit_fields.rs': '1b72fb2f79badd20eed9165b7deeddeb5b8451a93f69975e75a02ab5269ea1b2',
+    'src/controller/machine_resources.rs': 'cd2617a4b80d732d4ccbd876dc39761db69046e17c15952d4f9d01cf9cd3d1cd',
+    'src/controller/mod.rs': 'fd78de77cc2b7689fabfc2a73bd189c06a930651f6de264c6592dbf2c1d2ca96',
+    'src/controller/operations.rs': 'f990f50ba053c38d962af18c332a300de836a442a3c00f9439e7cd8629665127',
+    'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7',
+    'src/controller/operations/supplied_outer.rs': 'c51a074820b443b263bc93721c2f6a9fdbe329fb4bcae14e9a767e53d79a87b5',
+    'src/controller/read_pages.rs': 'fa0c5bc3adb04a1a60150241e5240f8cf61986048d397030e215b5b31a8d715b',
+    'src/controller/read_pagination.rs': '91e6260718f0173b452b3cbe730b6c6bfc68bfeaf01812e19d8ddacedb088956',
+    'src/controller/read_retention.rs': '0def3401d029f1b14eab602b3d3f6520862da8ddb7a4022967030fce0d1b72f7',
+    'src/controller/schema23-from22.sql': '95e229e4f9140322e176f7fdec8cb05a010634c0462ed7bb97643025519a2634',
+    'src/controller/schema24-from23.sql': 'f2318a08f58659caa2239149e7e051c63e41219a8f483f1ed5e75383f278ef7c',
+    'src/controller/sessions.rs': '540c0624425b2602dd8f1ecdae6ba3352c3bf6af798936dff492b16eeba0a89e',
+    'src/controller/task_creation.rs': '692580e630fdeb3de80bb78d1b539b120bcede67d9bc3dbafcce3094158df648',
+    'src/controller/task_handoffs.rs': '682ba3b2a2ba95639387628ef8d7a5c8ac13c294b0bbfb37d224727e6bffdd20',
+    'src/controller/task_submission.rs': 'ad337c3ef6c8cfd2ab6f6e8f6a6196ab9f117645883431d34250a396208a85d2',
+    'src/delegation.rs': 'd8c7e1f49f9abf98ca57f3f7a5ecf09c0bcf54fd908345436b5c541450188ebc',
+    'src/lib.rs': 'b9eeb9c686c1531c04b186ad153193f06e5b189c6589afa3f30d258e48bba60e',
+    'src/limits/identity.rs': 'eb5b55eda454c3bd98a81b3c962428c0c02bc650042f7e288e0cd04112292293',
+    'src/limits/mod.rs': '1785dc591b79a85ded3e1f45e3bbebbad97740d5f105c33626de9ab503afbf71',
+    'src/limits/worker.rs': '6b727ae7279c58fcfc67e7cc43d5990c463104f982943189b8900a1b89fa8b94',
+    'src/machine_resources.rs': 'b98c54d7e79b87a54d0e4e4ce4367c047fe2779efabbbf107fa9d3fbc2a1887e',
+    'src/mcp/identity_administration.rs': '9c9aa2daae61cbcbb208e761310774059393a950d102c387f96d472eb0bdb347',
+    'src/mcp/mod.rs': '734eb4884aacd34acfb0ea14817d92a9241d11e59c59e4a200529cb2ab4f4d1e',
+    'src/mcp/read_recovery.rs': '3856ef88f87e04e097b51679eec30d6e6b1c6f89bd704e622cd47dde375b290f',
+    'src/native/loop_step.rs': 'b3e944f86359f41bc0959c8a689ea3dbbf251ed93ac1f9a23f82f29e2043695f',
+    'src/protocol.rs': '9a04ea9917f388f10f055c1a341872f632da8626abf09092b5182e5edcd58fb6',
+    'src/protocol_identity.rs': '7a1fbda7127bb73950110d0c5bbdce5bc5394857bbc21846779cf0eb37af3281',
+    'src/protocol_identity_limit_fields.rs': '3d362ab19342ddae26005024230f25646b60df3ed611b9cb7dc806051796d9ed',
+    'src/protocol_read_pagination.rs': 'f467d2875373d2643483ff1580d7726da066ca73055115eb84bd36c0510be91a',
+    'src/read_page.rs': 'd386b2f8a310788e2bfe116878f47892382b5360ea89ca5a713754430c6e9a54',
+    'src/read_retention.rs': 'c1a069d41f3ff8d133b7929680d2b3f094e4d07a4331e6784427c64d9cc6a811',
+    'src/supplied_outer.rs': '7844aab69b622ffcabe6693930248ec0c94b6fc5c022f151a55e2230bfbf3e91',
+    'src/worker/acceptance.rs': 'edb4a355552c0caeadd5226c9db006649b31e7857eae993041b0831679af1465',
+    'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
+    'src/worker/charter_output.rs': 'b4231b3e24e7933a1e142a187bf6f07ff6d316889aaf2b14354bec2d6fef1900',
+    'src/worker/cleanup.rs': '54f15913412870da6984ade05477d09004a28ab07cece96931759d2381bba898',
+    'src/worker/cleanup_copyout.rs': '4181eeac29c4869d07fa11ca282e5963259a566240e0cc389d4e4ef2fc0aaa80',
+    'src/worker/cleanup_plugins.rs': '247e6241889e1f58d52172f20ee4359a9f9804af73171e8e42c5e3a7c07a42cd',
+    'src/worker/cleanup_reads.rs': '54940748108c99b7f496ca49f81c21fb5f8eca5f957d1b9d71d50edfc527bdf0',
+    'src/worker/codex.rs': 'd7e0e6923561c698c2ef68c8b57838f40430cbd802a57eb03d23df03f2fee0e5',
+    'src/worker/codex_charter.rs': '81c409316aa2cb4b651942c51688bd6c1719588ababed672d0f5b6e7dbef6e58',
+    'src/worker/codex_charter_turns.rs': 'db9798de3c855716f3b6d65df0df2c66ec9dadf3c75e700b4d548aefc85c43c3',
+    'src/worker/codex_mcp.rs': 'cadc88711a330d24b6b2257b6ee1ac8b32b004551700ec3d0a65348d7701a532',
+    'src/worker/codex_retry.rs': 'ca3e0f8d26a57d6ab8a073b9b90573f781ee521db886446ccd6935820847e5a0',
+    'src/worker/collaboration_notice.rs': 'b6924a898af2dc8990512421819f5d58f1b1cee7eea7d00d899455fa3e3fdc19',
+    'src/worker/completion.rs': '9fde728db6228fe7377137c817390c224d4782ae4c99e070f8eb1cb9a72159a5',
+    'src/worker/git_cleanup.rs': 'c291bc2926daf930e66522e52ea6c0f53199269beced4bce1124f26c08e9fd8c',
+    'src/worker/handoff.rs': 'd9c2feda72c95868aec915fd19842b918d58272e0e479e5931d9cfa048dbe60e',
+    'src/worker/identity_limit_fields.rs': '898745126398665a1a1885d4670e2e214533fa74996e2f7bd5fd1d87b949552c',
+    'src/worker/machine_resources.rs': '7e34c7ec3bc87298a88cb42b216584cb16b70e82a14c96b1786e9048aea45775',
+    'src/worker/mod.rs': '847f3a0fbff683524798034bf019a2a47452366ecab97367d0469ce68e00cfbf',
+    'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
+    'src/worker/native_loop.rs': '78108dbb1d06b545d9684d35fff6e7d3e2ebaa237170a44d3abcdc2caf360657',
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+    'src/worker/publication.rs': '972cda207bf324f5393dbee390b559089ad8798a6c920e00457e09a2dc0e7dc9',
+    'src/worker/pull_request.rs': 'f0308a668abbf229851cf0a454570371a3315a32a55a3e60bed8b145eff2ac1b',
+    'src/worker/read_pagination.rs': 'fa638c1d13b8d1c4585b221711ccf6602be9da6b2f4697f8cf81172f17735c6c',
+    'src/worker/read_retention.rs': '1c54c8a127c88859d9cf799884cc9c42e5f303a9e3edfd648c8c8888948ca381',
+}
+
 
 
 def cleanup_record(raw, name, selected):
@@ -1175,6 +1247,13 @@ _CODEX_RETAINED_SOURCES = {
     'src/worker/cleanup_copyout.rs':'d1925748bfcf7bbc5415f8e0c1d1bbd05c86681d62afdb5b2d8efa1581648b69'}
 
 
+_RECOVERED_CODEX_RETAINED_SOURCES = {
+    'src/worker/cleanup.rs': '54f15913412870da6984ade05477d09004a28ab07cece96931759d2381bba898',
+    'src/worker/cleanup_copyout.rs': '4181eeac29c4869d07fa11ca282e5963259a566240e0cc389d4e4ef2fc0aaa80',
+    'src/worker/cleanup_plugins.rs': '247e6241889e1f58d52172f20ee4359a9f9804af73171e8e42c5e3a7c07a42cd',
+}
+
+
 class CodexHomePreservation:
     """Closed proof of original vendor disappearance; no mutable path wildcard.
 
@@ -1300,7 +1379,7 @@ class CodexHomePreservation:
         """Current no-removal proof; the old progress body was not captured."""
         if re.fullmatch(r'cleanup-codex/(?:[0-9a-f]{2})+\.json',name) is None:return False
         h=self.host
-        if not h.selected_writer_sources(_CODEX_RETAINED_SOURCES):return False
+        if not h.selected_writer_sources(h.retained_writer_sources()):return False
         _codex_deadline(h)
         key=Path(name).stem;original=self.saved.get(key);dirs=h.inventory_directories
         if original is None:raise ValueError('codex_retained_unbound_original_home')
@@ -1420,7 +1499,7 @@ class CodexHomePreservation:
 
     def proof(self):
         return {'status':'SCOPED_CODEX_HOME_PRESERVATION' if self.retained else 'SCOPED_COMPLETED_CODEX_HOME_PRESERVATION','attempts':self.checked,
-                **({'retained_attempts':self.retained,'retained_source_files':_CODEX_RETAINED_SOURCES} if self.retained else {}),
+                **({'retained_attempts':self.retained,'retained_source_files':self.host.retained_writer_sources()} if self.retained else {}),
                 'observed_changes':len(self.observations),'same_format_contract_changed':False,
                 'other_original_rows_exact':True,'host_effects':False,'simultaneous_snapshot':False}
 
@@ -1436,6 +1515,14 @@ _CHARTER_MANIFEST_SOURCES = {
 
 _CHARTER_JOURNAL_SOURCES = {**_CHARTER_MANIFEST_SOURCES,
     'src/worker/mutations.rs':'e510c3020ca1476ac3d2bda9762b2cee11d2f29d1ac552472d9218b9237e0553'}
+
+
+_RECOVERED_CHARTER_JOURNAL_SOURCES = {
+    'src/worker/charter.rs': '700374cb2f81b3f1c17ffa37d3f8cb7bf3915bf9569843354f6c13d794320516',
+    'src/worker/charter_output.rs': 'b4231b3e24e7933a1e142a187bf6f07ff6d316889aaf2b14354bec2d6fef1900',
+    'src/worker/mutations.rs': 'f3d1c510541f125d531d908624cdad4238fa094e8abe3c8dbbdc7f59b0fd3486',
+    'src/worker/process.rs': 'c13c470c5b414e0df7793e5140095344df09f10f1f6888c0431533bfbf93a6bb',
+}
 
 
 class CharterManifestPreservation:
@@ -1628,7 +1715,7 @@ class CharterManifestPreservation:
     def proof(self):
         return {'status':'SCOPED_ORIGINAL_CHARTER_MANIFEST_OBSERVATIONS','records':len(self.observations),
                 'observations':copy.deepcopy(self.observations),'source_files':_CHARTER_MANIFEST_SOURCES,
-                'journal_observations':copy.deepcopy(self.journals),'journal_source_files':_CHARTER_JOURNAL_SOURCES,
+                'journal_observations':copy.deepcopy(self.journals),'journal_source_files':self.host.charter_journal_sources(),
                 'other_history_guards_unchanged':True,'host_effects':False,'directory_allowances_added':False,
                 'simultaneous_snapshot':False,'original_content_and_noninode_identity_preserved':True}
 
@@ -1759,14 +1846,16 @@ def verify_controller_receipts(host):
         raise ValueError('original_stopped_snapshot_changed')
     del stopped
     restart, proof['restart-copy/snapshot.json'] = controller_snapshot_read(host, 'restart-copy/snapshot.json')
-    plan = common.controller_receipt_plan(host.p,before,restart)
+    plan = common.controller_receipt_plan(host.p,before,restart,manifest=getattr(host,'_verified_manifest',None))
     ids = [row['id'] for row in common.controller_receipt_rows(before,'receipts',host.l['sqlite_rows']).values()]
     external_count = 0
+    compact_count = 0
     for expected in plan:
         if common.now_ms() >= host.r['deadline_ms']:
             raise ValueError('receipt_proof_deadline')
         common.verify_controller_lookup(expected,host.api('get_operation',{'operation_id':expected['id']}))
         external_count += expected['namespace'] == 'external'
+        compact_count += expected['namespace'] == 'committed_read_reference'
     for name in sorted(proof):
         _, after = controller_snapshot_read(host, name, retain=False)
         if not _same(common, proof[name], after):
@@ -1774,8 +1863,12 @@ def verify_controller_receipts(host):
     return {'preserved_controller_receipts': ids, 'proof': {
         'status': 'PASS_ORIGINAL_RAW_SNAPSHOTS_AND_LIVE_NAMESPACES',
         'files': proof, 'original_receipts': len(ids), 'live_lookups': len(plan),
-        'application_mutation_lookups': len(plan) - external_count,
+        'application_mutation_lookups': len(plan) - external_count - compact_count,
         'external_operation_lookups': external_count,
+        **({'compact_read_lookups':compact_count,
+            'compact_read_source_files':common.compact_receipt_sources(host.p,getattr(host,'_verified_manifest',None)),
+            'compact_scope':'already_compact_original_rows_only',
+            'original_body_reconstructed':False} if compact_count else {}),
         'raw_receipts_scope': 'original_stopped_and_original_restart_snapshots',
         'current_raw_receipts_read': False, 'fabricated_commit_stamp': False,
         'live_database_opened': False, 'host_mutations': False}}
@@ -2135,10 +2228,20 @@ class Host:
         if self.h['role']!='worker':return False
         files=getattr(self,'_verified_manifest',{}).get('source',{}).get('files',{})
         exact=lambda family:all(isinstance(files.get(n),dict) and files[n].get('sha256')==sha for n,sha in family.items())
+        if _same(c,self.p.get('formats',{}).get('after'),_RECOVERED_CODEX_HOME_FORMATS):
+            return exact(_RECOVERED_CODEX_HOME_SOURCES)
         if any(exact(family) for family in (_CODEX_HOME_SOURCES,_SUPPLIED_CODEX_HOME_SOURCES,_DIRECTORY_CODEX_HOME_SOURCES,_DEFAULT_ASSIGNMENT_CODEX_HOME_SOURCES)):
             return True
         return (_same(c,self.p.get('formats',{}).get('after'),_COMPOSED_CODEX_HOME_FORMATS)
                 and exact(_COMPOSED_CODEX_HOME_SOURCES))
+    def retained_writer_sources(self):
+        if _same(c,self.p.get('formats',{}).get('after'),_RECOVERED_CODEX_HOME_FORMATS):
+            return _RECOVERED_CODEX_RETAINED_SOURCES
+        return _CODEX_RETAINED_SOURCES
+    def charter_journal_sources(self):
+        if _same(c,self.p.get('formats',{}).get('after'),_RECOVERED_CODEX_HOME_FORMATS):
+            return _RECOVERED_CHARTER_JOURNAL_SOURCES
+        return _CHARTER_JOURNAL_SOURCES
     def cleanup_policy(self):
         if self.codex_home_scope():
             # The existing protected profile pins the selected metadata bytes.
@@ -2191,6 +2294,12 @@ class Host:
         sources=self.p['formats']['source_files']
         retained_holds=(sources.get('src/worker/cleanup.rs')==_RETAINED_HOLD_SOURCE_SHA
                         and sources.get('src/worker/process.rs')==_PROCESS_SOURCE_SHA)
+        if _same(c,self.p.get('formats',{}).get('after'),_RECOVERED_CODEX_HOME_FORMATS):
+            # The current20 hold producer is a separate authenticated family.
+            # Do not inherit the historical profile-only allowance for this tuple.
+            required={name:_RECOVERED_CODEX_HOME_SOURCES[name]
+                      for name in ('src/worker/cleanup.rs','src/worker/process.rs')}
+            retained_holds=self.selected_writer_sources(required)
         return {'original':old,'observed':new,**cleanup_clocks(original,observed,retained_holds=retained_holds)}
     def worker_history(self,stop,current):
         preserved={};observations={};mutable={'mutations/registration.json','mutations/await.json','worker-owner.json'}
@@ -2219,17 +2328,22 @@ class Host:
             self._codex_home_proof=home_proof.proof()
         return preserved,observations
     def current_format_observation(self,name,old,new):
-        # finish_state_upgrade re-persists current19 after owned admissions, even
-        # on19->19 startup. Preserve exact original bytes; only this inode may move.
+        # finish_state_upgrade re-persists the selected current marker after owned
+        # admissions. Same-format observation preserves bytes; only its inode moves.
         if name!='format.json':return False
         formats=self.p.get('formats',{})
         required={'src/worker/handoff.rs':'2d7be98666db4fe56debc5d91e90553050dbe195f4b6ec2a4592cdf88e505c75',
                   'src/worker/process.rs':_PROCESS_SOURCE_SHA,
                   'src/worker/mod.rs':'bced916dd3dbb0572f4955d0f65641f491b90ab80cf2ac84f76d89fe68da621a'}
+        selected=_COMPOSED_CODEX_HOME_FORMATS
+        if _same(c,formats.get('after'),_RECOVERED_CODEX_HOME_FORMATS):
+            selected=_RECOVERED_CODEX_HOME_FORMATS
+            required={name:_RECOVERED_CODEX_HOME_SOURCES[name] for name in required}
         if (self.h['role']!='worker' or c.forward(self.p)
-                or formats.get('before')!=_COMPOSED_CODEX_HOME_FORMATS
-                or formats.get('after')!=_COMPOSED_CODEX_HOME_FORMATS
+                or not _same(c,formats.get('before'),selected)
+                or not _same(c,formats.get('after'),selected)
                 or not self.selected_writer_sources(required)):return False
+        revision=selected['worker_format']
         if c.now_ms()>=self.r['deadline_ms']:raise ValueError('current_format_observation_deadline')
         if (not isinstance(old,dict) or not isinstance(new,dict)
                 or set(old)!={'sha256','identity'} or set(new)!={'sha256','identity'}
@@ -2244,11 +2358,11 @@ class Host:
         if identity!=b or c.digest(raw)!=new['sha256']:raise ValueError('current_format_sample_changed')
         marker=c.strict(raw)
         c.fields(marker,'format_revision','current worker marker')
-        if type(marker['format_revision']) is not int or marker['format_revision']!=19:
+        if type(marker['format_revision']) is not int or marker['format_revision']!=revision:
             raise ValueError('current_format_marker_value')
         if c.now_ms()>=self.r['deadline_ms']:raise ValueError('current_format_observation_deadline')
         proof={'kind':'same_current_worker_format_atomic_observation','relative_sha256':c.digest(name.encode()),
-               'original':copy.deepcopy(old),'observed':copy.deepcopy(new),'format_revision':19,
+               'original':copy.deepcopy(old),'observed':copy.deepcopy(new),'format_revision':revision,
                'writer_sources':required,'original_bytes_preserved':True,'noninode_identity_preserved':True,
                'current_read_matched_captured_row':True,'actual_writer_attributed':False,
                'simultaneous_snapshot':False,'service_effects':False}
@@ -2274,7 +2388,7 @@ class Host:
         return hook.observe(name,old,new)
     def charter_journal_observation(self,name,old,new,stop,current):
         if not isinstance(name,str) or re.fullmatch(r'charter/(?:[0-9a-f]{2})+\.json',name) is None:return False
-        if not self.selected_writer_sources(_CHARTER_JOURNAL_SOURCES):return False
+        if not self.selected_writer_sources(self.charter_journal_sources()):return False
         hook=getattr(self,'_charter_manifests',None)
         if hook is None:self._charter_manifests=hook=CharterManifestPreservation(self,stop,current)
         return hook.observe_journal(name,old,new)
@@ -2390,7 +2504,10 @@ class Host:
         q={'protocol_revision':self.p['formats']['after' if self.after else 'before']['wire'],'request_id':'rollout-read','operation':operation,'input':inp}
         reply=c.strict(c.http_read(a['host'],a['port'],c.canonical(q),self.l,self.r['deadline_ms']))
         if reply['request_id']!=q['request_id'] or reply['status']!='ok' or type(reply.get('observed_controller_revision')) is not int: raise ValueError('controller read refused')
-        if operation=='get_operation' and reply['data']['kind']=='operation' and reply['data']['value']['kind']=='application_mutation':
+        receipt_kind=reply['data']['value']['kind'] if operation=='get_operation' and reply['data']['kind']=='operation' else None
+        if receipt_kind=='committed_read_reference':
+            c.compact_receipt_sources(self.p,getattr(self,'_verified_manifest',None))
+        if receipt_kind in ('application_mutation','committed_read_reference'):
             stamp=reply['commit'];c.fields(stamp,'operation_id controller_revision','original commit')
             if stamp['operation_id']!=inp['operation_id'] or type(stamp['controller_revision']) is not int or not 0<stamp['controller_revision']<=reply['observed_controller_revision']:raise ValueError('original mutation commit stamp differs')
         elif reply['commit'] is not None:raise ValueError('unexpected commit on pure read')

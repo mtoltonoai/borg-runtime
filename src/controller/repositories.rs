@@ -660,8 +660,7 @@ pub(super) fn validate_instruction_sources(
         if count > receipt_bound {
             return Err(instruction_invalid());
         }
-        let record = super::metadata::read(tx, &row.get::<_, String>(0)?)?
-            .ok_or_else(instruction_invalid)?;
+        let Some(record) = super::metadata::scan_inline(tx, &row.get::<_, String>(0)?)? else { continue };
         if version < 21 {
             let new_vocabulary = match &record.request {
                 Operation::SubmitTask { input, .. } => has_instruction_source(input),

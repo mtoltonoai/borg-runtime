@@ -253,13 +253,24 @@ class Preparation(unittest.TestCase):
         self.assertFalse(receipt['human_rollout_authority'])
 
     def test_explicit_wire24_is_bound_into_prepared_journey(self):
-        protocol=(ROOT.parent/'src/protocol.rs').read_bytes()
-        self.assertIn(b'pub const WIRE_REVISION: u32 = 24;',protocol)
         self.r['preparation']['profile']['application_wire_revision']=24
         before=copy.deepcopy(self.r);steps,receipt=self.execute()
         self.assertEqual(self.r,before)
         journey=self.job/'prepared/journey.json'
         self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],24)
+        self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
+        prep.verify_prepared(self.r,receipt,self.work,local)
+        self.assertFalse(receipt['protected_check_emitted'])
+        self.assertFalse(receipt['human_rollout_authority'])
+
+    def test_explicit_wire25_is_bound_into_prepared_journey(self):
+        protocol=(ROOT.parent/'src/protocol.rs').read_bytes()
+        self.assertIn(b'pub const WIRE_REVISION: u32 = 25;',protocol)
+        self.r['preparation']['profile']['application_wire_revision']=25
+        before=copy.deepcopy(self.r);steps,receipt=self.execute()
+        self.assertEqual(self.r,before)
+        journey=self.job/'prepared/journey.json'
+        self.assertEqual(json.loads(journey.read_bytes())['protocol_revision'],25)
         self.assertEqual(receipt['prepared_inputs'][str(journey)],prep.sha(journey))
         prep.verify_prepared(self.r,receipt,self.work,local)
         self.assertFalse(receipt['protected_check_emitted'])
@@ -366,7 +377,7 @@ class Preparation(unittest.TestCase):
 
     def test_candidate_wire_is_closed_typed_and_profile_owned(self):
         self.assertEqual(prep.application_wire(self.r['preparation']['profile']),8)
-        for value in (True,False,None,'20',20.0,7,25):
+        for value in (True,False,None,'20',20.0,7,26):
             r=copy.deepcopy(self.r);r['preparation']['profile']['application_wire_revision']=value
             with self.subTest(value=value),self.assertRaisesRegex(ValueError,'application wire'):
                 prep.validate_profile(r['preparation'],r,local)

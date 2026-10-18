@@ -4,6 +4,7 @@ Record envelopes follow mutations.rs/charter.rs. Accepted limit values are a
 local reader projection, not a claim that a Rust runtime admitted these fixtures.
 """
 import copy
+import contextlib
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -17,7 +18,7 @@ def original_journal(f, kind):
                     transport={'body_bytes': 32768})
     f.retained['worker']['mutation_record_bytes'] = 65536
     f.host._verified_manifest['source']['files']['src/worker/mutations.rs'] = {
-        'sha256': hostmod._CHARTER_JOURNAL_SOURCES['src/worker/mutations.rs']}
+        'sha256': f.host.charter_journal_sources()['src/worker/mutations.rs']}
     observation = copy.deepcopy(f.manifest['observation'])
     operation = f.operation_id
     source = {'definition_id': 'original-definition', 'definition_revision': 'one'}
@@ -60,6 +61,7 @@ def replace_journal(f, name, value=None):
 
 
 class CharterJournalTests(unittest.TestCase):
+    fixture=staticmethod(fixture)
     def setUp(self):
         for name in ('subprocess.Popen', 'socket.socket', 'os.system', 'os.posix_spawn', 'os.posix_spawnp'):
             guard = mock.patch(name, side_effect=AssertionError('external effects forbidden'))
@@ -67,7 +69,7 @@ class CharterJournalTests(unittest.TestCase):
 
     def test_consumed_reply_supplied_reply_compaction_and_chunk_preserve_exact_original_joins(self):
         for kind in ('reply', 'supplied_reply', 'compaction_reply', 'output_chunk'):
-            with self.subTest(kind=kind), fixture('supplied_reply' if kind == 'output_chunk' else kind) as f:
+            with self.subTest(kind=kind), self.fixture('supplied_reply' if kind == 'output_chunk' else kind) as f:
                 name, value = original_journal(f, kind)
                 before = baseline(f, name, value); replace_journal(f, name)
                 current = copy.deepcopy(f.current)
@@ -96,7 +98,7 @@ class CharterJournalTests(unittest.TestCase):
                    lambda j: j.update(consumed=False), lambda j: j.update(recovery_epoch=1),
                    lambda j: j['limits'].update(revision='new-policy')]
         for index, change in enumerate(changes):
-            with self.subTest(index=index), fixture('supplied_reply') as f:
+            with self.subTest(index=index), self.fixture('supplied_reply') as f:
                 name, value = original_journal(f, 'supplied_reply'); baseline(f, name, value)
                 change(value); replace_journal(f, name, value)
                 with self.assertRaisesRegex(ValueError, 'charter_journal_content_or_presence_changed'): f.history()
@@ -111,18 +113,18 @@ class CharterJournalTests(unittest.TestCase):
                    lambda j: j['outcome_context'].update(observed_controller_revision=6),
                    lambda j: j['outcome_context']['commit'].update(controller_revision=True)]
         for index, change in enumerate(changes):
-            with self.subTest(index=index), fixture('supplied_reply') as f:
+            with self.subTest(index=index), self.fixture('supplied_reply') as f:
                 name, value = original_journal(f, 'supplied_reply'); change(value)
                 baseline(f, name, value); replace_journal(f, name)
                 with self.assertRaises(ValueError): f.history()
-        with fixture('supplied_reply') as f:
+        with self.fixture('supplied_reply') as f:
             name, value = original_journal(f, 'supplied_reply'); name = 'mutations/other-original.json'
             baseline(f, name, value); replace_journal(f, name)
             with self.assertRaisesRegex(ValueError, 'original_worker_history_changed'): f.history()
 
     def test_paired_manifest_caller_operation_outcome_and_accepted_policy_are_required(self):
         for change in ('missing-manifest', 'caller', 'observation', 'result-id', 'policy', 'path'):
-            with self.subTest(change=change), fixture('supplied_reply') as f:
+            with self.subTest(change=change), self.fixture('supplied_reply') as f:
                 name, value = original_journal(f, 'supplied_reply')
                 if change == 'caller': value['request']['input']['caller']['task_id'] = 'unrelated-task'
                 elif change == 'observation': value['request']['input']['observation']['terminal']['thread_id'] = 'unrelated-thread'
@@ -137,7 +139,7 @@ class CharterJournalTests(unittest.TestCase):
 
     def test_output_chunk_requires_original_bytes_reference_index_and_exact_receipt(self):
         for change in ('data', 'reference', 'index', 'receipt-hash', 'receipt-bytes', 'receipt-reference'):
-            with self.subTest(change=change), fixture('supplied_reply') as f:
+            with self.subTest(change=change), self.fixture('supplied_reply') as f:
                 name, value = original_journal(f, 'output_chunk')
                 chunk = value['request']['input']['observation']['chunk']; result = value['outcome']['data']['value']['value']
                 if change == 'data': chunk['data'] = ('x' * len(bytes.fromhex(chunk['data']))).encode().hex()
@@ -151,7 +153,7 @@ class CharterJournalTests(unittest.TestCase):
 
     def test_original_command_and_mutation_writer_pin_cannot_be_substituted(self):
         for change in ('missing-pin', 'drifted-pin', 'original-command'):
-            with self.subTest(change=change), fixture('supplied_reply') as f:
+            with self.subTest(change=change), self.fixture('supplied_reply') as f:
                 name, value = original_journal(f, 'supplied_reply'); baseline(f, name, value)
                 replace_journal(f, name)
                 if change == 'missing-pin': del f.host._verified_manifest['source']['files']['src/worker/mutations.rs']
@@ -163,7 +165,7 @@ class CharterJournalTests(unittest.TestCase):
 
     def test_journal_sample_non_inode_identity_deadline_and_byte_bounds_stay_strict(self):
         for change in ('sample-replaced', 'mode', 'device', 'deadline', 'mutation-bound'):
-            with self.subTest(change=change), fixture('supplied_reply') as f:
+            with self.subTest(change=change), self.fixture('supplied_reply') as f:
                 name, value = original_journal(f, 'supplied_reply'); baseline(f, name, value)
                 replace_journal(f, name)
                 if change == 'sample-replaced': f.write(name, (f.root / name).read_bytes())
@@ -174,6 +176,75 @@ class CharterJournalTests(unittest.TestCase):
                 else: f.retained['worker']['mutation_record_bytes'] = 1
                 with self.assertRaises(ValueError): f.history()
 
+
+
+
+@contextlib.contextmanager
+def recovered_fixture(*args,**kwargs):
+    with fixture(*args,**kwargs) as f:
+        f.host.p['formats']['before']=dict(hostmod._RECOVERED_CODEX_HOME_FORMATS)
+        f.host.p['formats']['after']=dict(hostmod._RECOVERED_CODEX_HOME_FORMATS)
+        f.host._verified_manifest={'source':{'files':{n:{'sha256':v}
+            for n,v in hostmod._RECOVERED_CODEX_HOME_SOURCES.items()}}}
+        yield f
+
+
+class RecoveredCharterJournalTests(CharterJournalTests):
+    fixture=staticmethod(recovered_fixture)
+
+    def test_selected20_journal_subset_matches_current_sources_and_refuses_drift(self):
+        # Authenticate the secondary journal subset independently of the fixture
+        # helper and of the larger family, so a stale subset cannot be masked.
+        required = hostmod._RECOVERED_CHARTER_JOURNAL_SOURCES
+        self.assertEqual(set(required), {'src/worker/charter.rs',
+            'src/worker/charter_output.rs', 'src/worker/mutations.rs', 'src/worker/process.rs'})
+        self.assertEqual(hostmod._RECOVERED_CODEX_HOME_FORMATS,
+                         {'wire': 25, 'controller_schema': 26, 'worker_format': 20})
+        root = Path(hostmod.__file__).resolve().parents[1]
+        for name, expected in required.items():
+            with self.subTest(source=name):
+                self.assertEqual(expected, hostmod._RECOVERED_CODEX_HOME_SOURCES[name])
+                self.assertEqual(C.digest((root / name).read_bytes()), expected)
+            for changed in (None, '0' * 64):
+                with self.subTest(source=name, pin=changed), self.fixture('supplied_reply') as f:
+                    journal, value = original_journal(f, 'supplied_reply')
+                    baseline(f, journal, value); replace_journal(f, journal)
+                    self.assertTrue(f.host.selected_writer_sources(required))
+                    selected = f.host._verified_manifest['source']['files']
+                    if changed is None:
+                        del selected[name]
+                    else:
+                        selected[name]['sha256'] = changed
+                    self.assertFalse(f.host.selected_writer_sources(required))
+                    with self.assertRaisesRegex(ValueError, 'original_worker_history_changed'):
+                        f.history()
+        # A complete current family cannot be substituted with its historical
+        # charter-output producer, even when every other selected pin is exact.
+        with self.fixture('supplied_reply') as f:
+            journal, value = original_journal(f, 'supplied_reply')
+            baseline(f, journal, value); replace_journal(f, journal)
+            selected = f.host._verified_manifest['source']['files']
+            selected['src/worker/charter_output.rs']['sha256'] = (
+                hostmod._CHARTER_JOURNAL_SOURCES['src/worker/charter_output.rs'])
+            self.assertFalse(f.host.selected_writer_sources(required))
+            with self.assertRaisesRegex(ValueError, 'original_worker_history_changed'):
+                f.history()
+
+    def test_selected20_journal_proof_retains_original_caller_and_selected_sources(self):
+        with self.fixture('supplied_reply') as f:
+            name,value=original_journal(f,'supplied_reply')
+            before=baseline(f,name,value);replace_journal(f,name)
+            _,observations=f.history();self.assertEqual(set(observations),{name})
+            proof=f.host._charter_manifests.proof()
+            self.assertEqual(proof['journal_source_files'],hostmod._RECOVERED_CHARTER_JOURNAL_SOURCES)
+            self.assertEqual(f.stop,before)
+            self.assertFalse(proof['host_effects'] or proof['directory_allowances_added'])
+            f.host.api.assert_not_called()
+        with self.fixture('supplied_reply') as f:
+            name,value=original_journal(f,'supplied_reply')
+            baseline(f,name,value);replace_journal(f,name)
+            f.host._verified_manifest['source']['files']['src/worker/mutations.rs']['sha256']=hostmod._CHARTER_JOURNAL_SOURCES['src/worker/mutations.rs']
+            with self.assertRaises(ValueError):f.history()
 
 if __name__ == '__main__':
     unittest.main()

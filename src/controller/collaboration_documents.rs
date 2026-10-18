@@ -321,7 +321,7 @@ pub(super) fn query_page<T:serde::Serialize,F>(q:&QueryContext<'_, '_>,kind:&str
         if let Some(item)=item {
             page.items.push(item);
             page.next_cursor=Some(cursor(kind,scope,&position)?);
-            if super::bounded_json_size(&page,q.limits.page_bytes).is_err() {
+            if !q.tx.fitting_read && super::bounded_json_size(&page,q.limits.page_bytes).is_err() {
                 page.items.pop();
                 if page.items.is_empty(){return refuse("response_bound","Configured limit exceeded: workflow.page_bytes")}
                 page.next_cursor=last;
@@ -331,7 +331,7 @@ pub(super) fn query_page<T:serde::Serialize,F>(q:&QueryContext<'_, '_>,kind:&str
         last=Some(cursor(kind,scope,&position)?);
     }
     page.next_cursor=if more {last}else{None};
-    if super::bounded_json_size(&page,q.limits.page_bytes).is_err(){return refuse("response_bound","Configured limit exceeded: workflow.page_bytes")}
+    if !q.tx.fitting_read && super::bounded_json_size(&page,q.limits.page_bytes).is_err(){return refuse("response_bound","Configured limit exceeded: workflow.page_bytes")}
     Ok(page)
 }
 

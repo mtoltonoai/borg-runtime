@@ -65,6 +65,52 @@ pub struct Tool {
     pub input_schema: Value,
     pub annotations: Value,
 }
+#[derive(Default)]
+pub(crate) struct ReadOptions {
+    pub max_bytes: Option<usize>,
+    pub cursor: Option<String>,
+    pub session_id: Option<String>,
+    pub task_part: Option<crate::read_page::TaskPart>,
+    pub document_part: Option<crate::read_page::DocumentPart>,
+}
+/// Remove only the newly optional read options; original list cursors and all
+/// mutation operands keep their historical validation and serialization.
+pub(crate) fn take_read_options(name:&str,args:&mut Value)->Result<ReadOptions,String> {
+    let mut result=ReadOptions::default();
+    if crate::read_page::ReadTool::parse(name).is_none() && name!="collab_read_continue" {return Ok(result);}
+    let values=args.as_object_mut().ok_or("read arguments must be an object")?;
+    if let Some(value)=values.remove("max_bytes") {
+        result.max_bytes=Some(value.as_u64().and_then(|n|usize::try_from(n).ok()).filter(|n|*n>0).ok_or("max_bytes must be a positive representable byte count")?);
+    }
+    if matches!(name,"collab_task_get"|"collab_document_get"|"collab_repository_read"|"collab_read_continue") {
+        if let Some(value)=values.remove("cursor") {
+            if !value.is_null(){result.cursor=Some(value.as_str().filter(|s|!s.is_empty()).ok_or("read cursor must be a nonempty string")?.into());}
+        }
+    }
+    if name=="collab_task_get" {
+        if let Some(value)=values.remove("part") {result.task_part=Some(serde_json::from_value(value).map_err(|_|"invalid task read part")?);}
+        if let Some(value)=values.remove("session_id") {result.session_id=Some(value.as_str().ok_or("invalid read session")?.into());}
+    }
+    if name=="collab_document_get" {
+        if let Some(value)=values.remove("part") {result.document_part=Some(serde_json::from_value(value).map_err(|_|"invalid document read part")?);}
+    }
+    Ok(result)
+}
+fn read_schemas(tools:&mut [Tool],limits:&RuntimeLimits) {
+    for tool in tools {
+        if crate::read_page::ReadTool::parse(&tool.name).is_none() && tool.name!="collab_read_continue" {continue;}
+        let p=tool.input_schema["properties"].as_object_mut().expect("closed read schema");
+        p.insert("max_bytes".into(),json!({"type":"integer","minimum":1,"maximum":usize::MAX}));
+        if matches!(tool.name.as_str(),"collab_task_get"|"collab_document_get"|"collab_repository_read") {
+            p.insert("cursor".into(),json!({"type":["string","null"],"minLength":1,"maxLength":limits.controller.collaboration_cursor_bytes,"x-borg-maxUtf8Bytes":limits.controller.collaboration_cursor_bytes}));
+        }
+        if tool.name=="collab_task_get" {
+            p.insert("part".into(),json!({"type":"string","enum":["record","instruction","result","recent_output"]}));
+            p.insert("session_id".into(),json!({"type":"string","minLength":1,"maxLength":limits.transport.identity_bytes,"x-borg-maxUtf8Bytes":limits.transport.identity_bytes}));
+        }
+        if tool.name=="collab_document_get" {p.insert("part".into(),json!({"type":"string","enum":["record","body"]}));}
+    }
+}
 /// Render the closed tool mechanisms against the selected metadata. UTF-8
 /// byte bounds are explicit extensions because JSON Schema maxLength counts
 /// Unicode scalar values, while controller records consume encoded bytes.
@@ -100,6 +146,7 @@ pub fn catalogue(limits: &RuntimeLimits) -> Vec<Tool> {
             }
         }
     }
+    read_schemas(&mut tools,limits);
     tools
 }
 
@@ -124,6 +171,7 @@ pub fn catalogue_for_profile(
     if matches!(profile, ExecutionProfile::CollaborationV2 { .. }) {
         tools.extend(identity_administration::catalogue(limits, limits.execution.collaboration.capabilities.as_ref()));
     }
+    read_schemas(&mut tools,limits);
     tools
 }
 
@@ -194,13 +242,18 @@ pub fn validate_arguments_for_profile(
         {
             return Err("collaboration workflow tools are not configured".into());
         }
+        let mut original=arguments.clone();
+        let options=take_read_options(tool_name,&mut original)?;
+        if options.cursor.as_ref().is_some_and(|s|s.len()>limits.controller.collaboration_cursor_bytes) {
+            return Err("Configured limit exceeded: controller.collaboration_cursor_bytes".into());
+        }
         if questions::handles(tool_name) {
-            return questions::validate_arguments(tool_name, arguments, limits);
+            return questions::validate_arguments(tool_name, &original, limits);
         }
         if documents_reviews::owns(tool_name) {
-            return documents_reviews::validate_arguments(tool_name, arguments, limits);
+            return documents_reviews::validate_arguments(tool_name, &original, limits);
         }
-        return work::validate_arguments(tool_name, arguments, limits);
+        return work::validate_arguments(tool_name, &original, limits);
     }
     validate_arguments(tool_name, arguments, limits)
 }
@@ -418,6 +471,9 @@ fn requires_quiescence(call: &Invocation, outcome: &Outcome) -> bool {
 }
 pub fn result(call: &Invocation, reply: Reply) -> Result<CallResult, String> {
     reply.validate_for(&call.operation())?;
+    if matches!(reply.outcome,Outcome::Ok {data:Data::OriginalReadBodyUnavailable(_)}) {
+        return Err(crate::read_retention::UNAVAILABLE.into());
+    }
     Ok(CallResult {
         requires_quiescence: requires_quiescence(call, &reply.outcome),
         reply,
@@ -441,6 +497,7 @@ pub fn recovered(call: &Invocation, lookup: Reply) -> Result<CallResult, String>
     {
         return Err("collaboration occurrence differs from original input".into());
     }
+    if record.kind=="committed_read_reference" {return Err(crate::read_retention::UNAVAILABLE.into());}
     let outcome: Outcome =
         serde_json::from_value(record.outcome.clone().ok_or("missing original outcome")?)
             .map_err(|_| "invalid original outcome")?;
@@ -484,7 +541,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 fn success(id: Value, value: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":value})
 }
-fn tool_result(id: Value, value: &CallResult) -> Value {
+pub(crate) fn tool_result(id: Value, value: &CallResult) -> Value {
     success(
         id,
         json!({"content":[{"type":"text","text":serde_json::to_string(value).expect("typed tool reply")}],"isError":!matches!(value.reply.outcome,Outcome::Ok{..})}),
@@ -1085,8 +1142,35 @@ mod metadata_tests {
 }
 
 #[cfg(test)]
-mod definition_update_schema_tests {
+mod tests {
     use super::*;
+    #[test]
+    fn identity_limit_fields_schema_is_closed_and_positive_without_enrollment() {
+        let limits = RuntimeLimits::seed().unwrap();
+        let tool = catalogue(&limits).into_iter().find(|t| t.name == "collab_definition_update").unwrap();
+        let changes = &tool.input_schema["properties"]["changes"];
+        assert_eq!(changes["properties"].as_object().unwrap().len(), 14);
+        assert_eq!(changes["additionalProperties"], false);
+        for name in ["coding.frame_bytes", "collaboration.journal_bytes"] {
+            assert_eq!(changes["properties"][name], json!({"type":"integer","minimum":1}));
+            for value in [json!(1), json!(4294967296u64)] {
+                let args = json!({"agent_id":"a","expected_revision":"r","expected_global_revision":"g","expected_policy_revision":"p","changes":{name:value}});
+                validate_arguments("collab_definition_update", &args, &limits).unwrap();
+                let typed: DefinitionUpdate = serde_json::from_value(args).unwrap();
+                assert_eq!(typed.changes.len(), 1);
+            }
+            for value in [json!(0), json!(-1), json!(1.5), json!("1"), Value::Null, json!(true)] {
+                let args = json!({"agent_id":"a","expected_revision":"r","expected_global_revision":"g","expected_policy_revision":"p","changes":{name:value}});
+                assert!(validate_arguments("collab_definition_update", &args, &limits).is_err());
+            }
+        }
+        for name in ["coding.stderr_bytes", "collaboration.frame_bytes", "unknown"] {
+            let args = json!({"agent_id":"a","expected_revision":"r","expected_global_revision":"g","expected_policy_revision":"p","changes":{name:1}});
+            assert!(validate_arguments("collab_definition_update", &args, &limits).is_err());
+            assert!(serde_json::from_value::<DefinitionUpdate>(args).is_err());
+        }
+        assert!(!crate::protocol::identity_limit_fields::metadata_uses(&limits));
+    }
     #[test]
     fn definition_updates_schema_has_closed_positive_fields_and_string_revision() {
         let limits = RuntimeLimits::seed().unwrap();

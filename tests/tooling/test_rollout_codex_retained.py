@@ -18,15 +18,17 @@ C = original.C
 
 
 class CodexRetainedTests(original.NoExternalEffects):
+    FAMILY=hostmod._COMPOSED_CODEX_HOME_SOURCES
+    FORMATS=hostmod._COMPOSED_CODEX_HOME_FORMATS
     @contextlib.contextmanager
     def fixture(self, reason='uncertain_effect', *, status=None, proof=False):
         with tempfile.TemporaryDirectory(prefix='codex-retained-readback-') as directory:
             f = original.CodexHomeFixture(Path(directory))
             f.host._verified_manifest = {'source': {'files': {
                 name: {'sha256': digest}
-                for name, digest in hostmod._COMPOSED_CODEX_HOME_SOURCES.items()}}}
-            f.host.p['formats']['before'] = dict(hostmod._COMPOSED_CODEX_HOME_FORMATS)
-            f.host.p['formats']['after'] = dict(hostmod._COMPOSED_CODEX_HOME_FORMATS)
+                for name, digest in self.FAMILY.items()}}}
+            f.host.p['formats']['before'] = dict(self.FORMATS)
+            f.host.p['formats']['after'] = dict(self.FORMATS)
             (f.root / 'cleanup-codex').mkdir(mode=0o700)
             saved = f.stop['codex_homes'][f.key]
             f.home_proof = {'path': str(f.root / f.base),
@@ -407,6 +409,26 @@ class CodexRetainedTests(original.NoExternalEffects):
             with self.assertRaisesRegex(ValueError, 'codex_copyout_authority_missing'):
                 f.check()
 
+
+
+
+class RecoveredCodexRetainedTests(CodexRetainedTests):
+    FAMILY=hostmod._RECOVERED_CODEX_HOME_SOURCES
+    FORMATS=hostmod._RECOVERED_CODEX_HOME_FORMATS
+
+    def test_retained_proof_uses_selected20_writers_and_refuses_mixed19_cleanup(self):
+        with self.fixture() as f:
+            f.check()
+            proof=f.host._codex_home_proof
+            self.assertEqual(proof['retained_source_files'],hostmod._RECOVERED_CODEX_RETAINED_SOURCES)
+            self.assertFalse(any(row['canonical_settlement_claimed'] or row['reclamation_claimed']
+                                 for row in proof['retained_attempts'].values()))
+        for name,digest in hostmod._CODEX_RETAINED_SOURCES.items():
+            with self.subTest(source=name),self.fixture() as f:
+                f.host._verified_manifest['source']['files'][name]['sha256']=digest
+                self.assertFalse(f.host.codex_home_scope())
+                _,accepted=self.observe(f);self.assertFalse(accepted)
+                with self.assertRaises(ValueError):f.check()
 
 if __name__ == '__main__':
     unittest.main()

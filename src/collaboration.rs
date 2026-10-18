@@ -17,6 +17,7 @@ use serde_json::Value;
     deny_unknown_fields
 )]
 pub enum Query {
+    Read(crate::read_page::Request),
     Repositories {
         after: Option<String>,
         limit: usize,
@@ -167,6 +168,7 @@ pub struct ReleaseCheck {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
+    Read(Box<Data>),
     Repositories(Page<crate::repository_catalogue::Entry>),
     RepositoryRegistration(crate::repository_catalogue::Entry),
     Limits {
@@ -179,6 +181,7 @@ pub enum QueryResult {
     Activity(ActivityPage),
     Tasks(crate::mcp::ListPage),
     Call(Box<CallRecord>),
+    RetainedCall(Box<crate::read_retention::ReleasedRead>),
     Repository(Box<crate::repository_view::Output>),
     Definition(Definition),
     MemoryKeys(Page<MemoryKey>),

@@ -704,3 +704,49 @@ async fn tool_response_timeout_uses_original_receipt_and_never_blindly_repeats_m
         assert!(!fixture.reporter.outbox.exists());
     }
 }
+
+
+#[tokio::test]
+async fn native_and_codex_original_read_recovery_parity() {
+    let fixture=Fixture::new(false,Script::default(),10_000,2);
+    handoff::initialize_state(&fixture.root,&fixture.control.runtime_limits.worker).unwrap();
+    let mut journal=fixture.invoke().await.unwrap();
+    let file=path(&fixture.root,&fixture.reporter.attempt,1,1);
+    let policy=crate::limits::WorkerRetentionLimits {success_grace_ms:0,failed_grace_ms:0,cancelled_grace_ms:0,
+        idle_cache_grace_ms:0,batch_entries:2,filesystem_entries_per_yield:2,operation_timeout_ms:1000,retry_delay_ms:1,record_bytes:1_048_576};
+    assert!(super::super::read_retention::native_reads(&fixture.root,&fixture.input,&fixture.reporter.attempt,&policy,None).is_err(),"unconsumed body is not custody");
+    mutations::consume(&file,&mut journal).unwrap();
+    let before=std::fs::read(&file).unwrap();
+    let (items,custody)=super::super::read_retention::native_reads(&fixture.root,&fixture.input,&fixture.reporter.attempt,&policy,None).unwrap();
+    assert!(custody.valid());assert_eq!(items.len(),1);assert_eq!(items[0].operation_id,fixture.call.operation_id);
+    assert_eq!(std::fs::read(&file).unwrap(),before,"Native unique journal stays full; only controller duplicate may shrink");
+    let original=fixture.original();
+    let reference=crate::read_retention::ReadReference::new(&fixture.call,&original).unwrap();
+    assert_eq!(reference.evidence,items[0].evidence);
+    let mut later=original.clone();later.reply.observed_controller_revision=Some(11);
+    assert_eq!(reference.restore(&fixture.call,later).unwrap(),original,"same typed recovery contract used by Coding references");
+    assert_eq!(fixture.retained().outcome,journal.outcome);
+    assert!(!fixture.root.join("native-transcripts").exists(),"no new provider history archive");
+    assert_eq!(fixture.peer.seen.lock().unwrap().calls.len(),1);
+}
+
+#[tokio::test]
+async fn retained_transcript_and_sibling_history_remain_exact() {
+    let fixture=Fixture::new(false,Script::default(),10_000,2);
+    handoff::initialize_state(&fixture.root,&fixture.control.runtime_limits.worker).unwrap();
+    let mut journal=fixture.invoke().await.unwrap();let file=path(&fixture.root,&fixture.reporter.attempt,1,1);mutations::consume(&file,&mut journal).unwrap();
+    let sibling=fixture.root.join("retained-sibling-history.json");std::fs::write(&sibling,b"unrelated original history\n").unwrap();
+    let original=std::fs::read(&file).unwrap();let other=std::fs::read(&sibling).unwrap();
+    let policy=crate::limits::WorkerRetentionLimits {success_grace_ms:0,failed_grace_ms:0,cancelled_grace_ms:0,
+        idle_cache_grace_ms:0,batch_entries:1,filesystem_entries_per_yield:1,operation_timeout_ms:1000,retry_delay_ms:1,record_bytes:1_048_576};
+    let a=super::super::read_retention::native_reads(&fixture.root,&fixture.input,&fixture.reporter.attempt,&policy,None).unwrap();
+    let b=super::super::read_retention::native_reads(&fixture.root,&fixture.input,&fixture.reporter.attempt,&policy,None).unwrap();assert_eq!(a,b);
+    assert_eq!(std::fs::read(&file).unwrap(),original);assert_eq!(std::fs::read(&sibling).unwrap(),other);
+    let removed=file.with_extension("original-held");std::fs::rename(&file,&removed).unwrap();
+    assert!(super::super::read_retention::native_reads(&fixture.root,&fixture.input,&fixture.reporter.attempt,&policy,None).is_err(),"missing/foreign source cannot reconstruct the expected custody");
+    std::fs::rename(removed,&file).unwrap();
+    let mut corrupt=journal.clone();corrupt.consumed=false;atomic_json(&file,&corrupt).unwrap();
+    assert!(super::super::read_retention::native_reads(&fixture.root,&fixture.input,&fixture.reporter.attempt,&policy,None).is_err());
+    std::fs::write(&file,&original).unwrap();
+    assert_eq!(super::super::read_retention::native_reads(&fixture.root,&fixture.input,&fixture.reporter.attempt,&policy,None).unwrap(),a);
+}

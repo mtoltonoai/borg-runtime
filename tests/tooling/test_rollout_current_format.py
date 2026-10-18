@@ -16,15 +16,17 @@ import rollout_host_v2 as H
 
 
 class CurrentFormatObservationTests(unittest.TestCase):
+    FORMATS=H._COMPOSED_CODEX_HOME_FORMATS
+    FAMILY=H._COMPOSED_CODEX_HOME_SOURCES
     def setUp(self):
         self.stack=ExitStack();self.addCleanup(self.stack.close)
         for name in ('subprocess.Popen','socket.socket','socket.create_connection','os.system','os.posix_spawn','os.posix_spawnp'):
             self.stack.enter_context(mock.patch(name,side_effect=AssertionError('external effects forbidden')))
         for name in ('run','http_read'):
             self.stack.enter_context(mock.patch.object(H.c,name,side_effect=AssertionError('host effects forbidden')))
-        self.profile={'formats':{'before':dict(H._COMPOSED_CODEX_HOME_FORMATS),
-                                 'after':dict(H._COMPOSED_CODEX_HOME_FORMATS),'source_files':{}}}
-        self.manifest={'source':{'files':{n:{'sha256':v} for n,v in H._COMPOSED_CODEX_HOME_SOURCES.items()}}}
+        self.profile={'formats':{'before':dict(self.FORMATS),
+                                 'after':dict(self.FORMATS),'source_files':{}}}
+        self.manifest={'source':{'files':{n:{'sha256':v} for n,v in self.FAMILY.items()}}}
         self.host=H.Host.__new__(H.Host)
         self.host.p=copy.deepcopy(self.profile)
         self.host.h={'role':'worker','service_uid':os.geteuid(),'state':{'root':'/fixture/current-format'}}
@@ -34,7 +36,7 @@ class CurrentFormatObservationTests(unittest.TestCase):
         self.host.retained_policy=mock.Mock(return_value={'worker':{'state_format_bytes':64}})
         self.now=1000
         self.stack.enter_context(mock.patch.object(H.c,'now_ms',side_effect=lambda:self.now))
-        self.raw=b'{"format_revision":19}'
+        self.raw=('{"format_revision":%d}' % self.FORMATS['worker_format']).encode()
         self.old={'sha256':H.c.digest(self.raw),'identity':[1,2,os.geteuid(),os.getegid(),0o600]}
         self.new=copy.deepcopy(self.old);self.new['identity'][1]=3
         self.stop={'state':{'format.json':copy.deepcopy(self.old)}}
@@ -78,7 +80,7 @@ class CurrentFormatObservationTests(unittest.TestCase):
         self.assertEqual(set(observed),{'format.json'})
         proof=observed['format.json']
         self.assertEqual((proof['original'],proof['observed']),(self.old,self.new))
-        self.assertEqual(proof['format_revision'],19)
+        self.assertEqual(proof['format_revision'],self.FORMATS['worker_format'])
         self.assertTrue(proof['original_bytes_preserved'] and proof['noninode_identity_preserved'])
         self.assertFalse(proof['actual_writer_attributed'] or proof['simultaneous_snapshot'] or proof['service_effects'])
         self.assertEqual(set(proof['writer_sources']),{'src/worker/handoff.rs','src/worker/process.rs','src/worker/mod.rs'})
@@ -178,5 +180,53 @@ class CurrentFormatObservationTests(unittest.TestCase):
         self.assertEqual(preserved,{'format.json':self.old});self.assertEqual(observed,{})
         self.capture.assert_not_called()
 
+
+
+
+class RecoveredFormatObservationTests(CurrentFormatObservationTests):
+    """Same local descriptor/refusal oracles, separately selected worker20."""
+    FORMATS=H._RECOVERED_CODEX_HOME_FORMATS
+    FAMILY=H._RECOVERED_CODEX_HOME_SOURCES
+
+    def test_selected20_family_exactly_matches_source_and_has_no_historical_fallback(self):
+        root=Path(H.__file__).parents[1]
+        self.assertEqual(len(self.FAMILY),67)
+        self.assertEqual(self.FORMATS,{'wire':25,'controller_schema':26,'worker_format':20})
+        self.assertIn(b'pub const WIRE_REVISION: u32 = 25;',(root/'src/protocol.rs').read_bytes())
+        self.assertIn(b'const VERSION: i64 = 26;',(root/'src/controller/application_schema.rs').read_bytes())
+        self.assertIn(b'const CURRENT_STATE_FORMAT: u32 = 20;',(root/'src/worker/handoff.rs').read_bytes())
+        self.assertIn(b'const JOURNAL: &str = "borg-supplied-outer.json";',
+                      (root/'src/worker/codex_retry.rs').read_bytes())
+        for name,digest in self.FAMILY.items():
+            with self.subTest(source=name):
+                self.assertEqual(H.c.digest((root/name).read_bytes()),digest)
+        saved=copy.deepcopy(self.host._verified_manifest)
+        for name in self.FAMILY:
+            for change in ('missing','changed'):
+                self.host._verified_manifest=copy.deepcopy(saved)
+                files=self.host._verified_manifest['source']['files']
+                if change=='missing':del files[name]
+                else:files[name]['sha256']='0'*64
+                with self.subTest(source=name,change=change):
+                    self.assertFalse(self.host.codex_home_scope())
+                    with self.assertRaises(ValueError):self.history()
+        # An entire exact historical family is insufficient under selected20.
+        for family in (H._CODEX_HOME_SOURCES,H._SUPPLIED_CODEX_HOME_SOURCES,
+                       H._DIRECTORY_CODEX_HOME_SOURCES,H._DEFAULT_ASSIGNMENT_CODEX_HOME_SOURCES,
+                       H._COMPOSED_CODEX_HOME_SOURCES):
+            self.host._verified_manifest={'source':{'files':{n:{'sha256':v} for n,v in family.items()}}}
+            self.assertFalse(self.host.codex_home_scope())
+        self.capture.assert_not_called()
+
+    def test_same_format_exception_cannot_authorize_forward_or_mixed_tuple(self):
+        self.host.p['formats']['forward']={'kind':H.c.RECOVERED_KIND}
+        self.assertFalse(self.host.current_format_observation('format.json',self.old,self.new))
+        del self.host.p['formats']['forward']
+        self.host.p['formats']['before']=dict(H._COMPOSED_CODEX_HOME_FORMATS)
+        self.assertFalse(self.host.current_format_observation('format.json',self.old,self.new))
+        self.host.p['formats']['before']=dict(self.FORMATS)
+        self.raw=b'{"format_revision":19}'
+        self.old['sha256']=self.new['sha256']=H.c.digest(self.raw)
+        with self.assertRaisesRegex(ValueError,'marker_value'):self.history()
 
 if __name__ == "__main__":unittest.main()

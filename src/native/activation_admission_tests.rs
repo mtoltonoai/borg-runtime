@@ -26,9 +26,7 @@ fn dimensions(value: &Value) -> Value {
 }
 
 #[test]
-fn exact_candidate_charter_catalogue_and_initial_probe_fit_selected_bounds() {
-    // Byte-exact pending activation data. This is not an invented live task;
-    // the ordinary probe instruction/schema are shared with identity_support.
+fn historical_activation_policy_refuses_expanded_charter_catalogue() {
     let limits: crate::limits::RuntimeLimits = serde_json::from_str(include_str!(
         "testdata/activation-controller-limits.pending.json"
     )).unwrap();
@@ -37,9 +35,39 @@ fn exact_candidate_charter_catalogue_and_initial_probe_fit_selected_bounds() {
     )).unwrap();
     limits.validate().unwrap();
     let execution = limits.resolve_definition(&definition).unwrap();
+    assert_eq!(execution.native.function_count, 73);
+    let mut rendered = limits.clone();
+    rendered.execution = execution.clone();
+    let profile = NativeLoopProfile {
+        functions: crate::mcp::catalogue_for_profile(&rendered, definition.execution_profile.as_ref())
+            .into_iter().map(|t| NativeFunction {
+                name: t.name, description: t.description, parameters: t.input_schema,
+            }).collect(),
+        web_search: None,
+    };
+    assert_eq!(profile.functions.len(), 74);
+    assert_eq!(profile.functions.iter().filter(|f| f.name == "collab_read_continue").count(), 1);
+    assert_eq!(selected(&profile, &execution.native),
+        Err("native_tool_profile_bound_native_function_count".into()));
+}
+
+#[test]
+fn current_charter_catalogue_and_initial_probe_fit_explicit_test_bounds() {
+    // Derive a current-catalogue test policy from the unchanged historical data.
+    // This is not a live metadata update or a claim that the old policy admits it.
+    let mut limits: crate::limits::RuntimeLimits = serde_json::from_str(include_str!(
+        "testdata/activation-controller-limits.pending.json"
+    )).unwrap();
+    assert_eq!(limits.execution.native.function_count, 73);
+    limits.execution.native.function_count = 74;
+    let definition: crate::protocol::Definition = serde_json::from_str(include_str!(
+        "testdata/activation-charter-definition.pending.json"
+    )).unwrap();
+    limits.validate().unwrap();
+    let execution = limits.resolve_definition(&definition).unwrap();
     let policy = &execution.native;
     assert_eq!(policy, &limits.execution.native);
-    assert_eq!(policy.function_count, 73);
+    assert_eq!(policy.function_count, 74);
     let mut rendered = limits.clone();
     rendered.execution = execution.clone();
     let tools = crate::mcp::catalogue_for_profile(&rendered, definition.execution_profile.as_ref());
@@ -49,7 +77,8 @@ fn exact_candidate_charter_catalogue_and_initial_probe_fit_selected_bounds() {
         }).collect(),
         web_search: None,
     };
-    assert_eq!(profile.functions.len(), 73);
+    assert_eq!(profile.functions.len(), 74);
+    assert_eq!(profile.functions.iter().filter(|f| f.name == "collab_read_continue").count(), 1);
     let output_schema = json!({"type":"integer"});
     let validation = serde_json::to_value(ValidationInput {
         schema: output_schema.clone(), profile: profile.clone(),
@@ -104,7 +133,7 @@ fn exact_candidate_charter_catalogue_and_initial_probe_fit_selected_bounds() {
     let request_size = schema::measure(&request, policy.request_bytes, policy, "native_request_bytes").unwrap();
     let profile_size = schema::measure(&profile_value, policy.schema_bytes, policy, "native_schema_bytes").unwrap();
     println!("candidate_activation_admission {}", json!({
-        "scope":"exact pending metadata and charter with fixed ordinary probe; no provider or live task",
+        "scope":"explicit current-catalogue test policy and historical charter with fixed probe; no provider or live task",
         "functions":profile.functions.len(),"profile_bytes":profile_size.0,"profile_nodes":profile_size.1,
         "validation_bytes":validation_size.0,"validation_nodes":validation_size.1,"validation_depth":depth(&validation),
         "context_bytes":context.0,"context_nodes":context.1,"context_depth":depth(&request["input"]),

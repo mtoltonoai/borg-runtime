@@ -99,7 +99,7 @@ pub(super) fn query(tx:&StoreContext<'_>,cfg:&super::ControllerConfig,query:&Que
                 let view=if visible {Some(tx.machine_resources.ok_or_else(||Fault::Store("machine observation owner absent".into()))?.view(tx,cfg,machine)?)}else{None};
                 rows.push((machine.machine_id.clone(),view));
             }
-            Ok(QueryResult::Machines(super::collaboration_queries::page(tx.limits,rows,*limit,"machines","")?))
+            Ok(QueryResult::Machines(super::collaboration_queries::project_page(tx,rows,*limit,"machines","")?))
         }
         _=>refuse("invalid_input","not a machine resource query"),
     }
@@ -129,7 +129,7 @@ pub(super) fn validate_existing(tx:&StoreContext<'_>,cfg:&super::ControllerConfi
     while let Some(row)=rows.next()? {
         count+=1;if count>bound{return Err(Fault::Store("machine vocabulary receipt inventory exceeds bound".into()));}
         let id:String=row.get(0)?;
-        let record=super::metadata::read(tx,&id)?.ok_or_else(||Fault::Store("machine vocabulary receipt disappeared".into()))?;
+        let Some(record)=super::metadata::scan_inline(tx,&id)? else {continue};
         let selected=match &record.request {
             Operation::ReportMachineResources{..}|Operation::QueryCollaboration{query:Query::Machines{..}|Query::Machine{..}}=>true,
             Operation::CallCollaboration{call}=>matches!(call.tool.as_str(),"collab_machines_list"|"collab_machine_get"),

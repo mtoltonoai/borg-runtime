@@ -372,7 +372,8 @@ async fn new_catalogue_fits_before_provider_send() {
         &p,
         Some(&ExecutionProfile::CollaborationV2 { web_search: None }),
     );
-    assert_eq!(old.len(), 66);
+    assert_eq!(old.len(), 67);
+    assert_eq!(old.iter().filter(|tool| tool.name == "collab_read_continue").count(), 1);
     p.execution.collaboration.capabilities = h
         .original
         .input
@@ -385,7 +386,7 @@ async fn new_catalogue_fits_before_provider_send() {
         &p,
         Some(&ExecutionProfile::CollaborationV2 { web_search: None }),
     );
-    assert_eq!(tools.len(), 73);
+    assert_eq!(tools.len(), 74);
     assert!(tools.iter().any(|t| t.name == "collab_document_create"));
     assert_eq!(
         tools
@@ -406,7 +407,7 @@ async fn new_catalogue_fits_before_provider_send() {
             Some(&ExecutionProfile::CollaborationV2 { web_search: None })
         )
         .len(),
-        67
+        68
     );
     assert_eq!(
         borg_runtime::mcp::catalogue_for_profile(
@@ -481,7 +482,7 @@ fn native_host(h: &Harness, input: &TaskInput) -> borg_runtime::native::Validati
 #[tokio::test]
 async fn old_readers_and_current_reopen_are_exact() {
     let h = Harness::new("versions", "charter", ExecutorKind::Native, true).await;
-    assert_eq!(WIRE_REVISION, 24);
+    assert_eq!(WIRE_REVISION, 25);
     let refused_call = invocation(&h.caller, "collab_task_create", json!({"agent_id":null}));
     assert_eq!(refused(h.invoke(&refused_call).await), "invalid_input");
     assert!(requires_wire24(&refused_call.operation()));
@@ -495,7 +496,7 @@ async fn old_readers_and_current_reopen_are_exact() {
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        25
+        26
     );
     connection.pragma_update(None, "user_version", 24).unwrap();
     drop(connection);
@@ -507,7 +508,7 @@ async fn old_readers_and_current_reopen_are_exact() {
             .unwrap(),
         24
     );
-    connection.pragma_update(None, "user_version", 25).unwrap();
+    connection.pragma_update(None, "user_version", 26).unwrap();
     drop(connection);
     let c = Controller::open_with_config(&db, cfg).unwrap();
     assert_eq!(

@@ -320,8 +320,7 @@ pub(super) fn validate_existing(
     let mut rows = q.query([])?;
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
-        let record = super::metadata::read(tx, &id)?
-            .ok_or_else(|| Fault::Store("agent directory receipt disappeared".into()))?;
+        let Some(record) = super::metadata::scan_inline(tx, &id)? else { continue };
         let record=super::identity_administration::project(record)?;
         let new_op = matches!(
             &record.request,

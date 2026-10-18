@@ -436,8 +436,7 @@ pub(super) fn validate_existing(tx: &StoreContext<'_>, cfg: &super::ControllerCo
     let mut rows = q.query([])?; count = 0;
     while let Some(row) = rows.next()? {
         count += 1; if count > bound { return Err(invalid("receipt inventory exceeds bound")); }
-        let receipt = super::metadata::read(tx, &row.get::<_, String>(0)?)?
-            .ok_or_else(|| invalid("receipt disappeared"))?;
+        let Some(receipt) = super::metadata::scan_inline(tx, &row.get::<_, String>(0)?)? else { continue };
         if version < 20 {
             let typed = match &receipt.request {
                 Operation::SubmitTask { input, .. } => has_selection(input),

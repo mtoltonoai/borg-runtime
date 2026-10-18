@@ -43,6 +43,8 @@ pub enum Query {
         start_line: usize,
         max_lines: usize,
     },
+    /// Private helper query. Authority still comes only from the resolved Source.
+    ReadFileSlice { path: String, start_line: usize, max_lines: usize, offset: usize },
     Search {
         path: String,
         needle: String,
@@ -80,6 +82,9 @@ pub struct Output {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Data {
+    FileSlice { path: String, object: String, start_line: usize, max_lines: usize,
+        total_lines: usize, next_line: Option<usize>, offset: usize,
+        total_bytes: usize, digest: String, text: String },
     Tree {
         entries: Vec<Entry>,
         next_after: Option<String>,
@@ -189,7 +194,7 @@ impl Query {
                 path: p,
                 start_line,
                 max_lines,
-            } => {
+            } | Self::ReadFileSlice { path: p, start_line, max_lines, .. } => {
                 query_path(p, false, limits)?;
                 query_count(
                     *start_line,
@@ -610,11 +615,8 @@ pub async fn read(
                 next_after,
             }
         }
-        Query::ReadFile {
-            path: p,
-            start_line,
-            max_lines,
-        } => {
+        Query::ReadFile { path: p, start_line, max_lines }
+        | Query::ReadFileSlice { path: p, start_line, max_lines, .. } => {
             let all = tree(&repo, limits, &source.commit, p, false, deadline).await?;
             let e = all
                 .iter()
@@ -657,13 +659,24 @@ pub async fn read(
                 return Err(Error::Invalid);
             }
             let end = from.saturating_add(*max_lines).min(lines.len());
-            Data::File {
-                path: p.clone(),
-                object: e.object.clone(),
-                start_line: *start_line,
-                total_lines: lines.len(),
-                text: lines[from..end].concat(),
-                next_line: (end < lines.len()).then_some(end + 1),
+            let selected = lines[from..end].concat();
+            if let Query::ReadFileSlice { offset, .. } = query {
+                if *offset > selected.len() || !selected.is_char_boundary(*offset) {
+                    return Err(Error::Invalid);
+                }
+                Data::FileSlice {
+                    path: p.clone(), object: e.object.clone(), start_line: *start_line,
+                    max_lines: *max_lines, total_lines: lines.len(),
+                    next_line: (end < lines.len()).then_some(end + 1), offset: *offset,
+                    total_bytes: selected.len(), digest: crate::read_page::digest(selected.as_bytes()),
+                    text: selected[*offset..].into(),
+                }
+            } else {
+                Data::File {
+                    path: p.clone(), object: e.object.clone(), start_line: *start_line,
+                    total_lines: lines.len(), text: selected,
+                    next_line: (end < lines.len()).then_some(end + 1),
+                }
             }
         }
         Query::Search { path: p, needle } => {
@@ -795,11 +808,30 @@ pub async fn read(
     // Traceability scope: Every successful repository operation returns the exact validated source tuple used for its read.
     //= spec/impl/v2/implementation.md#repository-reads-through-the-shared-tool-interface
     //# A repository read result MUST identify its exact source revision.
-    let output = Output {
-        source: source.clone(),
-        untrusted: true,
-        data,
-    };
+    let mut output = Output { source: source.clone(), untrusted: true, data };
+    // Slice only the already admitted immutable text. Keep the digest and total
+    // of the entire selected range, and retain the existing helper output cap.
+    if let Data::FileSlice { text, .. } = &mut output.data {
+        let original = std::mem::take(text);
+        let mut set = |n: usize| {
+            if let Data::FileSlice { text, .. } = &mut output.data {
+                *text = original[..n].into();
+            }
+            crate::protocol::bounded_json_size(&output, limits.output_bytes).is_ok()
+        };
+        if !set(original.len()) {
+            let first = original.chars().next().map_or(0, char::len_utf8);
+            if !set(first) { return Err(Error::Bound("repository.output_bytes")); }
+            let (mut low, mut high) = (first, original.len());
+            while low < high {
+                let mut n = low + (high-low).div_ceil(2);
+                while !original.is_char_boundary(n) { n -= 1; }
+                if n <= low { break; }
+                if set(n) { low = n; } else { high = n-1; }
+            }
+            set(low);
+        }
+    }
     if serde_json::to_vec(&output)
         .map_err(|_| Error::Bound("repository.output_bytes"))?
         .len()

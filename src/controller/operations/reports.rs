@@ -52,9 +52,13 @@ pub(super) fn observe(
     if current.incarnation != r.incarnation {
         return refuse("stale_incarnation", "worker incarnation was superseded");
     }
+    if let Observation::ReadTranscriptCustody {proof}=&r.observation {
+        return super::super::read_retention::observe_custody(tx,r,proof,cfg,now);
+    }
     super::task_tool::progress(tx, &t.task, r, now)?;
     let mut supplied_wait=None;
     match &r.observation {
+        Observation::ReadTranscriptCustody {..} => unreachable!("custody handled before task mutation"),
         Observation::SuppliedOuter { observation } => supplied_wait=super::supplied_outer::observe(tx, &mut t, r, observation, now)?,
         Observation::NativeRequestDiagnostic { .. } =>
             return super::super::native_request_diagnostics::observe(tx, r),

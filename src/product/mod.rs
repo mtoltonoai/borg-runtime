@@ -24,6 +24,7 @@ mod live;
 mod machine_resources;
 mod protected_view;
 mod repository;
+pub(crate) mod read_pages;
 mod repository_catalogue;
 mod sessions;
 mod task_defaults;
@@ -1552,6 +1553,10 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
 // These routes retain their original order and body. Their larger state machine
 // is constructed and polled only after the document/question probes decline.
 async fn get_other(controller: &Controller, path: &str, query: &str) -> UiResponse {
+    if path == "/ui/definition-settings.js" {
+        return UiResponse { status: 200, content_type: "text/javascript; charset=utf-8".into(),
+            body: include_str!("definition_settings.js").into(), location: None, limiting_field: None };
+    }
     if let Some(response) = machine_resources::get(controller, path, query).await {
         return response;
     }
@@ -1775,6 +1780,7 @@ async fn get_other(controller: &Controller, path: &str, query: &str) -> UiRespon
             _ => not_task(reply),
         };
     }
+    if let Some(response)=boxed_route(|| read_pages::task(controller,path,query)).await { return response; }
     let Some(rest) = path.strip_prefix("/tasks/") else {
         return error(404, "Unknown browser route");
     };

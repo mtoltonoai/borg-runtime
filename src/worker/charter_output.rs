@@ -206,11 +206,11 @@ pub(super) async fn upload(client:&ApiClient,state:&Path,limits:&RuntimeLimits,m
 pub(in crate::worker) fn admit(state:&Path,limits:&RuntimeLimits,worker:&str)->Result<(),String>{
     let root=root(state);if !root.exists(){return Ok(())}
     let format:serde_json::Value=serde_json::from_slice(&read(&state.join("format.json"),limits.worker.state_format_bytes)?).map_err(|_|"invalid output owner marker")?;
-    if !matches!(format.get("format_revision").and_then(|v|v.as_u64()),Some(13 | 14 | 15 | 16 | 17 | 18 | 19))
+    if !matches!(format.get("format_revision").and_then(|v|v.as_u64()),Some(13 | 14 | 15 | 16 | 17 | 18 | 19 | 20))
         && std::fs::read_dir(&root).map_err(|e|e.to_string())?.next().is_some(){return Err("new output records under historical worker marker".into())}
     for (manifest,original,maximum) in inventory(state,limits,worker)?{
         if matches!(&manifest.observation,CharterObservation::SuppliedReply{..})
-            &&!matches!(format.get("format_revision").and_then(|v|v.as_u64()),Some(17 | 18 | 19)){return Err("supplied original output requires worker17".into());}
+            &&!matches!(format.get("format_revision").and_then(|v|v.as_u64()),Some(17 | 18 | 19 | 20)){return Err("supplied original output requires worker17".into());}
         verify_files(state,&original,maximum,&manifest)?;
     }Ok(())
 }

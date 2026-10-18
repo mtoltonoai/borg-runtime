@@ -95,12 +95,19 @@ pub(super) fn identity(limits: &crate::limits::RuntimeLimits, value: &str) -> Re
 }
 /// At most limit+1 rows are materialized. Filtered pages still advance by the
 /// scanned row, so an empty partial page cannot masquerade as complete.
-pub(super) fn page<T: Serialize>(
+pub(super) fn page<T: Serialize>(limits: &crate::limits::RuntimeLimits, rows: Vec<(String, Option<T>)>, limit: usize, kind: &str, scope: &str) -> Result<Page<T>> {
+    page_inner(limits, rows, limit, kind, scope, false)
+}
+pub(super) fn project_page<T: Serialize>(tx: &Connection, rows: Vec<(String, Option<T>)>, limit: usize, kind: &str, scope: &str) -> Result<Page<T>> {
+    page_inner(tx.limits, rows, limit, kind, scope, tx.fitting_read)
+}
+fn page_inner<T: Serialize>(
     limits: &crate::limits::RuntimeLimits,
     rows: Vec<(String, Option<T>)>,
     limit: usize,
     kind: &str,
     scope: &str,
+    fitting: bool,
 ) -> Result<Page<T>> {
     let more = rows.len() > limit;
     let mut result = Page {
@@ -112,7 +119,7 @@ pub(super) fn page<T: Serialize>(
         if let Some(item) = item {
             result.items.push(item);
             result.next_cursor = Some(cursor(kind, scope, &position)?);
-            if bounded_json_size(&result, limits.controller.collaboration_page_bytes).is_err() {
+            if !fitting && bounded_json_size(&result, limits.controller.collaboration_page_bytes).is_err() {
                 result.items.pop();
                 if result.items.is_empty() {
                     return refuse(
@@ -127,7 +134,7 @@ pub(super) fn page<T: Serialize>(
         last = Some(cursor(kind, scope, &position)?);
     }
     result.next_cursor = if more { last } else { None };
-    if bounded_json_size(&result, limits.controller.collaboration_page_bytes).is_err() {
+    if !fitting && bounded_json_size(&result, limits.controller.collaboration_page_bytes).is_err() {
         return refuse(
             "response_bound",
             "collaboration page exceeds bound: controller.collaboration_page_bytes",
@@ -297,6 +304,7 @@ fn check_record(
 pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> Result<QueryResult> {
     let limits = tx.limits;
     match query {
+        Query::Read(request) => super::read_pages::query(tx,request,cfg).map(|data|QueryResult::Read(Box::new(data))),
         Query::Repositories { after, limit } => Ok(QueryResult::Repositories(
             super::repositories::list(tx, after, *limit)?,
         )),
@@ -353,7 +361,7 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                 .into_iter()
                 .map(|id| super::sessions::get(tx, &id).map(|v| (id, Some(v))))
                 .collect::<Result<Vec<_>>>()?;
-            page(limits, rows, *limit, "sessions", &scope).map(QueryResult::Sessions)
+            project_page(tx, rows, *limit, "sessions", &scope).map(QueryResult::Sessions)
         }
         Query::Repository { .. } => Err(Fault::Store(
             "repository query requires private read ticket".into(),
@@ -377,7 +385,7 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
             identity(limits, task_id)?;
             identity(limits, operation_id)?;
             load(tx, task_id)?;
-            let record = super::metadata::read(tx, operation_id)?.ok_or_else(|| {
+            let record = super::metadata::read_retained(tx, operation_id)?.ok_or_else(|| {
                 Fault::Refused("not_found", "collaboration call not found".into())
             })?;
             let Operation::CallCollaboration { call } = record.request else {
@@ -394,11 +402,21 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
             {
                 return refuse("not_found", "call is outside the closed catalogue");
             }
+            let outcome = match record.outcome {
+                super::metadata::RetainedOutcome::Inline(outcome) => outcome,
+                super::metadata::RetainedOutcome::ReadReference(reference) => {
+                    let view=QueryResult::RetainedCall(Box::new(crate::read_retention::ReleasedRead {
+                        invocation:call,original_commit:record.commit,record:reference,
+                    }));
+                    bounded_json_size(&view,limits.controller.collaboration_page_bytes).map_err(|_|Fault::Refused("response_bound","retained call view exceeds response bound".into()))?;
+                    return Ok(view);
+                }
+            };
             let reply = super::metadata::reply(
                 limits,
                 "ui-call-observation",
                 &call.operation(),
-                record.outcome,
+                outcome,
                 Some(record.commit),
                 super::metadata::current(tx)?,
             )?;
@@ -408,7 +426,7 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                 invocation: call,
                 result,
             }));
-            if bounded_json_size(&view, limits.controller.collaboration_page_bytes).is_err() {
+            if !tx.fitting_read && bounded_json_size(&view, limits.controller.collaboration_page_bytes).is_err() {
                 return refuse("response_bound", "call view exceeds response bound");
             }
             Ok(view)
@@ -446,8 +464,8 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                 .into_iter()
                 .map(|id| worker(tx, &id).map(|w| (id, Some(w))))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(QueryResult::Workers(page(
-                limits, rows, *limit, "workers", "",
+            Ok(QueryResult::Workers(project_page(
+                tx, rows, *limit, "workers", "",
             )?))
         }
         Query::MemoryKeys {
@@ -483,8 +501,8 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                     Ok((key.clone(), Some(MemoryKey { key, revision })))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(QueryResult::MemoryKeys(page(
-                limits,
+            Ok(QueryResult::MemoryKeys(project_page(
+                tx,
                 rows,
                 *limit,
                 "memory_keys",
@@ -533,8 +551,8 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(QueryResult::TaskHistory(page(
-                limits,
+            Ok(QueryResult::TaskHistory(project_page(
+                tx,
                 rows,
                 *limit,
                 "task_history",
@@ -593,8 +611,8 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(QueryResult::TaskAttempts(page(
-                limits,
+            Ok(QueryResult::TaskAttempts(project_page(
+                tx,
                 rows,
                 *limit,
                 "task_attempts",
@@ -672,8 +690,8 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(QueryResult::TaskCheckpoints(page(
-                limits,
+            Ok(QueryResult::TaskCheckpoints(project_page(
+                tx,
                 rows,
                 *limit,
                 "task_checkpoints",
@@ -707,8 +725,8 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
                     check_record(limits, release_id, id, p, q, r, revision)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(QueryResult::ReleaseChecks(page(
-                limits,
+            Ok(QueryResult::ReleaseChecks(project_page(
+                tx,
                 rows,
                 *limit,
                 "release_checks",

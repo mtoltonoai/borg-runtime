@@ -30,6 +30,7 @@ enum Mode {
     LossBefore,
     Uncommitted,
     Secret,
+    LargeRead,
 }
 struct State {
     calls: usize,
@@ -49,6 +50,9 @@ fn result(call: &Invocation, mode: Mode) -> CallResult {
             code: "capacity".into(),
             message: "known committed refusal".into(),
         },
+        Mode::LargeRead => Outcome::Ok {data:Data::Memory(Some(MemoryValue {
+            agent_id:"agent-1".into(),key:"fixture".into(),revision:1,value:json!("retained original ".repeat(1024)),
+        }))},
         Mode::Secret => Outcome::Ok {
             data: Data::Memory(Some(MemoryValue {
                 agent_id: "agent-1".into(),
@@ -526,6 +530,7 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
         "collab_agent_get",
         "collab_definition_get",
         "collab_definition_update",
+        "collab_read_continue",
         "collab_memory_list",
         "collab_memory_get",
         "collab_memory_set",
@@ -563,6 +568,7 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
     assert_eq!(actual, expected, "exact permitted server tool set changed");
     assert!(!enabled.contains(&json!("collab_task_delegate")));
     for name in [
+        "collab_read_continue",
         "collab_session_get",
         "collab_sessions_list",
         "collab_limits_get",
@@ -605,6 +611,10 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
         assert_eq!(tool.annotations["destructiveHint"], false);
         assert_eq!(tool.annotations["openWorldHint"], false);
     }
+    let continuation = mcp::catalogue(&runtime_limits).into_iter()
+        .find(|tool| tool.name == "collab_read_continue").unwrap();
+    assert_eq!(continuation.annotations, json!({"readOnlyHint":true,
+        "idempotentHint":false,"openWorldHint":false}));
     for tool in mcp::catalogue(&runtime_limits) {
         if writes.contains(&tool.name.as_str()) {
             assert_eq!(tool.annotations["readOnlyHint"], false);
@@ -692,7 +702,7 @@ async fn repository_reads_preserve_exact_host_caller_arguments_and_refusal() {
         assert_eq!(entry.invocation.arguments, arguments);
         assert_eq!(entry.invocation.logical_call_id, logical);
         assert!(matches!(
-            entry.outcome.as_ref().unwrap().reply.outcome,
+            entry.outcome.as_ref().unwrap().inline().unwrap().reply.outcome,
             Outcome::Refused { .. }
         ));
         bridge.delivered(index).unwrap();
@@ -950,7 +960,7 @@ async fn memory_boundary_above_1024_uses_exact_retained_occurrence_without_count
             thread_id: "thread-1".into(),
             session_id: "session-1".into(),
             invocation,
-            outcome: Some(outcome),
+            outcome: Some(CallBody::Inline(outcome)),
             delivered: index < selected,
         });
     }
@@ -1307,7 +1317,7 @@ async fn metadata_journal_above_former_byte_cap_reopens_exact_outcomes_without_r
         assert_eq!(entry.invocation.arguments, arguments);
         assert_eq!(entry.invocation.logical_call_id, logical);
         assert_eq!(entry.invocation.caller, selected.caller);
-        assert_eq!(entry.outcome, Some(result(&entry.invocation, Mode::Good)));
+        assert_eq!(entry.outcome, Some(result(&entry.invocation, Mode::Good).into()));
         bridge.delivered(index).unwrap();
         last_wire = Some(wire);
     }
@@ -1395,3 +1405,9 @@ async fn metadata_journal_above_former_byte_cap_reopens_exact_outcomes_without_r
 
 #[path = "codex_mcp_admission_tests.rs"]
 mod admission_tests;
+
+#[path = "codex_read_pagination_tests.rs"]
+mod read_pagination;
+
+#[path = "codex_mcp_retention_tests.rs"]
+mod retention_tests;

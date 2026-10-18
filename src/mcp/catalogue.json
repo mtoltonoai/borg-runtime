@@ -1020,6 +1020,14 @@
             "coding.model_context_window": {
               "type": "integer",
               "minimum": 1
+            },
+            "coding.frame_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "collaboration.journal_bytes": {
+              "type": "integer",
+              "minimum": 1
             }
           },
           "additionalProperties": false
@@ -1089,6 +1097,32 @@
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "collab_read_continue",
+    "description": "Read exactly one next page of the same permitted public content. A continuation is a fresh read occurrence; changed content returns stale_read. Never fetches all pages.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "cursor"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
       "idempotentHint": false,
       "openWorldHint": false
     }

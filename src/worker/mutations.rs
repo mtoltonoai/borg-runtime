@@ -30,6 +30,8 @@ pub(super) fn fresh_id(kind: &str) -> Result<String, String> {
 fn identity(operation: &Operation) -> Result<&str, String> {
     match operation {
         Operation::CallCollaboration { call } => Ok(&call.operation_id),
+        Operation::ReleaseTerminalReads(value) => Ok(&value.operation_id),
+        Operation::ObserveWorker {report} if matches!(report.observation,Observation::ReadTranscriptCustody {..}) => Ok(&report.report_id),
         Operation::EvaluateCompletion(input) => Ok(&input.operation_id),
         Operation::BeginCompletionContinuation(input) => Ok(&input.operation_id),
         Operation::AcknowledgeCompletionInput(input) => Ok(&input.operation_id),
@@ -78,7 +80,7 @@ fn read_bytes(path: &Path, bound: usize) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(bytes))
 }
 
-fn decode(bytes: &[u8], limits: &crate::limits::RuntimeLimits) -> Result<Journal, String> {
+pub(super) fn decode(bytes: &[u8], limits: &crate::limits::RuntimeLimits) -> Result<Journal, String> {
     if bytes.len() > limits.worker.mutation_record_bytes {
         return Err("worker mutation journal exceeds bound (worker.mutation_record_bytes)".into());
     }

@@ -200,11 +200,11 @@ class PrepareReleaseTests(unittest.TestCase):
 
     def test_current_wire_and_protocol_source_pin_match_selected_rust_source(self):
         protocol = (ROOT / "src/protocol.rs").read_bytes()
-        self.assertIn(b"pub const WIRE_REVISION: u32 = 24;", protocol)
-        self.assertEqual(prepare.WIRE_REVISION, 24)
+        self.assertIn(b"pub const WIRE_REVISION: u32 = 25;", protocol)
+        self.assertEqual(prepare.WIRE_REVISION, 25)
         self.assertEqual(hashlib.sha256(protocol).hexdigest(), prepare.PROTOCOL_SOURCE_SHA)
         self.run_prepare()
-        self.assertTrue(all(req["protocol_revision"] == 24 for _, req in self.peer.requests))
+        self.assertTrue(all(req["protocol_revision"] == 25 for _, req in self.peer.requests))
 
     def test_historical_wire_target_and_original_retry_are_preserved(self):
         prepare.execute("prepare", self.peer.origin, self.root/"wire8", self.digest, self.commit,
@@ -350,7 +350,7 @@ class PrepareReleaseTests(unittest.TestCase):
                 args += ["--package",str(self.package),"--task-id","task-1","--operation-id","cli"]
             else:
                 args += ["--original-receipt",str(self.root/"original")]
-            for wire in (None,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24):
+            for wire in (None,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25):
                 argv=args + ([] if wire is None else ["--protocol-revision",str(wire)])
                 with self.subTest(action=action,wire=wire),patch.object(prepare.sys,"argv",argv), \
                         patch.object(prepare.sys,"stdout",io.StringIO()), \
@@ -358,8 +358,8 @@ class PrepareReleaseTests(unittest.TestCase):
                     self.assertEqual(prepare.main(),0)
                     self.assertEqual(execute.call_args.args[-1],wire)
                     execute.assert_called_once()
-            with self.subTest(action=action,wire=25), \
-                    patch.object(prepare.sys,"argv",args+["--protocol-revision","25"]), \
+            with self.subTest(action=action,wire=26), \
+                    patch.object(prepare.sys,"argv",args+["--protocol-revision","26"]), \
                     patch.object(prepare.sys,"stderr",io.StringIO()), \
                     patch.object(prepare,"execute") as execute:
                 with self.assertRaises(SystemExit) as error:
@@ -672,14 +672,45 @@ class PrepareReleaseTests(unittest.TestCase):
                                     self.digest, self.commit, previous=origin, wire_revision=24)
                 self.assertEqual(len(self.peer.requests), count + 1)
 
+    def test_historical_wire8_through24_lookup_on25_preserves_original_operation(self):
+        for original_wire in range(8, 25):
+            with self.subTest(original_wire=original_wire):
+                origin = self.root / ("original-" + str(original_wire))
+                operation = "stable-prepare-operation-" + str(original_wire)
+                prepared = prepare.execute("prepare", self.peer.origin, origin, self.digest, self.commit,
+                                           self.package, "task-1", operation, wire_revision=original_wire)
+                self.assertEqual(prepared["status"], "prepared")
+                original = (origin / "prepare-request.json").read_bytes()
+                retried = self.root / ("retry-original-" + str(original_wire))
+                prepare.execute("retry", self.peer.origin, retried, self.digest, self.commit, previous=origin)
+                self.assertEqual((retried / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[-1][0], original)
+                count = len(self.peer.requests)
+                followed = self.root / ("lookup25-" + str(original_wire))
+                result = prepare.execute("reconcile", self.peer.origin, followed, self.digest, self.commit,
+                                         previous=origin, wire_revision=25)
+                self.assertEqual(result["status"], "prepared")
+                self.assertFalse(result["mutation_attempted"])
+                self.assertEqual(result["original_protocol_revision"], original_wire)
+                self.assertEqual(result["target_protocol_revision"], 25)
+                self.assertEqual((followed / "prepare-request.json").read_bytes(), original)
+                self.assertEqual((origin / "prepare-request.json").read_bytes(), original)
+                self.assertEqual(self.peer.requests[count:][0][1],
+                                 prepare.request("get_operation", {"operation_id": operation}, operation, 25))
+                self.assertEqual(len(self.peer.requests), count + 1)
+                with self.assertRaisesRegex(ValueError, "cannot rewrite"):
+                    prepare.execute("retry", self.peer.origin, self.root / ("rewrite25-" + str(original_wire)),
+                                    self.digest, self.commit, previous=origin, wire_revision=25)
+                self.assertEqual(len(self.peer.requests), count + 1)
+
     def test_wire15_lookup_does_not_accept_changed_original_or_unknown_target(self):
         prepare.execute("prepare", self.peer.origin, self.root / "wire14", self.digest, self.commit,
                         self.package, "task-1", "stable-prepare-operation", wire_revision=14)
         original = (self.root / "wire14/prepare-request.json").read_bytes()
         count = len(self.peer.requests)
         with self.assertRaisesRegex(ValueError, "application wire revision"):
-            prepare.execute("reconcile", self.peer.origin, self.root / "lookup25", self.digest, self.commit,
-                            previous=self.root / "wire14", wire_revision=25)
+            prepare.execute("reconcile", self.peer.origin, self.root / "lookup26", self.digest, self.commit,
+                            previous=self.root / "wire14", wire_revision=26)
         self.assertEqual(len(self.peer.requests), count)
         self.peer.mode = "wrong_original"
         with self.assertRaisesRegex(ValueError, "differs from original request"):
@@ -694,10 +725,10 @@ class PrepareReleaseTests(unittest.TestCase):
         self.assertNotIn("candidate", record)
 
     def test_wire_selection_rejects_invalid_types_before_network(self):
-        for i,value in enumerate((True,False,None,"20",20.0,7,25)):
+        for i,value in enumerate((True,False,None,"20",20.0,7,26)):
             with self.subTest(value=value),self.assertRaises(ValueError):
                 prepare.request("get_task",{"task_id":"task-1"},"wire",value)
-        for i,value in enumerate((True,False,"20",20.0,7,25)):
+        for i,value in enumerate((True,False,"20",20.0,7,26)):
             with self.subTest(value=value),self.assertRaises(ValueError):
                 prepare.execute("prepare",self.peer.origin,self.root/("invalid-wire-"+str(i)),self.digest,self.commit,
                                 self.package,"task-1","wire",wire_revision=value)
@@ -891,7 +922,7 @@ class PrepareReleaseTests(unittest.TestCase):
         saved = self.root / "prepared/prepare-request.json"
         receipt = self.root / "prepared/receipt.json"
         body = json.loads(saved.read_text())
-        self.assertEqual(body["protocol_revision"], 24)
+        self.assertEqual(body["protocol_revision"], 25)
         body["protocol_revision"] = 7
         saved.write_bytes(prepare.canonical(body))
         record = json.loads(receipt.read_text())

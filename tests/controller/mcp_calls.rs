@@ -304,9 +304,17 @@ async fn mcp_calls_actual_http_initialization_duplicate_refusal_and_discarded_ac
     let (base, server) = serve(c.clone()).await;
     let client = mcp::Client::new(&base, actor.clone(), metadata()).unwrap();
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 33);
+    assert_eq!(tools.len(), 36);
+    for name in ["collab_machines_list", "collab_machine_get"] {
+        let tool = tools.iter().find(|tool| tool.name == name)
+            .expect("accepted telemetry read remains in the closed catalogue");
+        assert_eq!(tool.annotations, json!({"readOnlyHint":true,
+            "destructiveHint":false,"idempotentHint":false,"openWorldHint":false}));
+    }
+    assert!(tools.iter().any(|tool| tool.name == "collab_read_continue"));
     assert!(tools.iter().any(|tool| tool.name == "collab_definition_update"));
     assert!(tools.iter().any(|tool|tool.name=="collab_limits_get"));
+    assert_eq!(tools, mcp::catalogue(&metadata()));
     assert!(serde_json::to_vec(&tools).unwrap().len() < metadata().execution.native.helper_value_bytes);
     let call = invocation(
         &actor,
@@ -1098,3 +1106,6 @@ async fn self_delivery_missing_task_target_is_a_committed_http_refusal() {
 
 // Closed configuration application uses this module's actual caller fixtures.
 include!("definition_updates.rs");
+
+#[path = "mcp_read_retention.rs"]
+mod read_retention;

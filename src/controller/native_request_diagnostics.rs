@@ -55,7 +55,7 @@ fn table_available(tx: &Connection<'_>) -> Result<bool> {
     // The database owner separately validates each complete schema's shape.
     match (version, present) {
         (12..=17, false) => Ok(false),
-        (18 | 19 | 20 | 21 | 22 | 23 | 24 | 25, true) => Ok(true),
+        (18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26, true) => Ok(true),
         _ => Err(Fault::Store("native diagnostic credit table differs from original schema".into())),
     }
 }
@@ -70,7 +70,7 @@ fn legacy_vocabulary(tx: &Connection<'_>) -> Result<()> {
         count += 1;
         if count > bound { return Err(Fault::Store("native diagnostic legacy inventory exceeds selected receipt bound".into())); }
         let id: String = row.get(0)?;
-        let record = metadata::read(tx, &id)?.ok_or_else(|| Fault::Store("native diagnostic legacy receipt disappeared".into()))?;
+        let Some(record) = metadata::scan_inline(tx, &id)? else { continue };
         if matches!(record.request, Operation::ObserveWorker { report: Report { observation:
             Observation::NativeRequestDiagnostic { .. } | Observation::Usage { native_diagnostic_reserved: true, .. }, .. } }) {
             return Err(Fault::Store("historical schema contains native diagnostic vocabulary".into()));
@@ -417,8 +417,7 @@ pub(super) fn require_attempt_terminals(tx: &Connection<'_>, task: &Task) -> Res
         count += 1;
         if count > bound { return Err(Fault::Store("native result diagnostic receipt inventory exceeds selected bound".into())); }
         let id: String = row.get(0)?;
-        let record = metadata::read(tx, &id)?
-            .ok_or_else(|| Fault::Store("native result diagnostic receipt disappeared".into()))?;
+        let Some(record) = metadata::scan_inline(tx, &id)? else { continue };
         let Operation::ObserveWorker { report } = &record.request else { continue };
         if !matches!(record.outcome, Outcome::Ok { .. }) { continue; }
         let Observation::Usage { model_requests, native_diagnostic_reserved: true, .. } = &report.observation else { continue };
@@ -662,13 +661,13 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_schema18_through25_accept_the_retained_credit_table() {
+    fn identity_limit_fields_only_explicit_schema18_through26_accept_the_retained_credit_table() {
         let limits=RuntimeLimits::seed().unwrap();
-        for version in [17,18,19,20,21,22,23,24,25,26] {
+        for version in [17,18,19,20,21,22,23,24,25,26,27] {
             let sql=legacy();sql.execute_batch(include_str!("schema18-from17.sql")).unwrap();
             sql.pragma_update(None,"user_version",version).unwrap();
             let tx=Connection::new(&sql,&limits);
-            let supported=matches!(version,18|19|20|21|22|23|24|25);
+            let supported=matches!(version,18|19|20|21|22|23|24|25|26);
             assert_eq!(table_available(&tx).is_ok(),supported);
             assert_eq!(validate_existing(&tx,true).is_ok(),supported);
             if supported {
@@ -680,7 +679,7 @@ mod tests {
             }
             assert_eq!(sql.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),version);
         }
-        for version in [18,19,20,21,22,23,24,25,26] {
+        for version in [18,19,20,21,22,23,24,25,26,27] {
             let sql=legacy();sql.pragma_update(None,"user_version",version).unwrap();
             assert!(table_available(&Connection::new(&sql,&limits)).is_err());
         }
@@ -743,7 +742,7 @@ pub(super) fn validate_existing(tx: &Connection<'_>, has_credit_table: bool) -> 
         count += 1;
         if count > bound { return Err(Fault::Store("native diagnostic receipt inventory exceeds selected bound".into())); }
         let id: String = row.get(0)?;
-        let record = metadata::read(tx, &id)?.ok_or_else(|| Fault::Store("native diagnostic receipt inventory changed".into()))?;
+        let Some(record) = metadata::scan_inline(tx, &id)? else { continue };
         let Operation::ObserveWorker { report } = &record.request else { continue };
         match &report.observation {
             Observation::Usage { native_diagnostic_reserved: true, model_requests, .. } => {

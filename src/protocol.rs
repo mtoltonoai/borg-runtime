@@ -2,11 +2,17 @@
 #[path = "protocol_identity.rs"]
 mod identity;
 pub use identity::*;
+#[path = "protocol_identity_limit_fields.rs"]
+pub(crate) mod identity_limit_fields;
+#[path = "protocol_read_pagination.rs"]
+mod read_pagination;
+pub use read_pagination::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use crate::native_loop_contract::NativeRequestEvidence;
 
-pub const WIRE_REVISION: u32 = 24;
+// Shared identity-field, paginated-read and read-retention vocabulary generation.
+pub const WIRE_REVISION: u32 = 25;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
@@ -463,6 +469,8 @@ pub enum WorkerCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Observation {
+    /// Fixed cleanup owner attests verified transcript custody; never a model tool.
+    ReadTranscriptCustody { proof: Box<crate::read_retention::TerminalReadRelease> },
     /// Original supplied outer occurrence facts and fresh continuation admission.
     SuppliedOuter { observation: crate::supplied_outer::Observation },
     /// Immutable facts for one acknowledged native request reservation. This
@@ -628,6 +636,8 @@ pub struct MemoryValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum Operation {
+    /// Terminal worker cleanup only. This is not a model tool or live ACK.
+    ReleaseTerminalReads(crate::read_retention::TerminalReadRelease),
     AdministerIdentity { operation_id: String, input: IdentityAdministrationRequest },
     /// Ephemeral trusted-host observation without a task mutation identity.
     /// Never exposed in the model tool catalogue.
@@ -867,6 +877,11 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Data {
+    ReadPage(Box<crate::read_page::ReadPage>),
+    ReadList(crate::read_page::ReadList),
+    TerminalReadRelease(crate::read_retention::ReleaseResult),
+    /// Host-authored fact about an original receipt, never its removed Outcome.
+    OriginalReadBodyUnavailable(Box<crate::read_retention::ReleasedRead>),
     IdentityAdministration(Box<IdentityAdministrationOutcome>),
     MachineResourceReport(crate::machine_resources::ReportDisposition),
     SuppliedOuterWait(crate::supplied_outer::Wait),
@@ -935,6 +950,7 @@ pub struct MutationCommit {
 impl Operation {
     pub fn mutation_id(&self) -> Option<&str> {
         match self {
+            Self::ReleaseTerminalReads(value) => Some(&value.operation_id),
             Self::AcquireNativeRequest { operation_id, .. }
             | Self::SettleNativeRequest { operation_id, .. }
             | Self::MutateGovernance { operation_id, .. }
@@ -1015,6 +1031,20 @@ impl Reply {
     /// Validate the supplied controller context, not fresh execution authority.
     /// The original receipt revision and a later read revision are distinct.
     pub fn validate_for(&self, operation: &Operation) -> Result<(), String> {
+        match (&self.outcome,operation) {
+            (Outcome::Ok {data:Data::TerminalReadRelease(result)},Operation::ReleaseTerminalReads(request))
+                if result.attempt_id==request.caller.attempt_id && result.body_bytes_after<=result.body_bytes_before
+                    && result.released.iter().all(|id|request.reads.iter().any(|r|&r.operation_id==id)) => (),
+            (Outcome::Ok {data:Data::TerminalReadRelease(_)},_) => return Err("terminal read release result differs".into()),
+            (Outcome::Ok {data:Data::OriginalReadBodyUnavailable(value)},Operation::CallCollaboration {call}) => {
+                value.record.validate(operation)?;
+                if &value.invocation!=call || self.commit.as_ref()!=Some(&value.original_commit) {
+                    return Err("released original read identity differs".into());
+                }
+            }
+            (Outcome::Ok {data:Data::OriginalReadBodyUnavailable(_)},_) => return Err("released read is not an ordinary outcome".into()),
+            _=>(),
+        }
         if let Outcome::Ok { data } = &self.outcome {
             if !native_request_response_matches(operation, data) {
                 return Err("native request response differs from original operation".into());
@@ -1068,6 +1098,21 @@ impl Reply {
             return Err("unsupported observed controller revision".into());
         }
         let receipt_lookup = match (&self.outcome, operation) {
+            (Outcome::Ok {data:Data::Operation(record)}, Operation::GetOperation {operation_id}
+                | Operation::GetCollaborationCall {operation_id,..}) if record.kind=="committed_read_reference" => {
+                let original:Operation=serde_json::from_value(record.intended.clone()).map_err(|_|"invalid compact original intent")?;
+                let reference:crate::read_retention::CompactOutcome=serde_json::from_value(record.outcome.clone().ok_or("compact original body missing")?).map_err(|_|"invalid compact read representation")?;
+                reference.validate(&original)?;
+                let Operation::CallCollaboration {call}=&original else {return Err("compact original is not a read".into())};
+                if record.id!=*operation_id || original.mutation_id()!=Some(operation_id.as_str()) || record.state!=crate::read_retention::UNAVAILABLE
+                    || record.task_id!=call.caller.task_id || record.attempt_id!=call.caller.attempt_id || record.generation!=call.caller.generation
+                    || serde_json::to_value(&original).map_err(|_|"compact intent encoding")?!=record.intended
+                    || Some(serde_json::to_value(&reference).map_err(|_|"compact read encoding")?)!=record.outcome {
+                    return Err("compact read binding or shape differs".into());
+                }
+                if let Operation::GetCollaborationCall {caller,..}=operation {if caller!=&call.caller{return Err("compact lookup caller differs".into())}}
+                Some(operation_id.as_str())
+            }
             (
                 Outcome::Ok {
                     data: Data::Operation(record),

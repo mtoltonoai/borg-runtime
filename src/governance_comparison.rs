@@ -1,4 +1,4 @@
-//! Pure effective-value comparison for the existing twelve-field update path.
+//! Pure effective-value comparison for the closed resource-limit update path.
 //! The caller still enforces allowed fields, authority, currentness and complete
 //! configuration validity. A comparison verdict is not an invocation grant.
 use crate::governance::{
@@ -69,7 +69,9 @@ pub(crate) fn compare(
             | DefinitionLimitField::CodingCommandOutputBytes
             | DefinitionLimitField::CodingSummaryChars
             | DefinitionLimitField::CodingSummaryBytes
-            | DefinitionLimitField::CollaborationCompleteResultBytes => {
+            | DefinitionLimitField::CollaborationCompleteResultBytes
+            | DefinitionLimitField::CodingFrameBytes
+            | DefinitionLimitField::CollaborationJournalBytes => {
                 ComparisonRule::ResourceAllowance
             }
         };
@@ -322,5 +324,32 @@ mod tests {
         assert!(compare(&before, &zero_after, &zero, &FIELDS, true).is_err());
         let neutral = BTreeMap::from([(field, before.coding.summary_bytes)]);
         assert!(compare(&before, &before, &neutral, &[field, field], true).is_err());
+    }
+
+    #[test]
+    fn identity_limit_fields_numeric_directions_and_configured_widening() {
+        let before = limits();
+        for field in [DefinitionLimitField::CodingFrameBytes, DefinitionLimitField::CollaborationJournalBytes] {
+            let old = field.value(&before).unwrap();
+            for (value, direction) in [(old - 1, EffectiveChange::Narrowing), (old, EffectiveChange::Neutral), (old + 1, EffectiveChange::Widening)] {
+                let changes = BTreeMap::from([(field, value)]);
+                let after = apply(&before, &changes);
+                after.validate().unwrap();
+                let (evidence, allowed, _) = compare(&before, &after, &changes, &[field], true).unwrap();
+                assert!(allowed);
+                assert_eq!(evidence, vec![FieldComparison { field, before: Some(old), after: value, rule: ComparisonRule::ResourceAllowance, change: direction }]);
+                for (selected, permitted) in [(vec![], true), (vec![field], false)] {
+                    assert_eq!(compare(&before, &after, &changes, &selected, permitted).unwrap().1, direction != EffectiveChange::Widening);
+                }
+                let mut unrelated = after.clone();
+                unrelated.coding.stderr_bytes += 1;
+                assert!(compare(&before, &unrelated, &changes, &[field], true).is_err());
+            }
+        }
+        // The historical twelve-field fixture and the shipped policy retain
+        // their original meaning; support is not automatic enrollment.
+        assert_eq!(FIELDS.len(), 12);
+        let seed = RuntimeLimits::seed().unwrap();
+        assert!(!seed.definition_updates.as_ref().unwrap().allowed_fields.iter().any(crate::protocol::identity_limit_fields::field_uses));
     }
 }
