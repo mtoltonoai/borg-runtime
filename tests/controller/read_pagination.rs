@@ -359,7 +359,7 @@ async fn oversized_accepted_result_journey() {
     receipt.validate_for(&operation).unwrap();assert!(receipt.commit.is_some());
     assert!(matches!(receipt.outcome,Outcome::Ok{data:Data::Operation(_)}));
     drop(c);controller_owner_released(&p).await;
-    let raw_receipt=|sql:&rusqlite::Connection|->(String,String,u64){
+    let raw_receipt=|sql:&rusqlite::Connection|->(String,String,i64){
         sql.query_row("SELECT request,outcome,controller_revision FROM receipts WHERE id='large-result-accepted'",
             [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
     };
