@@ -424,6 +424,7 @@ struct Proxy {
     url: String,
     calls: Arc<Mutex<Vec<Invocation>>>,
     lookups: Arc<AtomicU64>,
+    task_reads: Arc<Mutex<Vec<String>>>,
     dropped: Arc<AtomicBool>,
     owner: Background,
 }
@@ -437,7 +438,8 @@ impl Proxy {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let lookups = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicBool::new(false));
-        let (saved, reads, lost) = (calls.clone(), lookups.clone(), dropped.clone());
+        let task_reads = Arc::new(Mutex::new(Vec::new()));
+        let (saved, reads, lost, tasks) = (calls.clone(), lookups.clone(), dropped.clone(), task_reads.clone());
         let owner = Background(Some(tokio::spawn(async move {
             let client = reqwest::Client::builder()
                 .no_proxy()
@@ -449,22 +451,33 @@ impl Proxy {
             loop {
                 tokio::select! {
                     accepted=listener.accept()=>{
-                        let (stream,_)=accepted.unwrap();let (client,upstream,saved,reads,lost,hold)=(client.clone(),upstream.clone(),saved.clone(),reads.clone(),lost.clone(),hold.clone());
+                        let (stream,_)=accepted.unwrap();let (client,upstream,saved,reads,lost,hold,tasks)=(client.clone(),upstream.clone(),saved.clone(),reads.clone(),lost.clone(),hold.clone(),tasks.clone());
                         joins.spawn(async move {
                             let service=service_fn(move|request:HttpRequest<Incoming>| {
-                                let (client,upstream,saved,reads,lost,hold)=(client.clone(),upstream.clone(),saved.clone(),reads.clone(),lost.clone(),hold.clone());
+                                let (client,upstream,saved,reads,lost,hold,tasks)=(client.clone(),upstream.clone(),saved.clone(),reads.clone(),lost.clone(),hold.clone(),tasks.clone());
                                 async move {
-                                    assert_eq!(request.method(),hyper::Method::POST);assert_eq!(request.uri().path(),"/mcp");
+                                    assert_eq!(request.method(),hyper::Method::POST);
+                                    assert!(request.uri().query().is_none());
+                                    let path=request.uri().path().to_owned();
+                                    assert!(matches!(path.as_str(),"/mcp"|"/api/operations"));
                                     let caller=request.headers().get("x-borg-caller").cloned();let version=request.headers().get("mcp-protocol-version").cloned();
                                     let bytes=request.into_body().collect().await.unwrap().to_bytes();
                                     let rpc:Value=serde_json::from_slice(&bytes).unwrap();
-                                    let update=rpc["method"]=="tools/call"&&rpc["params"]["name"]=="collab_definition_update";
-                                    if rpc["method"]=="tools/call" {
+                                    let update=path=="/mcp"&&rpc["method"]=="tools/call"&&rpc["params"]["name"]=="collab_definition_update";
+                                    if path=="/api/operations" {
+                                        // Current opted-in catalogues verify the accepted task through
+                                        // the ordinary API. This fixture forwards only that typed read.
+                                        assert!(caller.is_none()&&version.is_none());
+                                        let api:Request=serde_json::from_slice(&bytes).unwrap();
+                                        assert_eq!(api.protocol_revision,WIRE_REVISION);
+                                        let Operation::GetTask{task_id}=api.command else {panic!("unexpected proxy API operation")};
+                                        tasks.lock().unwrap().push(task_id);
+                                    } else if rpc["method"]=="tools/call" {
                                         let actor:Caller=serde_json::from_slice(caller.as_ref().unwrap().as_bytes()).unwrap();
                                         let meta=&rpc["params"]["_meta"]["borg"];
                                         saved.lock().unwrap().push(Invocation{caller:actor,operation_id:meta["operation_id"].as_str().unwrap().into(),logical_call_id:meta["logical_call_id"].as_str().unwrap().into(),tool:rpc["params"]["name"].as_str().unwrap().into(),arguments:rpc["params"]["arguments"].clone()});
                                     } else if rpc["method"]=="borg/calls/get" {reads.fetch_add(1,Ordering::SeqCst);}
-                                    let mut post=client.post(format!("{upstream}/mcp")).header("content-type","application/json").body(bytes.to_vec());
+                                    let mut post=client.post(format!("{upstream}{path}")).header("content-type","application/json").body(bytes.to_vec());
                                     if let Some(caller)=caller {post=post.header("x-borg-caller",caller);}if let Some(version)=version {post=post.header("mcp-protocol-version",version);}
                                     let response=post.send().await.map_err(io::Error::other)?;let status=response.status();let bytes=response.bytes().await.map_err(io::Error::other)?;
                                     if update {if let Some(hold)=hold {
@@ -487,6 +500,7 @@ impl Proxy {
             url,
             calls,
             lookups,
+            task_reads,
             dropped,
             owner,
         }
@@ -734,6 +748,9 @@ async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_ap
     let config_bytes = serde_json::to_vec(&config).unwrap();
     let mut peer = Peer::start(config.clone()).await;
     let tools = peer.rpc("tools/list", json!({})).await;
+    assert_eq!(*proxy.task_reads.lock().unwrap(), vec![first.id.clone()]);
+    assert!(proxy.calls.lock().unwrap().is_empty());
+    assert_eq!(proxy.lookups.load(Ordering::SeqCst), 0);
     assert!(
         tools["tools"]
             .as_array()
@@ -811,8 +828,8 @@ async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_ap
         pinned
     );
 
-    // The same canonical value is too large for the old caller and is accepted
-    // by the later bridge. This exercises actual complete-response consumption.
+    // The same canonical value needs a partial page under the old caller's
+    // pin and fits whole under the later bridge's wider accepted bound.
     let memory = json!("x".repeat(old_bound));
     let attempt = first.attempt.as_ref().unwrap();
     assert!(matches!(
@@ -834,7 +851,33 @@ async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_ap
     let old_read = peer
         .call("old-read", "collab_memory_get", json!({"key":"large"}))
         .await;
-    refused(&old_read, "response_bound");
+    let Outcome::Ok { data: Data::ReadPage(page) } = &old_read.reply.outcome else {
+        panic!("old caller must receive a bounded partial page: {old_read:?}")
+    };
+    use borg_runtime::read_page::{Cursor, Encoding, ReadTool, Selection, Source, Summary};
+    assert_eq!(page.subject, Selection::Public {
+        tool: ReadTool::Memory, arguments: json!({"key":"large"}),
+        item: false, caller_task_id: Some(first.id.clone()),
+    });
+    assert_eq!(page.identity.source, Source::Public {
+        tool: ReadTool::Memory, item_id: None, revision: None,
+    });
+    assert_eq!(page.summary, Summary::Public { tool: ReadTool::Memory });
+    assert_eq!(page.encoding, Encoding::CanonicalJsonUtf8);
+    assert_eq!(page.offset, 0);
+    assert_eq!(page.returned_bytes, page.content.len());
+    assert!(page.returned_bytes > 0 && page.returned_bytes < page.total_bytes);
+    assert!(!page.complete);
+    assert_eq!(page.retained_truncation, None);
+    let cursor = Cursor::decode(page.next_cursor.as_deref().unwrap(),
+        lab.limits.controller.collaboration_cursor_bytes).unwrap();
+    assert_eq!(cursor.selection, page.subject);
+    assert_eq!(cursor.identity, page.identity);
+    assert_eq!(cursor.encoding, page.encoding);
+    assert_eq!(cursor.offset, page.returned_bytes);
+    assert_eq!(cursor.max_bytes, None);
+    assert!(serde_json::to_vec(&old_read).unwrap().len() <= old_bound);
+    exact_lookup(&lab, &peer.invocation("old-read"), &old_read).await;
     assert_eq!(peer.config.limits.complete_result_bytes, old_bound);
     let mut next = lab.input(old_bound);
     next.definition = update.selected_definition.clone();
@@ -843,6 +886,8 @@ async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_ap
     let mut later_config = lab.config(&later, &proxy.url, "later-bridge");
     later_config.execution_profile = later.input.definition.execution_profile.clone();
     let mut next_peer = Peer::start(later_config).await;
+    assert_eq!(next_peer.rpc("tools/list", json!({})).await, tools);
+    assert_eq!(*proxy.task_reads.lock().unwrap(), vec![first.id.clone(), later.id.clone()]);
     assert_eq!(next_peer.config.limits.complete_result_bytes, new_bound);
     // A second accepted caller cannot read the first caller's occurrence.
     let mismatch = lab
@@ -863,6 +908,12 @@ async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_ap
     );
     assert!(serde_json::to_vec(&read).unwrap().len() > old_bound);
     assert!(serde_json::to_vec(&read).unwrap().len() <= new_bound);
+    let Outcome::Ok { data } = &read.reply.outcome else { unreachable!() };
+    let full = borg_runtime::read_page::canonical(data).unwrap();
+    assert_eq!(page.total_bytes, full.len());
+    assert_eq!(page.identity.digest, borg_runtime::read_page::digest(full.as_bytes()));
+    assert_eq!(page.content, full[..page.returned_bytes]);
+    exact_lookup(&lab, &next_peer.invocation("later-read"), &read).await;
     assert_eq!(
         serde_json::to_vec(&lab.get(&first.id).await.input).unwrap(),
         pinned
