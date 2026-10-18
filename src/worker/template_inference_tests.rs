@@ -39,6 +39,7 @@ fn fixture() -> Fixture {
     std::fs::create_dir(&root).unwrap();
     let state = root.join("state");
     std::fs::create_dir(&state).unwrap();
+    handoff::initialize_state(&state, &test_limits().worker).unwrap();
     std::fs::create_dir(state.join("commands")).unwrap();
     let config = WorkerConfig {
         limits: test_limits(),
