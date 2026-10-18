@@ -222,7 +222,13 @@ async fn repository_calls_actual_http_all_five_exact_sources_and_closed_fields()
     let server = tokio::spawn(async move { borg_runtime::server::serve(cc, listener, bb).await });
     let client = mcp::Client::new(&base, actor.clone(), metadata()).unwrap();
     let tools = client.tools().await.unwrap();
-    assert_eq!(tools.len(), 34);
+    assert_eq!(tools.len(), 36);
+    for name in ["collab_machines_list", "collab_machine_get"] {
+        let tool = tools.iter().find(|tool| tool.name == name)
+            .expect("accepted telemetry read remains in the closed catalogue");
+        assert_eq!(tool.annotations, json!({"readOnlyHint":true,
+            "destructiveHint":false,"idempotentHint":false,"openWorldHint":false}));
+    }
     assert!(tools.iter().any(|tool| tool.name == "collab_read_continue"));
     assert!(tools.iter().any(|tool| tool.name == "collab_definition_update"));
     assert!(tools.iter().any(|tool| tool.name == "collab_limits_get"));

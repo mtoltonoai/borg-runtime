@@ -40,31 +40,45 @@ async fn step(config:&WorkerConfig,state:&Path,client:&ApiClient,active:&BTreeMa
     if !handoff::admits_read_references(state,&config.limits.worker)? {return Err("read release requires worker20".into())}
     let receipt:Receipt=read_record(path,config.limits.worker.command_record_bytes)?.ok_or("read cleanup command absent")?;
     let WorkerCommand::RunAttempt{command_id,attempt,task,..}=&receipt.command else{return Ok(None)};
-    if path!=state.join("commands").join(format!("{}.json",component(command_id))) || !receipt.completed
-        || attempt.worker_id!=config.id || active.contains_key(&attempt.id) || attempt_outbox(state,attempt,&config.limits)?
-        || process_obligation(&state.join("processes").join(component(&attempt.id)))? {return Err("original local attempt not closed".into())}
-    if task.definition.executor==ExecutorKind::Coding && !local_ready(config,state,&receipt,active)? {return Err("Coding closure remains".into())}
-    if task.definition.executor==ExecutorKind::Native && handoff::path(state,attempt).exists() {return Err("native handoff retains body consumer".into())}
-    let current=canonical_task(client,&receipt.command,state,policy).await?;
-    let directory=state.join("cleanup-reads");process::private_directory(&directory)?;
+    if path!=state.join("commands").join(format!("{}.json",component(command_id))) || attempt.worker_id!=config.id {
+        return Err("original read command binding differs".into());
+    }
+    let directory=state.join("cleanup-reads");
     let progress_path=directory.join(format!("{}.json",component(&attempt.id)));
     let mut progress:Progress=read_record(&progress_path,policy.record_bytes)?.unwrap_or(Progress{format_revision:20,command_id:command_id.clone(),
         policy:policy.clone(),policy_revision:revision.into(),after:None,pending:None});
     if progress.format_revision!=20||progress.command_id!=*command_id||progress.policy!=*policy||progress.policy_revision!=revision {return Err("read cleanup original policy differs".into())}
-    let (_sender,cancel)=watch::channel(false);
-    let control=Control{deadline_ms:add_ms(process::now_ms(),policy.operation_timeout_ms)?,cancel,worker_limits:Arc::new(config.limits.worker.clone()),
-        runtime_limits:config.limits.clone(),validation_runtime:runtime.clone()};
-    let (reads,custody)=if task.definition.executor==ExecutorKind::Coding {
+    // Establish whether there is original read work before asking canonical
+    // closure or copyout for authority. Empty valid inventories must not add a
+    // retry timer to unrelated workspace/plugin/cache grace periods.
+    let (reads,native_custody)=if task.definition.executor==ExecutorKind::Coding {
         let cfg=codex_mcp::Config{instruction_source:task.instruction_source.clone(),execution_profile:task.definition.execution_profile.as_ref().filter(|p|matches!(p,ExecutionProfile::CollaborationV2{..})).cloned(),
             controller_url:config.controller_url.clone(),caller:collaboration_caller(attempt),deadline_unix_ms:attempt.deadline_unix_ms.min(task.limits.deadline_unix_ms),
             state:codex::state_path(&state.join("codex"),&attempt.id),runtime_limits:(*task.resolved_limits.as_ref().ok_or("accepted metadata absent")?.global_metadata).clone(),
             limits:task.execution_limits()?.collaboration.clone(),worker_limits:config.limits.worker.clone()};
-        (codex_mcp::terminal_reads(&cfg,progress.after.as_deref(),policy.batch_entries)?,plugins::read_custody(state,attempt,policy,revision,&control).await?)
+        (codex_mcp::terminal_reads(&cfg,progress.after.as_deref(),policy.batch_entries)?,None)
     } else {
-        super::super::read_retention::native_reads(state,task,attempt,policy,progress.after.as_deref())?
+        let (reads,custody)=super::super::read_retention::native_reads(state,task,attempt,policy,progress.after.as_deref())?;
+        (reads,Some(custody))
     };
-    if reads.is_empty() {return Ok(None)}
+    if reads.is_empty() {
+        if progress.pending.is_some() {return Err("pending original read release lost its selected bodies".into());}
+        return Ok(None);
+    }
+    if !receipt.completed || active.contains_key(&attempt.id) || attempt_outbox(state,attempt,&config.limits)?
+        || process_obligation(&state.join("processes").join(component(&attempt.id)))? {return Err("original local attempt not closed".into())}
+    if task.definition.executor==ExecutorKind::Coding && !local_ready(config,state,&receipt,active)? {return Err("Coding closure remains".into())}
+    if task.definition.executor==ExecutorKind::Native && handoff::path(state,attempt).exists() {return Err("native handoff retains body consumer".into())}
+    let current=canonical_task(client,&receipt.command,state,policy).await?;
+    let (_sender,cancel)=watch::channel(false);
+    let control=Control{deadline_ms:add_ms(process::now_ms(),policy.operation_timeout_ms)?,cancel,worker_limits:Arc::new(config.limits.worker.clone()),
+        runtime_limits:config.limits.clone(),validation_runtime:runtime.clone()};
+    let custody=match native_custody {
+        Some(custody)=>custody,
+        None=>plugins::read_custody(state,attempt,policy,revision,&control).await?,
+    };
     if !custody.valid() {return Err("verified actual transcript absent".into())}
+    process::private_directory(&directory)?;
     let plan=match &progress.pending {
         Some(plan)=>{
             if plan.reads!=reads||plan.custody!=custody||plan.terminal_revision!=current.revision {return Err("original release evidence changed; no new batch sent".into())}

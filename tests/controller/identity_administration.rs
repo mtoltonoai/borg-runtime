@@ -372,7 +372,8 @@ async fn new_catalogue_fits_before_provider_send() {
         &p,
         Some(&ExecutionProfile::CollaborationV2 { web_search: None }),
     );
-    assert_eq!(old.len(), 66);
+    assert_eq!(old.len(), 67);
+    assert_eq!(old.iter().filter(|tool| tool.name == "collab_read_continue").count(), 1);
     p.execution.collaboration.capabilities = h
         .original
         .input
@@ -385,7 +386,7 @@ async fn new_catalogue_fits_before_provider_send() {
         &p,
         Some(&ExecutionProfile::CollaborationV2 { web_search: None }),
     );
-    assert_eq!(tools.len(), 73);
+    assert_eq!(tools.len(), 74);
     assert!(tools.iter().any(|t| t.name == "collab_document_create"));
     assert_eq!(
         tools
@@ -406,7 +407,7 @@ async fn new_catalogue_fits_before_provider_send() {
             Some(&ExecutionProfile::CollaborationV2 { web_search: None })
         )
         .len(),
-        67
+        68
     );
     assert_eq!(
         borg_runtime::mcp::catalogue_for_profile(

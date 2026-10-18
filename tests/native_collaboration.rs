@@ -813,15 +813,79 @@ async fn native_explicit_memory_cross_sessions_preserves_tool_results_without_no
     assert_eq!(lab.usage(&attempt.id), (3, Some(15), Some(6)));
 }
 
+// Measure the actual selected catalogue with the production serializer. The
+// validation envelope below is the non-charter/no-prefix ValidationInput shape
+// in native/loop_step.rs; the actual worker still performs its full admission.
+fn assert_fixture_native_profile_fits(
+    limits: &RuntimeLimits,
+    input: &TaskInput,
+    expected_functions: usize,
+) -> usize {
+    assert!(input.definition.charter.is_none());
+    assert!(matches!(&input.definition.execution_profile,
+        Some(ExecutionProfile::CollaborationV1 { web_search: None }
+            | ExecutionProfile::CollaborationV2 { web_search: None })));
+    let profile = borg_runtime::native::NativeLoopProfile {
+        functions: borg_runtime::mcp::catalogue_for_profile(
+            limits, input.definition.execution_profile.as_ref(),
+        ).into_iter().map(|tool| borg_runtime::native::NativeFunction {
+            name: tool.name, description: tool.description, parameters: tool.input_schema,
+        }).collect(),
+        web_search: None,
+    };
+    assert_eq!(profile.functions.len(), expected_functions);
+    assert!(profile.functions.len() <= limits.execution.native.function_count);
+    let profile_bytes = bounded_json_size(&profile, limits.execution.native.schema_bytes)
+        .expect("selected native catalogue exceeds explicit fixture schema bound");
+    let mut validation = json!({"schema":input.output_schema.as_ref().unwrap(),
+        "profile":profile,"output_bytes":input.limits.output_bytes});
+    if limits.native_retry.is_some() {
+        validation["repair_enabled"] = json!(true);
+    }
+    let validation_bytes = bounded_json_size(&validation, limits.execution.native.schema_bytes)
+        .expect("complete native validation envelope exceeds explicit fixture schema bound");
+    assert!(validation_bytes > profile_bytes);
+    profile_bytes
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_collaboration_actual_read_write_read_final_and_lost_ack_restart() {
-    let lab = Lab::new("read-write");
+    let mut lab = Lab::new("read-write");
+    let mut limits = (*lab.limits).clone();
+    let seed_schema_bytes = limits.execution.native.schema_bytes;
+    // This selected V1 catalogue outgrew the seed's schema allowance. Keep the
+    // finite override local to this positive fixture, not Lab or production.
+    limits.execution.native.schema_bytes = 32_768;
+    assert_eq!(limits.execution.native.function_count, 64);
+    assert_eq!(limits.execution.native.json_nodes, 4_096);
+    limits.validate().unwrap();
+    lab.limits = Arc::new(limits);
+    assert!(assert_fixture_native_profile_fits(&lab.limits, &lab.input(4), 36) > seed_schema_bytes);
+    std::fs::write(lab.root.join("limits.json"),
+        serde_json::to_vec_pretty(&*lab.limits).unwrap()).unwrap();
     let mut c = lab.controller("controller-one").await;
     let peer = Peer::start(|index, request| {
         no_memory_notices(request);
         assert_eq!(request["store"], false);
         assert_eq!(request["parallel_tool_calls"], false);
-        assert_eq!(request["tools"].as_array().unwrap().len(), 34);
+        let tools = request["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 36);
+        let names: std::collections::BTreeSet<_> = tools.iter()
+            .map(|tool| tool["name"].as_str().unwrap()).collect();
+        assert_eq!(names, std::collections::BTreeSet::from([
+            "collab_tasks_list", "collab_task_get", "collab_task_history_list",
+            "collab_agents_list", "collab_agent_get", "collab_definition_get",
+            "collab_memory_list", "collab_memory_get", "collab_memory_set",
+            "collab_task_progress", "collab_task_delegate", "collab_task_assign",
+            "collab_task_cancel", "collab_task_retry", "collab_workers_list",
+            "collab_worker_get", "collab_task_attempts_list", "collab_task_checkpoints_list",
+            "collab_task_releases_list", "collab_release_get", "collab_release_checks_list",
+            "collab_call_get", "collab_repository_tree", "collab_repository_read",
+            "collab_repository_search", "collab_repository_diff", "collab_repository_history",
+            "collab_session_get", "collab_sessions_list", "collab_limits_get",
+            "collab_repositories_list", "collab_repository_get", "collab_definition_update",
+            "collab_machines_list", "collab_machine_get", "collab_read_continue",
+        ]));
         assert!(request["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "collab_read_continue"));
         assert!(
             request["tools"]

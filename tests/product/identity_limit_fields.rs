@@ -1,4 +1,4 @@
-//! Real in-process product routes and canonical SQLite receipts. No DOM,
+//! Real product views, local operator HTTP routes and canonical SQLite receipts. No DOM,
 //! provider or actual executor claim; the accepted configured child is retained.
 use super::*;
 use borg_runtime::limits::{DefinitionLimitField, DefinitionUpdatePolicy};
@@ -81,22 +81,24 @@ async fn identity_limit_fields_product_bytes_apply_replay_and_preserve_parent_ch
             assert!(page.body.contains(&format!("name=\"{name}\"")));
         }
         let mut expected = prior.clone();
-        let edits: Vec<_> = FIELDS.iter().map(|(name, field)| {
+        for (_, field) in FIELDS {
             let value = field.value(&prior).unwrap().checked_add_signed(delta).unwrap();
             field.set(&mut expected, value);
-            (*name, value.to_string())
-        }).collect();
+        }
         let id = format!("identity-limit-fields-product-{step}");
-        let submitted = body(&f.controller, &id, &before, &edits);
-        let response = ui(&f.controller, "POST", &route(&before.id), submitted.clone()).await;
+        let update = DefinitionUpdate { agent_id: before.id.clone(), expected_revision: before.revision.clone(),
+            expected_global_revision: f.controller.limits().revision.clone(),
+            expected_policy_revision: f.controller.limits().definition_updates.as_ref().unwrap().revision.clone(),
+            changes: FIELDS.iter().map(|(_, field)| (*field, field.value(&expected).unwrap())).collect() };
+        let response = super::definition_settings::operator_post(&f.controller, &id, &update).await;
         assert!(matches!(response.status, 200 | 303), "{}", response.body);
         let (record, outcome) = receipt(&f.controller, &id).await;
         let intended: Operation = serde_json::from_value(record.intended.clone()).unwrap();
-        let Operation::UpdateDefinition { operation_id, update } = intended else { panic!("canonical operator adapter") };
+        let Operation::UpdateDefinition { operation_id, update: recorded_update } = intended else { panic!("canonical operator adapter") };
         assert_eq!(operation_id, id);
-        assert_eq!(update.expected_revision, before.revision);
-        assert_eq!(update.changes.len(), 2);
-        for (_, field) in FIELDS { assert_eq!(update.changes[&field], field.value(&expected).unwrap()); }
+        assert_eq!(recorded_update.expected_revision, before.revision);
+        assert_eq!(recorded_update.changes.len(), 2);
+        for (_, field) in FIELDS { assert_eq!(recorded_update.changes[&field], field.value(&expected).unwrap()); }
         assert_eq!(outcome.classification, if delta > 0 { ConfigurationChangeClass::Widening } else { ConfigurationChangeClass::Narrowing });
         assert_eq!(outcome.effective_for, ConfigurationEffect::FutureSubmissions);
         assert_eq!(outcome.selected_definition.executor, before.executor);
@@ -113,15 +115,15 @@ async fn identity_limit_fields_product_bytes_apply_replay_and_preserve_parent_ch
         assert_eq!(serde_json::to_vec(&current.input).unwrap(), input_bytes);
         assert_eq!(serde_json::to_vec(&current.input.native_workflow).unwrap(), child_bytes);
         assert_eq!(serde_json::to_vec(f.controller.limits()).unwrap(), global_bytes);
-        originals.push((id, before.clone(), submitted, record));
+        originals.push((id, before.clone(), update, record));
         before = outcome.selected_definition;
     }
     let Fixture { controller, path } = f;
     drop(controller);
     closure::owner_closed(&path).await;
     let c = Controller::open_with_config(&path, cfg).unwrap();
-    for (id, old, submitted, original) in originals {
-        let response = ui(&c, "POST", &route(&old.id), submitted).await;
+    for (id, old, update, original) in originals {
+        let response = super::definition_settings::operator_post(&c, &id, &update).await;
         assert!(matches!(response.status, 200 | 303), "{}", response.body);
         assert_eq!(receipt(&c, &id).await.0, original);
         assert_eq!(selected(&c, &old.id).await, before);
@@ -144,28 +146,34 @@ async fn identity_limit_fields_product_policy_and_stale_or_invalid_input_never_w
     assert!(!page.body.contains("name=\"collaboration.journal_bytes\""));
     let cases = [
         ("unselected", "collaboration.journal_bytes", (values.collaboration.journal_bytes + 1).to_string(), 409, "configuration_policy"),
-        ("zero", "coding.frame_bytes", "0".into(), 409, "invalid_input"),
+        ("zero", "coding.frame_bytes", "0".into(), 409, "invalid_limits"),
         ("fraction", "coding.frame_bytes", "1.5".into(), 400, "must be an integer"),
         ("unknown", "coding.unknown", "1".into(), 400, "Unknown definition-limit field"),
         ("grant", "host_admin", "true".into(), 400, "Unknown definition-limit field"),
     ];
     for (label, name, value, status, reason) in cases {
         let id = format!("identity-limit-fields-ui-{label}");
-        let response = ui(&f.controller, "POST", &route(&before.id), body(&f.controller, &id, &before, &[(name, value)])).await;
+        let response = if status == 400 {
+            ui(&f.controller, "POST", &route(&before.id), body(&f.controller, &id, &before, &[(name, value)])).await
+        } else {
+            let update = DefinitionUpdate { agent_id: before.id.clone(), expected_revision: before.revision.clone(),
+                expected_global_revision: f.controller.limits().revision.clone(),
+                expected_policy_revision: f.controller.limits().definition_updates.as_ref().unwrap().revision.clone(),
+                changes: [(serde_json::from_value(serde_json::json!(name)).unwrap(), value.parse().unwrap())].into_iter().collect() };
+            super::definition_settings::operator_post(&f.controller, &id, &update).await
+        };
         assert_eq!(response.status, status, "{label}: {}", response.body);
         assert!(response.body.contains(reason), "{label}: {}", response.body);
         assert_eq!(selected(&f.controller, &before.id).await, before);
     }
     for stale in ["expected_revision", "expected_global_revision", "expected_policy_revision"] {
         let id = format!("identity-limit-fields-ui-{stale}");
-        let fields = vec![
-            ("operation_id", id),
-            ("expected_revision", if stale == "expected_revision" { "obsolete".into() } else { before.revision.clone() }),
-            ("expected_global_revision", if stale == "expected_global_revision" { "obsolete".into() } else { f.controller.limits().revision.clone() }),
-            ("expected_policy_revision", if stale == "expected_policy_revision" { "obsolete".into() } else { f.controller.limits().definition_updates.as_ref().unwrap().revision.clone() }),
-            ("coding.frame_bytes", (values.coding.frame_bytes + 1).to_string()),
-        ];
-        let response = ui(&f.controller, "POST", &route(&before.id), form(&fields)).await;
+        let update = DefinitionUpdate { agent_id: before.id.clone(),
+            expected_revision: if stale == "expected_revision" { "obsolete".into() } else { before.revision.clone() },
+            expected_global_revision: if stale == "expected_global_revision" { "obsolete".into() } else { f.controller.limits().revision.clone() },
+            expected_policy_revision: if stale == "expected_policy_revision" { "obsolete".into() } else { f.controller.limits().definition_updates.as_ref().unwrap().revision.clone() },
+            changes: [(FIELDS[0].1, values.coding.frame_bytes + 1)].into_iter().collect() };
+        let response = super::definition_settings::operator_post(&f.controller, &id, &update).await;
         assert_eq!(response.status, 409, "{}", response.body);
         assert!(response.body.contains("configuration_conflict"));
         assert_eq!(selected(&f.controller, &before.id).await, before);

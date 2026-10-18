@@ -530,6 +530,7 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
         "collab_agent_get",
         "collab_definition_get",
         "collab_definition_update",
+        "collab_read_continue",
         "collab_memory_list",
         "collab_memory_get",
         "collab_memory_set",
@@ -567,6 +568,7 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
     assert_eq!(actual, expected, "exact permitted server tool set changed");
     assert!(!enabled.contains(&json!("collab_task_delegate")));
     for name in [
+        "collab_read_continue",
         "collab_session_get",
         "collab_sessions_list",
         "collab_limits_get",
@@ -609,6 +611,10 @@ fn exact_task_config_does_not_approve_other_servers_tools_or_change_annotations(
         assert_eq!(tool.annotations["destructiveHint"], false);
         assert_eq!(tool.annotations["openWorldHint"], false);
     }
+    let continuation = mcp::catalogue(&runtime_limits).into_iter()
+        .find(|tool| tool.name == "collab_read_continue").unwrap();
+    assert_eq!(continuation.annotations, json!({"readOnlyHint":true,
+        "idempotentHint":false,"openWorldHint":false}));
     for tool in mcp::catalogue(&runtime_limits) {
         if writes.contains(&tool.name.as_str()) {
             assert_eq!(tool.annotations["readOnlyHint"], false);

@@ -145,6 +145,14 @@ async fn pages_and_items() {
     for ((call,_),reference) in calls.iter().zip(&references) {
         assert_eq!(compact_lookup(&c,call).await.committed_read_reference.evidence,reference.evidence);
     }
+    for index in [0,1] {
+        let recovered=mcp::recovered(&calls[index].0,lookup(&c,&calls[index].0).await).unwrap();
+        assert_eq!(recovered.reply.commit,calls[index].1.commit);
+        assert_eq!(references[index].restore(&calls[index].0,recovered).unwrap().reply.outcome,calls[index].1.outcome);
+    }
+    for index in [2,3] {
+        assert_eq!(mcp::recovered(&calls[index].0,lookup(&c,&calls[index].0).await).unwrap_err(),borg_runtime::read_retention::UNAVAILABLE);
+    }
     drop(c);controller_owner_released(&path).await;assert_eq!(receipts(&path),originals);
     let sql=rusqlite::Connection::open(&path).unwrap();sql.pragma_update(None,"user_version",25).unwrap();drop(sql);
     let old_bytes=std::fs::read(&path).unwrap();
@@ -161,7 +169,7 @@ async fn original_version_and_occurrence() {
     let f=retained_fixture("retained-page-source").await;
     let doc=document(&f,"retained-source-document",&page_text()).await;
     let old=page_call(&f,"retained-source-old","collab_document_get",
-        json!({"document_id":doc.document.id,"part":"body","max_bytes":8192})).await;
+        json!({"document_id":doc.document.id,"version":null,"part":"body","max_bytes":8192})).await;
     let reference=reference(&old.0,&old.1);let old_page=original_page(&old.1).clone();
     let _new=append(&f,"retained-source-change",&doc,&"Different immutable version ".repeat(1000)).await;
     let current=page_call(&f,"retained-source-new-occurrence","collab_document_get",old.0.arguments.clone()).await;

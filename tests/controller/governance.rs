@@ -112,7 +112,10 @@ async fn register_candidate(c: &Controller, label: &str, allow_widening: bool) -
     candidate
 }
 async fn active_native(c: &Controller, label: &str) -> (Task, Attempt, Caller) {
-    let t = submit(c, &format!("{label}-submit"), governance_native(label)).await;
+    active_native_with_subject(c, label, governance_native(label)).await
+}
+async fn active_native_with_subject(c: &Controller, label: &str, subject: TaskInput) -> (Task, Attempt, Caller) {
+    let t = submit(c, &format!("{label}-submit"), subject).await;
     let w = worker(&format!("{label}-worker"), "incarnation-1", 1, 0);
     register(c, &w).await;
     let issued = commands(c, &w, vec![]).await;
@@ -197,7 +200,10 @@ struct Evidence {
     original: Operation, reply: Reply, operations: Vec<String>, attempt: Attempt,
 }
 async fn evidence(c: &Controller, label: &str, candidate: &ConfigurationVersion) -> Evidence {
-    let (t, attempt, caller) = active_native(c, &format!("{label}-subject")).await;
+    evidence_with_subject(c, label, candidate, governance_native(&format!("{label}-subject"))).await
+}
+async fn evidence_with_subject(c: &Controller, label: &str, candidate: &ConfigurationVersion, subject: TaskInput) -> Evidence {
+    let (t, attempt, caller) = active_native_with_subject(c, &format!("{label}-subject"), subject).await;
     let boundary = CompletionBoundary::NativeResponse { request_index: 1 };
     let original = Operation::EvaluateCompletion(EvaluateCompletion {
         operation_id: governance_completion::evaluation_id(&caller, &boundary).unwrap(), caller, boundary, intervening_requests: vec![],
@@ -241,8 +247,13 @@ pub(super) struct Promotion {
 /// Shared real qualification helper. Invoke before queuing another test task.
 /// It frees its actual attempt using cancellation and a stopped observation.
 pub(super) async fn promote(c: &Controller, label: &str, allow_widening: bool) -> Promotion {
+    promote_with_subject(c, label, allow_widening, governance_native(&format!("{label}-subject"))).await
+}
+/// Explicit caller-supplied fixture input retains admission under its selected
+/// policy; it does not repair an arbitrary task or bypass charter validation.
+pub(super) async fn promote_with_subject(c: &Controller, label: &str, allow_widening: bool, subject: TaskInput) -> Promotion {
     let candidate = register_candidate(c, label, allow_widening).await;
-    let prepared = evidence(c, label, &candidate).await;
+    let prepared = evidence_with_subject(c, label, &candidate, subject).await;
     let prior = state(c).await;
     let request = Operation::MutateGovernance { operation_id: format!("{label}-promote"), mutation: GovernanceMutation::Promote {
         expected_revision: prior.selected_revision, configuration_revision: candidate.revision.clone(),

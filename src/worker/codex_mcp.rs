@@ -1186,10 +1186,18 @@ pub(super) fn terminal_reads(config:&Config, after:Option<&str>, bound:usize)->R
     if !reference_owner(config)? {return Err("terminal read release requires worker20".into())}
     if inspect_retained_outcomes(config,None,false,None,false)?==OutcomeDisposition::Unresolved {return Err("Coding outcomes unresolved".into())}
     if super::collaboration_notice::unresolved(&config.state,&config.runtime_limits)? {return Err("Coding delivery remains unresolved".into())}
+    let journal_path=config.directory().join("calls.json");
+    if read_private(&journal_path,config.limits.journal_bytes,"execution.collaboration.journal_bytes")?.is_none() {
+        // A missing journal is no work only if no retained boundary still
+        // requires it. Do not manufacture a new private home/lock for absence.
+        if read_memory_boundary(config)?.is_some() {return Err("memory boundary journal absent".into());}
+        return Ok(vec![]);
+    }
     let lock=outer_boundary_file(config)?;
     lock.try_lock().map_err(|_|"terminal read has an active bridge owner")?;
     if let Some(boundary)=read_memory_boundary(config)? {if !boundary_released(config,&boundary)? {return Err("memory boundary still needs original body".into())}}
-    let Some(bytes)=read_private(&config.directory().join("calls.json"),config.limits.journal_bytes,"execution.collaboration.journal_bytes")? else{return Ok(vec![])};
+    let bytes=read_private(&journal_path,config.limits.journal_bytes,"execution.collaboration.journal_bytes")?
+        .ok_or("terminal read journal disappeared before owner lock")?;
     let journal:Journal=decode(&bytes,config.limits.journal_bytes)?;
     let mut selected=Vec::new();
     for entry in &journal.entries {

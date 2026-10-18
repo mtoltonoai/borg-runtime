@@ -1,4 +1,44 @@
 // Actual controller transactions using controlled callers, not live models.
+// The historical targets remain ordinary V1 definitions. Only the separate,
+// explicitly selected manager supplies the current bound update authority.
+fn definition_update_config() -> ControllerConfig {
+    let mut cfg = config();
+    Arc::make_mut(&mut cfg.limits).identity_administration = Some(borg_runtime::limits::IdentityAdministrationPolicy {
+        version: 1, revision: "definition-update-manager-policy".into(), enabled: true,
+        manager_agent_id: "charter".into(), complete_definitions: true,
+    });
+    cfg.limits.validate().unwrap();
+    cfg
+}
+async fn definition_update_fixture(c: &Controller, label: &str) -> (Task, Attempt, Caller) {
+    let mut manager = native("charter");
+    manager.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    let mut collaboration = c.limits().execution.collaboration.clone();
+    collaboration.capabilities = Some(borg_runtime::limits::CollaborationCapabilities {
+        version: 1, task_creation: false, identity_administration: true,
+    });
+    let mut native_limits = c.limits().execution.native.clone();
+    native_limits.context_bytes = 524_288;
+    native_limits.schema_bytes = 262_144;
+    native_limits.json_nodes = 65_536;
+    native_limits.function_count = 74;
+    manager.definition.limit_overrides = Some(Box::new(borg_runtime::limits::ExecutionLimitOverrides {
+        native: Some(native_limits), collaboration: Some(collaboration), ..Default::default()
+    }));
+    let manager = submit(c, &format!("{label}-manager-submit"), manager).await;
+    let w = worker(&format!("{label}-manager-worker"), "inc", 1, 0);
+    register(c, &w).await;
+    let a = run(&commands(c, &w, vec![]).await);
+    assert_eq!(a.task_id, manager.id);
+    task(report(c, &a, &format!("{label}-manager-start"), Observation::Started { thread_id: None, turn_id: None }).await);
+    let caller = Caller { task_id: a.task_id, attempt_id: a.id, generation: a.generation,
+        worker_id: a.worker_id, incarnation: a.worker_incarnation };
+    let (target, attempt, _) = fixture(c, label).await;
+    assert_ne!(target.id, caller.task_id);
+    assert_eq!(target.input.definition.execution_profile, Some(ExecutionProfile::CollaborationV1 { web_search: None }));
+    (target, attempt, caller)
+}
+
 fn definition_change_args(c: &Controller, definition: &Definition, changes: serde_json::Value) -> serde_json::Value {
     json!({"agent_id":definition.id, "expected_revision":definition.revision,
         "expected_global_revision":c.limits().revision,
@@ -36,8 +76,8 @@ async fn selected_definition(c: &Controller, id: &str) -> Definition {
 //# Submitting an explicitly pinned definition MUST NOT change an existing agent's selected definition revision.
 #[tokio::test]
 async fn definition_updates_apply_future_settings_keep_old_pins_and_assignment() {
-    let c=Controller::open_with_config(path(),config()).unwrap();
-    let (old, _, actor)=fixture(&c,"definition-apply").await;
+    let c=Controller::open_with_config(path(),definition_update_config()).unwrap();
+    let (old, _, actor)=definition_update_fixture(&c,"definition-apply").await;
     let before=old.input.definition.clone();
     let accepted=serde_json::to_vec(&get(&c,&old.id).await.input).unwrap();
     let old_pending=submit(&c,"old-pending",profiled("definition-apply")).await;
@@ -85,8 +125,8 @@ async fn definition_updates_apply_future_settings_keep_old_pins_and_assignment()
 //# A definition-limit change MUST compare the expected selected definition revision before applying a new immutable revision.
 #[tokio::test]
 async fn definition_updates_competing_cas_has_one_head_and_original_refusal() {
-    let c=Controller::open_with_config(path(),config()).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-cas").await;
+    let c=Controller::open_with_config(path(),definition_update_config()).unwrap();
+    let (task,_,actor)=definition_update_fixture(&c,"definition-cas").await;
     let n=c.limits().execution.native.context_bytes;
     let a=invocation(&actor,"cas-a","collab_definition_update",definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":n+1})));
     let b=invocation(&actor,"cas-b","collab_definition_update",definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":n+2})));
@@ -107,10 +147,10 @@ async fn definition_updates_competing_cas_has_one_head_and_original_refusal() {
 //# A definition-limit change MUST NOT grant host administration, credentials or protected release authority.
 #[tokio::test]
 async fn definition_updates_refuse_unknown_disallowed_zero_crossfield_and_authority() {
-    let mut cfg=config();
+    let mut cfg=definition_update_config();
     Arc::make_mut(&mut cfg.limits).definition_updates.as_mut().unwrap().allowed_fields=vec![borg_runtime::limits::DefinitionLimitField::NativeContextBytes];
     let c=Controller::open_with_config(path(),cfg).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-invalid").await;
+    let (task,_,actor)=definition_update_fixture(&c,"definition-invalid").await;
     for (id,changes,expected) in [
         ("unknown",json!({"native.model_requests":1}),"invalid_input"),
         ("disallowed",json!({"coding.summary_bytes":10}),"configuration_policy"),
@@ -139,8 +179,8 @@ async fn definition_updates_refuse_unknown_disallowed_zero_crossfield_and_author
 //# A definition-limit change MUST compare the expected active global metadata and change-policy revisions before application.
 #[tokio::test]
 async fn definition_updates_use_active_policy_not_callers_old_metadata() {
-    let p=path();let mut cfg=config();let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-current-policy").await;
+    let p=path();let mut cfg=definition_update_config();let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
+    let (task,_,actor)=definition_update_fixture(&c,"definition-current-policy").await;
     let old=definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":c.limits().execution.native.context_bytes*2}));
     let pinned=serde_json::to_vec(&get(&c,&task.id).await.input).unwrap();
     drop(c);controller_owner_released(&p).await;
@@ -163,26 +203,27 @@ async fn definition_updates_use_active_policy_not_callers_old_metadata() {
 }
 #[tokio::test]
 async fn definition_updates_absent_policy_disables_new_calls_and_preserves_old_bytes() {
-    let mut cfg=config();Arc::make_mut(&mut cfg.limits).definition_updates=None;
+    let mut cfg=definition_update_config();Arc::make_mut(&mut cfg.limits).definition_updates=None;
     let old=serde_json::to_vec(cfg.limits.as_ref()).unwrap();
     assert!(!serde_json::from_slice::<serde_json::Value>(&old).unwrap().as_object().unwrap().contains_key("definition_updates"));
     let recovered:borg_runtime::limits::RuntimeLimits=serde_json::from_slice(&old).unwrap();
     assert_eq!(serde_json::to_vec(&recovered).unwrap(),old);recovered.validate().unwrap();
     let c=Controller::open_with_config(path(),cfg).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-disabled").await;
+    let (task,_,actor)=definition_update_fixture(&c,"definition-disabled").await;
     let req=invocation(&actor,"disabled-update","collab_definition_update",definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":c.limits().execution.native.context_bytes+1})));
     assert_eq!(code(invoke(&c,&req).await.outcome),"configuration_disabled");
     assert_eq!(selected_definition(&c,&task.assigned_agent_id).await,task.input.definition);
 }
 #[tokio::test]
 async fn definition_updates_replay_after_cancel_restart_and_conflict_without_new_effect() {
-    let p=path();let mut cfg=config();let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-replay").await;
+    let p=path();let mut cfg=definition_update_config();let c=Controller::open_with_config(&p,cfg.clone()).unwrap();
+    let (task,_,actor)=definition_update_fixture(&c,"definition-replay").await;
     let req=invocation(&actor,"definition-exact-original","collab_definition_update",definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":c.limits().execution.native.context_bytes+1})));
     let first=invoke(&c,&req).await;let expected=definition_change(&first).selected_definition.clone();
     let mut changed=req.clone();changed.arguments["changes"]["native.context_bytes"]=json!(c.limits().execution.native.context_bytes+2);
     assert_eq!(code(invoke(&c,&changed).await.outcome),"operation_conflict");
-    let current=get(&c,&task.id).await;
+    let current=get(&c,&actor.task_id).await;
+    assert_eq!(current.assigned_agent_id, "charter");
     task_fn_cancel(&c,&current,"cancel-definition-caller").await;
     drop(c);controller_owner_released(&p).await;
     Arc::make_mut(&mut cfg.limits).definition_updates=None;
@@ -199,10 +240,10 @@ async fn task_fn_cancel(c:&Controller,t:&Task,id:&str) {
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn definition_updates_actual_commit_failure_leaves_no_revision_head_or_receipt() {
-    let p=path();let mut cfg=config();
+    let p=path();let mut cfg=definition_update_config();
     let fail=Arc::new(std::sync::atomic::AtomicBool::new(false));cfg.qualification_fail_next_commit=Some(fail.clone());
     let c=Controller::open_with_config(&p,cfg).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-rollback").await;
+    let (task,_,actor)=definition_update_fixture(&c,"definition-rollback").await;
     let req=invocation(&actor,"definition-commit-failed","collab_definition_update",definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":c.limits().execution.native.context_bytes+1})));
     fail.store(true,Ordering::SeqCst);let failed=invoke(&c,&req).await;
     assert!(!fail.load(Ordering::SeqCst));assert_eq!(code(failed.outcome),"store_unavailable");assert!(failed.commit.is_none());
@@ -212,13 +253,13 @@ async fn definition_updates_actual_commit_failure_leaves_no_revision_head_or_rec
     let db=rusqlite::Connection::open(&p).unwrap();
     assert_eq!(db.query_row("SELECT count(*) FROM definitions WHERE id=?1",[&task.assigned_agent_id],|r|r.get::<_,i64>(0)).unwrap(),1);
     drop(db);
-    let c=Controller::open_with_config(&p,config()).unwrap();
+    let c=Controller::open_with_config(&p,definition_update_config()).unwrap();
     let recovered=invoke(&c,&req).await;assert_eq!(definition_change(&recovered).selected_definition.revision,"definition-1");
 }
 #[tokio::test]
 async fn definition_updates_classify_effective_values_and_skip_existing_revision_spelling() {
-    let c=Controller::open_with_config(path(),config()).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-classification").await;
+    let c=Controller::open_with_config(path(),definition_update_config()).unwrap();
+    let (task,_,actor)=definition_update_fixture(&c,"definition-classification").await;
     let mut collision=profiled("definition-classification");collision.definition.revision="definition-1".into();
     submit(&c,"existing-generated-spelling",collision).await;
     let n=c.limits().execution.native.context_bytes;
@@ -310,8 +351,8 @@ enum LegacyData {
 #[tokio::test]
 async fn definition_updates_old_wire_is_refused_before_receipt_or_head_mutation() {
     assert_eq!(WIRE_REVISION,25);
-    let c=Controller::open_with_config(path(),config()).unwrap();
-    let (task,_,actor)=fixture(&c,"definition-wire").await;
+    let c=Controller::open_with_config(path(),definition_update_config()).unwrap();
+    let (task,_,actor)=definition_update_fixture(&c,"definition-wire").await;
     let req=invocation(&actor,"wire-bound-update","collab_definition_update",definition_change_args(&c,&task.input.definition,json!({"native.context_bytes":c.limits().execution.native.context_bytes+1})));
     for version in [8,9,10,11,12,13,14,15,16,17,18,24] {
         let old=c.handle(Request{protocol_revision:version,request_id:format!("old-wire-request-{version}"),command:req.operation()}).await;
@@ -328,11 +369,12 @@ async fn definition_updates_old_wire_is_refused_before_receipt_or_head_mutation(
 // This is a controlled controller qualification, not a full-window model load.
 #[tokio::test]
 async fn maximum_context_update_is_atomic_and_keeps_unspecified_history() {
-    let c=Controller::open_with_config(path(),config()).unwrap();
+    let c=Controller::open_with_config(path(),definition_update_config()).unwrap();
     // Establish a real current caller before another pending task enters the queue.
-    let (updater,updater_attempt,actor)=fixture(&c,"context-updater").await;
+    let (updater,updater_attempt,actor)=definition_update_fixture(&c,"context-updater").await;
     assert_eq!(updater_attempt.task_id,updater.id);
-    assert_eq!(actor.task_id,updater.id);
+    assert_ne!(actor.task_id,updater.id);
+    assert_eq!(get(&c,&actor.task_id).await.assigned_agent_id,"charter");
     let mut old_input=profiled("context-maximum");
     let mut native=c.limits().execution.native.clone();
     native.context_bytes=65_536;native.request_bytes=1_048_576;
@@ -375,4 +417,15 @@ async fn maximum_context_update_is_atomic_and_keeps_unspecified_history() {
     let stale=invocation(&actor,"context-stale","collab_definition_update",definition_change_args(&c,&before,json!({"coding.model_context_window":1_050_000})));
     assert!(matches!(invoke(&c,&stale).await.outcome,Outcome::Refused{ref code,..} if code=="configuration_conflict"));
     assert_eq!(selected_definition(&c,&before.id).await,outcome.selected_definition);
+}
+
+#[tokio::test]
+async fn definition_updates_ordinary_caller_cannot_acquire_selected_manager_authority() {
+    let c = Controller::open_with_config(path(), definition_update_config()).unwrap();
+    let (old, _, ordinary) = fixture(&c, "ordinary-update-denied").await;
+    let request = invocation(&ordinary, "ordinary-update-denied-operation", "collab_definition_update",
+        definition_change_args(&c, &old.input.definition, json!({"native.context_bytes":c.limits().execution.native.context_bytes + 1})));
+    assert_eq!(code(invoke(&c, &request).await.outcome), "identity_manager_required");
+    assert_eq!(selected_definition(&c, &old.assigned_agent_id).await, old.input.definition);
+    assert_eq!(get(&c, &old.id).await.input, old.input);
 }

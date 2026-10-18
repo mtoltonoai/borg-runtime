@@ -1553,6 +1553,10 @@ async fn get(controller: &Controller, path: &str, query: &str) -> UiResponse {
 // These routes retain their original order and body. Their larger state machine
 // is constructed and polled only after the document/question probes decline.
 async fn get_other(controller: &Controller, path: &str, query: &str) -> UiResponse {
+    if path == "/ui/definition-settings.js" {
+        return UiResponse { status: 200, content_type: "text/javascript; charset=utf-8".into(),
+            body: include_str!("definition_settings.js").into(), location: None, limiting_field: None };
+    }
     if let Some(response) = machine_resources::get(controller, path, query).await {
         return response;
     }

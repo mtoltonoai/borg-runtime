@@ -950,11 +950,10 @@ impl Database {
             if matches!(record.kind.as_str(), "application_mutation" | "committed_read_reference") {
                 let receipt = super::metadata::read_retained(&tx, operation_id)?
                     .ok_or_else(|| Fault::Store("mutation lookup lost original receipt".into()))?;
-                if *record != receipt.lookup()?
-                {
-                    return Err(Fault::Store(
-                        "mutation lookup changed original outcome".into(),
-                    ));
+                if *record != receipt.lookup()? {
+                    // Only the caller-scoped immutable read reader may restore
+                    // a removed body. Ordinary GetOperation equality is unchanged.
+                    super::collaboration_calls::validate_recovered_lookup(operation, &receipt, record)?;
                 }
                 commit = Some(receipt.commit);
             }

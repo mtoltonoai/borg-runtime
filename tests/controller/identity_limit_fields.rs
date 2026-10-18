@@ -166,7 +166,10 @@ async fn identity_limit_fields_touched_groups_inherit_current_retry_and_preserve
 #[tokio::test]
 async fn identity_limit_fields_full_replace_still_requires_widening_rule_for_decrease() {
     let h = fixture("conservative-rule").await;
-    let selection = super::governance::promote(&h.c, "identity-limit-fields-narrowing", false).await.configuration;
+    let mut subject = super::native("identity-limit-fields-narrowing-subject");
+    subject.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { web_search: None });
+    subject.definition.charter = Some(charter("identity-limit-fields-narrowing-subject"));
+    let selection = super::governance::promote_with_subject(&h.c, "identity-limit-fields-narrowing", false, subject).await.configuration;
     let before = selected(&h.c, "charter").await.definition;
     let values = h.cfg.limits.resolve_definition(&before).unwrap();
     let edits = [(FIELDS[0], values.coding.frame_bytes - 1), (FIELDS[1], values.collaboration.journal_bytes - 1)];

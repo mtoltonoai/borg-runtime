@@ -272,6 +272,31 @@ pub(super) fn lookup(tx: &Connection, actor: &Caller, id: &str, context: &Contex
     Ok((Data::Operation(receipt.lookup()?), false))
 }
 
+/// Bind a reconstructed lookup to the same retained original before attaching
+/// its commit. The body must satisfy the compact receipt's exact typed digest;
+/// a fresh query, another caller, or a different OperationRecord cannot pass.
+pub(super) fn validate_recovered_lookup(
+    operation: &Operation, receipt: &super::metadata::Retained, record: &OperationRecord,
+) -> Result<()> {
+    let invalid = || Fault::Store("mutation lookup changed original outcome".into());
+    let (
+        Operation::GetCollaborationCall { caller, operation_id },
+        Operation::CallCollaboration { call },
+        super::metadata::RetainedOutcome::ReadReference(reference),
+    ) = (operation, &receipt.request, &receipt.outcome) else { return Err(invalid()); };
+    if caller != &call.caller || operation_id != &call.operation_id
+        || operation_id != &receipt.commit.operation_id {
+        return Err(invalid());
+    }
+    let outcome: Outcome = serde_json::from_value(record.outcome.clone().ok_or_else(invalid)?)
+        .map_err(|_| invalid())?;
+    reference.committed_read_reference.evidence.verify(call, &outcome).map_err(|_| invalid())?;
+    if *record != super::metadata::lookup_record(operation_id, &receipt.request, &outcome)? {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn recover_original(tx: &Connection, context: &Context<'_>, call: &Invocation,
     reference: &crate::read_retention::CompactOutcome, now: u64) -> Result<Option<Outcome>> {
     use crate::read_retention::SourceProjection;
@@ -959,3 +984,97 @@ fn list(
 #[cfg(test)]
 #[path = "collaboration_calls/workflow_projection_tests.rs"]
 mod workflow_projection_tests;
+
+
+#[cfg(test)]
+mod recovered_lookup_tests {
+    use super::*;
+    use super::super::metadata::{self, Retained, RetainedOutcome};
+    use crate::read_retention::{CompactOutcome, CompactRead, ReadEvidence};
+
+    fn fixture() -> (Operation, Retained, OperationRecord) {
+        let call = Invocation {
+            operation_id: "original-read".into(), logical_call_id: "original-logical".into(),
+            caller: Caller { task_id: "task".into(), attempt_id: "attempt".into(), generation: 1,
+                worker_id: "worker".into(), incarnation: "incarnation".into() },
+            tool: "collab_repository_read".into(),
+            arguments: json!({"source":"start","path":"body.txt","start_line":1,"max_lines":1}),
+        };
+        let outcome = Outcome::Ok { data: Data::Repository(Box::new(crate::repository_view::Output {
+            source: crate::repository_view::Source {
+                registration: crate::repository_catalogue::Revision {
+                    repository_id: "repository".into(), registration_revision: "registration".into(),
+                },
+                repository: "file:///immutable.git".into(), commit: "1".repeat(40), base_commit: None,
+            },
+            untrusted: true,
+            data: crate::repository_view::Data::File { path: "body.txt".into(), object: "2".repeat(40),
+                start_line: 1, total_lines: 1, text: "original body\n".into(), next_line: None },
+        })) };
+        let evidence = ReadEvidence::from_outcome(&call, &outcome).unwrap();
+        let request = call.operation();
+        let record = metadata::lookup_record(&call.operation_id, &request, &outcome).unwrap();
+        let operation = Operation::GetCollaborationCall {
+            caller: call.caller.clone(), operation_id: call.operation_id.clone(),
+        };
+        // This focused seam starts after read_retained has validated durable
+        // release/custody provenance. Real receipt/reopen tests cover that join.
+        let retained = Retained { request, outcome: RetainedOutcome::ReadReference(CompactOutcome {
+            committed_read_reference: CompactRead { evidence, release_operation_id: "release".into(),
+                attempt_id: call.caller.attempt_id, session_id: "session".into() },
+        }), commit: MutationCommit { operation_id: call.operation_id, controller_revision: 7 } };
+        (operation, retained, record)
+    }
+
+    #[test]
+    fn reconstructed_lookup_requires_exact_original_request_caller_commit_and_evidence() {
+        let (operation, retained, record) = fixture();
+        assert!(validate_recovered_lookup(&operation, &retained, &record).is_ok());
+        assert_ne!(record, retained.lookup().unwrap(), "the selected seam actually reconstructs a body");
+        assert!(validate_recovered_lookup(&Operation::GetOperation {
+            operation_id: retained.commit.operation_id.clone(),
+        }, &retained, &record).is_err(), "ordinary GetOperation cannot use this exception");
+
+        let (mut operation, retained, record) = fixture();
+        let Operation::GetCollaborationCall { caller, .. } = &mut operation else { unreachable!() };
+        caller.incarnation = "other-incarnation".into();
+        assert!(validate_recovered_lookup(&operation, &retained, &record).is_err());
+        let (mut operation, retained, record) = fixture();
+        let Operation::GetCollaborationCall { operation_id, .. } = &mut operation else { unreachable!() };
+        *operation_id = "other-operation".into();
+        assert!(validate_recovered_lookup(&operation, &retained, &record).is_err());
+
+        let (operation, mut retained, record) = fixture();
+        retained.commit.operation_id = "other-commit".into();
+        assert!(validate_recovered_lookup(&operation, &retained, &record).is_err());
+        let (operation, mut retained, record) = fixture();
+        let Operation::CallCollaboration { call } = &mut retained.request else { unreachable!() };
+        call.arguments["path"] = json!("different.txt");
+        assert!(validate_recovered_lookup(&operation, &retained, &record).is_err());
+        let (operation, mut retained, record) = fixture();
+        let RetainedOutcome::ReadReference(reference) = &mut retained.outcome else { unreachable!() };
+        reference.committed_read_reference.evidence.outcome_sha256 = "f".repeat(64);
+        assert!(validate_recovered_lookup(&operation, &retained, &record).is_err());
+
+        let (operation, retained, record) = fixture();
+        let mut changed: Outcome = serde_json::from_value(record.outcome.clone().unwrap()).unwrap();
+        let Outcome::Ok { data: Data::Repository(body) } = &mut changed else { unreachable!() };
+        let crate::repository_view::Data::File { text, .. } = &mut body.data else { unreachable!() };
+        *text = "different body\n".into();
+        let changed = metadata::lookup_record(&retained.commit.operation_id, &retained.request, &changed).unwrap();
+        assert!(validate_recovered_lookup(&operation, &retained, &changed).is_err(), "well-typed changed body must fail its original digest");
+
+        let (operation, retained, record) = fixture();
+        for field in ["id", "task_id", "attempt_id", "generation", "kind", "intended", "state", "outcome"] {
+            let mut changed = serde_json::to_value(&record).unwrap();
+            changed[field] = match field {
+                "generation" => json!(9),
+                "intended" => json!({"different":"request"}),
+                "outcome" => json!({"status":"refused","code":"not_found","message":"different"}),
+                _ => json!("different"),
+            };
+            let changed: OperationRecord = serde_json::from_value(changed).unwrap();
+            assert!(validate_recovered_lookup(&operation, &retained, &changed).is_err(), "changed {field}");
+        }
+    }
+}

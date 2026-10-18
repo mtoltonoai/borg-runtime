@@ -86,7 +86,8 @@ async fn terminal_release_checks_real_closure_and_transcript_custody() {
     assert_eq!(code(release(&f,&active).await.outcome),"read_release_held");
     close_cancelled(&f).await;
     let plan=release_plan(&f,std::slice::from_ref(&read),"closed-custody").await;
-    assert_eq!(code(release(&f,&plan).await.outcome),"read_release_held","valid-looking hash/counts without original worker custody are not authority");
+    let mut missing_custody=plan.clone();missing_custody.operation_id="closed-release-without-custody".into();
+    assert_eq!(code(release(&f,&missing_custody).await.outcome),"read_release_held","valid-looking hash/counts without original worker custody are not authority");
     let mut foreign=plan.clone();foreign.caller.incarnation="foreign".into();
     assert!(matches!(report(&f.c,&f.attempt,"wrong-custody",Observation::ReadTranscriptCustody{proof:Box::new(foreign)}).await,Outcome::Refused{..}));
     let release_plan=custody_and_safe(&f,&plan).await;
@@ -168,6 +169,17 @@ async fn immutable_reference_keeps_actual_resolved_source() {
     let recovered=mcp::recovered(&call,lookup(&f.c,&call).await).unwrap();
     assert_eq!(recovered.reply.outcome,original.outcome);assert_eq!(recovered.reply.commit,original.commit);
     evidence.verify(&call,&recovered.reply.outcome).unwrap();
+    let reference=ReadReference::new(&call,&mcp::result(&call,original.clone()).unwrap()).unwrap();
+    let mut changed_commit=recovered.clone();
+    changed_commit.reply.commit.as_mut().unwrap().controller_revision+=1;
+    assert!(reference.restore(&call,changed_commit).is_err(),"original commit revision cannot change during reconstruction");
+    assert_eq!(reference.restore(&call,recovered).unwrap().reply,original);
+    let retained=exchange(&f.c,Operation::GetOperation {operation_id:call.operation_id.clone()}).await;
+    assert_eq!(retained.commit,original.commit);
+    assert!(matches!(retained.outcome,Outcome::Ok{data:Data::Operation(ref record)} if record.kind=="committed_read_reference"),
+        "ordinary GetOperation must retain the compact original, not the reconstructed body");
+    let mut foreign=call.clone();foreign.caller.incarnation="other-owner".into();
+    assert_eq!(code(lookup(&f.c,&foreign).await.outcome),"caller_mismatch");
     // The bare repository already has a newer HEAD. Original recovery is tied
     // to the resolved old commit/blob/range, with no global revision equality.
     assert_ne!(repo.old,repo.new);

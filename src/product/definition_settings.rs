@@ -57,7 +57,10 @@ async fn view(controller: &Controller, raw_id: &str, query: &str) -> Result<UiRe
     let invalid = |e: String| error(400, &e);
     let id = agent_id(raw_id, controller.limits()).map_err(invalid)?;
     let fields = parse_form(query.as_bytes(), controller.limits()).map_err(|e| error(400, &e))?;
-    fields_only(&fields, &["task_id"]).map_err(invalid)?;
+    fields_only(&fields, &["task_id", "original_operation"]).map_err(invalid)?;
+    if fields.get("original_operation").is_some_and(|value| !crate::mcp::valid_identity(value, controller.limits().transport.identity_bytes)) {
+        return Err(error(400, "Invalid original operation identity"));
+    }
     let reply = call(controller, Operation::GetAgent { agent_id: id.clone() }).await;
     let Outcome::Ok { data: Data::Agent(agent) } = reply.outcome else {
         return Err(not_task(reply));
@@ -95,14 +98,23 @@ async fn view(controller: &Controller, raw_id: &str, query: &str) -> Result<UiRe
     body.push_str(&json(&agent.definition));
     body.push_str(&json(&effective));
     body.push_str("</details>");
-    if let Some(policy) = &global.definition_updates {
+    if let Some(original) = fields.get("original_operation") {
+        let _ = write!(body, "<p class=\"notice\">A settings request was sent or may have been sent. Read its original receipt before starting another action; this view does not resend it.</p><p><a href=\"/operations/{}\">Read original operation {}</a></p>", encode(original), escape(original));
+    } else if let Some(policy) = &global.definition_updates {
         body.push_str("<dl>");
         term(&mut body, "Current change-policy revision", &policy.revision);
         body.push_str("</dl>");
         if policy.allowed_fields.is_empty() {
             body.push_str("<p class=\"notice\">The current policy allows no settings changes.</p>");
         } else {
-            let _ = write!(body, "<h2>Change future-task limits</h2><p id=\"settings-change-help\">Only the fields allowed by the current policy are editable. Leave a field blank to retain its effective value. The controller checks the complete resulting configuration and all three displayed revisions before committing.</p><form method=\"post\" action=\"{route}\" aria-describedby=\"settings-change-help\"><fieldset><legend>Allowed execution limits</legend>");
+            let bootstrap = serde_json::json!({
+                "wire": WIRE_REVISION, "body_bytes": global.transport.body_bytes,
+                "identity_bytes": global.transport.identity_bytes,
+                "request_timeout_ms": global.product.live.request_timeout_ms,
+                "maximum_value": usize::MAX.to_string(), "agent_id": id,
+                "fields": policy.allowed_fields,
+            });
+            let _ = write!(body, "<h2>Change future-task limits</h2><p id=\"settings-change-help\">Only the fields allowed by the current policy are editable. Leave a field blank to retain its effective value. The controller checks the complete resulting configuration and all three displayed revisions before committing.</p><form id=\"definition-settings-form\" data-settings=\"{}\" method=\"post\" action=\"{route}\" aria-describedby=\"settings-change-help\"><fieldset><legend>Allowed execution limits</legend>", escape(&bootstrap.to_string()));
             body.push_str(&hidden("operation_id", &identity()));
             body.push_str(&hidden("expected_revision", &agent.definition.revision));
             body.push_str(&hidden("expected_global_revision", &global.revision));
@@ -112,7 +124,7 @@ async fn view(controller: &Controller, raw_id: &str, query: &str) -> Result<UiRe
                 let value = limit.value(&effective).map(|n| n.to_string()).unwrap_or_else(|| "executor default (unspecified)".into());
                 let _ = write!(body, "<label>{} <small>Current effective value: {} · {}</small><input name=\"{}\" type=\"text\" inputmode=\"numeric\" pattern=\"[0-9]+\" placeholder=\"Keep {}\"></label>", escape(&name), escape(&value), field_unit(*limit), escape(&name), escape(&value));
             }
-            body.push_str("</fieldset><button type=\"submit\">Commit settings for future submissions</button></form>");
+            body.push_str("</fieldset><button type=\"submit\" disabled>Commit settings for future submissions</button><p class=\"settings-status\" role=\"status\">Not submitted. JavaScript uses the configured operator API.</p><a class=\"settings-lookup\" hidden>Read original operation</a></form>");
         }
     } else {
         body.push_str("<p class=\"notice\">Settings changes are disabled: no definition update policy is configured.</p>");
@@ -130,7 +142,12 @@ async fn view(controller: &Controller, raw_id: &str, query: &str) -> Result<UiRe
         body.push_str(&json(snapshot));
         let _ = write!(body, "<p><a href=\"/limits?task_id={}\">All accepted task limits</a> · <a href=\"{}\">Task evidence</a></p>", encode(&task.id), task_path(&task.id));
     }
-    Ok(page(200, "Agent settings", body))
+    body.push_str("<script src=\"/ui/definition-settings.js\" defer></script>");
+    let mut response = page(200, "Agent settings", body);
+    // Preserve the unsent form and, after dispatch, its exact original request.
+    // Live state refresh must not replace this operator form with a fresh one.
+    response.body = response.body.replacen("data-live-refresh=\"true\"", "data-live-refresh=\"false\"", 1);
+    Ok(response)
 }
 
 pub(super) async fn post(controller: &Controller, raw_id: &str, fields: Form, operation_id: &str) -> UiResponse {

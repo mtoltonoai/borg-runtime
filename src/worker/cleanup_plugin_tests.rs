@@ -847,6 +847,7 @@ async fn read_cleanup_without_new_work() {
     let _cp=cache_success(&lab).await;
     let task=lab.task().await;let command=std::fs::read(&lab.command_path).unwrap();
     let policy=&lab.config.limits.retention.as_ref().unwrap().worker;
+    workspace_only(&lab,process::now_ms()).await;
     only_plugins(&lab,process::now_ms()).await.unwrap();assert_eq!(progress(&lab)["done"],true);
     let archive=lab.state.join("codex-transcripts").join(component(&lab.attempt.id));
     assert_eq!(std::fs::read(archive.join("sessions/controlled-thread.jsonl")).unwrap(),transcript);
@@ -872,4 +873,73 @@ async fn read_cleanup_without_new_work() {
     let mut disabled=(*lab.config.limits).clone();disabled.retention=None;
     assert!(Scheduler::open_selected(&lab.config,&lab.state,&disabled).unwrap().deadline().is_none(),"absent configured policy schedules no cleanup");
     lab.close().await;
+}
+
+
+/// An empty typed read inventory is not a new cleanup obligation. The
+/// unavailable client makes any accidental canonical read fail this oracle.
+#[tokio::test]
+async fn terminal_read_cleanup_empty_inventory_preserves_due_and_pending_originals() {
+    Box::pin(empty_read_inventory()).await;
+}
+async fn empty_read_inventory() {
+    let lab=Lab::open("read-empty-inventory").await;
+    let home=codex::state_path(&lab.state.join("codex"),&lab.attempt.id);
+    let directory=lab.state.join("cleanup-reads");
+    let progress=directory.join(format!("{}.json",component(&lab.attempt.id)));
+    let policy=&lab.config.limits.retention.as_ref().unwrap().worker;
+    let unavailable=ApiClient::new("http://127.0.0.1:1",lab.config.limits.clone()).unwrap();
+    let original_task=lab.task().await;
+    let original_command=std::fs::read(&lab.command_path).unwrap();
+    let now=process::now_ms();
+    assert!(!home.exists());
+    assert_eq!(read_step(&lab,&unavailable,now).await,None);
+    assert!(!home.exists(),"no calls must not create a Codex home or boundary lock");
+    assert!(!directory.exists(),"no read work must not create a cleanup progress record");
+    let calls=home.join("collaboration-codex/calls.json");
+    process::private_directory(calls.parent().unwrap()).unwrap();
+    std::fs::write(&calls,b"{malformed original journal").unwrap();
+    std::fs::set_permissions(&calls,std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    assert_eq!(read_step(&lab,&unavailable,now).await,Some(now+policy.retry_delay_ms));
+    assert_eq!(std::fs::read(&calls).unwrap(),b"{malformed original journal");
+    let actor=collaboration_caller(&lab.attempt);
+    let metadata=lab.input.resolved_limits.as_ref().unwrap();
+    atomic_json(&calls,&json!({"runtime_limits":metadata.global_metadata,"limits":lab.input.execution_limits().unwrap().collaboration,
+        "worker_limits":lab.config.limits.worker,"revision":2,"caller":actor,"deadline_unix_ms":lab.attempt.deadline_unix_ms,
+        "controller_url":lab.config.controller_url,"entries":[]})).unwrap();
+    let empty_journal=std::fs::read(&calls).unwrap();
+    assert_eq!(read_step(&lab,&unavailable,now).await,None);
+    assert_eq!(std::fs::read(&calls).unwrap(),empty_journal);
+    // A real committed read identifies the synthetic interrupted local intent.
+    // The absent body cannot authorize release or discard that original intent.
+    let call=crate::mcp::Invocation {operation_id:"empty-inventory-original".into(),logical_call_id:"empty-inventory-original".into(),
+        caller:actor.clone(),tool:"collab_memory_get".into(),arguments:json!({"key":"absent"})};
+    let original=lab.call(call.operation()).await;
+    let evidence=crate::read_retention::ReadEvidence::from_outcome(&call,&original.outcome).unwrap();
+    let WorkerCommand::RunAttempt {command_id,..}=&lab.command else {unreachable!()};
+    let pending=crate::read_retention::TerminalReadRelease {operation_id:"pending-original-custody".into(),caller:actor,
+        command_id:command_id.clone(),session_id:lab.attempt.session_id.clone(),terminal_revision:original_task.revision,
+        first_safe_operation_id:None,policy_revision:lab.config.limits.revision.clone(),policy:policy.clone(),
+        custody:crate::read_retention::TranscriptCustody::CodingCopy {manifest_sha256:"0".repeat(64),bytes:1,files:1},
+        custody_operation_id:"pending-original-custody".into(),reads:vec![crate::read_retention::ReleaseItem {
+            operation_id:call.operation_id.clone(),commit:original.commit.clone().unwrap(),evidence}]};
+    process::private_directory(&directory).unwrap();
+    atomic_json(&progress,&json!({"format_revision":20,"command_id":command_id,"policy":policy,
+        "policy_revision":lab.config.limits.revision,"after":null,"pending":pending})).unwrap();
+    let pending_bytes=std::fs::read(&progress).unwrap();
+    assert_eq!(read_step(&lab,&unavailable,now).await,Some(now+policy.retry_delay_ms));
+    assert_eq!(std::fs::read(&progress).unwrap(),pending_bytes);
+    assert_eq!(std::fs::read(&calls).unwrap(),empty_journal);
+    let absent=lab.call(Operation::GetOperation {operation_id:"pending-original-custody".into()}).await;
+    assert!(matches!(absent.outcome,Outcome::Refused{ref code,..} if code=="not_found"));
+    std::fs::write(&progress,b"{malformed original progress").unwrap();
+    assert_eq!(read_step(&lab,&unavailable,now).await,Some(now+policy.retry_delay_ms));
+    assert_eq!(std::fs::read(&progress).unwrap(),b"{malformed original progress");
+    assert_eq!(std::fs::read(&lab.command_path).unwrap(),original_command);
+    assert_eq!(lab.task().await,original_task);
+    lab.close().await;
+}
+async fn read_step(lab:&Lab,client:&ApiClient,now:u64)->Option<u64> {
+    Box::pin(super::super::reads::attempt_at(&lab.config,&lab.state,client,&BTreeMap::new(),&lab.control.validation_runtime,
+        &lab.config.limits.retention.as_ref().unwrap().worker,&lab.config.limits.revision,&lab.command_path,now)).await.unwrap()
 }

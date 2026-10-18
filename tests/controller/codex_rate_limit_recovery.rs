@@ -425,7 +425,7 @@ fn stamp_negative_old_marker(p: &std::path::Path) {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        25
+        26
     );
     // Deliberate incompatible-marker corruption of a current producer, never
     // evidence of a schema24 executable or valid historical upgrade.
