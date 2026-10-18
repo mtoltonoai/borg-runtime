@@ -699,3 +699,76 @@ async fn typed_http_facts_do_not_copy_decoded_credentials_or_arbitrary_provider_
         })
     );
 }
+
+#[tokio::test]
+//= spec/impl/v2/implementation.md#platform-owned-model-retries
+//= type=test
+//# A provider quota exhaustion MUST be distinguished from transient throttling.
+async fn native_selected_throttle_shapes_use_original_header_delay_without_message_authority() {
+    for (body, kind) in [
+        (json!({"error":{"message":"PRIVATE_PROMPT try again in 999s", "type":"rate_limit_error", "param":null, "code":"slow_down"}}), RejectionKind::RateLimited),
+        (json!({"error":{"message":"PRIVATE_PROMPT try again in 999s", "type":"tokens", "param":null, "code":"rate_limit_exceeded"}}), RejectionKind::RateLimited),
+        (json!({"error":{"message":"PRIVATE_PROMPT retry now", "type":"insufficient_quota", "param":null, "code":"insufficient_quota"}}), RejectionKind::QuotaExhausted),
+    ] {
+        let fixture = Fixture::start(429, serde_json::to_vec(&body).unwrap(), Duration::ZERO,
+            "retry-after: 1\r\nretry-after-ms: 23\r\n").await;
+        let result = observed(&task(), &config(fixture.endpoint.clone())).await;
+        fixture.finish().await;
+        assert_eq!(result.provider_outcome, ProviderOutcome::Rejected(ProviderRejection {
+            kind, retry_after: RetryAfter::DelayMs(1000),
+        }));
+        assert_eq!(result.request_exposure, RequestExposure::HttpResponseReceived);
+        assert_eq!(result.usage, UsageObservation::Unknown);
+        let text = result.result.unwrap_err();
+        assert!(!text.contains("PRIVATE_PROMPT"));
+        assert!(!text.contains("999s"));
+        assert!(!text.contains("classification_refused"));
+    }
+}
+
+#[tokio::test]
+//= spec/impl/v2/implementation.md#platform-owned-model-retries
+//= type=test
+//# Retained provider diagnostics MUST exclude configured credentials and submitted prompt content.
+async fn native_unknown_throttle_shapes_explain_only_fixed_refusal_reason() {
+    let credential = std::env::var("HOME").unwrap();
+    for (body, reason) in [
+        (json!({"error":{"code":"rate_limit_exceeded","type":"requests","message":credential,"param":null}}), "unsupported_type"),
+        (json!({"error":{"code":"slow_down","type":"insufficient_quota"}}), "status_or_type_mismatch"),
+        (json!({"error":{"code":"slow_down","type":"rate_limit_error"},"PRIVATE_ROOT_FIELD":true}), "unexpected_root_keys"),
+        (json!({"error":{"code":"slow_down","type":"rate_limit_error","PRIVATE_ERROR_FIELD":true}}), "unexpected_error_keys"),
+        (json!({"error":{"code":"slow_down","type":42}}), "invalid_field_type"),
+        (json!({"error":{"code":"slow_down"}}), "status_or_type_mismatch"),
+        (json!({"error":{"code":"rate_limit_exceeded","type":"tokens"}}), "status_or_type_mismatch"),
+        (json!({"error":{"code":"rate_limit_exceeded","type":"tokens","message":"PRIVATE_PROMPT","param":"PRIVATE_PARAM"}}), "status_or_type_mismatch"),
+        (json!({"error":{"code":"PRIVATE_CODE","type":"rate_limit_error","message":"PRIVATE_PROMPT"}}), "unsupported_code"),
+        (json!({"error":{}}), "missing_discriminator"),
+        (json!({"error":null}), "invalid_error"),
+    ] {
+        let fixture = Fixture::start(429, serde_json::to_vec(&body).unwrap(), Duration::ZERO, "retry-after: 0\r\n").await;
+        let result = observed(&task(), &config(fixture.endpoint.clone())).await;
+        fixture.finish().await;
+        assert_eq!(result.provider_outcome, ProviderOutcome::Unknown);
+        assert_eq!(result.usage, UsageObservation::Unknown);
+        let facts = result.diagnostic.as_ref().unwrap();
+        assert_eq!(facts.http.as_ref().unwrap().category, borg_runtime::native::CategoryDiagnostic::Absent);
+        let text = result.result.unwrap_err();
+        assert!(text.contains(&format!("classification_refused={reason}")), "{text}");
+        for private in [credential.as_str(), "PRIVATE_ROOT_FIELD", "PRIVATE_ERROR_FIELD", "PRIVATE_PROMPT", "PRIVATE_PARAM", "PRIVATE_CODE"] {
+            assert!(!text.contains(private), "provider text leaked");
+            assert!(!serde_json::to_string(facts).unwrap().contains(private));
+        }
+    }
+    for body in [
+        br#"{"error":{"code":"slow_down","type":"rate_limit_error","type":"rate_limit_error"}}"#.as_slice(),
+        br#"{"error":{"code":"rate_limit_exceeded","type":"tokens","message":"safe","param":null,"param":null}}"#.as_slice(),
+        br#"{"error":{"code":"slow_down","type":"rate_limit_error"}"#.as_slice(),
+    ] {
+        let fixture = Fixture::start(429, body.to_vec(), Duration::ZERO, "retry-after: 0\r\n").await;
+        let result = observed(&task(), &config(fixture.endpoint.clone())).await;
+        fixture.finish().await;
+        assert_eq!(result.provider_outcome, ProviderOutcome::Unknown);
+        assert_eq!(result.usage, UsageObservation::Unknown);
+        assert!(!result.result.unwrap_err().contains("category=rate_limited"));
+    }
+}
