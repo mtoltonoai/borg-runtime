@@ -4,11 +4,17 @@ These tests do not compile Rust/SQLite or qualify the fake ELF as runnable. Root
 actual two-build and packaged-controller acceptance is separate evidence.
 """
 from pathlib import Path
+import copy
+import datetime
 import hashlib
+import importlib.util
 import json
 import os
+import re
+import shutil
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -116,7 +122,7 @@ class PackageTests(unittest.TestCase):
         self.git("commit", "--quiet", "-m", "private package fixture")
         return self.git("rev-parse", "HEAD").decode().strip()
 
-    def fake_build(self, checkout, output, builder, archive, toolchain, cargo_home):
+    def fake_build(self, checkout, output, builder, archive, toolchain, cargo_home, source=None):
         self.assertEqual(package.digest(builder), package.BUILDER_SHA)
         self.assertNotEqual(builder, checkout / "tooling/build_v2.py")
         self.assertEqual(archive, self.archive)
@@ -173,7 +179,9 @@ class PackageTests(unittest.TestCase):
     def test_manifest_and_lock_change_refuse_before_builder(self):
         for name in ("Cargo.toml", "Cargo.lock"):
             original = (self.repo / name).read_bytes()
-            (self.repo / name).write_bytes(original + b"\n# new profile\n")
+            # Syntax-only comments are admitted by revision 2; a new parsed
+            # field still changes the complete selected policy and refuses.
+            (self.repo / name).write_bytes(b"unselected = true\n" + original)
             self.commit = self.commit_all()
             with patch.object(package, "verify_archive"), patch.object(package, "verify_tool_files"), patch.object(package, "run_builder") as builder:
                 out = self.root / name.replace(".", "-")
@@ -388,6 +396,232 @@ class PackageTests(unittest.TestCase):
                 return data
             with self.subTest(kind=kind), patch.object(package, "git", side_effect=altered), self.assertRaisesRegex(ValueError, "object bytes"):
                 package.immutable_tree(self.repo, self.commit)
+
+    def refuse_cargo(self, name, raw, label):
+        for path, original in selected_build_files().items():
+            (self.repo / path).write_bytes(raw if path == name else original)
+        self.commit = self.commit_all()
+        output = self.root / label
+        with patch.object(package, "verify_archive"), patch.object(package, "verify_tool_files"), patch.object(package, "run_builder") as run:
+            with self.assertRaises((ValueError, RecursionError)):
+                package.build(self.repo, self.commit, output, self.archive, self.tools, self.cache)
+            run.assert_not_called()
+        self.assertFalse((output / "borg-runtime.tar").exists())
+        self.assertEqual(json.loads((output / "receipt.json").read_bytes())["status"], "failed")
+
+    def test_candidate_toml_syntax_changes_keep_policy_and_bind_exact_source(self):
+        selected = selected_build_files()
+        self.assertEqual(len(package.parsed_toml(selected["Cargo.toml"].decode())), 1760)
+        self.assertEqual(len(package.parsed_toml(selected["Cargo.lock"].decode())), 57914)
+        results = []
+        for index in range(2):
+            manifest = selected["Cargo.toml"].decode().replace('edition = "2024"', "edition = '2024'")
+            # Table/key order, comments, literal spelling and line endings only.
+            if index:
+                manifest = "\n\n".join(reversed(manifest.strip().split("\n\n"))) + "\n"
+            inputs = {"Cargo.toml": (f"# candidate {index} \u2603\n" + manifest).encode(),
+                      "Cargo.lock": (f"# candidate {index}\n" + selected["Cargo.lock"].decode().replace("version = 4", "version = 0x4", 1)).replace("\n", "\r\n").encode()}
+            for name, raw in inputs.items():
+                (self.repo / name).write_bytes(raw)
+                self.assertEqual(package.parsed_toml(raw.decode()), package.parsed_toml(selected[name].decode()))
+            self.commit = self.commit_all()
+            # Dirty policy-changing text must never replace the committed input.
+            (self.repo / "Cargo.toml").write_text('[package]\nname = "dirty"\n')
+            output = self.root / f"syntax-{index}"
+            def controlled(checkout, *args):
+                for name, raw in inputs.items():
+                    self.assertEqual((checkout / name).read_bytes(), raw)
+                return self.fake_build(checkout, *args)
+            result = self.build(output, controlled)
+            value = package.verify(output / "borg-runtime.tar", result["package_sha256"], self.commit)
+            self.assertEqual(value["profile"]["revision"], 2)
+            self.assertEqual(value["profile"]["dependency_policy"], package.DEPENDENCY_POLICY)
+            for name, (key, _) in package.CARGO_INPUTS.items():
+                raw = inputs[name]; entry = value["source"]["files"][name]
+                self.assertEqual(value["profile"]["cargo_inputs"][name].encode(), raw)
+                self.assertEqual(value["profile"][key], hashlib.sha256(raw).hexdigest())
+                self.assertEqual(entry["sha256"], value["profile"][key])
+                self.assertEqual(entry["size"], len(raw))
+                self.assertEqual(entry["git_blob"], hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest())
+                self.assertNotEqual(value["profile"][key], package.PROFILE[key])
+            results.append((output, result, value))
+        self.assertNotEqual(results[0][2]["source"]["commit"], results[1][2]["source"]["commit"])
+        for key, _ in package.CARGO_INPUTS.values():
+            self.assertNotEqual(results[0][2]["profile"][key], results[1][2]["profile"][key])
+        shutil.rmtree(self.repo)
+        for output, result, value in results:
+            shutil.rmtree(output / "source")
+            with patch.object(package, "git", side_effect=AssertionError("package-only verification cannot read Git")):
+                self.assertEqual(package.verify(output / "borg-runtime.tar", result["package_sha256"], value["source"]["commit"]), value)
+
+    def test_candidate_manifest_semantics_change_refuses_before_builder(self):
+        raw = selected_build_files()["Cargo.toml"]
+        changes = [
+            (b'version = "0.2.0"', b'version = "0.2.1"'),
+            (b'=0.13.5', b'=0.13.6'),
+            (b'https://github.com/camshaft/bach', b'https://example.invalid/bach'),
+            (b'default-features = false', b'default-features = true'),
+            (b'default-features = false', b'default-features = 0'),
+            (b'["rustls", "http2"]', b'["rustls", "http2", "gzip"]'),
+            (b'["rustls", "http2"]', b'["http2", "rustls"]'),
+            (b'[package]', b'[package]\nbuild = "different.rs"'),
+            (b'httpdate = "=1.0.3"\n', b''),
+            (b'[lints.rust]', b'[profile.release]\nopt-level = 1\n\n[lints.rust]'),
+        ]
+        for index, (before, after) in enumerate(changes):
+            self.assertIn(before, raw)
+            with self.subTest(change=before):
+                self.refuse_cargo("Cargo.toml", raw.replace(before, after, 1), f"manifest-semantic-{index}")
+
+    def test_candidate_lock_semantics_change_refuses_before_builder(self):
+        raw = selected_build_files()["Cargo.lock"]
+        checksum = re.search(rb'checksum = "([0-9a-f]+)"', raw).group(1)
+        version = re.search(rb'version = "([^"]+)"', raw).group(1)
+        edge = re.search(rb'dependencies = \[\n "([^"]+)"', raw).group(1)
+        parts = raw.split(b"[[package]]")
+        changes = [raw.replace(b"version = 4", b"version = 3", 1),
+                   raw.replace(b"version = 4", b"version = true", 1),
+                   raw.replace(b'version = "' + version + b'"', b'version = "0.0.0"', 1),
+                   raw.replace(checksum, b"0" * len(checksum), 1),
+                   raw.replace(b"registry+https://github.com/rust-lang/crates.io-index", b"registry+https://example.invalid/index", 1),
+                   raw.replace(b' "' + edge + b'"', b' "unselected-edge"', 1),
+                   b"[[package]]".join([parts[0], parts[2], parts[1], *parts[3:]])]
+        for index, changed in enumerate(changes):
+            with self.subTest(index=index):
+                self.refuse_cargo("Cargo.lock", changed, f"lock-semantic-{index}")
+
+    def test_candidate_input_caps_types_and_embedded_hashes_fail_closed(self):
+        raw = selected_build_files()["Cargo.toml"]
+        invalid = [b"[broken", b"same=1\nsame=1\n", b"bad = 1.5\n", b"bad = nan\n", b"bad = inf\n",
+                   b"bad = 2026-10-18\n", b"bad = 12:34:56\n", b"bad = 2026-10-18T12:34:56Z\n",
+                   b"bad = [1, {nested = 0.5}]\n", b"bad = null\n", b"\xff\n"]
+        for index, value in enumerate(invalid):
+            with self.subTest(input=value):
+                self.refuse_cargo("Cargo.toml", value + raw, f"invalid-toml-{index}")
+        class CustomInt(int):
+            pass
+        class CustomStr(str):
+            pass
+        for value in (None, 1.0, float('nan'), datetime.date(2026, 10, 18), (1,), CustomInt(1), CustomStr("x"), {1: "x"}):
+            with self.subTest(type=type(value)), patch.object(package.tomllib, "loads", return_value={"nested": [value]}), self.assertRaises(ValueError):
+                package.parsed_toml("unused")
+        # Real bounded Git admission and escaped manifest preflight both occur
+        # before the mocked build boundary; no dependency acquisition is used.
+        for cap, value in [("MAX_SOURCE_FILE", 1024), ("MAX_SOURCE", 1024), ("MAX_MANIFEST", 200_000)]:
+            text = b"#" + ("\u2603" * 40_000).encode() + b"\n" + raw if cap == "MAX_MANIFEST" else raw + b"\n# " + cap.encode() + b"\n"
+            with self.subTest(cap=cap), patch.object(package, cap, value):
+                self.refuse_cargo("Cargo.toml", text, "cap-" + cap)
+        for name, value in selected_build_files().items():
+            (self.repo / name).write_bytes(value)
+        self.commit = self.commit_all()
+        result = self.build(self.root / "tamper-good")
+        original = package.verify(self.root / "tamper-good/borg-runtime.tar", result["package_sha256"])
+        cases = []
+        def change(fn):
+            value = copy.deepcopy(original); fn(value); cases.append(value)
+        change(lambda m: m["profile"]["cargo_inputs"].update({"Cargo.toml": m["profile"]["cargo_inputs"]["Cargo.toml"] + "# altered\n"}))
+        for name, (key, policy_key) in package.CARGO_INPUTS.items():
+            change(lambda m: m["profile"].update({key: "f" * 64}))
+            change(lambda m: m["source"]["files"][name].update({"sha256": "f" * 64}))
+            change(lambda m: m["source"]["files"][name].update({"size": m["source"]["files"][name]["size"] + 1}))
+            change(lambda m: m["source"]["files"][name].update({"git_blob": "f" * 40}))
+            change(lambda m: m["profile"]["dependency_policy"].update({policy_key: "f" * 64}))
+        for revision in (1, 3, True, 2.0, "2"):
+            change(lambda m: m["profile"].update({"revision": revision}))
+        change(lambda m: m["profile"].update({"extra": True}))
+        change(lambda m: m["profile"].pop("target"))
+        change(lambda m: m["profile"]["cargo_inputs"].pop("Cargo.lock"))
+        change(lambda m: m["profile"]["cargo_inputs"].update({"extra": ""}))
+        for value in (None, False, 17, [], {}):
+            change(lambda m: m["profile"]["cargo_inputs"].update({"Cargo.toml": value}))
+        change(lambda m: m["profile"]["dependency_policy"].update({"revision": True}))
+        change(lambda m: m["profile"]["dependency_policy"].update({"extra": 1}))
+        change(lambda m: m["source"]["files"]["Cargo.toml"].update({"size": True}))
+        change(lambda m: m["source"].update({"object_format": "sha256"}))
+        for claim_changed_policy in (False, True):
+            def rebind(m):
+                text = m["profile"]["cargo_inputs"]["Cargo.toml"].replace('version = "0.2.0"', 'version = "9.0.0"')
+                data = text.encode(); h = hashlib.sha256(data).hexdigest()
+                m["profile"]["cargo_inputs"]["Cargo.toml"] = text
+                m["profile"]["cargo_manifest_sha256"] = h
+                m["source"]["files"]["Cargo.toml"].update(size=len(data), sha256=h, git_blob=hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest())
+                if claim_changed_policy:
+                    m["profile"]["dependency_policy"]["manifest_parsed_sha256"] = hashlib.sha256(package.parsed_toml(text)).hexdigest()
+            change(rebind)
+        for index, value in enumerate(cases):
+            path = self.root / f"tamper-{index}.tar"
+            package.package_tar(path, self.root / "tamper-good/target/release/borg-runtime", value)
+            with self.subTest(tamper=index), self.assertRaises((ValueError, RecursionError)):
+                package.verify(path, package.digest(path), self.commit)
+
+    def test_candidate_build_receipt_hashes_must_match_immutable_source(self):
+        for name, raw in selected_build_files().items():
+            (self.repo / name).write_bytes(b"# receipt candidate\n" + raw)
+        self.commit = self.commit_all()
+        checkout = self.root / "receipt-source"
+        source, profile = package.materialize(self.repo, self.commit, checkout)
+        paths = {}; hashes = {}
+        for name in package.TOOL_SHA:
+            p = self.tools / name; p.write_text("controlled tool identity " + name)
+            paths[name] = str(p); hashes[name] = package.digest(p)
+        for index, wrong in enumerate((None, "manifest_sha256", "lock_sha256")):
+            output = self.root / f"receipt-{index}"; output.mkdir()
+            sql = output / "sqlite"; sql.mkdir(); (sql / "cargo-fixture").mkdir()
+            (sql / "libsqlite3.a").write_bytes(b"controlled library")
+            log = output / "cargo.log"; log.write_bytes(b"controlled command result")
+            sqlite = {"status": "passed", "profile": {"builder_sha256": package.BUILDER_SHA, "archive_sha3_256": package.SQLITE_SHA3, "cflags": package.CFLAGS},
+                      "identity": {"version": "3.54.0", "source_id": package.SQLITE_SOURCE, "threadsafe": 1, "api_armor": 1, "foreign_keys": 1},
+                      "tools": {"paths": paths, "sha256": hashes, "versions": {"rustc": "rustc 1.99.0\nhost: " + package.TARGET}},
+                      "outputs": {"libsqlite3.a": package.digest(sql / "libsqlite3.a")}, "source_input_sha256": package.SQLITE_FILES, "archive_sha256": package.SQLITE_ARCHIVE_SHA}
+            package.write_json(sql / "build-receipt.json", sqlite)
+            cargo = {"status": "passed", "manifest_sha256": profile["cargo_manifest_sha256"], "lock_sha256": profile["cargo_lock_sha256"],
+                     "sqlite_receipt_sha256": package.digest(sql / "build-receipt.json"), "path_normalization": package.ENV_PROFILE["path_normalization"],
+                     "path_environment": {k: "controlled" for k in ("CARGO_ENCODED_RUSTFLAGS", "CFLAGS", "CXXFLAGS")},
+                     "commands": [{"exit": 0, "command": [paths["cargo"], *package.PROFILE["cargo_arguments"]], "cwd": str(checkout), "log": str(log), "log_sha256": package.digest(log)}]}
+            if wrong:
+                cargo[wrong] = package.MANIFEST_SHA if wrong == "manifest_sha256" else package.LOCK_SHA
+            package.write_json(sql / "cargo-fixture/receipt.json", cargo)
+            process = types.SimpleNamespace(pid=123, wait=lambda: 0, returncode=0)
+            with self.subTest(wrong=wrong), patch.object(package.subprocess, "Popen", return_value=process) as spawn:
+                args = (checkout, output, ROOT / "tooling/build_v2.py", self.archive, self.tools, self.cache, source)
+                if wrong:
+                    with self.assertRaisesRegex(ValueError, "build receipt association"):
+                        package.run_builder(*args)
+                else:
+                    self.assertEqual(package.run_builder(*args)["sqlite"]["source_sha256"], package.SQLITE_FILES)
+                spawn.assert_called_once()
+
+    def test_legacy_profile_reader_is_explicit_and_new_profile_is_distinct(self):
+        # Exercise the actual immediately selected prior recipe in a private
+        # fixture. Both builds mock compilation; neither is a release PASS.
+        old = subprocess.check_output(["/usr/bin/git", "show", "447d49bf549c8d93f7964de643f38776a4e17f6c:tooling/package_v2.py"], cwd=ROOT)
+        root = self.root / "legacy-recipe"; root.mkdir()
+        (root / "package_v2.py").write_bytes(old)
+        (root / "build_v2.py").write_bytes((ROOT / "tooling/build_v2.py").read_bytes())
+        spec = importlib.util.spec_from_file_location("legacy_package_recipe", root / "package_v2.py")
+        legacy = importlib.util.module_from_spec(spec); spec.loader.exec_module(legacy)
+        with patch.object(legacy, "verify_archive"), patch.object(legacy, "verify_tool_files"), patch.object(legacy, "run_builder", side_effect=self.fake_build):
+            result = legacy.build(self.repo, self.commit, self.root / "legacy", self.archive, self.tools, self.cache)
+        path = self.root / "legacy/borg-runtime.tar"; before = path.read_bytes()
+        value = legacy.verify(path, result["package_sha256"], self.commit)
+        self.assertEqual(package.verify(path, result["package_sha256"], self.commit), value)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(value["profile"], package.PROFILE)
+        self.assertNotIn("revision", value["profile"])
+        self.assertEqual(value["recipe"]["packager_sha256"], hashlib.sha256(old).hexdigest())
+        current = self.build(self.root / "current-profile")
+        new_path = self.root / "current-profile/borg-runtime.tar"
+        new = package.verify(new_path, current["package_sha256"], self.commit)
+        self.assertEqual(new["profile"]["revision"], 2)
+        self.assertNotEqual(current["package_sha256"], result["package_sha256"])
+        with self.assertRaisesRegex(ValueError, "manifest profile"):
+            legacy.verify(new_path, current["package_sha256"], self.commit)
+        for index, mutate in enumerate((lambda p: p.update(revision=1), lambda p: p.update(revision=2), lambda p: p.update(cargo_lock_sha256="a" * 64))):
+            bad = copy.deepcopy(value); mutate(bad["profile"])
+            forged = self.root / f"legacy-invalid-{index}.tar"
+            package.package_tar(forged, self.root / "legacy/target/release/borg-runtime", bad)
+            with self.assertRaisesRegex(ValueError, "manifest profile"):
+                package.verify(forged, package.digest(forged), self.commit)
 
 
 if __name__ == "__main__":

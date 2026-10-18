@@ -215,10 +215,13 @@ def verify_cargo_base(profile, protected, selected=None):
     return selected
 
 
-def project_cargo_cache(profile, source_inventory, execution, recipe, protected):
+def project_cargo_cache(packager, profile, source, candidate_profile, execution, recipe, protected):
+    # The pinned reader recomputes both the complete policy and exact source
+    # association. Neither claimed policy digests nor cache hashes prove them.
+    packager.validate_package_profile(candidate_profile,source,allow_legacy=False)
     selected=verify_cargo_base(profile,protected);manifest,files,links,directories=selected
-    if any(manifest[key]!=source_inventory[name]['sha256'] for key,name in [('lock_sha256','Cargo.lock'),('manifest_sha256','Cargo.toml')]):
-        raise ValueError('Cargo cache source build profile differs')
+    if manifest['manifest_sha256']!=packager.MANIFEST_SHA or manifest['lock_sha256']!=packager.LOCK_SHA:
+        raise ValueError('Cargo cache baseline build profile differs')
     job=protected(execution.job,directory=True);workspace=Path(execution.workspace)
     if workspace!=job/'workspace' or workspace.is_symlink() or not workspace.is_dir() or workspace.resolve()!=workspace:raise ValueError('Cargo projection workspace identity')
     destination=workspace/'cargo-home';destination.mkdir(mode=0o700)
@@ -238,10 +241,12 @@ def project_cargo_cache(profile, source_inventory, execution, recipe, protected)
         for path in reversed(created):os.chown(path,recipe['execution_uid'],recipe['execution_gid'],follow_symlinks=False)
     # The mutable projection is never a protected input or shared cache.
     # Existing job/cgroup cleanup and retained-workspace policy stay unchanged.
-    return {'revision':1,'manifest_sha256':profile['cargo_manifest']['sha256'],'base':str(base),'destination':str(destination),
+    return {'revision':2,'manifest_sha256':profile['cargo_manifest']['sha256'],'base':str(base),'destination':str(destination),
             'files':len(files),'symlinks':len(links),'directories':len(directories),'bytes':sum(e['size'] for e in files.values()),
             'entry_bound':len(files)+len(links)+len(directories),'execution_uid':recipe['execution_uid'],'execution_gid':recipe['execution_gid'],
-            'source_lock_sha256':manifest['lock_sha256'],'source_manifest_sha256':manifest['manifest_sha256'],
+            'source_lock_sha256':candidate_profile['cargo_lock_sha256'],'source_manifest_sha256':candidate_profile['cargo_manifest_sha256'],
+            'cache_baseline_lock_sha256':manifest['lock_sha256'],'cache_baseline_manifest_sha256':manifest['manifest_sha256'],
+            'dependency_policy':candidate_profile['dependency_policy'],
             'scope':'Fresh mutable job-local cache copied from pinned immutable inputs; no shared-cache writes or reuse.'}
 
 
@@ -269,18 +274,21 @@ def snapshot_repository(packager, source, artifact, destination):
         if hashlib.new(fmt,encoded).hexdigest()!=oid:raise ValueError('source object identity changed')
         folder=destination/'objects'/oid[:2];folder.mkdir(exist_ok=True)
         write(folder/oid[2:],zlib.compress(encoded))
-    # Verify the selected manifest/lock with the existing reader, retaining
+    # Validate exact candidate bytes against the selected complete policy,
     # only immutable Git objects and no candidate repository configuration.
-    inventory={}
+    inventory={};cargo_inputs={}
     for name,mode,oid,size in entries:
         data=packager.git(destination,'cat-file','blob',oid)
+        if len(data)!=size or hashlib.new(fmt,b'blob '+str(size).encode()+b'\0'+data).hexdigest()!=oid:raise ValueError('snapshot source blob changed')
         inventory[name]={'mode':mode,'git_blob':oid,'size':size,'sha256':hashlib.sha256(data).hexdigest()}
-    if inventory['Cargo.toml']['sha256']!=packager.MANIFEST_SHA or inventory['Cargo.lock']['sha256']!=packager.LOCK_SHA:raise ValueError('source build profile differs')
+        if name in packager.CARGO_INPUTS:cargo_inputs[name]=data.decode('utf-8')
+    source_record={'commit':artifact['source_commit'],'tree':tree,'object_format':fmt,'files':inventory}
+    candidate_profile=packager.candidate_profile(cargo_inputs,source_record)
     if packager.immutable_tree(destination,artifact['source_commit'])[:2]!=(tree,fmt):raise ValueError('snapshot source verification failed')
     for p in sorted(destination.rglob('*'),reverse=True):
         if p.is_dir():p.chmod(0o555)
     destination.chmod(0o555)
-    return inventory
+    return source_record,candidate_profile
 
 
 def fixed_git(args,cwd,home):
@@ -300,11 +308,12 @@ def prepare(recipe, config, subject, candidate, work, execution, executable, pro
     if cc['repository']!=subject['repository'] or cc['target_ref']!=subject['target_ref']:raise ValueError('source repository target differs')
     job=execution.job;inputs=job/'prepared';inputs.mkdir(mode=0o755)
     source=inputs/'source.git'
-    inventory=snapshot_repository(package,Path(cc['repository_path']),subject['artifact'],source)
-    projection=project_cargo_cache(p,inventory,execution,recipe,protected)
+    source_record,candidate_profile=snapshot_repository(package,Path(cc['repository_path']),subject['artifact'],source)
+    inventory=source_record['files']
+    projection=project_cargo_cache(package,p,source_record,candidate_profile,execution,recipe,protected)
     write(inputs/'cargo-projection.json',projection)
     package_snapshot=work/'behavior-source-manifest.json'
-    write(package_snapshot,{'subject':subject,'candidate':candidate,'source_files':inventory,'modules':p['modules']},0o600)
+    write(package_snapshot,{'subject':subject,'candidate':candidate,'source_files':inventory,'cargo_profile':candidate_profile,'modules':p['modules']},0o600)
     build={'revision':1,'packager':str(root/'package_v2.py'),'packager_sha256':p['modules']['package_v2.py'],'builder_sha256':p['modules']['build_v2.py'],'repo':str(source),'source_commit':subject['artifact']['source_commit'],'source_tree':subject['artifact']['source_tree'],'archive':p['archive']['path'],'toolchain':p['toolchain'],'cargo_home':projection['destination'],'output':str(execution.workspace/'selected-build'),'binding_module_sha256':p['modules']['candidate_binding.py']}
     buildpath=inputs/'build.json';write(buildpath,build)
     # Fixed controlled seed data, never candidate-provided privileged commands.

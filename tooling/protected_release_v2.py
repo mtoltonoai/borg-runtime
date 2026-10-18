@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse, hashlib, importlib.util, json, os, select, socket, stat, struct, sys, time
 from pathlib import Path
 MAX=128*1024
-VERIFIER_SHA="8a687969b22b11dfbd73e5c45e2c1e516a8117408a857d34b03e9fd98bf16d4b"
+VERIFIER_SHA="512296740c56d216f8dd2dbe61a05c3aef3749f7aba2630c4ab916ffec02a05b"
 BEHAVIOR_SHA='7ed0df87efe47aff54e82ba22bae7861594c82b8c3ab7659fdb04c538c93a3db'
 def canonical(v):return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
 def strict(data):

@@ -1,5 +1,5 @@
 """Preparation tests are private local fixtures, never protected account proof."""
-import copy, hashlib, json, os, shutil, subprocess, tempfile, types, unittest
+import copy, hashlib, json, os, shutil, subprocess, sys, tempfile, types, unittest
 from pathlib import Path
 from unittest.mock import patch, Mock
 import protected_preparation_v2 as prep
@@ -50,12 +50,25 @@ def cargo_fixture(base):
     return {'cargo_home':str(cache),'cargo_manifest':{'path':str(path),'sha256':prep.sha(path)}}
 
 def recipe(base):
-    mods={n:prep.sha(ROOT/n) for n in prep.MODULES}
-    pp={'path':str(ROOT/'protected_preparation_v2.py'),'sha256':mods['protected_preparation_v2.py'],'profile':{'revision':2,'limits':{'path':str(ROOT.parent/'metadata/limits.json'),'sha256':prep.sha(ROOT.parent/'metadata/limits.json')},'modules':mods,'archive':{'path':'/home/dev-user/borg-runtime/.build/sqlite-amalgamation-3540000.zip','sha256':package.SQLITE_ARCHIVE_SHA},'toolchain':'/home/dev-user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin','cargo_home':'/home/dev-user/.cargo'}}
+    # These preparation fixtures never compile or execute the generated recipe.
+    # Give them private module copies with the required launcher modes, without
+    # changing checkout/host modes. Pin an explicitly synthetic archive in the
+    # private reader only; production archive checks/pins remain unchanged.
+    modules=base/'recipe-modules';modules.mkdir()
+    archive=base/'sqlite-archive.fixture';archive.write_bytes(b'controlled preparation archive; not SQLite or release evidence')
+    archive_sha=prep.sha(archive);archive_sha3=hashlib.sha3_256(archive.read_bytes()).hexdigest()
+    for name in prep.MODULES:
+        data=(ROOT/name).read_bytes()
+        if name=='package_v2.py':
+            data+=f'\n# Private non-executing preparation fixture archive identities.\nSQLITE_ARCHIVE_SHA = {archive_sha!r}\nSQLITE_SHA3 = {archive_sha3!r}\n'.encode()
+        path=modules/name;path.write_bytes(data);path.chmod(0o555 if name in ('fixed_build_launcher.py','candidate_launcher.py') else 0o444)
+    mods={n:prep.sha(modules/n) for n in prep.MODULES}
+    toolchain=Path(os.environ.get('RUSTUP_HOME',str(Path.home()/'.rustup')))/'toolchains/stable-x86_64-unknown-linux-gnu/bin'
+    pp={'path':str(modules/'protected_preparation_v2.py'),'sha256':mods['protected_preparation_v2.py'],'profile':{'revision':2,'limits':{'path':str(ROOT.parent/'metadata/limits.json'),'sha256':prep.sha(ROOT.parent/'metadata/limits.json')},'modules':mods,'archive':{'path':str(archive),'sha256':archive_sha},'toolchain':str(toolchain)}}
     pp['profile'].update(cargo_fixture(base))
     steps=[]
-    for name,commands,observer,oracle in [('selected_build',{'build':{'executable':str(ROOT/'fixed_build_launcher.py'),'sha256':mods['fixed_build_launcher.py'],'arguments':['{prepared_build}','{prepared_build_sha256}']}},'build_observer.py','build_oracle.py'),('actual_candidate_journey',{n:{'executable':str(ROOT/'candidate_launcher.py'),'sha256':mods['candidate_launcher.py'],'arguments':['{prepared_journey}','{prepared_journey_sha256}',n]} for n in ('controller','native1','coding1','coding2')},'journey_observer.py','journey_oracle.py')]:
-        steps.append({'check':name,'commands':commands,'observer':{'path':str(ROOT/observer),'sha256':mods[observer]},'oracle':{'path':str(ROOT/oracle),'sha256':mods[oracle]},'timeout_ms':210000,'output_bytes':1024*1024})
+    for name,commands,observer,oracle in [('selected_build',{'build':{'executable':str(modules/'fixed_build_launcher.py'),'sha256':mods['fixed_build_launcher.py'],'arguments':['{prepared_build}','{prepared_build_sha256}']}},'build_observer.py','build_oracle.py'),('actual_candidate_journey',{n:{'executable':str(modules/'candidate_launcher.py'),'sha256':mods['candidate_launcher.py'],'arguments':['{prepared_journey}','{prepared_journey_sha256}',n]} for n in ('controller','native1','coding1','coding2')},'journey_observer.py','journey_oracle.py')]:
+        steps.append({'check':name,'commands':commands,'observer':{'path':str(modules/observer),'sha256':mods[observer]},'oracle':{'path':str(modules/oracle),'sha256':mods[oracle]},'timeout_ms':210000,'output_bytes':1024*1024})
     return {'revision':3,'supervisor_sha256':mods['protected_behavior_v2.py'],'controller_config':str(base/'controller.json'),'execution_uid':2000,'execution_gid':2000,'execution_root':str(base),'execution_cgroup':'/uninstalled/candidate','oracle_cgroup':'/uninstalled/observer','policy':'fixed-policy','deployment_target':'private-target','target_revision':'revision-one','installed_package_sha256':'1'*64,'required_checks':list(prep.CHECKS),'steps':steps,'preparation':pp}
 
 class Preparation(unittest.TestCase):
@@ -379,7 +392,7 @@ class Preparation(unittest.TestCase):
             seen.append(str(path))
             if str(path)=='/usr/bin/git':raise ValueError('reader has writable ancestor')
             return local(path,directory)
-        with self.assertRaisesRegex(ValueError,'writable ancestor'):prep.load_package(ROOT,self.r['preparation']['profile'],guard)
+        with self.assertRaisesRegex(ValueError,'writable ancestor'):prep.load_package(Path(self.r['preparation']['path']).parent,self.r['preparation']['profile'],guard)
         self.assertIn('/usr/bin/git',seen)
     def test_prepared_source_receipt_change_refused(self):
         _,receipt=self.execute();(self.work/'behavior-source-manifest.json').write_text('{}')
@@ -389,13 +402,14 @@ class CargoProjection(unittest.TestCase):
     def setUp(self):
         self.root=Path(tempfile.mkdtemp(prefix='cargo-projection-',dir=TEST_ROOT));self.profile=cargo_fixture(self.root)
         self.base=Path(self.profile['cargo_home']);self.manifest=Path(self.profile['cargo_manifest']['path'])
-        self.inventory={name:{'sha256':value} for name,value in [('Cargo.lock',package.LOCK_SHA),('Cargo.toml',package.MANIFEST_SHA)]}
+        self.source,self.candidate_profile=prep.snapshot_repository(package,source_repository(),artifact(),self.root/'source.git')
+        self.inventory=self.source['files']
         self.recipe={'execution_uid':os.geteuid(),'execution_gid':os.getegid()}
     def execution(self,name='job'):
         job=self.root/name;job.mkdir();workspace=job/'workspace';workspace.mkdir()
         return types.SimpleNamespace(job=job,workspace=workspace)
     def project(self,e=None):
-        return prep.project_cargo_cache(self.profile,self.inventory,e or self.execution(),self.recipe,local)
+        return prep.project_cargo_cache(package,self.profile,self.source,self.candidate_profile,e or self.execution(),self.recipe,local)
     def manifest_change(self,change):
         value=json.loads(self.manifest.read_bytes());change(value);self.manifest.chmod(0o600);save(self.manifest,value);self.manifest.chmod(0o444)
         self.profile['cargo_manifest']['sha256']=prep.sha(self.manifest)
@@ -483,6 +497,84 @@ class CargoProjection(unittest.TestCase):
         e=self.execution();e.workspace.rmdir();e.workspace.symlink_to(self.base,target_is_directory=True)
         with self.assertRaisesRegex(ValueError,'workspace identity'):self.project(e)
 
+    def test_candidate_hashes_are_distinct_from_selected_cache_baseline(self):
+        repo=self.root/'candidates'
+        prep.fixed_git(['clone','--no-hardlinks',str(source_repository()),str(repo)],self.root,self.root)
+        pin=copy.deepcopy(self.profile);base_before={str(p):prep.sha(p) for p in self.base.rglob('*') if p.is_file() and not p.is_symlink()}
+        results=[];commits=[]
+        for index in range(2):
+            inputs={name:(f'# candidate cache {index}\n'.encode()+raw) for name,raw in selected_build_files().items()}
+            for name,raw in inputs.items():(repo/name).write_bytes(raw)
+            prep.fixed_git(['add','.'],repo,self.root);prep.fixed_git(['commit','-m',f'candidate-{index}'],repo,self.root)
+            commit=prep.fixed_git(['rev-parse','HEAD'],repo,self.root);tree,fmt,_=package.immutable_tree(repo,commit);commits.append(commit)
+            a={**artifact(),'source_commit':commit,'source_tree':tree,'object_format':fmt}
+            self.source,self.candidate_profile=prep.snapshot_repository(package,repo,a,self.root/f'candidate-{index}.git')
+            e=self.execution(f'candidate-job-{index}');result=self.project(e);results.append(result)
+            self.assertEqual(result['revision'],2)
+            self.assertEqual(result['cache_baseline_manifest_sha256'],package.MANIFEST_SHA)
+            self.assertEqual(result['cache_baseline_lock_sha256'],package.LOCK_SHA)
+            self.assertEqual(result['dependency_policy'],package.DEPENDENCY_POLICY)
+            for name,key,baseline in [('Cargo.toml','source_manifest_sha256',package.MANIFEST_SHA),('Cargo.lock','source_lock_sha256',package.LOCK_SHA)]:
+                actual=hashlib.sha256(inputs[name]).hexdigest()
+                self.assertEqual(result[key],actual);self.assertNotEqual(result[key],baseline)
+                self.assertEqual(self.source['files'][name]['sha256'],actual)
+            self.assertEqual(self.profile,pin)
+        self.assertNotEqual(*commits)
+        self.assertNotEqual(results[0]['source_manifest_sha256'],results[1]['source_manifest_sha256'])
+        self.assertNotEqual(results[0]['source_lock_sha256'],results[1]['source_lock_sha256'])
+        copies=[Path(r['destination'])/'registry/cache/fixture/sample.crate' for r in results]
+        self.assertNotEqual(copies[0].stat().st_ino,copies[1].stat().st_ino)
+        copies[0].write_bytes(b'independent first candidate mutation')
+        self.assertNotEqual(copies[0].read_bytes(),copies[1].read_bytes())
+        self.assertEqual(base_before,{str(p):prep.sha(p) for p in self.base.rglob('*') if p.is_file() and not p.is_symlink()})
+        prep.verify_cargo_base(self.profile,local)
+
+    def test_candidate_policy_or_cache_drift_refuses_before_execution(self):
+        source=copy.deepcopy(self.source);profile=copy.deepcopy(self.candidate_profile)
+        cases=[]
+        for kind in ('claimed_policy','source_hash','source_blob','source_size','source_format','embedded_text','semantics'):
+            s=copy.deepcopy(source);p=copy.deepcopy(profile)
+            if kind=='claimed_policy':p['dependency_policy']['manifest_parsed_sha256']='f'*64
+            elif kind=='source_hash':s['files']['Cargo.toml']['sha256']='f'*64
+            elif kind=='source_blob':s['files']['Cargo.toml']['git_blob']='f'*40
+            elif kind=='source_size':s['files']['Cargo.toml']['size']+=1
+            elif kind=='source_format':s['object_format']='sha256'
+            elif kind=='embedded_text':p['cargo_inputs']['Cargo.toml']+='# changed\n'
+            else:
+                text=p['cargo_inputs']['Cargo.toml'].replace('default-features = false','default-features = true',1)
+                raw=text.encode();h=hashlib.sha256(raw).hexdigest()
+                p['cargo_inputs']['Cargo.toml']=text;p['cargo_manifest_sha256']=h
+                s['files']['Cargo.toml'].update(size=len(raw),sha256=h,git_blob=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest())
+            cases.append((kind,s,p))
+        for index,(kind,s,p) in enumerate(cases):
+            e=self.execution(f'drift-{index}')
+            with self.subTest(kind=kind),patch.object(prep,'verify_cargo_base') as base_check,self.assertRaises(ValueError):
+                prep.project_cargo_cache(package,self.profile,s,p,e,self.recipe,local)
+            base_check.assert_not_called();self.assertFalse((e.workspace/'cargo-home').exists())
+        # Even a newly pinned cache manifest cannot substitute candidate raw
+        # hashes for the trusted selected cache baseline.
+        for index,key in enumerate(('manifest_sha256','lock_sha256')):
+            original=self.manifest.read_bytes();old_pin=self.profile['cargo_manifest']['sha256']
+            self.manifest_change(lambda m:m.update({key:'f'*64}))
+            e=self.execution(f'baseline-{index}')
+            with self.subTest(cache=key),self.assertRaisesRegex(ValueError,'cache baseline'):
+                self.project(e)
+            self.assertFalse((e.workspace/'cargo-home').exists())
+            self.manifest.chmod(0o600);self.manifest.write_bytes(original);self.manifest.chmod(0o444)
+            self.profile['cargo_manifest']['sha256']=old_pin
+        # Keep failed copies quarantined in this job and refuse post-copy base
+        # drift before returning any executable prepared input to the caller.
+        target=self.base/'registry/cache/fixture/sample.crate';original=prep.cargo_file
+        def drift(path,entry,protected,destination=None):
+            original(path,entry,protected,destination)
+            if destination is not None and Path(path)==target:
+                target.chmod(0o644);target.write_bytes(b'x'*entry['size']);target.chmod(0o444)
+        e=self.execution('post-copy')
+        with patch.object(prep,'cargo_file',side_effect=drift),self.assertRaisesRegex(ValueError,'changed'):
+            self.project(e)
+        self.assertTrue((e.workspace/'cargo-home').is_dir())
+        self.assertFalse((e.job/'prepared/build.json').exists())
+
 
 class RecipeAndSourceAdmission(unittest.TestCase):
     def setUp(self):
@@ -520,12 +612,42 @@ class RecipeAndSourceAdmission(unittest.TestCase):
             (repo/'src/lib.rs').write_text('// candidate '+label+'\n');prep.fixed_git(['add','.'],repo,self.root);prep.fixed_git(['commit','-m',label],repo,self.root)
             commit=prep.fixed_git(['rev-parse','HEAD'],repo,self.root);tree,fmt,_=package.immutable_tree(repo,commit)
             a={**artifact(),'source_commit':commit,'source_tree':tree,'object_format':fmt};out=self.root/('snapshot-'+label)
-            inventory=prep.snapshot_repository(package,repo,a,out);commits.append(commit)
+            source,_=prep.snapshot_repository(package,repo,a,out);inventory=source['files'];commits.append(commit)
             self.assertEqual(inventory['src/lib.rs']['sha256'],hashlib.sha256(('// candidate '+label+'\n').encode()).hexdigest())
         self.assertNotEqual(*commits)
         (repo/'Cargo.toml').write_text('[package]\nname="unselected"\n');prep.fixed_git(['add','.'],repo,self.root);prep.fixed_git(['commit','-m','unselected'],repo,self.root)
         commit=prep.fixed_git(['rev-parse','HEAD'],repo,self.root);tree,fmt,_=package.immutable_tree(repo,commit)
         with self.assertRaisesRegex(ValueError,'build profile'):prep.snapshot_repository(package,repo,{**artifact(),'source_commit':commit,'source_tree':tree,'object_format':fmt},self.root/'bad-profile')
+
+    def test_candidate_syntax_profile_is_preserved_through_snapshot(self):
+        for fmt in ('sha1','sha256'):
+            repo=self.root/('syntax-'+fmt);repo.mkdir();(repo/'src').mkdir()
+            (repo/'src/main.rs').write_text('fn main() {}\n');(repo/'src/lib.rs').write_text('// controlled fixture\n')
+            prep.fixed_git(['init','--object-format='+fmt],repo,self.root)
+            commits=[]
+            for index in range(2):
+                inputs={name:f'# {fmt} candidate {index} \u2603\n'+raw.decode() for name,raw in selected_build_files().items()}
+                inputs['Cargo.toml']=inputs['Cargo.toml'].replace('edition = "2024"',"edition = '2024'")
+                inputs['Cargo.lock']=inputs['Cargo.lock'].replace('version = 4','version = 0x4',1)
+                for name,text in inputs.items():(repo/name).write_bytes(text.encode())
+                prep.fixed_git(['add','.'],repo,self.root);prep.fixed_git(['commit','-m',f'syntax-{index}'],repo,self.root)
+                commit=prep.fixed_git(['rev-parse','HEAD'],repo,self.root);tree,actual_fmt,_=package.immutable_tree(repo,commit);commits.append(commit)
+                a={**artifact(),'source_commit':commit,'source_tree':tree,'object_format':actual_fmt}
+                (repo/'Cargo.toml').write_text('[package]\nname="dirty-substitution"\n')
+                out=self.root/f'snapshot-{fmt}-{index}'
+                source,profile=prep.snapshot_repository(package,repo,a,out)
+                self.assertEqual(profile['revision'],2);self.assertEqual(profile['cargo_inputs'],inputs)
+                self.assertEqual(profile['dependency_policy'],package.DEPENDENCY_POLICY)
+                self.assertEqual(source['commit'],commit);self.assertEqual(source['tree'],tree)
+                for name,text in inputs.items():
+                    raw=text.encode();entry=source['files'][name]
+                    self.assertEqual(entry['size'],len(raw));self.assertEqual(entry['sha256'],hashlib.sha256(raw).hexdigest())
+                    self.assertEqual(entry['git_blob'],hashlib.new(fmt,b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest())
+                    self.assertEqual(package.git(out,'cat-file','blob',entry['git_blob']),raw)
+                captured,captured_profile=package.materialize(out,commit,self.root/f'materialized-{fmt}-{index}')
+                self.assertEqual(captured,source);self.assertEqual(captured_profile,profile)
+                self.assertFalse((out/'hooks').exists());self.assertFalse((out/'objects/info/alternates').exists())
+            self.assertNotEqual(*commits)
 
 
 class ProducerJoin(unittest.TestCase):
@@ -562,6 +684,7 @@ class ProducerJoin(unittest.TestCase):
             supervisor.behavior_check.assert_not_called();exchange.assert_not_called()
 
 def tearDownModule():
+    sys.modules['package_v2']=package
     for p in sorted(TEST_ROOT.rglob('*'),reverse=True):
         if not p.is_symlink():
             try:p.chmod(0o700 if p.is_dir() else 0o600)

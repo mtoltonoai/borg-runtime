@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 
 MANIFEST_SHA = "20f1acdf87b07698a2881653d76c579e81c3c98eacbfdd735e161a20bb80cc1d"
 LOCK_SHA = "df189e6ea91a5e05839f2773611a59830bafc0114f13a06cbc8359b44195c28b"
@@ -39,12 +40,22 @@ READER_SHA = {"git_sha256": "2a8c18fbf43da9f692d75474c72bea9dfd796c260b0f3dfe456
 ENV_PROFILE = {"locale": "C", "timezone": "UTC", "cargo_incremental": "0", "network": "offline",
                "path_normalization": "borg-v2-build-paths/1"}
 TARGET = "x86_64-unknown-linux-gnu"
+# Immediately preceding profile, retained exactly for legacy package reads.
+# New writes use candidate_profile(), never this raw-byte baseline directly.
 PROFILE = {"cargo_manifest_sha256": MANIFEST_SHA, "cargo_lock_sha256": LOCK_SHA,
            "build_helper_sha256": BUILDER_SHA, "cargo_arguments": ["build", "--locked", "--offline", "--release"],
            "target": TARGET, "sqlite_version": "3.54.0", "sqlite_archive_sha3_256": SQLITE_SHA3,
            "sqlite_source_id": SQLITE_SOURCE, "managed_cargo_source_config_sha256": MANAGED_CONFIG_SHA}
+DEPENDENCY_POLICY = {"revision": 1,
+                     "manifest_parsed_sha256": "e8e9e8b21f515d93e39b295738e7b857dcc88df12614db3f17484bc8128ac1bd",
+                     "lock_parsed_sha256": "fe872ec79ea98442f4369331cdf1ba643ec06648cd3afc3d4efcf4c07898704f"}
+CARGO_INPUTS = {"Cargo.toml": ("cargo_manifest_sha256", "manifest_parsed_sha256"),
+                "Cargo.lock": ("cargo_lock_sha256", "lock_parsed_sha256")}
 MAX_FILES, MAX_SOURCE_FILE, MAX_SOURCE = 10_000, 8 * 1024 * 1024, 128 * 1024 * 1024
 MAX_BINARY, MAX_MANIFEST = 256 * 1024 * 1024, 4 * 1024 * 1024
+# Reserve and enforce room for the trusted builder's finite metadata before
+# executing it. Candidate strings can expand substantially when JSON-escaped.
+BUILD_METADATA_RESERVE = 16 * 1024
 HEX40, HEX64 = re.compile(r"[0-9a-f]{40}\Z"), re.compile(r"[0-9a-f]{64}\Z")
 PACKAGE_FILES = ("bin/borg-runtime", "manifest.json")
 
@@ -59,6 +70,101 @@ def digest(path: Path, algorithm: str = "sha256") -> str:
 
 def canonical(value) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode()
+
+
+def parsed_toml(text: str) -> bytes:
+    """Canonical complete typed value, not a dependency subset or Python ==."""
+    if type(text) is not str:
+        raise ValueError("Cargo TOML input must be an exact UTF-8 string")
+    value = tomllib.loads(text)
+
+    def supported(item):
+        if type(item) is dict:
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise ValueError("unsupported Cargo TOML key type")
+                supported(child)
+        elif type(item) is list:
+            for child in item:
+                supported(child)
+        elif type(item) not in (str, bool, int):
+            raise ValueError("unsupported Cargo TOML value type")
+
+    supported(value)
+    return canonical(value)
+
+
+def validate_source(source: dict, expected_commit: str | None = None) -> None:
+    if type(source) is not dict or set(source) != {"commit", "tree", "object_format", "files"}:
+        raise ValueError("invalid source identity")
+    fmt = source["object_format"]
+    pattern = {"sha1": HEX40, "sha256": HEX64}.get(fmt) if type(fmt) is str else None
+    if (pattern is None or any(type(source[k]) is not str or not pattern.fullmatch(source[k]) for k in ("commit", "tree"))
+            or (expected_commit is not None and source["commit"] != expected_commit)):
+        raise ValueError("source identity mismatch")
+    inventory = source["files"]
+    if (type(inventory) is not dict or not 4 <= len(inventory) <= MAX_FILES
+            or not {"Cargo.toml", "Cargo.lock", "src/main.rs", "src/lib.rs"} <= inventory.keys()):
+        raise ValueError("source inventory bound/membership")
+    total = 0
+    for name, entry in inventory.items():
+        if type(name) is not str:
+            raise ValueError("invalid source inventory name")
+        source_policy(name)
+        if (type(entry) is not dict or set(entry) != {"mode", "git_blob", "size", "sha256"}
+                or entry["mode"] not in ("100644", "100755")
+                or type(entry["git_blob"]) is not str or not pattern.fullmatch(entry["git_blob"])
+                or type(entry["sha256"]) is not str or not HEX64.fullmatch(entry["sha256"])
+                or type(entry["size"]) is not int or not 0 <= entry["size"] <= MAX_SOURCE_FILE):
+            raise ValueError("invalid source inventory entry")
+        total += entry["size"]
+    if total > MAX_SOURCE:
+        raise ValueError("source inventory exceeds bound")
+
+
+def candidate_profile(inputs: dict, source: dict) -> dict:
+    """Bind captured exact Cargo text to immutable source and trusted policy."""
+    validate_source(source)
+    if type(inputs) is not dict or set(inputs) != set(CARGO_INPUTS):
+        raise ValueError("manifest profile Cargo input membership")
+    profile = {**PROFILE, "revision": 2, "dependency_policy": dict(DEPENDENCY_POLICY), "cargo_inputs": dict(inputs)}
+    total = 0
+    for name, (raw_key, policy_key) in CARGO_INPUTS.items():
+        text = inputs[name]
+        if type(text) is not str or len(text) > MAX_SOURCE_FILE:
+            raise ValueError("manifest profile Cargo input type/bound")
+        raw = text.encode("utf-8")
+        total += len(raw)
+        if len(raw) > MAX_SOURCE_FILE or total > MAX_SOURCE:
+            raise ValueError("manifest profile Cargo input byte bound")
+        entry = source["files"][name]
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        blob = hashlib.new(source["object_format"], b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+        if entry["size"] != len(raw) or entry["sha256"] != raw_hash or entry["git_blob"] != blob:
+            raise ValueError("manifest profile source manifest/lock build profile binding differs: " + name)
+        if hashlib.sha256(parsed_toml(text)).hexdigest() != DEPENDENCY_POLICY[policy_key]:
+            raise ValueError("source manifest/lock build profile dependency policy differs: " + name)
+        profile[raw_key] = raw_hash
+    return profile
+
+
+def validate_package_profile(profile: dict, source: dict, *, allow_legacy: bool = True) -> None:
+    if type(profile) is not dict:
+        raise ValueError("manifest profile shape mismatch")
+    # Explicit, exact legacy branch: no older profile or candidate-supplied
+    # policy is an allowlist. Identical legacy rebuilds use their old recipe.
+    if allow_legacy and canonical(profile) == canonical(PROFILE):
+        if any(source["files"][name]["sha256"] != PROFILE[keys[0]] for name, keys in CARGO_INPUTS.items()):
+            raise ValueError("source profile mismatch")
+        return
+    if (set(profile) != set(PROFILE) | {"revision", "dependency_policy", "cargo_inputs"}
+            or type(profile["revision"]) is not int or profile["revision"] != 2
+            or type(profile["dependency_policy"]) is not dict
+            or canonical(profile["dependency_policy"]) != canonical(DEPENDENCY_POLICY)):
+        raise ValueError("manifest profile revision/policy mismatch")
+    expected = candidate_profile(profile["cargo_inputs"], source)
+    if canonical(profile) != canonical(expected):
+        raise ValueError("manifest profile exact input/recipe mismatch")
 
 
 def write_json(path: Path, value) -> None:
@@ -170,10 +276,11 @@ def immutable_tree(repo: Path, commit: str) -> tuple[str, str, list[tuple[str, s
     return tree, object_format, sorted(entries)
 
 
-def materialize(repo: Path, commit: str, checkout: Path) -> dict:
+def materialize(repo: Path, commit: str, checkout: Path) -> tuple[dict, dict]:
     tree, object_format, entries = immutable_tree(repo, commit)
     checkout.mkdir()
     inventory = {}
+    cargo_inputs = {}
     for name, mode, oid, size in entries:
         data = git(repo, "cat-file", "blob", oid)
         if len(data) != size or hashlib.new(object_format, b"blob " + str(size).encode() + b"\0" + data).hexdigest() != oid:
@@ -184,10 +291,12 @@ def materialize(repo: Path, commit: str, checkout: Path) -> dict:
             f.write(data)
         path.chmod(int(mode[-3:], 8))
         inventory[name] = {"mode": mode, "git_blob": oid, "size": size, "sha256": hashlib.sha256(data).hexdigest()}
-    if inventory["Cargo.toml"]["sha256"] != MANIFEST_SHA or inventory["Cargo.lock"]["sha256"] != LOCK_SHA:
-        raise ValueError("source manifest/lock differs from selected dependency/profile")
+        if name in CARGO_INPUTS:
+            cargo_inputs[name] = data.decode("utf-8")
+    source = {"commit": commit, "tree": tree, "object_format": object_format, "files": inventory}
+    profile = candidate_profile(cargo_inputs, source)
     check_checkout(checkout, inventory)
-    return {"commit": commit, "tree": tree, "object_format": object_format, "files": inventory}
+    return source, profile
 
 
 def check_checkout(root: Path, inventory: dict) -> None:
@@ -261,7 +370,8 @@ def verify_tool_files(toolchain: Path) -> None:
         raise ValueError("installed tools differ from selected build identities")
 
 
-def run_builder(checkout: Path, output: Path, builder: Path, archive: Path, toolchain: Path, cargo_home: Path) -> dict:
+def run_builder(checkout: Path, output: Path, builder: Path, archive: Path, toolchain: Path, cargo_home: Path,
+                source: dict) -> dict:
     env = {"PATH": str(toolchain) + ":/usr/bin:/bin", "HOME": str(output / "home"), "LC_ALL": "C", "TZ": "UTC",
            "CARGO_HOME": str(cargo_home), "CARGO_TARGET_DIR": str(output / "target"), "CARGO_NET_OFFLINE": "true",
            "CARGO_INCREMENTAL": "0"}
@@ -297,7 +407,8 @@ def run_builder(checkout: Path, output: Path, builder: Path, archive: Path, tool
         raise ValueError("expected exactly one fresh Cargo receipt")
     cargo = json.loads(cargos[0].read_text())
     if (sqlite.get("status") != "passed" or cargo.get("status") != "passed"
-            or cargo.get("manifest_sha256") != MANIFEST_SHA or cargo.get("lock_sha256") != LOCK_SHA
+            or cargo.get("manifest_sha256") != source["files"]["Cargo.toml"]["sha256"]
+            or cargo.get("lock_sha256") != source["files"]["Cargo.lock"]["sha256"]
             or cargo.get("sqlite_receipt_sha256") != digest(output / "sqlite/build-receipt.json")):
         raise ValueError("build receipt association mismatch")
     if (cargo.get("path_normalization") != ENV_PROFILE["path_normalization"]
@@ -430,29 +541,13 @@ def verify(path: Path, expected_sha256: str, expected_commit: str | None = None)
         if tail != b"\0" * required or f.read(1):
             raise ValueError("extra/truncated package contents")
     if (not isinstance(manifest, dict) or set(manifest) != {"format", "source", "profile", "recipe", "build", "files"}
-            or manifest["format"] != "borg-v2-release/1" or manifest["profile"] != PROFILE
+            or manifest["format"] != "borg-v2-release/1"
             or manifest["files"] != {PACKAGE_FILES[0]: actual_binary}):
         raise ValueError("manifest profile/inventory mismatch")
     source = manifest["source"]
     validate_build_metadata(manifest["recipe"], manifest["build"])
-    if not isinstance(source, dict):
-        raise ValueError("invalid source identity")
-    pattern = {"sha1": HEX40, "sha256": HEX64}.get(source.get("object_format"))
-    if (set(source) != {"commit", "tree", "object_format", "files"} or pattern is None
-            or not pattern.fullmatch(source["commit"]) or not pattern.fullmatch(source["tree"])
-            or (expected_commit is not None and source["commit"] != expected_commit)):
-        raise ValueError("source identity mismatch")
-    inventory = source["files"]
-    if not isinstance(inventory, dict) or not 4 <= len(inventory) <= MAX_FILES:
-        raise ValueError("source inventory bound")
-    for name, entry in inventory.items():
-        source_policy(name)
-        if (set(entry) != {"mode", "git_blob", "size", "sha256"} or entry["mode"] not in ("100644", "100755")
-                or not pattern.fullmatch(entry["git_blob"]) or not HEX64.fullmatch(entry["sha256"])
-                or type(entry["size"]) is not int or not 0 <= entry["size"] <= MAX_SOURCE_FILE):
-            raise ValueError("invalid source inventory entry")
-    if sum(e["size"] for e in inventory.values()) > MAX_SOURCE or inventory.get("Cargo.toml", {}).get("sha256") != MANIFEST_SHA or inventory.get("Cargo.lock", {}).get("sha256") != LOCK_SHA:
-        raise ValueError("source profile mismatch")
+    validate_source(source, expected_commit)
+    validate_package_profile(manifest["profile"], source)
     return manifest
 
 
@@ -486,9 +581,20 @@ def build(repo: Path, commit: str, output: Path, archive: Path, toolchain: Path,
         packager_hash = digest(Path(__file__))
         reader_tools = {"git_sha256": digest(Path("/usr/bin/git")), "python_sha256": digest(Path("/usr/bin/python3"))}
         archive_hash = digest(archive)
-        source = materialize(repo, commit, output / "source")
+        source, profile = materialize(repo, commit, output / "source")
+        recipe = {"packager_sha256": packager_hash, "build_helper_sha256": BUILDER_SHA,
+                  **reader_tools, "environment": ENV_PROFILE}
+        # Bound the complete candidate-controlled encoding plus a separately
+        # enforced builder envelope before invoking any trusted build command.
+        envelope = {"format": "borg-v2-release/1", "source": source, "profile": profile, "recipe": recipe,
+                    "build": {}, "files": {PACKAGE_FILES[0]: {"sha256": "0" * 64, "size": MAX_BINARY,
+                                                              "mode": "0555", "target": TARGET}}}
+        if len(canonical(envelope)) + BUILD_METADATA_RESERVE > MAX_MANIFEST:
+            raise ValueError("embedded manifest bound exceeded before builder")
         reject_configs(output / "source", cargo_home)
-        built = run_builder(output / "source", output, retained_builder, archive, toolchain, cargo_home)
+        built = run_builder(output / "source", output, retained_builder, archive, toolchain, cargo_home, source)
+        if len(canonical(built)) > BUILD_METADATA_RESERVE:
+            raise ValueError("build metadata exceeds reserved manifest bound")
         check_checkout(output / "source", source["files"])
         reject_configs(output / "source", cargo_home)
         if (digest(builder) != BUILDER_SHA or digest(retained_builder) != BUILDER_SHA
@@ -500,10 +606,8 @@ def build(repo: Path, commit: str, output: Path, archive: Path, toolchain: Path,
             raise ValueError("source tree identity changed")
         binary = checked_path(output / "target/release/borg-runtime")
         binary_info = elf_binary(binary)
-        manifest = {"format": "borg-v2-release/1", "source": source, "profile": PROFILE,
-                    "recipe": {"packager_sha256": packager_hash, "build_helper_sha256": BUILDER_SHA,
-                               **reader_tools,
-                               "environment": ENV_PROFILE},
+        manifest = {"format": "borg-v2-release/1", "source": source, "profile": profile,
+                    "recipe": recipe,
                     "build": built, "files": {PACKAGE_FILES[0]: binary_info}}
         write_json(output / "manifest.json", manifest)
         package_tar(package, binary, manifest)

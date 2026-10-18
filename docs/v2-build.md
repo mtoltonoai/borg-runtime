@@ -124,3 +124,47 @@ or rollback use, with an owner and reference that can release the hold. Runtime
 and package images are outside this test-payload finalizer. Reconstructible
 compiler caches remain a separate bounded local resource policy. This workflow
 does not change worker product cleanup, runtime features or package policy.
+
+## Candidate Cargo source and selected dependency policy
+
+New packages keep the `borg-v2-release/1` container and its two members, and write
+package profile revision 2. The profile embeds the exact UTF-8 `Cargo.toml` and
+`Cargo.lock` strings, their actual raw SHA-256 hashes, and dependency policy
+revision 1. Admission parses the complete TOML values with the standard library
+`tomllib`, permits only dictionaries, lists, strings, booleans and integers, and
+compares the canonical JSON digests to the trusted selected policy. Canonical
+JSON sorts keys, uses compact separators and ASCII escapes, rejects nonfinite
+numbers, and ends with one newline. Array order and value types remain significant.
+
+Comments, whitespace, key ordering and equivalent TOML literals can change the
+candidate bytes while keeping this policy. A dependency, feature, checksum,
+source, build setting or any other parsed-value change refuses before the trusted
+builder runs. Existing source/configuration restrictions, raw source bounds,
+offline inputs and build/tool pins still apply. The complete embedded manifest
+has the existing size cap; admission reserves a bounded envelope for trusted
+build metadata before execution and enforces that envelope on the returned metadata.
+
+The source inventory binds each captured Cargo file's raw hash, byte length and
+Git blob under the recorded object format. The builder receipt must report those
+same candidate raw hashes. Package-only verification recomputes the complete
+policy, raw hashes, sizes and blob identities from the embedded strings without
+extracting files, reading a source checkout, executing candidate code or fetching
+dependencies. A candidate's claimed semantic digest is insufficient.
+
+Protected preparation captures Cargo bytes through immutable Git reads and uses
+the same validator. The approved cache manifest, membership and data pins stay
+unchanged: its manifest/lock hashes identify the selected cache baseline. The
+projection receipt's `source_manifest_sha256` and `source_lock_sha256` identify
+the actual candidate; `cache_baseline_manifest_sha256` and
+`cache_baseline_lock_sha256` separately identify the approved baseline. Each job
+gets a fresh independent mutable copy with all existing protection, alias,
+membership and post-copy base checks. A missing or mismatched approved cache is
+an explicit failure. There is no offline-build network fallback.
+
+The new reader also has one explicit exact branch for the immediately preceding
+package profile. Other historical profiles remain refused. Existing legacy
+packages and receipts are unchanged; reproducing their exact bytes requires
+their original pinned recipe. A revision-2 build is a distinct artifact and is
+not claimed byte-identical to a legacy package. Local fixture ELF and mocked-build
+tests establish tooling behavior only; actual release execution, protected checks,
+independent review and rollout remain separate evidence.

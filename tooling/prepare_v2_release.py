@@ -20,7 +20,7 @@ import urllib.parse
 
 MAX_BODY = 1_048_576
 WIRE_REVISION = 23
-VERIFIER_SHA = "8a687969b22b11dfbd73e5c45e2c1e516a8117408a857d34b03e9fd98bf16d4b"
+VERIFIER_SHA = "512296740c56d216f8dd2dbe61a05c3aef3749f7aba2630c4ab916ffec02a05b"
 PROTOCOL_SOURCE_SHA = "8ac0c2fe1a18781886cc283e5972f1356670a526769a67969bb0699262dffe3c"
 QUALIFICATION = {"artifact": "claimed", "repository_submission": "unconfigured",
                  "checks": "unconfigured", "human_rollout": "unconfigured"}
