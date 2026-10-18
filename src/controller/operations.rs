@@ -1336,7 +1336,7 @@ pub(crate) fn await_request(
     // policy. Use the existing bounded Stop-only projection and original
     // receipt/credit path; this exchange admits no new work. Replay/identity,
     // storage, body bounds and delivery accounting below remain mandatory.
-    let stop_commands = if maintenance_pending || tx.governance_limits.governance.is_some() {
+    let stop_commands = if maintenance_pending || !ordinary || tx.governance_limits.governance.is_some() {
         delivery_snapshot(tx, id, inc, cfg, false)?
     } else { Vec::new() };
     let control_exchange = maintenance_pending || stop_acknowledged || !stop_commands.is_empty();
