@@ -28,16 +28,23 @@ pub struct CollaborationCapabilities {
 }
 impl CollaborationCapabilities {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 { return Err("unsupported collaboration.capabilities.version".into()); }
+        if self.version != 1 {
+            return Err("unsupported collaboration.capabilities.version".into());
+        }
         Ok(())
     }
 }
 fn identity(value: &str, limits: &super::TransportLimits) -> bool {
-    !value.is_empty() && value.len() <= limits.identity_bytes && !value.chars().any(char::is_control)
+    !value.is_empty()
+        && value.len() <= limits.identity_bytes
+        && !value.chars().any(char::is_control)
 }
 impl IdentityAdministrationPolicy {
     pub fn validate(&self, limits: &super::TransportLimits) -> Result<(), String> {
-        if self.version != 1 || !identity(&self.revision, limits) || !identity(&self.manager_agent_id, limits) {
+        if self.version != 1
+            || !identity(&self.revision, limits)
+            || !identity(&self.manager_agent_id, limits)
+        {
             return Err("invalid identity_administration policy".into());
         }
         Ok(())
@@ -45,7 +52,9 @@ impl IdentityAdministrationPolicy {
 }
 impl TaskCreationPolicy {
     pub fn validate(&self, limits: &super::TransportLimits) -> Result<(), String> {
-        if self.version != 1 || !identity(&self.revision, limits) { return Err("invalid task_creation policy".into()); }
+        if self.version != 1 || !identity(&self.revision, limits) {
+            return Err("invalid task_creation policy".into());
+        }
         Ok(())
     }
 }
