@@ -306,7 +306,7 @@ impl Fixture {
     }
 
     async fn session(&self) -> Session {
-        Session::start_with_key(
+        Session::start_with_auth(
             &self.binary, &self.root, &self.state(), &self.root.join("processes"),
             &InferenceSettings::selected(), self.input.execution_limits().unwrap(),
             Arc::from(self.runtime.worker.clone()), None,
