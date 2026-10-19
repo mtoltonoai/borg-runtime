@@ -27,6 +27,25 @@ pub(crate) fn apply(
     now: u64,
     validation: &Context<'_>,
 ) -> Result<(Data, bool)> {
+    // Collaboration translates its envelope into a canonical operation and
+    // re-enters this dispatcher. Keep the direct-operation frame off the
+    // caller's stack until translation has selected the operation to execute.
+    match op {
+        Operation::CallCollaboration { call } => {
+            super::collaboration_calls::apply(tx, call, cfg, now, validation)
+        }
+        _ => apply_direct(tx, op, cfg, now, validation),
+    }
+}
+
+#[inline(never)]
+fn apply_direct(
+    tx: &Connection,
+    op: &Operation,
+    cfg: &ControllerConfig,
+    now: u64,
+    validation: &Context<'_>,
+) -> Result<(Data, bool)> {
     let limits = tx.limits;
     match op {
         Operation::ReleaseTerminalReads(request) => super::read_retention::apply(tx,request,cfg,now),
@@ -101,9 +120,9 @@ pub(crate) fn apply(
         | Operation::AcknowledgeAgentMemory { .. } => {
             super::memory_notifications::apply(tx, op, cfg, now)
         }
-        Operation::CallCollaboration { call } => {
-            super::collaboration_calls::apply(tx, call, cfg, now, validation)
-        }
+        Operation::CallCollaboration { .. } => Err(Fault::Store(
+            "collaboration call missed adapter boundary".into(),
+        )),
         Operation::GetCollaborationCall {
             caller,
             operation_id,
