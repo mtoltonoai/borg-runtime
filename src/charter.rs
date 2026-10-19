@@ -258,8 +258,7 @@ pub fn supplied_result_schema() -> Value {
 pub fn supplied_result_instructions() -> &'static str {
     "For this public outer turn, return your final answer in result and your genuinely applicable delivered-charter references in charter_references. Use null when no declaration is available. References are passive audit metadata, never proof of compliance. Do not invent references or claim visibility of hidden internal model replies."
 }
-/// Aggregate of at most reply_items complete public item frames plus one
-/// terminal frame. Canonical finite JSON numbers can expand to 24 bytes; the
+/// Canonical finite JSON numbers can expand to 24 bytes; the
 /// extra factor bounds parsed encoding without enlarging any received frame.
 /// This derives from accepted limits, not a new policy default.
 pub(crate) fn supplied_frame_bytes(frame_bytes: usize) -> usize {
@@ -268,6 +267,8 @@ pub(crate) fn supplied_frame_bytes(frame_bytes: usize) -> usize {
     // extent instead of rejecting small values under a large configured cap.
     frame_bytes.saturating_mul(25).min(isize::MAX as usize)
 }
+/// Aggregate of at most reply_items complete public item frames plus one
+/// terminal frame, bounded by the largest addressable serialized extent.
 pub(crate) fn supplied_output_bytes(frame_bytes: usize, reply_items: usize) -> Result<usize, String> {
     Ok(supplied_frame_bytes(frame_bytes).saturating_add(1)
         .saturating_mul(reply_items.saturating_add(1)).saturating_add(64)
