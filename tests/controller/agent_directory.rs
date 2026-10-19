@@ -189,7 +189,7 @@ async fn retirement_preserves_accepted_sessions_memory_history_and_original_rece
     let input = native("directory-history");
     let registered = registration("history-register", &input.definition);
     let register_receipt = directory_reply(&c, registered.clone()).await;
-    let submit_command = Operation::SubmitTask { operation_id: "history-submit".into(), input: input.clone() };
+    let submit_command = Operation::SubmitTask { operation_id: "history-submit".into(), input: (input.clone()).into() };
     let submit_receipt = directory_reply(&c, submit_command.clone()).await;
     let accepted = task(submit_receipt.outcome.clone());
     let queued = submit(&c, "history-second-session", input.clone()).await;
@@ -238,7 +238,7 @@ async fn retirement_preserves_accepted_sessions_memory_history_and_original_rece
     assert!(agents(&c, None, 10).await.is_empty());
 
     assert_eq!(code(directory_reply(&c, Operation::SubmitTask {
-        operation_id: "history-new-submit".into(), input: input.clone(),
+        operation_id: "history-new-submit".into(), input: (input.clone()).into(),
     }).await.outcome), "agent_retired");
     // Re-selecting the already accepted identity creates no new work or session,
     // even after retirement. A genuinely new assignment still refuses.
@@ -356,8 +356,8 @@ async fn retired_recipient_refuses_new_questions_and_delegation_but_keeps_existi
     let question_query = Operation::QueryQuestion { query: QuestionQuery::Get { question_id: question.question.id.clone() } };
     let question_read = directory_reply(&c, question_query.clone()).await;
     assert!(matches!(&question_read.outcome, Outcome::Ok {
-        data: Data::QuestionQuery(QuestionQueryResult::Question(value))
-    } if value == &question));
+        data: Data::QuestionQuery(value)
+    } if matches!(value.as_ref(), QuestionQueryResult::Question(value) if value == &question)));
     exact_replay(&c, &question_command, &question_receipt).await;
 
     let w = worker("directory-parent-worker", "incarnation-1", 1, 0);
@@ -368,8 +368,8 @@ async fn retired_recipient_refuses_new_questions_and_delegation_but_keeps_existi
     let mut child = native(&recipient.id);
     child.limits.deadline_unix_ms = parent.input.limits.deadline_unix_ms;
     child.limits.model_requests = 3;
-    let delegate = |id: &str, child| Operation::DelegateTask { operation_id: id.into(),
-        parent_task_id: parent.id.clone(), parent_attempt_id: a.id.clone(), generation: a.generation, child };
+    let delegate = |id: &str, child: TaskInput| Operation::DelegateTask { operation_id: id.into(),
+        parent_task_id: parent.id.clone(), parent_attempt_id: a.id.clone(), generation: a.generation, child: (child).into() };
     let before = get(&c, &parent.id).await;
     assert_eq!(code(directory_reply(&c, delegate("directory-delegate-retired", child.clone())).await.outcome), "agent_retired");
     assert_eq!(get(&c, &parent.id).await, before, "refused delegation must not reserve work or stop its parent");
@@ -407,7 +407,7 @@ async fn registered_agents_share_the_implicit_submission_capacity_without_refusa
     let directory = agents(&c, None, 10).await;
     assert_eq!(directory.len(), 2);
     let unknown = native("directory-capacity-unknown");
-    let command = Operation::SubmitTask { operation_id: "capacity-implicit-new".into(), input: unknown.clone() };
+    let command = Operation::SubmitTask { operation_id: "capacity-implicit-new".into(), input: (unknown.clone()).into() };
     let refused = directory_reply(&c, command.clone()).await;
     assert_eq!(code(refused.outcome.clone()), "capacity");
     if let Outcome::Refused { message, .. } = &refused.outcome {
@@ -609,7 +609,9 @@ async fn retired_document_and_review_principals_remain_historical_but_refuse_new
     }
     fn review(reply: &Reply) -> ReviewView {
         match &reply.outcome {
-            Outcome::Ok { data: Data::ReviewMutation(ReviewMutationOutcome::Review(view)) } => view.clone(),
+            Outcome::Ok { data: Data::ReviewMutation(value) } => match value.as_ref() {
+                ReviewMutationOutcome::Review(view) => view.clone(),
+            },
             other => panic!("review expected: {other:?}"),
         }
     }

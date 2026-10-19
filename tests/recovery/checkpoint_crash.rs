@@ -495,7 +495,7 @@ async fn checkpoint_crash_cancelled_or_expired_task_closes_recorded_terminal_ref
             lab.client
                 .call(Operation::SubmitTask {
                     operation_id: "submit-terminal".into(),
-                    input,
+                    input: (input).into(),
                 })
                 .await
                 .unwrap(),

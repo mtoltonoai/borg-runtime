@@ -85,7 +85,7 @@ fn repository(root: &Path) -> Repository {
 fn control() -> (Control, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
     let runtime_limits = limits();
-    let worker_limits = Arc::new(runtime_limits.worker.clone());
+    let worker_limits: Arc<borg_runtime::limits::WorkerLimits> = Arc::from(runtime_limits.worker.clone());
     let validation_runtime = Arc::new(borg_runtime::native::ValidationRuntime::new(worker_limits.clone()).unwrap());
     (
         Control {

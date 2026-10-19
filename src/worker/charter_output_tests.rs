@@ -137,7 +137,7 @@ fn canonical_expansion_retains_and_reopens_under_original_resolved_policy() {
         dependencies:vec![],native_workflow:None};
     task.resolved_limits=Some(l.resolve_task(&task).unwrap());
     let attempt=Attempt{id:"attempt".into(),session_id:"session".into(),task_id:"task".into(),generation:1,worker_id:"worker".into(),worker_incarnation:"one".into(),phase:AttemptPhase::Running,deadline_unix_ms:task.limits.deadline_unix_ms,stopped:false,uncertain:false};
-    let command=WorkerCommand::RunAttempt{command_id:"command".into(),session:crate::protocol::Session{id:"session".into(),agent_id:"agent".into(),definition:task.definition.clone(),task_id:"task".into()},attempt,task,checkpoint:None,continuation:None,workflow_continuation:None,completion_continuation:None};
+    let command=WorkerCommand::RunAttempt{command_id:"command".into(),session:(crate::protocol::Session{id:"session".into(),agent_id:"agent".into(),definition:task.definition.clone(),task_id:"task".into()}).into(),attempt,task: (task).into(),checkpoint:None,continuation:None,workflow_continuation:None,completion_continuation:None};
     std::fs::create_dir(s.join("commands")).unwrap();let command_path=s.join("commands").join(format!("{}.json",component("command")));
     record_launch(&command_path,&command,&l).unwrap();let command_before=std::fs::read(&command_path).unwrap();
     atomic_json(&s.join("format.json"),&serde_json::json!({"format_revision":13})).unwrap();

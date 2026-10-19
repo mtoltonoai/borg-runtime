@@ -40,7 +40,7 @@ pub(super) fn recorded_evaluation(tx:&StoreContext<'_>,id:&DecisionRef)->Result<
     let value=CompletionEvaluation {decision:id.clone(),state,boundary:input.boundary.clone()};
     let valid=match (&value.state.disposition,&record.actual_outcome,&original.outcome) {
         (CompletionDisposition::Admit,crate::governance::ActualDecisionOutcome::Applied,
-            Outcome::Ok {data:Data::Completion(CompletionOutcome::Evaluated(found))})=>found==&value,
+            Outcome::Ok {data:Data::Completion(found)})=>matches!(found.as_ref(),CompletionOutcome::Evaluated(found) if found==&value),
         (CompletionDisposition::Blocked {..},crate::governance::ActualDecisionOutcome::GovernanceBlocked,
             Outcome::Refused {code,..})=>code=="governance_completion_blocked",
         _=>false,
@@ -114,7 +114,7 @@ fn acknowledged_target(target:&CompletionTarget,boundary:&CompletionBoundary)->b
 //= spec/impl/v2/implementation.md#voluntary-completion-checks-remaining-work
 //# A continuation after refused voluntary completion MUST preserve the task's original identity, accepted settings, remaining deadline, accounting and unresolved effects.
 
-fn validate_initial_command(tx:&StoreContext<'_>,task:&Task,caller:&Caller,evaluation:&CompletionEvaluation,target:&CompletionTarget)->Result<CompletionResume> {
+fn validate_initial_command(tx:&StoreContext<'_>,task:&Task,caller:&Caller,evaluation:&CompletionEvaluation,target:&CompletionTarget)->Result<Box<CompletionResume>> {
     // Historical input ACKs stay valid after another ordinary attempt. Read
     // their exact command attempt; live Begin separately validated current caller.
     let raw_attempt:String=tx.query_row("SELECT CAST(substr(CAST(body AS BLOB),1,?2) AS TEXT) FROM attempts WHERE id=?1",
@@ -253,8 +253,8 @@ pub(super) fn validate_continuation(tx:&StoreContext<'_>,task:&Task,hold:&Comple
         return Err(Fault::Store("retained completion input differs from original decision or Begin".into()));
     }
     let mut first=value.clone();first.acknowledged=None;
-    if !matches!(begin.outcome,Outcome::Ok {data:Data::Completion(CompletionOutcome::Begun(feedback))}
-        if feedback.evaluation==evaluation&&feedback.continuation==first) {
+    if !matches!(begin.outcome,Outcome::Ok {data:Data::Completion(feedback)}
+        if matches!(feedback.as_ref(),CompletionOutcome::Begun(feedback) if feedback.evaluation==evaluation&&feedback.continuation==first)) {
         return Err(Fault::Store("completion Begin original outcome differs".into()));
     }
     identity(tx,&input.operation_id,begin_id(&value.caller,&value.decision)?)?;
@@ -262,7 +262,7 @@ pub(super) fn validate_continuation(tx:&StoreContext<'_>,task:&Task,hold:&Comple
         let original=governance::original_receipt(tx,&ack.operation_id)?.ok_or_else(||Fault::Store("completion input ACK receipt missing".into()))?;
         if !matches!(original.request,Operation::AcknowledgeCompletionInput(input)
             if input.caller==value.caller&&input.begin_operation_id==value.begin_operation_id&&input.consumed_at==ack.consumed_at&&input.delivery_ack_operation_id==ack.delivery_ack_operation_id&&input.native_input==ack.native_input)
-            ||!matches!(original.outcome,Outcome::Ok {data:Data::Completion(CompletionOutcome::InputAcknowledged(actual))} if actual==*value)
+            ||!matches!(original.outcome,Outcome::Ok {data:Data::Completion(actual)} if matches!(actual.as_ref(),CompletionOutcome::InputAcknowledged(actual) if actual==value))
             ||!acknowledged_target(&value.target,&ack.consumed_at) {
             return Err(Fault::Store("completion input ACK differs from its original supported boundary".into()));
         }
@@ -286,7 +286,7 @@ pub(in crate::controller) fn apply(tx:&StoreContext<'_>,op:&Operation,cfg:&super
             identity(tx,&input.operation_id,evaluation_id(caller,&input.boundary)?)?;
             original_boundary(tx,&stored,&input.boundary,&input.intervening_requests)?;
             let Some(assessment)=assess_running(tx,&stored,now)? else {
-                return Ok((Data::Completion(CompletionOutcome::NotEnforced),false));
+                return Ok((Data::Completion(Box::new(CompletionOutcome::NotEnforced)),false));
             };
             let decision=DecisionRef {operation_id:input.operation_id.clone(),point:DecisionPoint::Completion};
             governance::stage_completion(tx,&input.operation_id,&actor(&stored.task,caller),assessment.decision.clone(),assessment.observed_product_revision)?;
@@ -400,7 +400,7 @@ pub(in crate::controller) fn apply(tx:&StoreContext<'_>,op:&Operation,cfg:&super
     let after=(cfg.clock)();
     if after<now {return refuse("clock_unavailable","clock moved backwards during completion transition");}
     collaboration_calls::caller(tx,caller,after)?;
-    Ok((Data::Completion(result.0),result.1))
+    Ok((Data::Completion(Box::new(result.0)),result.1))
 }
 
 /// Root invokes this at the existing delivery dispatch. A governance Begin may
@@ -437,11 +437,17 @@ pub(in crate::controller) fn validate_native_request(tx:&StoreContext<'_>,task:&
         return refuse("source_mismatch","native continuation evidence differs from original eligible rejection");
     }
     let begin=governance::original_receipt(tx,&evidence.begin_operation_id)?.ok_or_else(||Fault::Refused("source_mismatch","native continuation Begin absent".into()))?;
-    let Outcome::Ok {data:Data::Completion(CompletionOutcome::Begun(feedback))}=&begin.outcome else {
+    let Outcome::Ok {data:Data::Completion(feedback)}=&begin.outcome else {
+        return refuse("source_mismatch","native continuation Begin was not accepted");
+    };
+    let CompletionOutcome::Begun(feedback)=feedback.as_ref() else {
         return refuse("source_mismatch","native continuation Begin was not accepted");
     };
     let ack=governance::original_receipt(tx,&evidence.acknowledgement_operation_id)?.ok_or_else(||Fault::Refused("source_mismatch","native continuation ACK absent".into()))?;
-    let Outcome::Ok {data:Data::Completion(CompletionOutcome::InputAcknowledged(continuation))}=&ack.outcome else {
+    let Outcome::Ok {data:Data::Completion(continuation)}=&ack.outcome else {
+        return refuse("source_mismatch","native continuation input has no actual ACK");
+    };
+    let CompletionOutcome::InputAcknowledged(continuation)=continuation.as_ref() else {
         return refuse("source_mismatch","native continuation input has no actual ACK");
     };
     if feedback.evaluation!=evaluation || feedback.continuation.begin_operation_id!=evidence.begin_operation_id
@@ -493,14 +499,17 @@ pub(in crate::controller) fn validate_native_final(tx:&StoreContext<'_>,task:&Ta
     let (charged,revision)=super::super::operations::validate_completion_gap(tx,&caller,final_response_index,&input.intervening_requests)?;
     if charged!=total||revision>=original.commit.controller_revision {return refuse("source_mismatch","native final gap accounting or original ordering differs")}
     match original.outcome {
-        Outcome::Ok {data:Data::Completion(CompletionOutcome::NotEnforced)}=>Ok(()),
-        Outcome::Ok {data:Data::Completion(CompletionOutcome::Evaluated(ref evaluation))}
-            if matches!(evaluation.state.disposition,CompletionDisposition::Admit)=>{
-            let (_,validated)=recorded_evaluation(tx,&evaluation.decision)?;
-            if validated!=*evaluation||evaluation.boundary!=boundary||evaluation.decision.operation_id!=id {
-                return refuse("source_mismatch","native final admission does not bind original evidence");
-            }
-            Ok(())
+        Outcome::Ok {data:Data::Completion(completion)}=>match *completion {
+            CompletionOutcome::NotEnforced=>Ok(()),
+            CompletionOutcome::Evaluated(ref evaluation)
+                if matches!(evaluation.state.disposition,CompletionDisposition::Admit)=>{
+                let (_,validated)=recorded_evaluation(tx,&evaluation.decision)?;
+                if validated!=*evaluation||evaluation.boundary!=boundary||evaluation.decision.operation_id!=id {
+                    return refuse("source_mismatch","native final admission does not bind original evidence");
+                }
+                Ok(())
+            },
+            _=>refuse("source_mismatch","native final boundary has no original admission"),
         },
         _=>refuse("source_mismatch","native final boundary has no original admission"),
     }

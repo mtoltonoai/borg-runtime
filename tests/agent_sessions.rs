@@ -109,7 +109,7 @@ async fn submit(c: &Controller, id: &str, t: TaskInput) -> Task {
             c,
             Operation::SubmitTask {
                 operation_id: id.into(),
-                input: t,
+                input: (t).into(),
             },
         )
         .await,
@@ -205,7 +205,7 @@ async fn commands(c: &Controller, w: &Worker, ack: Vec<String>) -> Vec<WorkerCom
         o => panic!("{o:?}"),
     }
 }
-fn launch(v: &[WorkerCommand], id: &str) -> (String, Session, Attempt, TaskInput) {
+fn launch(v: &[WorkerCommand], id: &str) -> (String, Box<Session>, Attempt, Box<TaskInput>) {
     v.iter()
         .find_map(|c| match c {
             WorkerCommand::RunAttempt {
@@ -520,7 +520,7 @@ async fn sessions_failed_retry_and_restart_keep_session_and_new_attempt_fence() 
     assert_eq!(retried.session_id, s.id);
     let v = commands(&c, &w, vec![cmd]).await;
     let (_, s2, a2, i) = launch(&v, &t.id);
-    assert_eq!(s2, s);
+    assert_eq!(s2.as_ref(), &s);
     assert_eq!(a2.session_id, a.session_id);
     assert!(a2.generation > a.generation);
     assert_ne!(a.id, a2.id);
@@ -686,7 +686,7 @@ async fn sessions_revision_and_assignment_cannot_retarget_existing_session() {
             &c,
             Operation::SubmitTask {
                 operation_id: "changed-definition".into(),
-                input: conflict,
+                input: (conflict).into(),
             },
         )
         .await,
@@ -707,7 +707,7 @@ async fn sessions_submission_commit_failure_rolls_back_allocation_and_exact_repl
     let c = Controller::open_with_config(&p, config).unwrap();
     let op = Operation::SubmitTask {
         operation_id: "atomic-submit".into(),
-        input: input("atomic-agent"),
+        input: (input("atomic-agent")).into(),
     };
     probe.store(true, Ordering::SeqCst);
     let failed = x(&c, op.clone()).await;
@@ -1005,7 +1005,7 @@ async fn sessions_configured_child_gets_distinct_session_parent_continuation_ret
     let c = Controller::open_with_config(&p, cfg()).unwrap();
     let v = commands(&c, &w, vec![child_command]).await;
     let (_, resumed, ra, ri) = launch(&v, &t.id);
-    assert_eq!(resumed, original);
+    assert_eq!(resumed.as_ref(), &original);
     assert_eq!(ra.session_id, a.session_id);
     assert_ne!(ra.id, a.id);
     resumed.validate_for(&ra, &ri).unwrap();

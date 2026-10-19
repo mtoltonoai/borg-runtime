@@ -55,7 +55,7 @@ async fn invalid_resource_profile_reaps_owned_process_and_retains_reports_withou
         &root,
         &registry,
         &[],
-        Arc::new(selected_policy.worker.clone()),
+        Arc::from(selected_policy.worker.clone()),
     )
     .await
     .unwrap();

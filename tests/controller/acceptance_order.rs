@@ -318,8 +318,8 @@ async fn child_settles_before_parent_stop_without_overlapping_successor_across_r
     assert!(waiting.waiting_child_id.is_none());
     assert!(!waiting.attempt.as_ref().unwrap().stopped);
     assert_eq!(
-        waiting.completed_child.as_ref().unwrap().result,
-        completed.result
+        waiting.completed_child.as_ref().unwrap().result.as_ref(),
+        completed.result.as_deref()
     );
     let spare = worker("spare-worker", "inc", 1, 0);
     register(&c, &spare).await;

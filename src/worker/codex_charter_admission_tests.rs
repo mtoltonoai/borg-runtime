@@ -36,8 +36,11 @@ fn as_task(reply: Reply) -> Task {
 fn as_delivery(reply: &Reply) -> CharterSuppliedContext {
     match &reply.outcome {
         Outcome::Ok {
-            data: Data::Charter(CharterOutcome::SuppliedContext(value)),
-        } => value.clone(),
+            data: Data::Charter(value),
+        } => match value.as_ref() {
+            CharterOutcome::SuppliedContext(value) => value.clone(),
+            other => panic!("{other:?}"),
+        },
         other => panic!("{other:?}"),
     }
 }
@@ -261,7 +264,7 @@ impl AdmissionFixture {
             client
                 .call(Operation::SubmitTask {
                     operation_id: "admission-submit".into(),
-                    input,
+                    input: (input).into(),
                 })
                 .await
                 .unwrap(),
@@ -385,8 +388,11 @@ impl AdmissionFixture {
             .outcome
         {
             Outcome::Ok {
-                data: Data::CharterQuery(CharterQueryResult::Session(Some(value))),
-            } => value,
+                data: Data::CharterQuery(value),
+            } => match *value {
+                CharterQueryResult::Session(Some(value)) => value,
+                other => panic!("{other:?}"),
+            },
             other => panic!("{other:?}"),
         }
     }
@@ -406,7 +412,7 @@ impl AdmissionFixture {
     }
     fn control(&self) -> (watch::Sender<bool>, Control) {
         let (tx, cancel) = watch::channel(false);
-        let worker_limits = Arc::new(self.runtime.worker.clone());
+        let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(self.runtime.worker.clone());
         (
             tx,
             Control {
@@ -667,7 +673,7 @@ async fn real_launch_admission_precedes_supplied_begin_and_exact_executor_associ
     assert!(
         matches!(f.call(Operation::QueryCharter {query:CharterQuery::Turns {
         session_id:f.scope.session_id.clone(),after:None,limit:4}}).await.outcome,
-        Outcome::Ok {data:Data::CharterQuery(CharterQueryResult::Turns(page))} if page.items.is_empty())
+        Outcome::Ok {data:Data::CharterQuery(value)} if matches!(value.as_ref(), CharterQueryResult::Turns(page) if page.items.is_empty()))
     );
 }
 

@@ -136,7 +136,7 @@ async fn coding_worker_reads_pinned_secondary_instructions_before_primary_edit()
         lab.client
             .call(Operation::SubmitTask {
                 operation_id: "submit-instructions".into(),
-                input,
+                input: (input).into(),
             })
             .await
             .unwrap(),

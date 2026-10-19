@@ -129,7 +129,7 @@ pub(super) fn validate_existing(tx: &Connection, cfg: &ControllerConfig) -> Resu
                 ..
             } => {
                 session.validate_for(a, input).is_ok()
-                    && session == &super::sessions::get(tx, &a.session_id)?
+                    && session.as_ref() == &super::sessions::get(tx, &a.session_id)?
                     && command_id == &id
                     && a.id == attempt
                     && a.task_id == task

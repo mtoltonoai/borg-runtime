@@ -930,7 +930,7 @@ async fn batched_stop_transitions_charge_one_receipt_without_cross_owner_theft()
                 &c,
                 Operation::SubmitTask {
                     operation_id: "batch-fill".into(),
-                    input: invalid
+                    input: (invalid).into()
                 }
             )
             .await

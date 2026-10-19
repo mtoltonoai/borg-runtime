@@ -126,7 +126,7 @@ mod tests {
         DefinitionLimitField::CollaborationCompleteResultBytes,
     ];
 
-    fn limits() -> ExecutionLimits {
+    fn limits() -> Box<ExecutionLimits> {
         let mut values = RuntimeLimits::seed().unwrap().execution;
         values.native.context_bytes = 65_536;
         values.native.output_bytes = 16_384;
@@ -147,8 +147,8 @@ mod tests {
     fn apply(
         before: &ExecutionLimits,
         changes: &BTreeMap<DefinitionLimitField, usize>,
-    ) -> ExecutionLimits {
-        let mut after = before.clone();
+    ) -> Box<ExecutionLimits> {
+        let mut after = Box::new(before.clone());
         for (&field, &value) in changes {
             field.set(&mut after, value);
         }

@@ -194,7 +194,7 @@ async fn browser_pagination_and_private_boundary_use_the_actual_http_adapter() {
         match client
             .call(Operation::SubmitTask {
                 operation_id: format!("http-submit-{i}"),
-                input,
+                input: (input).into(),
             })
             .await
             .unwrap()

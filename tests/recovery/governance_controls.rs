@@ -555,7 +555,7 @@ async fn clock_unavailable_stop_replays_without_fabricating_missing_physical_evi
     clock.store(0, Ordering::SeqCst);
     let held_submission = Operation::SubmitTask {
         operation_id: "ordinary-clock-refusal".into(),
-        input: lab.input("clock-refused-agent"),
+        input: (lab.input("clock-refused-agent")).into(),
     };
     let held_receipt = request(&lab, held_submission.clone()).await;
     assert!(held_receipt.commit.is_some());
@@ -721,7 +721,7 @@ async fn bounded_completion_evaluator_failure_still_delivers_stop_to_the_live_wo
     let mut input = lab.input("bounded-evaluator-agent");
     input.definition.execution_profile = Some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None });
     let accepted = task(request(&lab, Operation::SubmitTask {
-        operation_id: "bounded-evaluator-submit".into(), input,
+        operation_id: "bounded-evaluator-submit".into(), input: (input).into(),
     }).await);
     assert_eq!(accepted.input.resolved_limits.as_ref().unwrap().global_metadata.governance.as_ref().unwrap().reason_items, 1);
     let proxy = ControlProxy::new(&lab, Some(accepted.id.clone())).await;
@@ -923,7 +923,7 @@ async fn qualify(lab: &Lab, label: &str) -> ConfigurationVersion {
             lab,
             Operation::SubmitTask {
                 operation_id: format!("{label}-submit"),
-                input,
+                input: (input).into(),
             },
         )
         .await,

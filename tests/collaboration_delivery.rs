@@ -19,14 +19,14 @@ impl Lab{fn new()->Self{Self::with(limits())}fn with(p:RuntimeLimits)->Self{let 
 async fn released(path:&std::path::Path){let mut name=path.as_os_str().to_owned();name.push(".controller-lock");tokio::time::timeout(std::time::Duration::from_secs(3),async{loop{let file=std::fs::OpenOptions::new().read(true).write(true).open(PathBuf::from(&name)).unwrap();if file.try_lock().is_ok(){break}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}}).await.expect("previous controller owner released");}
 async fn call(c:&Controller,command:Operation)->Reply{let reply=c.handle(Request{protocol_revision:WIRE_REVISION,request_id:unique(),command:command.clone()}).await;reply.validate_for(&command).unwrap();reply}
 fn task(reply:Reply)->Task{match reply.outcome{Outcome::Ok{data:Data::Task(t)}=>*t,x=>panic!("expected task: {x:?}")}}
-fn changed(reply:&Reply)->QuestionMutationOutcome{assert!(reply.commit.is_some(),"{reply:?}");match &reply.outcome{Outcome::Ok{data:Data::QuestionMutation(v)}=>v.clone(),x=>panic!("expected committed question: {x:?}")}}
+fn changed(reply:&Reply)->QuestionMutationOutcome{assert!(reply.commit.is_some(),"{reply:?}");match &reply.outcome{Outcome::Ok{data:Data::QuestionMutation(v)}=>v.as_ref().clone(),x=>panic!("expected committed question: {x:?}")}}
 fn refused(reply:&Reply,code:&str){assert!(matches!(&reply.outcome,Outcome::Refused{code:c,..}if c==code),"{reply:?}");}
 async fn mutate(c:&Controller,op:&str,mutation:QuestionMutation)->Reply{call(c,Operation::MutateQuestion{operation_id:op.into(),mutation}).await}
 fn pose_for(record:RecordRef,recipient:PrincipalRef)->PoseQuestion{PoseQuestion{record,recipient,prompt:"Choose one option. Recommended: keep.".into(),options:vec![QuestionOption{id:"keep".into(),label:"Keep".into(),explanation:"Preserve the current choice".into()},QuestionOption{id:"change".into(),label:"Change".into(),explanation:"Use the stated alternative".into()}],recommended_option_id:"keep".into()}}
 fn answer(q:&Question,option:&str)->QuestionMutation{QuestionMutation::Answer{question_id:q.id.clone(),expected_revision:q.revision,answer:QuestionAnswer{option_id:option.into(),explanation:"Explicit decision".into()}}}
 async fn actor(c:&Controller,agent:&str)->(Task,Caller){actor_profile(c,agent,ExecutionProfile::CollaborationV2{ publication: None,web_search:None}).await}
 async fn actor_profile(c:&Controller,agent:&str,profile:ExecutionProfile)->(Task,Caller){
-    let mut data=input(agent);data.definition.execution_profile=Some(profile);let t=task(call(c,Operation::SubmitTask{operation_id:unique(),input:data}).await);let w=Worker{id:unique(),incarnation:"inc".into(),coding_capacity:0,native_capacity:1};
+    let mut data=input(agent);data.definition.execution_profile=Some(profile);let t=task(call(c,Operation::SubmitTask{operation_id:unique(),input:(data).into()}).await);let w=Worker{id:unique(),incarnation:"inc".into(),coding_capacity:0,native_capacity:1};
     assert!(matches!(call(c,Operation::RegisterWorker{operation_id:unique(),worker:w.clone()}).await.outcome,Outcome::Ok{..}));
     let commands=call(c,Operation::AwaitCommands{operation_id:unique(),worker_id:w.id.clone(),incarnation:w.incarnation.clone(),acknowledged:vec![]}).await;
     let Outcome::Ok{data:Data::Commands(commands)}=commands.outcome else{panic!("{commands:?}")};
@@ -37,7 +37,7 @@ async fn actor_profile(c:&Controller,agent:&str,profile:ExecutionProfile)->(Task
 async fn tool(c:&Controller,caller:&Caller,id:&str,name:&str,args:Value)->Reply{let invocation=Invocation{operation_id:id.into(),logical_call_id:format!("logical-{id}"),caller:caller.clone(),tool:name.into(),arguments:args};call(c,invocation.operation()).await}
 
 
-fn delivery(reply:&Reply)->DeliveryObservation {match &reply.outcome{Outcome::Ok{data:Data::CollaborationDelivery(v)}=>v.clone(),x=>panic!("delivery: {x:?}")}}
+fn delivery(reply:&Reply)->DeliveryObservation {match &reply.outcome{Outcome::Ok{data:Data::CollaborationDelivery(v)}=>v.as_ref().clone(),x=>panic!("delivery: {x:?}")}}
 async fn observe(c:&Controller,caller:&Caller)->DeliveryObservation{delivery(&call(c,Operation::ObserveCollaborationDelivery{caller:caller.clone(),limit:8}).await)}
 async fn event(c:&Controller,t:&Task,caller:&Caller)->Question {
     let q=changed(&tool(c,caller,&unique(),"collab_question_pose",json!({"question":pose_for(RecordRef::Task{task_id:t.id.clone()},PrincipalRef::Agent{agent_id:t.assigned_agent_id.clone()})})).await).question.question;

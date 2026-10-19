@@ -42,7 +42,10 @@ pub(super) async fn session(
     )
     .await?
     {
-        Data::CharterQuery(CharterQueryResult::Session(value)) => Ok(value),
+        Data::CharterQuery(value) => match *value {
+            CharterQueryResult::Session(value) => Ok(value),
+            _ => Err("charter session response differs".into()),
+        },
         _ => Err("charter session response differs".into()),
     }
 }
@@ -53,7 +56,7 @@ pub(super) async fn mutate(
     control: &Control,
     operation_id: String,
     observation: CharterObservation,
-) -> Result<CharterOutcome, String> {
+) -> Result<Box<CharterOutcome>, String> {
     mutate_original(
         &reporter.client,
         state,
@@ -74,7 +77,7 @@ async fn mutate_original(
     original: crate::mcp::Caller,
     operation_id: String,
     observation: CharterObservation,
-) -> Result<CharterOutcome, String> {
+) -> Result<Box<CharterOutcome>, String> {
     let request = Operation::ObserveCharter {
         operation_id: operation_id.clone(),
         caller: original,
@@ -158,7 +161,10 @@ pub(super) async fn begin_same_input(
         )
         .await?
         {
-            Data::CharterQuery(CharterQueryResult::Turn(value)) => value,
+            Data::CharterQuery(value) => match *value {
+                CharterQueryResult::Turn(value) => value,
+                _ => return Err("prior charter turn response differs".into()),
+            },
             _ => return Err("prior charter turn response differs".into()),
         };
         // A new canonical attempt may follow a confirmed rejected request,
@@ -195,6 +201,7 @@ pub(super) async fn begin_same_input(
                 },
             )
             .await?
+            .as_ref()
             {
                 CharterOutcome::Turn(value)
                     if value.completed_by.is_some() && value.boundary == previous.boundary => {}
@@ -219,8 +226,9 @@ pub(super) async fn begin_same_input(
         },
     )
     .await?
+    .as_ref()
     {
-        CharterOutcome::Boundary(value) => value,
+        CharterOutcome::Boundary(value) => value.clone(),
         _ => return Err("charter boundary response differs".into()),
     };
     if boundary.caller != caller(&reporter.attempt)
@@ -311,6 +319,7 @@ pub(super) async fn record(
         },
     )
     .await?
+    .as_ref()
     {
         CharterOutcome::Reply(value)
             if value.turn_id == turn.boundary.turn_id
@@ -347,6 +356,7 @@ pub(super) async fn close(
         },
     )
     .await?
+    .as_ref()
     {
         CharterOutcome::Turn(value)
             if value.boundary == turn.boundary && value.completed_by.is_some() =>
@@ -382,7 +392,7 @@ pub(super) async fn record_original(
     control: &Control,
     operation_id: String,
     observation: CharterObservation,
-) -> Result<CharterOutcome, String> {
+) -> Result<Box<CharterOutcome>, String> {
     // Preserve the original inline representation whenever the complete audit
     // and journal have ample room. Large originals use the same occurrence's
     // bounded reference; this does not lower the accepted response maximum.
@@ -428,7 +438,7 @@ pub(super) async fn record_supplied_original(
     original: crate::mcp::Caller,
     operation_id: String,
     observation: CharterObservation,
-) -> Result<CharterOutcome, String> {
+) -> Result<Box<CharterOutcome>, String> {
     if !matches!(&observation, CharterObservation::SuppliedReply { .. }) {
         return Err("not a supplied original result".into());
     }
@@ -461,9 +471,12 @@ pub(super) async fn close_assignment(
     let reply = reporter.client.call(op.clone()).await?;
     reply.validate_for(&op)?;
     let Outcome::Ok {
-        data: Data::CharterQuery(CharterQueryResult::Session(view)),
+        data: Data::CharterQuery(view),
     } = reply.outcome
     else {
+        return Err("assignment charter session unavailable".into());
+    };
+    let CharterQueryResult::Session(view) = *view else {
         return Err("assignment charter session unavailable".into());
     };
     let Some(view) = view else { return Ok(()) };
@@ -479,9 +492,12 @@ pub(super) async fn close_assignment(
     let reply = reporter.client.call(op.clone()).await?;
     reply.validate_for(&op)?;
     let Outcome::Ok {
-        data: Data::CharterQuery(CharterQueryResult::Turn(turn)),
+        data: Data::CharterQuery(turn),
     } = reply.outcome
     else {
+        return Err("assignment original turn unavailable".into());
+    };
+    let CharterQueryResult::Turn(turn) = *turn else {
         return Err("assignment original turn unavailable".into());
     };
     if turn.boundary.caller != call.caller
@@ -532,6 +548,7 @@ pub(super) async fn close_assignment(
         },
     )
     .await?
+    .as_ref()
     {
         CharterOutcome::Turn(value)
             if value.boundary == turn.boundary && value.completed_by.is_some() =>

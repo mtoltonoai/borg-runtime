@@ -298,8 +298,8 @@ async fn promote(api: &ApiClient, lab: &Lab) {
     assert!(matches!(
         original.outcome,
         Outcome::Ok {
-            data: Data::Completion(CompletionOutcome::NotEnforced)
-        }
+            data: Data::Completion(result)
+        } if matches!(*result, CompletionOutcome::NotEnforced)
     ));
     shadow(
         api,
@@ -636,8 +636,11 @@ async fn scenario(continue_work: bool) {
             .outcome
         {
             Outcome::Ok {
-                data: Data::CharterQuery(CharterQueryResult::Compaction(run)),
-            } => run,
+                data: Data::CharterQuery(result),
+            } => match *result {
+                CharterQueryResult::Compaction(run) => run,
+                other => panic!("original compaction {other:?}"),
+            },
             other => panic!("original compaction {other:?}"),
         };
         assert_eq!(run.request_index, index);

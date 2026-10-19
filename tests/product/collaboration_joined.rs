@@ -72,15 +72,17 @@ async fn document(c: &Controller, id: &str, version: Option<u64>) -> DocumentVie
     view
 }
 async fn question(c: &Controller, id: &str) -> QuestionView {
-    let Data::QuestionQuery(QuestionQueryResult::Question(view)) = call(c,
+    let Data::QuestionQuery(result) = call(c,
         Operation::QueryQuestion { query: QuestionQuery::Get { question_id: id.into() } }).await
         else { panic!("question view expected") };
+    let QuestionQueryResult::Question(view) = *result else { panic!("question view expected") };
     view
 }
 async fn review(c: &Controller, id: &str) -> ReviewView {
-    let Data::ReviewQuery(ReviewQueryResult::Review(view)) = call(c,
+    let Data::ReviewQuery(result) = call(c,
         Operation::QueryReview { query: ReviewQuery::Get { review_id: id.into() } }).await
         else { panic!("review view expected") };
+    let ReviewQueryResult::Review(view) = *result else { panic!("review view expected") };
     view
 }
 async fn original_receipt(c: &Controller, id: &str) -> (Reply, Outcome) {
@@ -247,7 +249,8 @@ async fn joined_scenario() {
     let decided = ui(&f.controller, "POST", &decide_path, decision_body.clone()).await;
     assert_eq!(decided.status, 303, "{}", decided.body);
     let (decision_original, decision_outcome) = original_receipt(&f.controller, &decision_operation).await;
-    let Outcome::Ok { data: Data::ReviewMutation(ReviewMutationOutcome::Review(decided)) } = decision_outcome else { panic!("review decision receipt expected") };
+    let Outcome::Ok { data: Data::ReviewMutation(result) } = decision_outcome else { panic!("review decision receipt expected") };
+    let ReviewMutationOutcome::Review(decided) = *result else { panic!("review decision receipt expected") };
     let decision = decided.decision.unwrap();
     assert_eq!(decision.operation_id, decision_operation); assert_eq!(decision.target, target);
     assert_eq!(decision.verdict, ReviewVerdict::ChangesRequested); browser_actor(&decision.reviewer);

@@ -663,7 +663,7 @@ async fn run_case(
     for i in 0..lab.n {
         let op = Operation::SubmitTask {
             operation_id: format!("load-native-submit-{i}"),
-            input: lab.input(i, false),
+            input: (lab.input(i, false)).into(),
         };
         let reply = lab.client.call(op.clone()).await.unwrap();
         let task = actual_task(reply.clone());
@@ -705,7 +705,7 @@ async fn run_case(
     for i in 0..=lab.c {
         let op = Operation::SubmitTask {
             operation_id: format!("load-coding-submit-{i}"),
-            input: lab.input(i, true),
+            input: (lab.input(i, true)).into(),
         };
         let reply = lab.client.call(op.clone()).await.unwrap();
         let task = actual_task(reply.clone());

@@ -101,7 +101,7 @@ fn settings_route(agent_id: &str) -> String {
     format!("/agents/{}/settings", encode(agent_id))
 }
 
-fn settings_submission_input(task: &Task, definition: Definition) -> TaskInput {
+fn settings_submission_input(task: &Task, definition: Definition) -> Box<TaskInput> {
     let mut input = task.input.clone();
     input.resolved_limits = None;
     input.definition = definition;
@@ -286,7 +286,7 @@ async fn settings_apply_uses_canonical_receipt_and_preserves_accepted_task_and_c
     assert!(next_form.body.contains(&format!("value=\"{}\"", selected.revision)), "{}", next_form.body);
     let next_input = settings_submission_input(&old, selected.clone());
     let Data::Task(next) = call(&f.controller, Operation::SubmitTask {
-        operation_id: "settings-next-selected".into(), input: next_input,
+        operation_id: "settings-next-selected".into(), input: (next_input).into(),
     }).await else { panic!("selected revision task") };
     assert_eq!(next.input.definition, selected);
     assert_eq!(next.input.resolved_limits.as_ref().unwrap().values, expected);
@@ -302,7 +302,7 @@ async fn settings_apply_uses_canonical_receipt_and_preserves_accepted_task_and_c
 
     let explicit_old = settings_submission_input(&old, before.clone());
     let Data::Task(pinned) = call(&f.controller, Operation::SubmitTask {
-        operation_id: "settings-explicit-old".into(), input: explicit_old,
+        operation_id: "settings-explicit-old".into(), input: (explicit_old).into(),
     }).await else { panic!("old pinned revision task") };
     assert_eq!(pinned.input.definition, before);
     assert_eq!(settings_selected(&f.controller, &before.id).await, selected);

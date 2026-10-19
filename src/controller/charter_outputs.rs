@@ -141,7 +141,7 @@ fn envelope_bounds(
         operation_id: operation_id.into(), caller: caller.clone(),
         observation: CharterObservation::OutputChunk { chunk: chunk.clone() },
     };
-    let outcome = Outcome::Ok { data: Data::Charter(CharterOutcome::OutputChunk(result.clone())) };
+    let outcome = Outcome::Ok { data: Data::Charter(Box::new(CharterOutcome::OutputChunk(result.clone()))) };
     let query = CharterQueryResult::OutputChunk(chunk.clone());
     // Both policies are mandatory. Identical immutable values have the same
     // encoded predicate; do not serialize a large piece a second time merely

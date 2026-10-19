@@ -376,7 +376,7 @@ pub(super) fn observe(
                 Some("acceptance_failed".into())
             };
             if success {
-                t.task.result = accepted;
+                t.task.result = accepted.map(Box::new);
             }
         }
     }

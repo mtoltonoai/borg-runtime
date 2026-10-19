@@ -160,7 +160,7 @@ impl Lab {
                 output_bytes: self.limits.task_defaults.output_bytes, result_bytes: self.limits.task_defaults.result_bytes,
                 max_delegation_depth: 0 },
         };
-        let reply = self.api.call(Operation::SubmitTask { operation_id: format!("submit-{label}"), input }).await.unwrap();
+        let reply = self.api.call(Operation::SubmitTask { operation_id: format!("submit-{label}"), input: (input).into() }).await.unwrap();
         let task = match reply.outcome {
             Outcome::Ok { data: Data::Task(task) } => task,
             other => panic!("submission refused: {other:?}"),

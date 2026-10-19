@@ -305,7 +305,7 @@ async fn live_json_passes_small_responses_and_bounds_an_oversized_activity_page(
     input.resolved_limits = None;
     for index in 1..page_items {
         call(&f.controller, Operation::SubmitTask {
-            operation_id: format!("bounded-live-{index}"), input: input.clone(),
+            operation_id: format!("bounded-live-{index}"), input: (input.clone()).into(),
         }).await;
     }
     let response = ui(&f.controller, "GET", "/ui/activity", vec![]).await;

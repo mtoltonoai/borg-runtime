@@ -14,14 +14,14 @@ fn git_at(root: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
-async fn lineage(api: &ApiClient, session_id: &str) -> (Session, TaskInput, bool) {
+async fn lineage(api: &ApiClient, session_id: &str) -> (Session, Box<TaskInput>, bool) {
     let operation = Operation::QueryCollaboration {
         query: Query::SessionInput { session_id: session_id.into() },
     };
     let reply = api.call(operation.clone()).await.unwrap(); reply.validate_for(&operation).unwrap();
     let Outcome::Ok { data: Data::Collaboration(QueryResult::SessionInput { session, input, current }) }
         = reply.outcome else { panic!("exact session input required: {reply:?}") };
-    (session, *input, current)
+    (session, input, current)
 }
 
 // Read-only projections over the completed original task. The worker is already
@@ -205,8 +205,9 @@ async fn journey() {
     assert_eq!(new_input, current.input); assert!(new_current);
     for (session_id, definition) in [(&original.session_id, &original.input.definition), (&current.session_id, &current.input.definition)] {
         let reply = api.call(Operation::QueryCharter { query: CharterQuery::Session { session_id: session_id.clone() } }).await.unwrap();
-        let Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Session(Some(binding))) } = reply.outcome
+        let Outcome::Ok { data: Data::CharterQuery(result) } = reply.outcome
             else { panic!("each actual session has its own accepted charter") };
+        let CharterQueryResult::Session(Some(binding)) = *result else { panic!("each actual session has its own accepted charter") };
         assert_eq!(binding.session.session_id, *session_id);
         assert_eq!(binding.session.effective.definition_id, definition.id);
         assert_eq!(binding.session.effective.definition_revision, definition.revision);
@@ -254,7 +255,7 @@ async fn journey() {
         let Outcome::Ok { data: Data::Collaboration(QueryResult::SessionInput { session, input, current }) }
             = &before_restart[index].1.outcome else { unreachable!() };
         assert_eq!(&session.id, session_id); assert_eq!(session.task_id, original.id);
-        assert_eq!(session.definition, accepted.definition); assert_eq!(input.as_ref(), accepted);
+        assert_eq!(session.definition, accepted.definition); assert_eq!(input.as_ref(), accepted.as_ref());
         assert_eq!(*current, expected_current);
     }
     let Outcome::Ok { data: Data::Collaboration(QueryResult::TaskAttempts(final_attempts)) }
@@ -323,11 +324,12 @@ async fn journey() {
     let completions: Vec<_> = receipts.iter().filter(|(operation, outcome, _)| matches!(operation,
         Operation::ObserveCharter { caller, observation: CharterObservation::CompleteTurn { .. }, .. }
             if caller.task_id == original.id && caller.attempt_id == first.id)
-        && matches!(outcome, Outcome::Ok { data: Data::Charter(CharterOutcome::Turn(_)) })).collect();
+        && matches!(outcome, Outcome::Ok { data: Data::Charter(result) } if matches!(result.as_ref(), CharterOutcome::Turn(_)))).collect();
     assert_eq!(completions.len(), 1, "the predecessor's real charter turn closes despite its self-stop");
     let (Operation::ObserveCharter { operation_id, observation: CharterObservation::CompleteTurn { turn_id, results }, .. },
-        Outcome::Ok { data: Data::Charter(CharterOutcome::Turn(turn)) }, completion_revision) = completions[0]
+        Outcome::Ok { data: Data::Charter(result) }, completion_revision) = completions[0]
         else { unreachable!() };
+    let CharterOutcome::Turn(turn) = result.as_ref() else { unreachable!() };
     assert_eq!(results, &vec![CharterResultReceipt::Collaboration { call_id: call.logical_call_id.clone(), operation_id: call.operation_id.clone() }]);
     assert_eq!(&turn.boundary.turn_id, turn_id); assert_eq!(turn.completed_by.as_ref(), Some(operation_id));
     assert_eq!(&turn.delivered_results, results);

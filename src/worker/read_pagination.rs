@@ -59,7 +59,7 @@ mod tests {
             repository:None,acceptance_commands:vec![],output_schema:None,limits:metadata.task_defaults.at(process::now_ms()).unwrap(),dependencies:vec![],native_workflow:None};
         task.resolved_limits=Some(metadata.resolve_task(&task).unwrap());
         let attempt=Attempt{id:"machine-attempt".into(),session_id:"machine-session".into(),task_id:"machine-task".into(),generation:1,worker_id:"worker".into(),worker_incarnation:"one".into(),phase:AttemptPhase::Assigned,deadline_unix_ms:task.limits.deadline_unix_ms,stopped:false,uncertain:false};
-        WorkerCommand::RunAttempt{command_id:"machine-command".into(),session:Session{id:attempt.session_id.clone(),agent_id:task.definition.id.clone(),definition:task.definition.clone(),task_id:attempt.task_id.clone()},attempt,task,checkpoint:None,continuation:None,workflow_continuation:None,completion_continuation:None}
+        WorkerCommand::RunAttempt{command_id:"machine-command".into(),session:(Session{id:attempt.session_id.clone(),agent_id:task.definition.id.clone(),definition:task.definition.clone(),task_id:attempt.task_id.clone()}).into(),attempt,task: (task).into(),checkpoint:None,continuation:None,workflow_continuation:None,completion_continuation:None}
     }
 
     fn page()->Outcome {

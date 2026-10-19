@@ -163,7 +163,7 @@ async fn submit_tool(lab: &Lab, deadline: u64) -> Task {
         lab.client
             .call(Operation::SubmitTask {
                 operation_id: "submit-native-tool".into(),
-                input: input(deadline, &lab.limits),
+                input: (input(deadline, &lab.limits)).into(),
             })
             .await
             .unwrap(),
@@ -210,7 +210,7 @@ async fn actual_tool_read_two_requests_durable_evidence_usage_and_restart() {
             lab.client
                 .call(Operation::SubmitTask {
                     operation_id: "submit-native-tool".into(),
-                    input: selected_input,
+                    input: (selected_input).into(),
                 })
                 .await
                 .unwrap(),

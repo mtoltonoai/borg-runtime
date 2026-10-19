@@ -340,7 +340,7 @@ pub(super) fn apply(tx: &Connection, query: &Query, cfg: &ControllerConfig) -> R
             let session=super::sessions::get(tx,session_id)?;
             let input=super::sessions::input(tx,&session)?;
             let current=load(tx,&session.task_id)?.task.session_id==session.id;
-            Ok(QueryResult::SessionInput { session, input:Box::new(input), current })
+            Ok(QueryResult::SessionInput { session, input, current })
         }
         Query::Sessions {
             agent_id,

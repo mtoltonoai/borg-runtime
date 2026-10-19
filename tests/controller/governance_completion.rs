@@ -103,7 +103,10 @@ async fn evaluated(c: &Controller, actor: &Caller, index: u32, blocked: bool) ->
         assert_eq!(state.disposition, CompletionDisposition::Admit);
         assert!(state.reasons.is_empty());
         match &value.outcome {
-            Outcome::Ok { data: Data::Completion(CompletionOutcome::Evaluated(actual)) } => {
+            Outcome::Ok { data: Data::Completion(completion) } => {
+                let CompletionOutcome::Evaluated(actual) = completion.as_ref() else {
+                    panic!("admitted original completion expected: {completion:?}");
+                };
                 assert_eq!(actual.decision, record.id); assert_eq!(actual.state, state);
                 assert_eq!(actual.boundary, CompletionBoundary::NativeResponse { request_index: index });
             },
@@ -172,7 +175,7 @@ fn has_input(state: &CompletionDecision, event: &EventId) -> bool {
 }
 fn delivery(value: Reply) -> DeliveryObservation {
     match value.outcome {
-        Outcome::Ok { data: Data::CollaborationDelivery(view) } => view,
+        Outcome::Ok { data: Data::CollaborationDelivery(view) } => *view,
         other => panic!("delivery observation expected: {other:?}"),
     }
 }
@@ -275,7 +278,7 @@ async fn absent_or_unpromoted_policy_returns_not_enforced_without_hold_or_audit(
         let (before, _a, actor, _w) = active(&c, "not-enforced").await;
         let operation = evaluation(&actor, 1);
         let original = reply(&c, operation.clone()).await;
-        assert_eq!(original.outcome, Outcome::Ok { data: Data::Completion(CompletionOutcome::NotEnforced) });
+        assert_eq!(original.outcome, Outcome::Ok { data: Data::Completion(Box::new(CompletionOutcome::NotEnforced)) });
         assert!(original.commit.is_some());
         assert_eq!(get(&c, &before.id).await, before, "no synthetic completion hold or task revision");
         same_original(&reply(&c, operation.clone()).await, &original);
@@ -322,7 +325,7 @@ async fn optional_unanswered_question_admits_but_explicit_wait_fences_the_live_c
     let projected = get(&c, &before.id).await;
     let mut expected_projection = waiting.task.clone();
     expected_projection.blocked_reason = Some("prior_execution_active".into());
-    assert_eq!(projected, expected_projection, "GetTask projects the active admission fence without changing the wait");
+    assert_eq!(&projected, expected_projection.as_ref(), "GetTask projects the active admission fence without changing the wait");
     let operation = evaluation(&actor, 2);
     let refused = reply(&c, operation.clone()).await;
     assert_eq!(code(refused.outcome), "invalid_transition");
@@ -391,7 +394,10 @@ async fn exact_terminal_input_is_required_through_observe_prepare_and_begin_unti
     let begin = begin_completion(&actor, &decision_ref(&later_decision), 6, Some(later_batch.batch_id.clone()));
     let begun = reply(&c, begin.clone()).await;
     let continuation = match &begun.outcome {
-        Outcome::Ok { data: Data::Completion(CompletionOutcome::Begun(feedback)) } => feedback.continuation.clone(),
+        Outcome::Ok { data: Data::Completion(completion) } => match completion.as_ref() {
+            CompletionOutcome::Begun(feedback) => feedback.continuation.clone(),
+            other => panic!("completion continuation expected: {other:?}"),
+        },
         other => panic!("paired completion input expected: {other:?}"),
     };
     assert!(continuation.acknowledged.is_none());
@@ -415,7 +421,7 @@ async fn exact_terminal_input_is_required_through_observe_prepare_and_begin_unti
         native_input: Some(NativeCompletionInput { request_binding: completion_binding(), rejections: vec![] }),
     };
     let mut expected = continuation; expected.acknowledged = Some(expected_ack);
-    assert_eq!(acknowledged.outcome, Outcome::Ok { data: Data::Completion(CompletionOutcome::InputAcknowledged(expected)) });
+    assert_eq!(acknowledged.outcome, Outcome::Ok { data: Data::Completion(Box::new(CompletionOutcome::InputAcknowledged(expected))) });
     same_original(&reply(&c, acknowledgement).await, &acknowledged);
     same_original(&reply(&c, begin).await, &begun);
     let (_, _, consumed) = evaluated(&c, &actor, 6, false).await;
@@ -593,7 +599,10 @@ async fn unknown_begin_allows_only_original_input_and_operator_cancellation_bypa
     let begin = begin_completion(&actor, &decision_ref(&original_evaluation), 2, Some(batch.batch_id.clone()));
     let original = reply(&c, begin.clone()).await;
     let feedback = match &original.outcome {
-        Outcome::Ok { data: Data::Completion(CompletionOutcome::Begun(feedback)) } => feedback.clone(),
+        Outcome::Ok { data: Data::Completion(completion) } => match completion.as_ref() {
+            CompletionOutcome::Begun(feedback) => feedback.clone(),
+            other => panic!("completion continuation expected: {other:?}"),
+        },
         other => panic!("original retained continuation expected: {other:?}"),
     };
     assert!(feedback.continuation.acknowledged.is_none());
@@ -846,7 +855,10 @@ async fn exhausted_physical_stop_resumes_only_for_original_independent_required_
     });
     let begun = reply(&c, begin.clone()).await;
     let continuation = match &begun.outcome {
-        Outcome::Ok { data: Data::Completion(CompletionOutcome::Begun(value)) } => {
+        Outcome::Ok { data: Data::Completion(completion) } => {
+            let CompletionOutcome::Begun(value) = completion.as_ref() else {
+                panic!("original reset continuation expected: {completion:?}");
+            };
             assert_eq!(value.evaluation, resume.evaluation); value.continuation.clone()
         }, other => panic!("original reset witness permits exactly this initial input: {other:?}"),
     };
@@ -863,7 +875,8 @@ async fn exhausted_physical_stop_resumes_only_for_original_independent_required_
     let Operation::AcknowledgeCompletionInput(value) = &mut ack else { unreachable!() };
     value.delivery_ack_operation_id = Some(workflow_ack_id);
     let acknowledged = reply(&c, ack.clone()).await;
-    assert!(matches!(acknowledged.outcome, Outcome::Ok { data: Data::Completion(CompletionOutcome::InputAcknowledged(_)) }));
+    assert!(matches!(&acknowledged.outcome, Outcome::Ok { data: Data::Completion(value) }
+        if matches!(value.as_ref(), CompletionOutcome::InputAcknowledged(_))));
     assert_eq!(audit(&c, &decision).await, immutable_audit);
     let (new_decision, new_reply, reset) = evaluated(&c, &new_actor, 1, true).await;
     assert_eq!(reset.independent_reset_event, Some(resolution.id.clone()));
@@ -897,7 +910,8 @@ async fn stopped_completion_resume_preserves_unknown_effect_cancel_deadline_and_
             let batch = prepare(&c, &actor, &view).await;
             let begin = begin_completion(&actor, &decision_ref(&decision), 2, Some(batch.batch_id.clone()));
             let r = reply(&c, begin.clone()).await;
-            assert!(matches!(r.outcome, Outcome::Ok { data: Data::Completion(CompletionOutcome::Begun(_)) }));
+            assert!(matches!(&r.outcome, Outcome::Ok { data: Data::Completion(value) }
+                if matches!(value.as_ref(), CompletionOutcome::Begun(_))));
             unknown = Some((begin, r));
         } else if mode == "pending_effect" {
             // A generic pending effect tests the resume fence, without PR publication.
@@ -986,7 +1000,10 @@ async fn native_completion_ack_requires_same_binding_and_every_original_rejectio
         let begin = begin_completion(&actor, &decision_ref(&decision), 2, Some(batch.batch_id.clone()));
         let begun = reply(&c, begin.clone()).await;
         let continuation = match &begun.outcome {
-            Outcome::Ok { data: Data::Completion(CompletionOutcome::Begun(value)) } => value.continuation.clone(),
+            Outcome::Ok { data: Data::Completion(completion) } => match completion.as_ref() {
+                CompletionOutcome::Begun(value) => value.continuation.clone(),
+                other => panic!("completion continuation expected: {other:?}"),
+            },
             other => panic!("one fixed original input expected: {other:?}"),
         };
         assert_eq!(continuation.target, CompletionTarget::NativeRequest { request_index: 2 });
@@ -1037,7 +1054,7 @@ async fn native_completion_ack_requires_same_binding_and_every_original_rejectio
                 consumed_at: CompletionBoundary::NativeResponse { request_index: 4 },
                 delivery_ack_operation_id: Some(workflow_ack_id), native_input: Some(exact_input.clone()),
             });
-            assert_eq!(original.outcome, Outcome::Ok { data: Data::Completion(CompletionOutcome::InputAcknowledged(expected.clone())) });
+            assert_eq!(original.outcome, Outcome::Ok { data: Data::Completion(Box::new(CompletionOutcome::InputAcknowledged(expected.clone()))) });
         } else {
             assert_eq!(code(original.outcome.clone()), if mode == "missing_rejection" { "capacity" } else { "source_mismatch" });
             assert_eq!(get(&c, &accepted.id).await, before, "rejected evidence cannot acknowledge or replace the fixed input");
@@ -1090,7 +1107,10 @@ async fn codex_completion_ack_uses_no_native_request_evidence() {
         });
         let begun = reply(&c, begin.clone()).await;
         let continuation = match &begun.outcome {
-            Outcome::Ok { data: Data::Completion(CompletionOutcome::Begun(value)) } => value.continuation.clone(),
+            Outcome::Ok { data: Data::Completion(completion) } => match completion.as_ref() {
+                CompletionOutcome::Begun(value) => value.continuation.clone(),
+                other => panic!("completion continuation expected: {other:?}"),
+            },
             other => panic!("original Codex continuation expected: {other:?}"),
         };
         assert!(continuation.acknowledged.is_none());
@@ -1116,7 +1136,7 @@ async fn codex_completion_ack_uses_no_native_request_evidence() {
         } else {
             expected.acknowledged = Some(CompletionInputAck { operation_id: ack.mutation_id().unwrap().into(),
                 consumed_at, delivery_ack_operation_id: Some(workflow_ack_id), native_input: None });
-            assert_eq!(original.outcome, Outcome::Ok { data: Data::Completion(CompletionOutcome::InputAcknowledged(expected.clone())) });
+            assert_eq!(original.outcome, Outcome::Ok { data: Data::Completion(Box::new(CompletionOutcome::InputAcknowledged(expected.clone()))) });
         }
         same_original(&reply(&c, ack.clone()).await, &original);
         drop(c); controller_owner_released(&p).await;

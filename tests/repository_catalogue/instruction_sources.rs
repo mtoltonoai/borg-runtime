@@ -27,7 +27,7 @@ async fn registered(c: &Controller, registration: &Registration) {
 async fn submitted(c: &Controller, input: TaskInput) -> (Task, Operation, Reply) {
     let op = Operation::SubmitTask {
         operation_id: id("instruction-submit"),
-        input,
+        input: (input).into(),
     };
     let receipt = call(c, op.clone()).await;
     (task(receipt.clone()), op, receipt)
@@ -437,7 +437,7 @@ async fn instruction_admission_refuses_unbound_forged_and_unselected_scope_witho
                 &c,
                 Operation::SubmitTask {
                     operation_id: id("bad-instruction"),
-                    input,
+                    input: (input).into(),
                 },
             )
             .await,
@@ -471,7 +471,7 @@ async fn instruction_admission_refuses_unbound_forged_and_unselected_scope_witho
             &c,
             Operation::SubmitTask {
                 operation_id: id("stale"),
-                input: bound.clone(),
+                input: (bound.clone()).into(),
             },
         )
         .await,
@@ -495,7 +495,7 @@ async fn instruction_admission_refuses_unbound_forged_and_unselected_scope_witho
             &c,
             Operation::SubmitTask {
                 operation_id: id("disabled"),
-                input: bound,
+                input: (bound).into(),
             },
         )
         .await,
@@ -587,7 +587,7 @@ async fn configured_instruction_source_is_pinned_at_parent_admission_and_child_r
                     parent_task_id: parent.id.clone(),
                     parent_attempt_id: attempt.id.clone(),
                     generation: attempt.generation,
-                    child: forged,
+                    child: (forged).into(),
                 },
             )
             .await,
@@ -608,7 +608,7 @@ async fn configured_instruction_source_is_pinned_at_parent_admission_and_child_r
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: attempt.id,
                 generation: attempt.generation,
-                child,
+                child: (child).into(),
             }
         };
         let receipt = call(&c, op.clone()).await;
@@ -707,7 +707,7 @@ async fn instruction_endpoint_and_complete_input_bounds_are_enforced_without_omi
         &c,
         Operation::SubmitTask {
             operation_id: id("overbound"),
-            input: value,
+            input: (value).into(),
         },
     )
     .await;
@@ -737,7 +737,7 @@ async fn instruction_endpoint_and_complete_input_bounds_are_enforced_without_omi
         &c,
         Operation::SubmitTask {
             operation_id: id("complete-bound"),
-            input: complete,
+            input: (complete).into(),
         },
     )
     .await;
@@ -1091,7 +1091,7 @@ async fn genuine_schema20_refused_instructions_call_migrates_unchanged_and_old_r
     );
     let op = Operation::SubmitTask {
         operation_id: id("old-submit"),
-        input: input(registration.binding(), &"a".repeat(40), true),
+        input: (input(registration.binding(), &"a".repeat(40), true)).into(),
     };
     let accepted_receipt = client.call(op.clone()).await.unwrap();
     let accepted = task(accepted_receipt.clone());

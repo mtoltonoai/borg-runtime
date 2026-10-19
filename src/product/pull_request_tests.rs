@@ -24,7 +24,7 @@ fn sample() -> Task {
     input.pull_request = Some(pr::Request { title: "Explicit <title>".into(), body: "Keep user text: credential_name".into() });
     input.repository.as_mut().unwrap().pull_request_target = Some(target());
     Task { id: "pr-task".into(), session_id: "pr-session".into(), assigned_agent_id: input.definition.id.clone(),
-        input, status: TaskStatus::Queued, revision: 1, attempt: None, selected_checkpoint: None,
+        input: input.into(), status: TaskStatus::Queued, revision: 1, attempt: None, selected_checkpoint: None,
         result: None, blocked_reason: None, pending_assignment: None, native_retry_block: None, progress: String::new(),
         recent_output: String::new(), output_truncated: false, parent_task_id: None,
         waiting_child_id: None, completed_child: None }
@@ -164,7 +164,7 @@ async fn actual_ui_and_mcp_keep_private_target_canonical_and_original_public_rec
     values.insert("pull_request_title".into(), "Explicit PR".into());
     values.insert("pull_request_body".into(), "Exact request body".into());
     let input = task_input(&values, controller.limits()).unwrap();
-    let submitted = task_reply(actual(&controller, Operation::SubmitTask { operation_id: "pr-submit".into(), input }).await);
+    let submitted = task_reply(actual(&controller, Operation::SubmitTask { operation_id: "pr-submit".into(), input: (input).into() }).await);
     assert_eq!(submitted.input.repository.as_ref().unwrap().pull_request_target, Some(target()));
     let accepted = submitted.input.clone();
     let registered = actual(&controller, Operation::RegisterWorker { operation_id: "pr-worker-register".into(),

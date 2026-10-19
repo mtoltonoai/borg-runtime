@@ -152,7 +152,7 @@ pub(in crate::worker) fn refused_and_begin(state:&Path,limits:&RuntimeLimits,fee
     receipt(state,limits,boundary,"begin.json",Operation::BeginCompletionContinuation(BeginCompletionContinuation {
         operation_id:feedback.continuation.begin_operation_id.clone(),caller,decision:feedback.evaluation.decision.clone(),
         context_binding:feedback.continuation.context_binding.clone(),target:feedback.continuation.target.clone(),delivery_batch_id:None}),
-        if allow {Outcome::Ok {data:Data::Completion(CompletionOutcome::Begun(feedback.clone()))}}
+        if allow {Outcome::Ok {data:Data::Completion(Box::new(CompletionOutcome::Begun(feedback.clone())))}}
         else {Outcome::Refused {code:"governance_completion_exhausted".into(),message:"recorded bound".into()}});
 }
 pub(in crate::worker) fn initial_begin_receipt(state:&Path,limits:&RuntimeLimits,feedback:&CompletionFeedback,allow:bool) {
@@ -160,7 +160,7 @@ pub(in crate::worker) fn initial_begin_receipt(state:&Path,limits:&RuntimeLimits
     receipt(state,limits,&feedback.evaluation.boundary,"begin.json",Operation::BeginCompletionContinuation(BeginCompletionContinuation {
         operation_id:value.begin_operation_id.clone(),caller:value.caller.clone(),decision:value.decision.clone(),
         context_binding:value.context_binding.clone(),target:value.target.clone(),delivery_batch_id:None,
-    }),if allow {Outcome::Ok {data:Data::Completion(CompletionOutcome::Begun(feedback.clone()))}}
+    }),if allow {Outcome::Ok {data:Data::Completion(Box::new(CompletionOutcome::Begun(feedback.clone())))}}
     else {Outcome::Refused {code:"governance_completion_exhausted".into(),message:"original recorded bound".into()}});
 }
 pub(in crate::worker) fn acknowledge_receipt(state:&Path,limits:&RuntimeLimits,feedback:&CompletionFeedback,boundary:CompletionBoundary) {
@@ -179,7 +179,7 @@ fn acknowledge_native_receipt(state:&Path,limits:&RuntimeLimits,feedback:&Comple
     continuation.acknowledged = Some(CompletionInputAck {operation_id:id.clone(),consumed_at:boundary.clone(),delivery_ack_operation_id:None,native_input:native_input.clone()});
     receipt(state,limits,&feedback.evaluation.boundary,"acknowledge.json",Operation::AcknowledgeCompletionInput(AcknowledgeCompletionInput {
         operation_id:id,caller:continuation.caller.clone(),begin_operation_id:continuation.begin_operation_id.clone(),consumed_at:boundary,
-        delivery_ack_operation_id:None,native_input}),Outcome::Ok {data:Data::Completion(CompletionOutcome::InputAcknowledged(continuation))});
+        delivery_ack_operation_id:None,native_input}),Outcome::Ok {data:Data::Completion(Box::new(CompletionOutcome::InputAcknowledged(continuation)))});
 }
 fn host(state:&Path,limits:&RuntimeLimits) -> Host {
     Host::open(ApiClient::new("http://127.0.0.1:9",Arc::new(limits.clone())).unwrap(),caller(),"completion-session",state).unwrap()
@@ -188,7 +188,7 @@ fn control(limits:&RuntimeLimits) -> (watch::Sender<bool>,Control) {
     let (sender,receiver) = watch::channel(false);
     let mut control = crate::worker::test_control(process::now_ms()+10_000,receiver);
     control.runtime_limits = Arc::new(limits.clone());
-    control.worker_limits = Arc::new(limits.worker.clone());
+    control.worker_limits = Arc::from(limits.worker.clone());
     (sender,control)
 }
 

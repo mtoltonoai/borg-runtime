@@ -139,14 +139,14 @@ async fn missing_or_unsupported_template_refuses_both_workers_before_effects() {
         task.definition.executor = ExecutorKind::Coding;
         let command = WorkerCommand::RunAttempt {
             command_id: "command".into(),
-            session: crate::protocol::Session {
+            session: (crate::protocol::Session {
                 id: f.reporter.attempt.session_id.clone(),
                 agent_id: task.definition.id.clone(),
                 definition: task.definition.clone(),
                 task_id: f.reporter.attempt.task_id.clone(),
-            },
+            }).into(),
             attempt: f.reporter.attempt.clone(),
-            task: task.clone(),
+            task: (task.clone()).into(),
             checkpoint: None,
             continuation: None,
                 workflow_continuation: None, completion_continuation: None,
@@ -198,14 +198,14 @@ async fn startup_audits_completed_coding_receipt_and_exact_old_caller() {
     let a = &f.reporter.attempt;
     let command = WorkerCommand::RunAttempt {
         command_id: "command".into(),
-        session: crate::protocol::Session {
+        session: (crate::protocol::Session {
             id: a.session_id.clone(),
             agent_id: task.definition.id.clone(),
             definition: task.definition.clone(),
             task_id: a.task_id.clone(),
-        },
+        }).into(),
         attempt: a.clone(),
-        task: task.clone(),
+        task: (task.clone()).into(),
         checkpoint: None,
         continuation: None,
                 workflow_continuation: None, completion_continuation: None,
@@ -351,14 +351,14 @@ fn session_command(f: &Fixture) -> WorkerCommand {
     let task = input(f, ExecutorKind::Native);
     WorkerCommand::RunAttempt {
         command_id: "session-launch".into(),
-        session: crate::protocol::Session {
+        session: (crate::protocol::Session {
             id: f.reporter.attempt.session_id.clone(),
             agent_id: task.definition.id.clone(),
             definition: task.definition.clone(),
             task_id: f.reporter.attempt.task_id.clone(),
-        },
+        }).into(),
         attempt: f.reporter.attempt.clone(),
-        task,
+        task: (task).into(),
         checkpoint: None,
         continuation: None,
                 workflow_continuation: None, completion_continuation: None,

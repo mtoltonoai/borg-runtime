@@ -44,7 +44,7 @@ async fn submit(lab: &Lab, name: &str, deadline: u64) -> (Request, Reply, Task) 
     };
     input.limits.deadline_unix_ms = deadline;
     let original = request(&format!("submit-{name}"), Operation::SubmitTask {
-        operation_id: format!("original-{name}"), input,
+        operation_id: format!("original-{name}"), input: (input).into(),
     });
     let reply = tokio::time::timeout(Duration::from_secs(10),
         Box::pin(lab.controller().handle(original.clone()))).await.expect("genuine helper admission must finish");

@@ -132,7 +132,7 @@ fn validate_current(reporter: &Reporter, input: &TaskInput, reply: Reply) -> Res
         || a.uncertain
         || a.phase != AttemptPhase::Running
         || task.waiting_child_id.is_some()
-        || task.input != expected
+        || *task.input != expected
         || !crate::execution_profile::collaboration(&task.input)
     {
         return Err("native collaboration owner/input changed".into());
@@ -2392,7 +2392,7 @@ mod storage_barrier_tests {
                 outbox_lock: Arc::new(tokio::sync::Mutex::new(())),
             };
             let (cancel, rx) = watch::channel(false);
-            let worker_limits = Arc::new(limits.worker.clone());
+            let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(limits.worker.clone());
             let control = Control {
                 deadline_ms: input.limits.deadline_unix_ms,
                 cancel: rx,
@@ -2441,7 +2441,7 @@ mod storage_barrier_tests {
                 Data::Task(Box::new(Task {
                     id: "barrier-child".into(),
                     session_id: "barrier-child-session".into(),
-                    input: self.input.clone(),
+                    input: (self.input.clone()).into(),
                     assigned_agent_id: self.input.definition.id.clone(),
                     status: TaskStatus::Queued,
                     revision: 1,
@@ -2524,7 +2524,7 @@ mod storage_barrier_tests {
         task.id=f.reporter.attempt.task_id.clone();task.session_id=f.reporter.attempt.session_id.clone();task.parent_task_id=None;
         task.attempt=Some(f.reporter.attempt.clone());task.status=TaskStatus::Blocked;
         let mut target=task.input.definition.clone();target.id="different-agent".into();
-        task.pending_assignment=Some(PendingAssignment{operation_id:call.operation_id.clone(),from_session_id:task.session_id.clone(),session:Session{id:"reserved-successor".into(),task_id:task.id.clone(),agent_id:target.id.clone(),definition:target}});
+        task.pending_assignment=Some(Box::new(PendingAssignment{operation_id:call.operation_id.clone(),from_session_id:task.session_id.clone(),session:Session{id:"reserved-successor".into(),task_id:task.id.clone(),agent_id:target.id.clone(),definition:target}}));
         let outcome=Outcome::Ok{data:Data::Task(task.clone())};
         assert!(call_requires_quiescence(&call,&outcome));
         let mut wrong=call.clone();wrong.caller.attempt_id="another-attempt".into();assert!(!call_requires_quiescence(&wrong,&outcome));

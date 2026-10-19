@@ -13,12 +13,12 @@ pub(crate) fn input(value: &TaskInput) -> TaskInput {
 }
 pub(crate) fn task(value: &Task) -> Task {
     let mut value = value.clone();
-    value.input = input(&value.input);
+    value.input = Box::new(input(&value.input));
     value
 }
 pub(crate) fn work(value: &crate::collaboration::work::WorkMutationOutcome) -> crate::collaboration::work::WorkMutationOutcome {
     let mut value = value.clone();
-    value.view.task = task(&value.view.task);
+    value.view.task = Box::new(task(&value.view.task));
     value
 }
 fn encode(value: &impl serde::Serialize) -> Result<Value, String> {
@@ -63,7 +63,7 @@ fn command(value: &mut Operation) -> Result<(), String> {
             if let Some(repository)=&mut value.repository { repository.pull_request_target=None; }
             if let Some(NativeWorkflow::CodingThenContinue { child } | NativeWorkflow::Reassign { target: child })=value.native_workflow.as_deref_mut() { child.repository.pull_request_target=None; }
         }
-        Operation::SubmitTask { input: value, .. } | Operation::DelegateTask { child: value, .. } => *value = input(value),
+        Operation::SubmitTask { input: value, .. } | Operation::DelegateTask { child: value, .. } => *value = Box::new(input(value)),
         Operation::RegisterRepository { registration, .. } | Operation::ReviseRepository { registration, .. } => {
             registration.pull_request_target = None;
         }
@@ -102,10 +102,10 @@ pub(crate) fn data(mut value: Data) -> Result<Data, String> {
         Data::Task(value) => **value = task(value),
         Data::Tasks(values) => { for value in values { *value = task(value); } }
         Data::WorkMutation(value) => *value = work(value),
-        Data::WorkQuery(crate::collaboration::work::WorkQueryResult::Task(value)) => value.task = task(&value.task),
+        Data::WorkQuery(crate::collaboration::work::WorkQueryResult::Task(value)) => value.task = Box::new(task(&value.task)),
         Data::Commands(values) => {
             for value in values {
-                if let WorkerCommand::RunAttempt { task: value, .. } = value { *value = input(value); }
+                if let WorkerCommand::RunAttempt { task: value, .. } = value { *value = Box::new(input(value)); }
             }
         }
         // Model call lookup can contain a previous typed outcome. Decode only

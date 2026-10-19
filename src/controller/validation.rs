@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 #[derive(Debug, Clone, PartialEq)]
 struct Owner {
     task_id: String,
-    input: TaskInput,
+    input: Box<TaskInput>,
     assigned_agent: String,
     attempt_id: String,
     generation: u64,
@@ -54,7 +54,9 @@ enum Completion {
     SourcesChecked,
 }
 pub(super) struct Proof {
-    ticket: Ticket,
+    // Keep the admission allocation through execution and owner reentry.
+    // Unboxing here would copy every retained input into queued requests.
+    ticket: Box<Ticket>,
     completion: Completion,
 }
 pub(super) struct Context<'a> {
@@ -157,13 +159,13 @@ impl Context<'_> {
     }
 }
 impl Ticket {
-    pub fn no_capacity(self) -> Proof {
+    pub fn no_capacity(self: Box<Self>) -> Proof {
         Proof {
             ticket: self,
             completion: Completion::Capacity,
         }
     }
-    pub async fn execute(self, host: &crate::native::ValidationHost, repositories: &crate::repository_read::Config) -> Proof {
+    pub async fn execute(self: Box<Self>, host: &crate::native::ValidationHost, repositories: &crate::repository_read::Config) -> Proof {
         let duration = Duration::from_millis(
             self.input
                 .limits

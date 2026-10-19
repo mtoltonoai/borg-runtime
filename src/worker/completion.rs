@@ -361,14 +361,17 @@ impl Host {
         let outcome = self.resolve(&path,&mut journal,control).await?;
         let id = DecisionRef {operation_id:operation_id(&journal.request)?.into(),point:DecisionPoint::Completion};
         let gate = match outcome {
-            Outcome::Ok {data:Data::Completion(CompletionOutcome::NotEnforced)} => Gate::Admit,
-            Outcome::Ok {data:Data::Completion(CompletionOutcome::Evaluated(value))} => {
-                if value.decision != id || value.boundary != *boundary
-                    || !self.matches_subject(&value.state.subject)
-                    || value.state.disposition != CompletionDisposition::Admit {
-                    return Err("completion decision does not bind this admitted boundary".into());
-                }
-                Gate::Admit
+            Outcome::Ok {data:Data::Completion(value)} => match *value {
+                CompletionOutcome::NotEnforced => Gate::Admit,
+                CompletionOutcome::Evaluated(value) => {
+                    if value.decision != id || value.boundary != *boundary
+                        || !self.matches_subject(&value.state.subject)
+                        || value.state.disposition != CompletionDisposition::Admit {
+                        return Err("completion decision does not bind this admitted boundary".into());
+                    }
+                    Gate::Admit
+                },
+                _ => return Err("unexpected completion evaluation outcome".into()),
             },
             Outcome::Refused {code,..} if code == "governance_completion_blocked" => Gate::Blocked(self.blocked_evaluation(&journal,id,boundary,control).await?),
             Outcome::Refused {..} => Gate::Held,
@@ -418,7 +421,10 @@ impl Host {
         let outcome = self.resolve(&path,&mut journal,control).await?;
         let feedback = match outcome {
             Outcome::Refused {..} => {mutations::consume(&path,&mut journal)?;return Ok(None);},
-            Outcome::Ok {data:Data::Completion(CompletionOutcome::Begun(feedback))} => feedback,
+            Outcome::Ok {data:Data::Completion(value)} => match *value {
+                CompletionOutcome::Begun(feedback) => feedback,
+                _ => return Err("unexpected completion Begin outcome".into()),
+            },
             _ => return Err("unexpected completion Begin outcome".into()),
         };
         let expected = CompletionContinuation {begin_operation_id:operation_id(&journal.request)?.into(),caller:self.caller.clone(),
@@ -469,9 +475,12 @@ impl Host {
         let mut expected = input.record.feedback.continuation.clone();
         expected.acknowledged = Some(CompletionInputAck {operation_id:operation_id(&journal.request)?.into(),consumed_at:boundary,delivery_ack_operation_id,native_input});
         match outcome {
-            Outcome::Ok {data:Data::Completion(CompletionOutcome::InputAcknowledged(value))} if value == expected => {
-                mutations::consume(&path,&mut journal)?;
-                Ok(value)
+            Outcome::Ok {data:Data::Completion(value)} => match *value {
+                CompletionOutcome::InputAcknowledged(value) if value == expected => {
+                    mutations::consume(&path,&mut journal)?;
+                    Ok(value)
+                },
+                _ => Err("completion input acknowledgment unavailable; original intent retained".into()),
             },
             _ => Err("completion input acknowledgment unavailable; original intent retained".into()),
         }

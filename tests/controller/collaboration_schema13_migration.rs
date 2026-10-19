@@ -59,7 +59,7 @@ async fn fixture13(p:&std::path::Path)->HistoricalFixture {
     let mut originals=Vec::new();let mut tasks=Vec::new();
     for (i,agent) in ["schema13-source","schema13-waiter"].into_iter().enumerate() {
         let mut input=native(agent);input.limits.result_bytes=limits.task_defaults.result_bytes;
-        let op=Operation::SubmitTask{operation_id:format!("schema13-submit-{i}"),input};
+        let op=Operation::SubmitTask{operation_id:format!("schema13-submit-{i}"),input: (input).into()};
         let r=Box::pin(call13(&client,op.clone())).await;assert!(r.commit.is_some());
         tasks.push(task(r.outcome.clone()));originals.push((op,r));
     }

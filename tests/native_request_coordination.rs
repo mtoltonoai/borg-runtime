@@ -129,7 +129,7 @@ impl Lab {
             resolved_limits: None,
         };
         let submitted = task(call(&self.controller, Operation::SubmitTask {
-            operation_id: unique("submit"), input,
+            operation_id: unique("submit"), input: (input).into(),
         }).await);
         let worker = Worker {
             id: unique("worker"), incarnation: "incarnation-1".into(),

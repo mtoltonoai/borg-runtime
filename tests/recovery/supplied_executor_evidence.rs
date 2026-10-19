@@ -578,7 +578,7 @@ async fn failed_acceptance(lab: &mut Lab, agent: &str, command: Vec<String>) -> 
         lab.client
             .call(Operation::SubmitTask {
                 operation_id: format!("{agent}-submit"),
-                input,
+                input: (input).into(),
             })
             .await
             .unwrap(),

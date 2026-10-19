@@ -13,17 +13,17 @@ fn sample() -> WorkView {
     let limits = Limits { deadline_unix_ms: 999_999, model_requests: 2, output_bytes: 1024, result_bytes: 4096, max_delegation_depth: 1 };
     let task = Task {
         id: "projection-task".into(), session_id: "projection-session".into(),
-        input: TaskInput { instruction_source: None, pull_request: None,  resolved_limits: None, repository_read: None,
+        input: Box::new(TaskInput { instruction_source: None, pull_request: None,  resolved_limits: None, repository_read: None,
             instruction: "Synthetic finite projection test".into(), definition,
             repository: None, acceptance_commands: vec![], output_schema: None,
-            limits, dependencies: vec![], native_workflow: None },
+            limits, dependencies: vec![], native_workflow: None }),
         assigned_agent_id: "projection-agent".into(), status: TaskStatus::Queued, revision: 1,
         attempt: None, selected_checkpoint: None, result: None, blocked_reason: None, pending_assignment: None, native_retry_block: None,
         progress: String::new(), recent_output: String::new(), output_truncated: false,
         parent_task_id: None, waiting_child_id: None, completed_child: None,
     };
     WorkView { state: WorkState::Runnable { state: ResumeState { status: task.status, assigned_agent_id: task.assigned_agent_id.clone() } },
-        task, coordination_revision: 0, responsible_owner: PrincipalRef::TrustedHostOperator,
+        task: Box::new(task), coordination_revision: 0, responsible_owner: PrincipalRef::TrustedHostOperator,
         open_waits: 0, coordination_blocked: false, waits: Page { items: vec![], next_cursor: None } }
 }
 fn projections(view: WorkView) -> [Data; 2] {

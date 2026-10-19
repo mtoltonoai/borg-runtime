@@ -291,7 +291,7 @@ async fn document_query(controller:&Controller,query:DocumentQuery)->Result<Docu
     let r=call(controller,Operation::QueryDocument{query}).await;
     match r.outcome {Outcome::Ok{data:Data::DocumentQuery(value)}=>Ok(value),_=>Err(not_task(r))}
 }
-async fn review_query(controller:&Controller,query:ReviewQuery)->Result<ReviewQueryResult,UiResponse> {
+async fn review_query(controller:&Controller,query:ReviewQuery)->Result<Box<ReviewQueryResult>,UiResponse> {
     let r=call(controller,Operation::QueryReview{query}).await;
     match r.outcome {Outcome::Ok{data:Data::ReviewQuery(value)}=>Ok(value),_=>Err(not_task(r))}
 }
@@ -318,8 +318,9 @@ async fn get_inner(controller:&Controller,path:&str,raw_query:&str)->Result<Opti
             None=>None,Some("open")=>Some(ReviewStatus::Open),Some("decided")=>Some(ReviewStatus::Decided),Some("withdrawn")=>Some(ReviewStatus::Withdrawn),
             _=>return Err(error(400,"Unsupported review status")),
         };
-        let ReviewQueryResult::Reviews(p)=review_query(controller,ReviewQuery::List{record,status,after:after(&f),limit:count}).await? else{return Err(error(502,"Unexpected review list"))};
-        return Ok(Some(review_list(&p,&f)))
+        let result=review_query(controller,ReviewQuery::List{record,status,after:after(&f),limit:count}).await?;
+        let ReviewQueryResult::Reviews(p)=result.as_ref() else{return Err(error(502,"Unexpected review list"))};
+        return Ok(Some(review_list(p,&f)))
     }
     for (prefix,kind) in [("/documents/","document"),("/reviews/","review"),("/questions/","question"),("/tasks/","task")] {
         let Some(tail)=path.strip_prefix(prefix) else{continue};
@@ -334,8 +335,9 @@ async fn get_inner(controller:&Controller,path:&str,raw_query:&str)->Result<Opti
         if kind=="task"&&action=="review-target" {
             let f=query_fields(raw_query,&["scope"],limits)?;
             let scope=match f.get("scope").map(String::as_str).unwrap_or("result"){"result"=>AcceptedReviewScope::Result,"checkpoint"=>AcceptedReviewScope::Checkpoint,_=>return Err(error(400,"Unsupported accepted review scope"))};
-            let ReviewQueryResult::AcceptedTarget(target)=review_query(controller,ReviewQuery::AcceptedTarget{task_id:id,scope}).await? else{return Err(error(502,"Unexpected accepted subject"))};
-            return Ok(Some(page(200,"Request result review",review_request_form(&target))))
+            let result=review_query(controller,ReviewQuery::AcceptedTarget{task_id:id,scope}).await?;
+            let ReviewQueryResult::AcceptedTarget(target)=result.as_ref() else{return Err(error(502,"Unexpected accepted subject"))};
+            return Ok(Some(page(200,"Request result review",review_request_form(target))))
         }
         if kind=="document"&&action=="versions" {
             let f=query_fields(raw_query,&["after","cursor","max_bytes"],limits)?;
@@ -358,8 +360,9 @@ async fn get_inner(controller:&Controller,path:&str,raw_query:&str)->Result<Opti
         }
         if kind=="review"&&action.is_empty() {
             query_fields(raw_query,&[],limits)?;
-            let ReviewQueryResult::Review(view)=review_query(controller,ReviewQuery::Get{review_id:id}).await? else{return Err(error(502,"Unexpected review"))};
-            return Ok(Some(review(&view)))
+            let result=review_query(controller,ReviewQuery::Get{review_id:id}).await?;
+            let ReviewQueryResult::Review(view)=result.as_ref() else{return Err(error(502,"Unexpected review"))};
+            return Ok(Some(review(view)))
         }
         return Ok(None)
     }

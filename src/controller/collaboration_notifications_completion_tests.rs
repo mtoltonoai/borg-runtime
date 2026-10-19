@@ -78,7 +78,7 @@ fn task(reply: Reply) -> Task {
     match reply.outcome { Outcome::Ok { data: Data::Task(t) } => *t, other => panic!("task: {other:?}") }
 }
 fn delivery(reply: Reply) -> DeliveryObservation {
-    match reply.outcome { Outcome::Ok { data: Data::CollaborationDelivery(v) } => v, other => panic!("delivery: {other:?}") }
+    match reply.outcome { Outcome::Ok { data: Data::CollaborationDelivery(v) } => *v, other => panic!("delivery: {other:?}") }
 }
 async fn report(c: &Controller, caller: &Caller, observation: Observation) -> Task {
     task(call(c, Operation::ObserveWorker { report: Report { report_id: unique(), task_id: caller.task_id.clone(),
@@ -97,7 +97,7 @@ async fn admit(c: &Controller, queued: &Task) -> (Task, Caller) {
     (report(c, &caller, Observation::Started { thread_id: None, turn_id: None }).await, caller)
 }
 async fn actor(c: &Controller, agent: &str, v2: bool) -> (Task, Caller) {
-    let queued = task(call(c, Operation::SubmitTask { operation_id: unique(), input: input(agent, v2) }).await);
+    let queued = task(call(c, Operation::SubmitTask { operation_id: unique(), input: (input(agent, v2)).into() }).await);
     admit(c, &queued).await
 }
 async fn document(c: &Controller, owner: &str) -> DocumentView {
@@ -269,7 +269,7 @@ async fn completion_advisory_only_begin_remains_a_fence_without_required_termina
 async fn completion_foreign_route_ack_cannot_discharge_concrete_waiter_input() {
     let mut lab = Lab::new(selected());
     let (routing_task, routing_caller) = actor(lab.c(), "route-owner", true).await;
-    let waiting = task(call(lab.c(), Operation::SubmitTask { operation_id: unique(), input: input("waiter", true) }).await);
+    let waiting = task(call(lab.c(), Operation::SubmitTask { operation_id: unique(), input: (input("waiter", true)).into() }).await);
     let doc = document(lab.c(), "route-owner").await;
     let q = pose(lab.c(), RecordRef::Document { document_id: doc.document.id.clone() }, PrincipalRef::TrustedHostOperator).await;
     let added = call(lab.c(), Operation::MutateWork { operation_id: unique(), mutation: WorkMutation::AddWait {

@@ -83,20 +83,20 @@ fn task(reply: Reply) -> Task {
     match reply.outcome { Outcome::Ok { data: Data::Task(t) } => *t, other => panic!("task: {other:?}") }
 }
 fn delivery(reply: &Reply) -> DeliveryObservation {
-    match &reply.outcome { Outcome::Ok { data: Data::CollaborationDelivery(v) } => v.clone(), other => panic!("delivery: {other:?}") }
+    match &reply.outcome { Outcome::Ok { data: Data::CollaborationDelivery(v) } => v.as_ref().clone(), other => panic!("delivery: {other:?}") }
 }
 fn refused(reply: &Reply, code: &str) {
     assert!(matches!(&reply.outcome, Outcome::Refused { code: actual, .. } if actual == code), "{reply:?}");
 }
 fn changed(reply: &Reply) -> QuestionMutationOutcome {
     assert!(reply.commit.is_some(), "{reply:?}");
-    match &reply.outcome { Outcome::Ok { data: Data::QuestionMutation(v) } => v.clone(), other => panic!("question: {other:?}") }
+    match &reply.outcome { Outcome::Ok { data: Data::QuestionMutation(v) } => v.as_ref().clone(), other => panic!("question: {other:?}") }
 }
 async fn actor(c: &Controller, agent: &str) -> (Task, Caller) {
     actor_profile(c, agent, ExecutionProfile::CollaborationV2 { publication: None, web_search: None }).await
 }
 async fn actor_profile(c: &Controller, agent: &str, profile: ExecutionProfile) -> (Task, Caller) {
-    let t = task(call(c, Operation::SubmitTask { operation_id: unique(), input: input(agent, profile) }).await);
+    let t = task(call(c, Operation::SubmitTask { operation_id: unique(), input: (input(agent, profile)).into() }).await);
     let w = Worker { id: unique(), incarnation: "inc".into(), coding_capacity: 0, native_capacity: 1 };
     assert!(matches!(call(c, Operation::RegisterWorker { operation_id: unique(), worker: w.clone() }).await.outcome, Outcome::Ok { .. }));
     let reply = call(c, Operation::AwaitCommands { operation_id: unique(), worker_id: w.id, incarnation: w.incarnation, acknowledged: vec![] }).await;
@@ -550,7 +550,7 @@ async fn routing_retains_exact_previously_acknowledged_work_input_without_second
     let doc = document(&lab.c, "initial-ineligible-owner").await;
     let q = question(&lab.c, &doc, None).await;
     let waiting = task(call(&lab.c, Operation::SubmitTask { operation_id: unique(),
-        input: input("work-recipient", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }) }).await);
+        input: (input("work-recipient", ExecutionProfile::CollaborationV2 { publication: None, web_search: None })).into() }).await);
     assert!(waiting.attempt.is_none());
     let added = call(&lab.c, Operation::MutateWork { operation_id: unique(), mutation: WorkMutation::AddWait {
         task_id: waiting.id.clone(), expected_revision: 0, resolver: ResolverRef::Question { question_id: q.id.clone() },
@@ -671,7 +671,7 @@ mod terminal_payload_corruption {
     async fn cancelled_task(lab: &Lab) -> (Task, Operation, Reply, WorkflowActivity) {
         let submitted = task(call(&lab.c, Operation::SubmitTask {
             operation_id: unique(),
-            input: input("terminal-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
+            input: (input("terminal-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None })).into(),
         }).await);
         assert!(submitted.attempt.is_none(), "queued fixture needs no worker or executor");
         let operation = Operation::CancelTask {
@@ -788,7 +788,7 @@ mod terminal_payload_corruption {
         // this queued fixture never creates a worker or performs execution.
         task(call(&lab.c, Operation::SubmitTask {
             operation_id: unique(),
-            input: input("question-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
+            input: (input("question-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None })).into(),
         }).await);
         let doc = document(&lab.c, "question-payload-owner").await;
         let q = question(&lab.c, &doc, None).await;
@@ -810,7 +810,7 @@ mod terminal_payload_corruption {
         let lab = Lab::new();
         task(call(&lab.c, Operation::SubmitTask {
             operation_id: unique(),
-            input: input("review-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None }),
+            input: (input("review-payload-owner", ExecutionProfile::CollaborationV2 { publication: None, web_search: None })).into(),
         }).await);
         let doc = document(&lab.c, "review-payload-owner").await;
         let target = ReviewTarget::DocumentVersion { version: doc.version.reference.clone() };
@@ -821,7 +821,9 @@ mod terminal_payload_corruption {
             },
         }).await;
         let review = match request.outcome {
-            Outcome::Ok { data: Data::ReviewMutation(ReviewMutationOutcome::Review(view)) } => view.review,
+            Outcome::Ok { data: Data::ReviewMutation(value) } => match *value {
+                ReviewMutationOutcome::Review(view) => view.review, other => panic!("requested review: {other:?}"),
+            },
             other => panic!("requested review: {other:?}"),
         };
         let operation = Operation::MutateReview {
@@ -833,7 +835,9 @@ mod terminal_payload_corruption {
         let receipt = call(&lab.c, operation.clone()).await;
         assert!(receipt.commit.is_some());
         let decided = match &receipt.outcome {
-            Outcome::Ok { data: Data::ReviewMutation(ReviewMutationOutcome::Review(view)) } => view,
+            Outcome::Ok { data: Data::ReviewMutation(value) } => match value.as_ref() {
+                ReviewMutationOutcome::Review(view) => view, other => panic!("decided review: {other:?}"),
+            },
             other => panic!("decided review: {other:?}"),
         };
         assert_eq!(decided.review.status, ReviewStatus::Decided);

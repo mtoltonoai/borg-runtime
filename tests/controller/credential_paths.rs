@@ -108,7 +108,7 @@ async fn credential_repository_and_workflow_inputs_refuse_before_any_durable_rec
                 index += 1;
                 let operation = Operation::SubmitTask {
                     operation_id: id.clone(),
-                    input,
+                    input: (input).into(),
                 };
                 rejected(&c, operation.clone()).await;
                 rejected(&c, operation).await;
@@ -147,7 +147,7 @@ async fn credential_repository_and_workflow_inputs_refuse_before_any_durable_rec
         &c,
         Operation::SubmitTask {
             operation_id: "credential-input-0".into(),
-            input: contaminated,
+            input: (contaminated).into(),
         },
     )
     .await;
@@ -231,7 +231,7 @@ async fn credential_child_rejection_does_not_create_wait_reservation_or_child() 
                     parent_task_id: parent.id.clone(),
                     parent_attempt_id: a.id.clone(),
                     generation: a.generation,
-                    child,
+                    child: (child).into(),
                 },
             )
             .await;
@@ -283,7 +283,7 @@ async fn credential_child_rejection_does_not_create_wait_reservation_or_child() 
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: a.id,
                 generation: a.generation,
-                child,
+                child: (child).into(),
             },
         )
         .await,

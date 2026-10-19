@@ -157,7 +157,7 @@ impl PeerState {
         let data = match &command {
             Operation::ObserveCollaborationDelivery { caller: actual, .. } => {
                 assert_eq!(actual, &caller());
-                Data::CollaborationDelivery(self.observation.clone())
+                Data::CollaborationDelivery(Box::new(self.observation.clone()))
             }
             Operation::GetOperation { .. } => {
                 // The fixture starts with a prepared batch; every new Begin/ACK
@@ -190,7 +190,7 @@ impl PeerState {
                         context_binding: context_binding.clone(),
                     });
                 }
-                Data::CollaborationDelivery(self.observation.clone())
+                Data::CollaborationDelivery(Box::new(self.observation.clone()))
             }
             Operation::AcknowledgeCollaborationDelivery { caller: actual, batch_id, context_binding, .. } => {
                 assert_eq!(actual, &caller());
@@ -207,7 +207,7 @@ impl PeerState {
                 if let Some(route) = pending.page.routing { self.observation.routing_cursor = route.to_cursor; }
                 self.observation.acknowledged_cursor = pending.page.to_cursor;
                 std::fs::write(ack_marker, b"controller peer observed exact ACK").unwrap();
-                Data::CollaborationDelivery(self.observation.clone())
+                Data::CollaborationDelivery(Box::new(self.observation.clone()))
             }
             other => panic!("unexpected canned controller operation: {other:?}"),
         };
@@ -287,7 +287,7 @@ impl Fixture {
 
     fn control(&self) -> (watch::Sender<bool>, Control) {
         let (cancel, receiver) = watch::channel(false);
-        let worker_limits = Arc::new(self.runtime.worker.clone());
+        let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(self.runtime.worker.clone());
         let control = Control {
             deadline_ms: self.input.limits.deadline_unix_ms, cancel: receiver,
             runtime_limits: self.runtime.clone(), worker_limits: worker_limits.clone(),
@@ -309,7 +309,7 @@ impl Fixture {
         Session::start_with_key(
             &self.binary, &self.root, &self.state(), &self.root.join("processes"),
             &InferenceSettings::selected(), self.input.execution_limits().unwrap(),
-            Arc::new(self.runtime.worker.clone()), None,
+            Arc::from(self.runtime.worker.clone()), None,
         ).await.unwrap()
     }
 

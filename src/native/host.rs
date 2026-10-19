@@ -205,7 +205,7 @@ impl FixtureHost {
                         program.to_owned(),
                         registry.clone(),
                         Arc::new(limits.execution.native),
-                        Arc::new(ValidationRuntime::new(Arc::new(limits.worker))?),
+                        Arc::new(ValidationRuntime::new(Arc::from(limits.worker))?),
                     );
                     host.fixture_registry = Some(Arc::new(FixtureRegistry(registry)));
                     return Ok(Self(host));

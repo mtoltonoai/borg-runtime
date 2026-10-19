@@ -98,7 +98,7 @@ async fn publication_mcp_both_executors_share_catalogue_and_absent_capability_re
         if enabled {
             let reply=client.call(&call).await.unwrap().reply;assert_eq!(view(&reply).branch.state,p::State::Pending);
             let cmds=commands(&c,&worker,vec![]).await;let request=publication_command(&cmds);
-            assert_eq!(request.input,requester.input);assert_eq!(request.head.binding.task_id,source.id);
+            assert_eq!(&request.input,requester.input.as_ref());assert_eq!(request.head.binding.task_id,source.id);
             assert_eq!(request.head.publication.as_ref().unwrap().requester.caller,caller);
             assert_ne!(request.attempt.id,request.head.binding.attempt_id);
         } else {
@@ -217,7 +217,7 @@ async fn publication_mcp_missing_target_disallowed_action_and_small_worker_envel
     assert!(commands(&c,&w,vec![]).await.iter().all(|c|!matches!(c,WorkerCommand::PublishRepository{..})));
     let mut input=native("missing-publication-target");input.definition.execution_profile=Some(profile(Some(p::Selection::V1{repository_id:reg.repository_id.clone(),registration_revision:reg.registration_revision.clone(),target_revision:"unregistered-target".into(),actions:vec![p::Action::PublishBranch],branch_namespace:"borg/fixture".into()})));
     bind_native_publication_fixture(&c, &mut input);
-    let refusal = call(&c,Operation::SubmitTask{operation_id:"missing-target-task".into(),input}).await;
+    let refusal = call(&c,Operation::SubmitTask{operation_id:"missing-target-task".into(),input: (input).into()}).await;
     assert_eq!(code(refusal.clone()),"publication_configuration","{refusal:?}");
     let selected=selection(&reg,vec![p::Action::PublishBranch]);
     assert!(p::validate("collab_pull_request_open",&json!({"publication_id":"x","title":"title","body":"body"}),c.limits(),Some(&selected)).is_err());

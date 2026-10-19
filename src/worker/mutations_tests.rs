@@ -379,7 +379,7 @@ impl Fixture {
         match self
             .call(Operation::SubmitTask {
                 operation_id: id.into(),
-                input: input(id),
+                input: (input(id)).into(),
             })
             .await
         {
@@ -500,9 +500,9 @@ fn control() -> (Control, watch::Sender<bool>) {
             deadline_ms: process::now_ms() + 60_000,
             cancel: rx,
             runtime_limits: crate::worker::test_limits(),
-            worker_limits: Arc::new(crate::worker::test_limits().worker.clone()),
+            worker_limits: Arc::from(crate::worker::test_limits().worker.clone()),
             validation_runtime: Arc::new(
-                crate::native::ValidationRuntime::new(Arc::new(
+                crate::native::ValidationRuntime::new(Arc::from(
                     crate::worker::test_limits().worker.clone(),
                 ))
                 .unwrap(),
@@ -515,7 +515,7 @@ fn control() -> (Control, watch::Sender<bool>) {
 async fn required_report_native(
     f: &Fixture,
     lifetime_ms: u64,
-) -> (Reporter, TaskInput, Control, watch::Sender<bool>) {
+) -> (Reporter, Box<TaskInput>, Control, watch::Sender<bool>) {
     native_report_fixture(f, lifetime_ms, true).await
 }
 
@@ -523,7 +523,7 @@ async fn native_report_fixture(
     f: &Fixture,
     lifetime_ms: u64,
     completed_request: bool,
-) -> (Reporter, TaskInput, Control, watch::Sender<bool>) {
+) -> (Reporter, Box<TaskInput>, Control, watch::Sender<bool>) {
     let mut task = input("required-report-agent");
     task.definition.executor = ExecutorKind::Native;
     task.repository = None;
@@ -531,7 +531,7 @@ async fn native_report_fixture(
     task.output_schema = Some(json!({"type":"integer"}));
     task.limits.deadline_unix_ms = process::now_ms() + lifetime_ms;
     let submitted = f.call(Operation::SubmitTask {
-        operation_id: "required-report-submit".into(), input: task,
+        operation_id: "required-report-submit".into(), input: (task).into(),
     }).await;
     assert!(matches!(&submitted, Outcome::Ok { data: Data::Task(_) }),
         "native fixture admission: {submitted:?}");

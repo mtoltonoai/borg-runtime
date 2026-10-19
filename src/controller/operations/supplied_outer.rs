@@ -308,10 +308,8 @@ pub(crate) fn observe(
                             || !matches!(
                                 begin.outcome,
                                 Outcome::Ok {
-                                    data: Data::Completion(
-                                        crate::governance_completion::CompletionOutcome::Begun(_)
-                                    )
-                                }
+                                    data: Data::Completion(ref completion)
+                            } if matches!(completion.as_ref(), crate::governance_completion::CompletionOutcome::Begun(_))
                             )
                         {
                             return refuse(
@@ -645,10 +643,8 @@ fn validate_retained(tx: &Connection<'_>, report: &Report, o: &Outer, revision: 
                         || !matches!(
                             begin.outcome,
                             Outcome::Ok {
-                                data: Data::Completion(
-                                    crate::governance_completion::CompletionOutcome::Begun(_)
-                                )
-                            }
+                                data: Data::Completion(ref completion)
+                            } if matches!(completion.as_ref(), crate::governance_completion::CompletionOutcome::Begun(_))
                         )
                     {
                         return Err(Fault::Store("supplied completion original differs".into()));
@@ -766,7 +762,7 @@ pub(crate) fn validate_existing(
                 }
                 let id: String = row.get(0)?;
                 let session = super::super::sessions::get(tx, &id)?;
-                if contract::input_uses(&super::super::sessions::input(tx, &session)?) {
+                if contract::input_uses(super::super::sessions::input(tx, &session)?.as_ref()) {
                     return Err(Fault::Store(
                         "supplied retry historical input requires schema25".into(),
                     ));

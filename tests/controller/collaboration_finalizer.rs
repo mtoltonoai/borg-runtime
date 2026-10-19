@@ -40,7 +40,10 @@ async fn work(c: &Controller, id: &str) -> WorkView {
 }
 async fn question(c: &Controller, id: &str) -> QuestionView {
     match call(c, Operation::QueryQuestion { query: QuestionQuery::Get { question_id: id.into() } }).await {
-        Outcome::Ok { data: Data::QuestionQuery(QuestionQueryResult::Question(view)) } => view,
+        Outcome::Ok { data: Data::QuestionQuery(value) } => match *value {
+            QuestionQueryResult::Question(view) => view,
+            other => panic!("question view expected: {other:?}"),
+        },
         other => panic!("question expected: {other:?}"),
     }
 }

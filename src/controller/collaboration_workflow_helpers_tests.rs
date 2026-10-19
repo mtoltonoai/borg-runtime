@@ -53,7 +53,7 @@ fn fixture_task(tx: &StoreContext<'_>) -> database::StoredTask {
     let session = Session { id: "session".into(), agent_id: definition.id.clone(), definition,
         task_id: "task".into() };
     super::super::sessions::insert(tx, &session, 1).unwrap();
-    let t = Task { id: "task".into(), session_id: "session".into(), input,
+    let t = Task { id: "task".into(), session_id: "session".into(), input: input.into(),
         assigned_agent_id: "agent".into(), status: TaskStatus::Queued, revision: 1,
         attempt: None, selected_checkpoint: None, result: None, blocked_reason: None, pending_assignment: None, native_retry_block: None,
         progress: String::new(), recent_output: String::new(), output_truncated: false,
@@ -81,7 +81,7 @@ fn observation(r: &AcceptedResult) -> Observation {
         validation: r.validation.clone(), output: r.output.clone() }
 }
 fn accept_fixture(tx: &StoreContext<'_>, t: &mut database::StoredTask, r: &AcceptedResult) -> (u64, u64) {
-    t.task.status = TaskStatus::Succeeded; t.task.result = Some(r.clone()); t.executor_success = Some(true);
+    t.task.status = TaskStatus::Succeeded; t.task.result = Some(Box::new(r.clone())); t.executor_success = Some(true);
     database::save(tx, t, "worker_observation", &observation(r)).unwrap();
     let seq: i64 = tx.query_row("SELECT MAX(seq) FROM history", [], |r| r.get(0)).unwrap();
     (seq as u64, t.task.revision)

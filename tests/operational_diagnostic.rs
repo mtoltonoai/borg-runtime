@@ -58,8 +58,8 @@ impl Lab {
         reply.validate_for(&command).unwrap();reply
     }
     async fn get(&self,id:&str)->Task { task(&self.x(Operation::GetTask{task_id:id.into()}).await) }
-    async fn submit(&self,input:TaskInput)->Task {
-        task(&self.x(Operation::SubmitTask{operation_id:unique("submit"),input}).await)
+    async fn submit(&self,input:impl Into<Box<TaskInput>>)->Task {
+        task(&self.x(Operation::SubmitTask{operation_id:unique("submit"),input: (input).into()}).await)
     }
     async fn start(&self,t:&Task)->Actor {
         let r=self.x(Operation::AwaitCommands{operation_id:unique("await"),worker_id:self.worker.id.clone(),incarnation:self.worker.incarnation.clone(),acknowledged:vec![]}).await;

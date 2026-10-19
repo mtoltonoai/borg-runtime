@@ -116,7 +116,7 @@ async fn native_task(lab:&Lab,source:&Task)->Task {
         // the larger provider request includes its catalogue and context framing.
         native.json_nodes=65_536;
     input.definition.limit_overrides=Some(Box::new(borg_runtime::limits::ExecutionLimitOverrides{native:Some(native),..Default::default()}));
-    task(lab.client.call(Operation::SubmitTask{operation_id:"native-publication-submit".into(),input}).await.unwrap())
+    task(lab.client.call(Operation::SubmitTask{operation_id:"native-publication-submit".into(),input: (input).into()}).await.unwrap())
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
@@ -208,7 +208,7 @@ async fn coding_case(lose_create:bool,token:bool) {
     let mut lab=Lab::new(if lose_create{"publication-mcp-pr-lost-ack"}else if token{"publication-mcp-coding-success"}else{"publication-mcp-missing-token"}).await;
     let remote=remote(&lab);let mut provider=Provider::start(lab.root.clone(),remote.clone(),lose_create).await;let source=source(&mut lab,remote.clone(),&provider.url,None).await;
     let mut input=lab.input("publication-coding-agent");input.definition.execution_profile=Some(selected(&source));input.dependencies=vec![source.id.clone()];input.limits.model_requests=10;
-    let root=task(lab.client.call(Operation::SubmitTask{operation_id:"coding-publication-submit".into(),input}).await.unwrap());
+    let root=task(lab.client.call(Operation::SubmitTask{operation_id:"coding-publication-submit".into(),input: (input).into()}).await.unwrap());
     let fixture=lab.root.join("publication-coding.py");fs::write(&fixture,CODING_PEER).unwrap();fs::set_permissions(&fixture,fs::Permissions::from_mode(0o700)).unwrap();save(fixture.with_extension("json"),&json!({"port":lab.gate.local_addr().unwrap().port(),"publish":args(&source),"expected":if token{"completed"}else{"refused"}}));
     let first_worker=coding_worker(&mut lab,"one",token);let branch=lab.gate().await;assert_eq!(branch.observed["phase"],"branch");assert_eq!(branch.observed["child_env_clean"],true);let admitted=public(&branch.observed["reply"]);assert_eq!(admitted.branch.state,p::State::Pending);
     let current=lab.get(&root.id).await;let caller=actor(&current);let branch_view=wait_status(&lab.client,&caller,&admitted.publication_id,false,p::State::Completed).await;

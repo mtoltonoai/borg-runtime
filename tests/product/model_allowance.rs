@@ -204,7 +204,7 @@ async fn workflow_child_default_uses_largest_applicable_reservation_without_over
             parent_task_id: parent.id.clone(),
             parent_attempt_id: attempt.id.clone(),
             generation: attempt.generation,
-            child: child.clone(),
+            child: (child.clone()).into(),
         },
     )
     .await

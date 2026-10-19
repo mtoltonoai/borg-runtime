@@ -286,7 +286,7 @@ impl Lab {
             &api,
             Operation::SubmitTask {
                 operation_id: "submit-rate".into(),
-                input,
+                input: (input).into(),
             },
         )
         .await

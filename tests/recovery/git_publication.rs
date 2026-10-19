@@ -158,7 +158,7 @@ async fn actual_git_ref_lock_failure_requires_original_readback_before_retry() {
     fs::remove_file(&lock).unwrap();
     let (_cancel, receiver) = tokio::sync::watch::channel(false);
     let runtime_limits = accepted_limits(&assigned);
-    let worker_limits = Arc::new(lab.limits.worker.clone());
+    let worker_limits: Arc<borg_runtime::limits::WorkerLimits> = Arc::from(lab.limits.worker.clone());
     let control = Control {
         runtime_limits,
         worker_limits: worker_limits.clone(),

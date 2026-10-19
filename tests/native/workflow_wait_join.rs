@@ -225,8 +225,9 @@ async fn self_wait_scenario(with_charter: bool) {
         }};
         let reply = api.call(operation.clone()).await.unwrap();
         reply.validate_for(&operation).unwrap();
-        let Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Turn(turn)) } = reply.outcome
+        let Outcome::Ok { data: Data::CharterQuery(result) } = reply.outcome
         else { panic!("original self-wait charter turn unavailable: {reply:?}") };
+        let CharterQueryResult::Turn(turn) = *result else { panic!("original self-wait charter turn unavailable") };
         assert_eq!(turn.boundary.caller, call.caller);
         assert_eq!(turn.boundary.session_id, task.session_id);
         assert_eq!(turn.boundary.request_index, 1);
@@ -334,8 +335,9 @@ async fn self_wait_scenario(with_charter: bool) {
         }};
         let reply = api.call(operation.clone()).await.unwrap();
         reply.validate_for(&operation).unwrap();
-        let Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Turn(turn)) } = reply.outcome
+        let Outcome::Ok { data: Data::CharterQuery(result) } = reply.outcome
         else { panic!("fresh self-wait charter turn unavailable: {reply:?}") };
+        let CharterQueryResult::Turn(turn) = *result else { panic!("fresh self-wait charter turn unavailable") };
         assert_eq!(turn.boundary.caller.attempt_id, fresh.id);
         assert_eq!(turn.boundary.caller.generation, fresh.generation);
         assert_eq!(turn.boundary.session_id, task.session_id);
@@ -442,8 +444,9 @@ async fn self_wait_scenario(with_charter: bool) {
         assert_eq!(observation, CharterObservation::CompleteTurn {
             turn_id: turn.boundary.turn_id.clone(), results: turn.delivered_results.clone(),
         });
-        let Outcome::Ok { data: Data::Charter(CharterOutcome::Turn(stored_turn)) } = closure_outcome
+        let Outcome::Ok { data: Data::Charter(result) } = closure_outcome
         else { panic!("original self-wait closure did not commit") };
+        let CharterOutcome::Turn(stored_turn) = *result else { panic!("original self-wait closure did not commit") };
         assert_eq!(&stored_turn, turn);
         assert!(wait_revision < closure_revision && closure_revision < stop_revision,
             "original wait result and charter closure must precede physical stop and successor admission");

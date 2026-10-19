@@ -215,7 +215,7 @@ async fn genuine_schema16_migrates_in_place_and_old_reader_refuses_schema18_with
             definition:Definition {charter:None,limit_overrides:None,execution_profile:Some(ExecutionProfile::CollaborationV1{web_search:None}),inference:Some(InferenceSettings::selected()),id:"schema16-owner".into(),revision:"original-1".into(),executor:ExecutorKind::Native},
             repository:None,acceptance_commands:vec![],output_schema:Some(serde_json::json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false})),
             limits:Limits {deadline_unix_ms:process::now_ms()+600000,model_requests:3,output_bytes:16384,result_bytes:limits.task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None};
-        let submit=Operation::SubmitTask {operation_id:"schema16-submit".into(),input};
+        let submit=Operation::SubmitTask {operation_id:"schema16-submit".into(),input: (input).into()};
         let submitted=old_call(&client,&address,submit.clone()).await;
         let task=match &submitted.outcome {Outcome::Ok{data:Data::Task(t)}=>t,_=>panic!("{submitted:?}")};
         let cancel=Operation::CancelTask {operation_id:"schema16-cancel".into(),task_id:task.id.clone(),expected_revision:task.revision};
@@ -279,7 +279,7 @@ async fn historical_wire14_and15_refuse_before_rows_current16_accepts() {
         definition:Definition {charter:None,limit_overrides:None,execution_profile:Some(ExecutionProfile::CollaborationV1{web_search:None}),inference:Some(InferenceSettings::selected()),id:"output-wire-owner".into(),revision:"original-1".into(),executor:ExecutorKind::Native},
         repository:None,acceptance_commands:vec![],output_schema:Some(serde_json::json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false})),
         limits:Limits {deadline_unix_ms:process::now_ms()+600000,model_requests:3,output_bytes:16384,result_bytes:limits.task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None};
-    let submit=Operation::SubmitTask {operation_id:"output-wire-original-submit".into(),input};
+    let submit=Operation::SubmitTask {operation_id:"output-wire-original-submit".into(),input: (input).into()};
     let who=Caller {task_id:"unadmitted-task".into(),attempt_id:"unadmitted-attempt".into(),generation:1,worker_id:"unadmitted-worker".into(),incarnation:"one".into()};
     let reference=CharterOutputReference {request_id:"unadmitted-request".into(),bytes:4,sha256:aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256,b"null").as_ref().iter().map(|b|format!("{b:02x}")).collect(),chunk_bytes:4,chunks:1};
     let commands=[submit.clone(),

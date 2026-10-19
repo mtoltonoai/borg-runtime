@@ -326,7 +326,7 @@ async fn fixture(label: &str) -> Fixture {
     let task = Task {
         id: reporter.attempt.task_id.clone(),
         session_id: reporter.attempt.session_id.clone(),
-        input: input.clone(),
+        input: (input.clone()).into(),
         assigned_agent_id: input.definition.id.clone(),
         status: TaskStatus::Active,
         revision: 3,

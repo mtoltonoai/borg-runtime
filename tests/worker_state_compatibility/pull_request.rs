@@ -86,7 +86,7 @@ async fn genuine_schema19_preserves_original_receipts_and_pending_generic_pr_the
         repository: None, acceptance_commands: vec![], output_schema: Some(json!({"type":"integer"})),
         limits: Limits { deadline_unix_ms: process::now_ms() + 600_000, model_requests: 3, output_bytes: 16384,
             result_bytes: limits.task_defaults.result_bytes, max_delegation_depth: 4 }, dependencies: vec![], native_workflow: None };
-    let submitted = original(&client, &address, Operation::SubmitTask { operation_id: "prior-submit".into(), input }, &mut saved).await;
+    let submitted = original(&client, &address, Operation::SubmitTask { operation_id: "prior-submit".into(), input: (input).into() }, &mut saved).await;
     let Outcome::Ok { data: Data::Task(task) } = submitted.outcome else { unreachable!() };
     original(&client, &address, Operation::RegisterWorker { operation_id: "prior-register".into(),
         worker: Worker { id: "prior-worker".into(), incarnation: "one".into(), coding_capacity: 0, native_capacity: 1 } }, &mut saved).await;

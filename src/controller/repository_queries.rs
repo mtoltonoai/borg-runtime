@@ -14,7 +14,7 @@ use std::{sync::Arc, time::Duration};
 pub(super) use crate::repository_view::SourceSelector as Selector;
 #[derive(Debug, Clone, PartialEq)]
 struct Binding {
-    input: TaskInput,
+    input: Box<TaskInput>,
     assigned_agent: String,
     // Including the exact full checkpoint prevents a newer publication with
     // equal commit bytes from being mistaken for the original selected source.
@@ -37,7 +37,8 @@ enum Completion {
     Finished(Result<repository_view::Output, repository_read::Error>),
 }
 pub(super) struct Proof {
-    ticket: Ticket,
+    // Preserve the allocation supplied by the controller's preflight boundary.
+    ticket: Box<Ticket>,
     completion: Completion,
 }
 
@@ -328,14 +329,14 @@ fn require_bound(
     }
 }
 impl Ticket {
-    pub fn no_capacity(self) -> Proof {
+    pub fn no_capacity(self: Box<Self>) -> Proof {
         Proof {
             ticket: self,
             completion: Completion::Capacity,
         }
     }
     pub async fn execute(
-        self,
+        self: Box<Self>,
         config: &repository_read::Config,
         clock: &Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Proof {

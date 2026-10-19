@@ -162,7 +162,7 @@ fn retain_outcome(host: &Host, name: &str, request: Operation, observation: Deli
     let path = host.directory.join(name);
     let operation_id = mutation_identity(&request).unwrap().0.to_owned();
     let mut journal = mutations::create(&path, request, 0, host.client.limits()).unwrap();
-    journal.outcome = Some(Outcome::Ok { data: Data::CollaborationDelivery(observation) });
+    journal.outcome = Some(Outcome::Ok { data: Data::CollaborationDelivery(Box::new(observation)) });
     journal.outcome_context = Some(CommitContext {
         commit: MutationCommit { operation_id, controller_revision: 17 },
         observed_controller_revision: 17,
@@ -1299,7 +1299,7 @@ async fn lost_completion_ack_uses_one_exact_lookup_without_widening_other_mutati
         };
         value.acknowledged = Some(CompletionInputAck { operation_id: ack.operation_id.clone(), consumed_at: ack.consumed_at.clone(),
             delivery_ack_operation_id: ack.delivery_ack_operation_id.clone(), native_input: ack.native_input.clone() });
-        let outcome = Outcome::Ok { data: Data::Completion(CompletionOutcome::InputAcknowledged(value)) };
+        let outcome = Outcome::Ok { data: Data::Completion(Box::new(CompletionOutcome::InputAcknowledged(value))) };
         let request = if mode == "non-ack" {
             Operation::RegisterWorker { operation_id: "original-registration".into(), worker: Worker {
                 id: "worker".into(), incarnation: "one".into(), coding_capacity: 0, native_capacity: 1,

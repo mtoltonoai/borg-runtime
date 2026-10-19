@@ -25,7 +25,7 @@ impl OutputProxy {
                     if h.load(Ordering::SeqCst)&&d.load(Ordering::SeqCst)&&(chunk||lookup){return Ok::<_,io::Error>(Response::builder().status(503).body(Full::new(Bytes::new())).unwrap())}
                     let mut forward=client.post(format!("{upstream}{path}")).header("content-type","application/json").body(bytes.to_vec());if let Some(c)=caller{forward=forward.header("x-borg-caller",c);}if let Some(v)=version{forward=forward.header("mcp-protocol-version",v);}let response=forward.send().await.map_err(io::Error::other)?;
                     let status=response.status();let bytes=response.bytes().await.map_err(io::Error::other)?;
-                    if chunk{let result:Reply=serde_json::from_slice(&bytes).expect("canonical chunk reply");assert!(status.is_success(),"chunk HTTP {status}");assert!(matches!(&result.outcome,Outcome::Ok{data:Data::Charter(CharterOutcome::OutputChunk(_))}),"chunk outcome {:?}",result.outcome);assert_eq!(result.commit.as_ref().map(|c|c.operation_id.as_str()),value["input"]["operation_id"].as_str(),"held ACK must be the committed original chunk");}
+                    if chunk{let result:Reply=serde_json::from_slice(&bytes).expect("canonical chunk reply");assert!(status.is_success(),"chunk HTTP {status}");assert!(matches!(&result.outcome,Outcome::Ok{data:Data::Charter(result)} if matches!(result.as_ref(), CharterOutcome::OutputChunk(_))),"chunk outcome {:?}",result.outcome);assert_eq!(result.commit.as_ref().map(|c|c.operation_id.as_str()),value["input"]["operation_id"].as_str(),"held ACK must be the committed original chunk");}
                     if chunk&&h.load(Ordering::SeqCst)&&!d.swap(true,Ordering::SeqCst){return Ok(Response::builder().status(503).body(Full::new(Bytes::new())).unwrap())}
                     if let Some(report)=result_report{if status.is_success(){let reply:Reply=serde_json::from_slice(&bytes).expect("canonical ResultCandidate reply");if matches!(&reply.outcome,Outcome::Ok{..}){
                         reply.validate_for(&Operation::ObserveWorker{report:report.clone()}).unwrap();assert_eq!(reply.commit.as_ref().map(|c|c.operation_id.as_str()),Some(report.report_id.as_str()));
@@ -110,7 +110,7 @@ async fn scenario(restart:bool){
     }
     let turn=loop{
         let value=api.call(Operation::QueryCharter{query:CharterQuery::Turns{session_id:task.session_id.clone(),after:None,limit:1}}).await.unwrap();
-        if let Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Turns(page))}=value.outcome{assert!(page.next_cursor.is_none());if let Some(v)=page.items.first().filter(|v|v.reply.is_some()){break v.clone()}}
+        if let Outcome::Ok{data:Data::CharterQuery(result)}=value.outcome{if let CharterQueryResult::Turns(page)=*result{assert!(page.next_cursor.is_none());if let Some(v)=page.items.first().filter(|v|v.reply.is_some()){break v.clone()}}}
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     turn
@@ -133,7 +133,7 @@ async fn scenario(restart:bool){
         assert_eq!(record.id,report.report_id);assert_eq!(record.intended,serde_json::to_value(Operation::ObserveWorker{report}).unwrap());assert_eq!(record.outcome,Some(serde_json::to_value(&committed.outcome).unwrap()));assert_eq!(peer.count(),1);
     }
     let reply=turn.reply.as_ref().unwrap();assert!(reply.observation.output.is_none());let reference=reply.observation.output_reference.as_ref().unwrap();assert_eq!(reference.bytes,expected.len()as u64);
-    let mut bytes=Vec::new();for index in 0..reference.chunks{let value=api.call(Operation::QueryCharter{query:CharterQuery::OutputChunk{request_id:turn.boundary.turn_id.clone(),index}}).await.unwrap();let Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::OutputChunk(chunk))}=value.outcome else{panic!("chunk query differs")};assert_eq!(&chunk.reference,reference);assert_eq!(chunk.index,index);bytes.extend(unhex(&chunk.data));}
+    let mut bytes=Vec::new();for index in 0..reference.chunks{let value=api.call(Operation::QueryCharter{query:CharterQuery::OutputChunk{request_id:turn.boundary.turn_id.clone(),index}}).await.unwrap();let Outcome::Ok{data:Data::CharterQuery(result)}=value.outcome else{panic!("chunk query differs")};let CharterQueryResult::OutputChunk(chunk)=*result else{panic!("chunk query differs")};assert_eq!(&chunk.reference,reference);assert_eq!(chunk.index,index);bytes.extend(unhex(&chunk.data));}
     assert_eq!(bytes,expected);assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(),original);assert_eq!(peer.count(),1);
     let original_receipt=api.call(Operation::GetOperation{operation_id:reply.reply_id.clone()}).await.unwrap();assert!(serde_json::to_vec(&original_receipt).unwrap().len()<64*1024);
     if restart{assert!(matches!(memory(&api).await,Outcome::Ok{data:Data::Memory(None)}));let call=borg_runtime::native_loop_contract::call_operation_id(&turn.boundary.caller.attempt_id,1,1);assert!(matches!(api.call(Operation::GetOperation{operation_id:call}).await.unwrap().outcome,Outcome::Refused{ref code,..}if code=="not_found"));}

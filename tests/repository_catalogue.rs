@@ -164,7 +164,7 @@ async fn submit(c: &Controller, value: TaskInput) -> Task {
             c,
             Operation::SubmitTask {
                 operation_id: id("submit"),
-                input: value,
+                input: (value).into(),
             },
         )
         .await,
@@ -337,7 +337,7 @@ async fn admission_rejects_missing_or_forged_projection_and_retains_r1_after_r2_
             &c,
             Operation::SubmitTask {
                 operation_id: id("missing"),
-                input: missing,
+                input: (missing).into(),
             },
         )
         .await,
@@ -350,7 +350,7 @@ async fn admission_rejects_missing_or_forged_projection_and_retains_r1_after_r2_
             &c,
             Operation::SubmitTask {
                 operation_id: id("forged"),
-                input: forged,
+                input: (forged).into(),
             },
         )
         .await,
@@ -391,7 +391,7 @@ async fn admission_rejects_missing_or_forged_projection_and_retains_r1_after_r2_
             &c,
             Operation::SubmitTask {
                 operation_id: id("stale-input"),
-                input: supplied,
+                input: (supplied).into(),
             },
         )
         .await,
@@ -414,7 +414,7 @@ async fn admission_rejects_missing_or_forged_projection_and_retains_r1_after_r2_
             &c,
             Operation::SubmitTask {
                 operation_id: id("disabled-input"),
-                input: input(second.binding(), &"b".repeat(40), true),
+                input: (input(second.binding(), &"b".repeat(40), true)).into(),
             },
         )
         .await,
@@ -774,7 +774,7 @@ async fn configured_child_keeps_parent_admission_revision_after_revise_and_disab
                 parent_task_id: parent.id,
                 parent_attempt_id: attempt.id,
                 generation: attempt.generation,
-                child,
+                child: (child).into(),
             },
         )
         .await,

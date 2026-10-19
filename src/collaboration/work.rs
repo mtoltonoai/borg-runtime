@@ -52,7 +52,7 @@ pub struct WorkflowWait {
 #[serde(deny_unknown_fields)]
 pub struct WorkView {
     /// One transaction's execution observation; no separate GetTask race.
-    pub task: Task,
+    pub task: Box<Task>,
     /// Zero is an existing task with no coordination mutation yet.
     pub coordination_revision: u64,
     pub responsible_owner: PrincipalRef,

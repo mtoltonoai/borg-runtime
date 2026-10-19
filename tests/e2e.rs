@@ -185,7 +185,7 @@ async fn real_coding_checkpoint_and_controller_restart() {
         client
             .call(Operation::SubmitTask {
                 operation_id: "e2e-submit-1".into(),
-                input,
+                input: (input).into(),
             })
             .await
             .unwrap(),

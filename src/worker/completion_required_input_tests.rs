@@ -54,7 +54,7 @@ async fn native_reader(f: &ScanFixture) -> (Task, Caller) {
             output_bytes:4096, result_bytes:f.limits.task_defaults.result_bytes, max_delegation_depth:1 },
         dependencies:vec![], native_workflow:None,
     };
-    let task = match request(f, Operation::SubmitTask { operation_id:occurrence("completion-submit"), input }).await.outcome {
+    let task = match request(f, Operation::SubmitTask { operation_id:occurrence("completion-submit"), input: (input).into() }).await.outcome {
         Outcome::Ok { data:Data::Task(task) } => *task,
         other => panic!("native task expected: {other:?}"),
     };
@@ -136,7 +136,7 @@ async fn close(f: &ScanFixture, question: &Question) -> WorkflowActivity {
 
 async fn observe(f: &ScanFixture, actor: &Caller) -> DeliveryObservation {
     match request(f, Operation::ObserveCollaborationDelivery { caller:actor.clone(), limit:8 }).await.outcome {
-        Outcome::Ok { data:Data::CollaborationDelivery(view) } => view,
+        Outcome::Ok { data:Data::CollaborationDelivery(view) } => *view,
         other => panic!("actual workflow delivery expected: {other:?}"),
     }
 }

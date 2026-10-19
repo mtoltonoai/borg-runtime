@@ -75,7 +75,7 @@ impl Fixture {
             repository:Some(Repository{registration:Some(registration.binding()),url:String::new(),checkpoint_remote:String::new(),start_commit:"a".repeat(40),pull_request_target:None}),
             acceptance_commands:vec![vec!["controlled-check".into()]],output_schema:None,
             limits:Limits{deadline_unix_ms:10_000,model_requests:2,output_bytes,result_bytes:limits.task_defaults.result_bytes,max_delegation_depth:1},dependencies:vec![],native_workflow:None };
-        data(direct(&controller,Operation::SubmitTask{operation_id:"submit".into(),input}).await);
+        data(direct(&controller,Operation::SubmitTask{operation_id:"submit".into(),input: (input).into()}).await);
         data(direct(&controller,Operation::RegisterWorker{operation_id:"register-worker".into(),worker:Worker{id:"worker".into(),incarnation:"one".into(),coding_capacity:1,native_capacity:0}}).await);
         let Data::Commands(commands)=data(direct(&controller,Operation::AwaitCommands{operation_id:"launch".into(),worker_id:"worker".into(),incarnation:"one".into(),acknowledged:vec![]}).await) else {panic!("commands")};
         let command=commands.into_iter().find(|v|matches!(v,WorkerCommand::RunAttempt{..})).unwrap();
@@ -155,8 +155,8 @@ impl Fixture {
     }
     fn control(&self)->(Control,watch::Sender<bool>) {
         let (sender,cancel)=watch::channel(false);
-        (Control{deadline_ms:process::now_ms()+60_000,cancel,runtime_limits:self.limits.clone(),worker_limits:Arc::new(self.limits.worker.clone()),
-            validation_runtime:Arc::new(crate::native::ValidationRuntime::new(Arc::new(self.limits.worker.clone())).unwrap())},sender)
+        (Control{deadline_ms:process::now_ms()+60_000,cancel,runtime_limits:self.limits.clone(),worker_limits:Arc::from(self.limits.worker.clone()),
+            validation_runtime:Arc::new(crate::native::ValidationRuntime::new(Arc::from(self.limits.worker.clone())).unwrap())},sender)
     }
     fn completed(&self) {
         let path=self.state.join("commands/launch.json");
@@ -164,7 +164,7 @@ impl Fixture {
     }
     async fn recover(&self) -> Result<(),String> {
         recover(&self.config,&self.state,&None,&Arc::new(tokio::sync::Mutex::new(())),
-            &Arc::new(crate::native::ValidationRuntime::new(Arc::new(self.limits.worker.clone())).unwrap())).await
+            &Arc::new(crate::native::ValidationRuntime::new(Arc::from(self.limits.worker.clone())).unwrap())).await
     }
     async fn current(&self) -> Task {
         match data(direct(&self.controller,Operation::GetTask{task_id:context(&self.command).unwrap().0.task_id.clone()}).await) {
@@ -334,7 +334,7 @@ async fn publication_mcp_settlement_coexists_with_legacy_phase_without_accepting
     let id=p::publication_id(&invocation.operation_id).unwrap();
     let head=contract::prepare_publication_head(p::Binding{publication_id:id.clone(),admission_operation_id:invocation.operation_id.clone(),
         requester:p::Requester{caller,session_id:session.id.clone()},source,selection:selected},target(),&Bounds::from_limits(&f.limits)).unwrap();
-    let request=p::Command{invocation,session:session.clone(),attempt:attempt.clone(),input:task.clone(),head,create:None};
+    let request=p::Command{invocation,session:session.as_ref().clone(),attempt:attempt.clone(),input:task.as_ref().clone(),head,create:None};
     request.validate(&id).unwrap();
     let mut effect=Effect::new(request.effect(&f.limits).unwrap()).unwrap();
     effect.prepare_commit=Some(MutationCommit{operation_id:effect.intended.id.clone(),controller_revision:2});

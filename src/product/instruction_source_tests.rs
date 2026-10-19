@@ -36,7 +36,7 @@ fn workflow(input: &TaskInput) -> Value {
 fn task(input: TaskInput) -> Task {
     Task {
         id: "instruction-task".into(), session_id: "instruction-session".into(),
-        assigned_agent_id: input.definition.id.clone(), input, status: TaskStatus::Queued,
+        assigned_agent_id: input.definition.id.clone(), input: Box::new(input), status: TaskStatus::Queued,
         revision: 1, attempt: None, selected_checkpoint: None, result: None,
         blocked_reason: None, pending_assignment: None, native_retry_block: None, progress: String::new(),
         recent_output: String::new(), output_truncated: false, parent_task_id: None,
@@ -266,7 +266,7 @@ async fn instruction_post_resolves_only_registered_sources_and_replays_original_
     let original = Box::pin(call(&controller, Operation::GetOperation { operation_id: "instruction-submit".into() })).await;
     let Outcome::Ok { data: Data::Operation(ref record) } = original.outcome else { panic!("original task receipt absent: {original:?}"); };
     assert_eq!(record.intended, serde_json::to_value(Operation::SubmitTask {
-        operation_id: "instruction-submit".into(), input: task_input(&values, controller.limits()).unwrap(),
+        operation_id: "instruction-submit".into(), input: (task_input(&values, controller.limits()).unwrap()).into(),
     }).unwrap());
     let retained: Outcome = serde_json::from_value(record.outcome.clone().unwrap()).unwrap();
     let Outcome::Ok { data: Data::Task(accepted) } = retained else { panic!("submission did not retain its task"); };

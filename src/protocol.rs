@@ -404,15 +404,15 @@ pub struct PendingAssignment {
 pub struct Task {
     pub id: String,
     pub session_id: String,
-    pub input: TaskInput,
+    pub input: Box<TaskInput>,
     pub assigned_agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_assignment: Option<PendingAssignment>,
+    pub pending_assignment: Option<Box<PendingAssignment>>,
     pub status: TaskStatus,
     pub revision: u64,
     pub attempt: Option<Attempt>,
     pub selected_checkpoint: Option<Checkpoint>,
-    pub result: Option<AcceptedResult>,
+    pub result: Option<Box<AcceptedResult>>,
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_retry_block: Option<crate::native::NativeRetryBlock>,
@@ -421,7 +421,7 @@ pub struct Task {
     pub output_truncated: bool,
     pub parent_task_id: Option<String>,
     pub waiting_child_id: Option<String>,
-    pub completed_child: Option<ChildOutcome>,
+    pub completed_child: Option<Box<ChildOutcome>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChildOutcome {
@@ -446,16 +446,16 @@ pub enum WorkerCommand {
     },
     RunAttempt {
         command_id: String,
-        session: Session,
+        session: Box<Session>,
         attempt: Attempt,
-        task: TaskInput,
+        task: Box<TaskInput>,
         checkpoint: Option<Checkpoint>,
-        continuation: Option<ChildOutcome>,
+        continuation: Option<Box<ChildOutcome>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_continuation: Option<crate::collaboration::workflow::WorkflowContinuation>,
         /// Original held decision carried by a fresh ordinary attempt; not input ACK.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        completion_continuation: Option<crate::governance_completion::CompletionResume>,
+        completion_continuation: Option<Box<crate::governance_completion::CompletionResume>>,
     },
     CollaborationReady {
         command_id: String,
@@ -764,11 +764,11 @@ pub enum Operation {
     },
     SubmitTask {
         operation_id: String,
-        input: TaskInput,
+        input: Box<TaskInput>,
     },
     SubmitTaskDraft {
         operation_id: String,
-        input: TaskDraft,
+        input: Box<TaskDraft>,
     },
     RegisterAgent {
         operation_id: String,
@@ -819,7 +819,7 @@ pub enum Operation {
         parent_task_id: String,
         parent_attempt_id: String,
         generation: u64,
-        child: TaskInput,
+        child: Box<TaskInput>,
     },
     RegisterWorker {
         operation_id: String,
@@ -880,6 +880,8 @@ pub struct Request {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+// Large replies own their payloads on the heap so one variant cannot enlarge
+// every command result, retry item, and serializer temporary. Box is wire-transparent.
 pub enum Data {
     ReadPage(Box<crate::read_page::ReadPage>),
     ReadList(crate::read_page::ReadList),
@@ -894,17 +896,17 @@ pub enum Data {
     NativeRequestSettlement(crate::native_retry::NativeRequestSettlement),
     NativeRequestReadiness { acquire_operation_id: String, changed: bool },
     Governance(Box<crate::governance::GovernanceResult>),
-    Charter(crate::charter::CharterOutcome),
-    CharterQuery(crate::charter::CharterQueryResult),
-    Completion(crate::governance_completion::CompletionOutcome),
-    CollaborationDelivery(crate::collaboration::notifications::DeliveryObservation),
+    Charter(Box<crate::charter::CharterOutcome>),
+    CharterQuery(Box<crate::charter::CharterQueryResult>),
+    Completion(Box<crate::governance_completion::CompletionOutcome>),
+    CollaborationDelivery(Box<crate::collaboration::notifications::DeliveryObservation>),
     WorkflowActivity(crate::collaboration::workflow::WorkflowActivityPage),
-    QuestionMutation(crate::collaboration::questions::QuestionMutationOutcome),
-    QuestionQuery(crate::collaboration::questions::QuestionQueryResult),
+    QuestionMutation(Box<crate::collaboration::questions::QuestionMutationOutcome>),
+    QuestionQuery(Box<crate::collaboration::questions::QuestionQueryResult>),
     DocumentMutation(crate::collaboration::documents::DocumentMutationOutcome),
     DocumentQuery(crate::collaboration::documents::DocumentQueryOutcome),
-    ReviewMutation(crate::collaboration::documents::ReviewMutationOutcome),
-    ReviewQuery(crate::collaboration::documents::ReviewQueryOutcome),
+    ReviewMutation(Box<crate::collaboration::documents::ReviewMutationOutcome>),
+    ReviewQuery(Box<crate::collaboration::documents::ReviewQueryOutcome>),
     WorkQuery(crate::collaboration::work::WorkQueryResult),
     WorkMutation(crate::collaboration::work::WorkMutationOutcome),
     RepositoryRegistration(crate::repository_catalogue::Entry),
@@ -1065,7 +1067,7 @@ impl Reply {
                 (Operation::RetireAgent { agent_id, expected_revision, .. }, Data::Agent(agent)) =>
                     agent.id == *agent_id && agent.definition.revision == *expected_revision && agent.retired,
                 (Operation::RegisterAgent { .. } | Operation::RetireAgent { .. }, _) => false,
-                (Operation::MutateCharter { mutation, .. }, Data::Charter(value)) => match (mutation,value) {
+                (Operation::MutateCharter { mutation, .. }, Data::Charter(value)) => match (mutation,value.as_ref()) {
                     (crate::charter::CharterMutation::Publish { agent_id, expected_definition_revision, .. }, crate::charter::CharterOutcome::Definition(value)) =>
                         value.effect==crate::charter::CharterDefinitionEffect::PublicationOnly && value.definition.id==*agent_id && value.previous_revision==*expected_definition_revision,
                     (crate::charter::CharterMutation::SelectForFutureTasks { agent_id, expected_definition_revision, .. }, crate::charter::CharterOutcome::Definition(value)) =>
@@ -1073,7 +1075,7 @@ impl Reply {
                     (crate::charter::CharterMutation::SetPending { .. },crate::charter::CharterOutcome::Session(_)) => true,
                     _=>false,
                 },
-                (Operation::ObserveCharter { .. }, Data::Charter(crate::charter::CharterOutcome::Definition(_))) => false,
+                (Operation::ObserveCharter { .. }, Data::Charter(value)) if matches!(value.as_ref(), crate::charter::CharterOutcome::Definition(_)) => false,
                 (Operation::ObserveCharter { .. }, Data::Charter(_))
                 | (Operation::QueryCharter { .. }, Data::CharterQuery(_)) => true,
                 (Operation::MutateCharter { .. } | Operation::ObserveCharter { .. } | Operation::QueryCharter { .. }, _)

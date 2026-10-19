@@ -82,7 +82,7 @@ fn pose_input(task_id: &str) -> PoseQuestion {
 }
 async fn question_mutation(c: &Controller, id: &str, mutation: QuestionMutation) -> QuestionMutationOutcome {
     match call(c, Operation::MutateQuestion { operation_id: id.into(), mutation }).await {
-        Outcome::Ok { data: Data::QuestionMutation(out) } => out,
+        Outcome::Ok { data: Data::QuestionMutation(out) } => *out,
         x => panic!("question mutation expected: {x:?}"),
     }
 }
@@ -91,7 +91,10 @@ async fn pose(c: &Controller, id: &str, task_id: &str) -> Question {
 }
 async fn question(c: &Controller, id: &str) -> QuestionView {
     match call(c, Operation::QueryQuestion { query: QuestionQuery::Get { question_id: id.into() } }).await {
-        Outcome::Ok { data: Data::QuestionQuery(QuestionQueryResult::Question(view)) } => view,
+        Outcome::Ok { data: Data::QuestionQuery(value) } => match *value {
+            QuestionQueryResult::Question(view) => view,
+            other => panic!("question view expected: {other:?}"),
+        },
         x => panic!("question view expected: {x:?}"),
     }
 }
@@ -317,7 +320,7 @@ async fn existing_delegation_parent_edge_participates_in_wait_cycle_check() {
     child_input.limits.model_requests = 2;
     let child = task(call(&c, Operation::DelegateTask {
         operation_id: "parent-cycle-delegate".into(), parent_task_id: parent.id.clone(),
-        parent_attempt_id: a.id.clone(), generation: a.generation, child: child_input,
+        parent_attempt_id: a.id.clone(), generation: a.generation, child: (child_input).into(),
     }).await);
     assert_eq!(child.parent_task_id.as_deref(), Some(parent.id.as_str()));
     let before = work(&c, &child.id).await;
@@ -562,7 +565,9 @@ async fn review_rejection_resolves_exact_review_wait_without_task_acceptance() {
     let review = match call(&c, Operation::MutateReview { operation_id: "review-request".into(), mutation: ReviewMutation::Request {
         target: target.clone(), reviewer: PrincipalRef::TrustedHostOperator, summary: "Assess exact document".into(),
     }}).await {
-        Outcome::Ok { data: Data::ReviewMutation(ReviewMutationOutcome::Review(view)) } => view.review,
+        Outcome::Ok { data: Data::ReviewMutation(value) } => match *value {
+            ReviewMutationOutcome::Review(view) => view.review,
+        },
         x => panic!("review expected: {x:?}"),
     };
     add(&c, "review-wait", &t.id, 0, ResolverRef::Review { review_id: review.id.clone() }).await;
@@ -570,7 +575,9 @@ async fn review_rejection_resolves_exact_review_wait_without_task_acceptance() {
         review_id: review.id.clone(), expected_revision: review.revision,
         verdict: ReviewVerdict::Rejected, explanation: "Required condition is absent".into(),
     }}).await {
-        Outcome::Ok { data: Data::ReviewMutation(ReviewMutationOutcome::Review(view)) } => view.decision.unwrap(),
+        Outcome::Ok { data: Data::ReviewMutation(value) } => match *value {
+            ReviewMutationOutcome::Review(view) => view.decision.unwrap(),
+        },
         x => panic!("review decision expected: {x:?}"),
     };
     let view = work(&c, &t.id).await;
@@ -673,7 +680,7 @@ fn caller_for(attempt: &Attempt) -> Caller {
 }
 fn delivery(r: &Reply) -> DeliveryObservation {
     match &r.outcome {
-        Outcome::Ok { data: Data::CollaborationDelivery(value) } => value.clone(),
+        Outcome::Ok { data: Data::CollaborationDelivery(value) } => value.as_ref().clone(),
         other => panic!("delivery observation expected: {other:?}"),
     }
 }

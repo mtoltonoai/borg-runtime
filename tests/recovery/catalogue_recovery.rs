@@ -407,7 +407,7 @@ finally:
             lab.client
                 .call(Operation::SubmitTask {
                     operation_id: "joined-disabled-admission".into(),
-                    input: current_input
+                    input: (current_input).into()
                 })
                 .await
                 .unwrap()

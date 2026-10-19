@@ -130,7 +130,7 @@ async fn submit(controller: &Controller, operation: &str, input: TaskInput) -> T
             controller,
             Operation::SubmitTask {
                 operation_id: operation.into(),
-                input,
+                input: (input).into(),
             },
         )
         .await,
@@ -358,7 +358,7 @@ fn bach_generated_duplicate_conflict_traces_preserve_the_first_committed_outcome
                         &controller,
                         Operation::SubmitTask {
                             operation_id: "one-logical-submit".into(),
-                            input: input("agent", *label),
+                            input: (input("agent", *label)).into(),
                         },
                     )
                     .await;

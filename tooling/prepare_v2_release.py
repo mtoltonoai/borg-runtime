@@ -21,7 +21,7 @@ import urllib.parse
 MAX_BODY = 1_048_576
 WIRE_REVISION = 27
 VERIFIER_SHA = "512296740c56d216f8dd2dbe61a05c3aef3749f7aba2630c4ab916ffec02a05b"
-PROTOCOL_SOURCE_SHA = "b615c7929db85c93c6df32537fb544ec7f9a342f4936aea90dc835dbce0bfaa7"
+PROTOCOL_SOURCE_SHA = "1cf2097fe4268ecf3d9c654d8dce4f8cbaaa50402661405cf892978519e0fc34"
 QUALIFICATION = {"artifact": "claimed", "repository_submission": "unconfigured",
                  "checks": "unconfigured", "human_rollout": "unconfigured"}
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")

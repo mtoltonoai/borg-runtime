@@ -316,7 +316,7 @@ while not (root/'release-acceptance').exists():
         limits:Limits{deadline_unix_ms:process::now_ms()+120_000,model_requests:2,output_bytes:16_384,result_bytes:policy.task_defaults.result_bytes,max_delegation_depth:4},
         dependencies:vec![],native_workflow:None,
     };
-    let submitted=call(&api,Operation::SubmitTask{operation_id:"cleanup-submit".into(),input}).await;
+    let submitted=call(&api,Operation::SubmitTask{operation_id:"cleanup-submit".into(),input: (input).into()}).await;
     let Outcome::Ok{data:Data::Task(submitted)}=submitted.outcome else {panic!("submit refused")};
     let mut proxy=AckProxy::start(origin.clone(),policy.transport.body_bytes).await;
     let worker_root=root.join("worker");let worker_id="automatic-cleanup-worker";
@@ -508,8 +508,8 @@ for line in sys.stdin:
         limits:Limits{deadline_unix_ms:process::now_ms()+120_000,model_requests:2,output_bytes:16_384,result_bytes:policy.task_defaults.result_bytes,max_delegation_depth:4},
         dependencies:vec![],native_workflow:None,
     };
-    let Outcome::Ok{data:Data::Task(fast)}=call(&api,Operation::SubmitTask{operation_id:"cleanup-fast-submit".into(),input:make("fast")}).await.outcome else{panic!("fast submit refused")};
-    let Outcome::Ok{data:Data::Task(slow)}=call(&api,Operation::SubmitTask{operation_id:"cleanup-slow-submit".into(),input:make("slow")}).await.outcome else{panic!("slow submit refused")};
+    let Outcome::Ok{data:Data::Task(fast)}=call(&api,Operation::SubmitTask{operation_id:"cleanup-fast-submit".into(),input:(make("fast")).into()}).await.outcome else{panic!("fast submit refused")};
+    let Outcome::Ok{data:Data::Task(slow)}=call(&api,Operation::SubmitTask{operation_id:"cleanup-slow-submit".into(),input:(make("slow")).into()}).await.outcome else{panic!("slow submit refused")};
     let worker_root=root.join("worker");let worker_id="cleanup-liveness-worker";
     let gate=Arc::new(CleanupReadGate{task_id:fast.id.clone(),held:AtomicU64::new(0),
         worker_state:worker_root.join(".borg-worker").join(process::component(worker_id)),evidence:root.clone(),

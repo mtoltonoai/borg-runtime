@@ -60,7 +60,7 @@ async fn retained_startup_await_loss_recovers_near_full_page_with_original_polic
     for batch in 0..4 {
         for n in 0..8 {
             let label = format!("small-{batch}-{n}");
-            api_task(&admin, Operation::SubmitTask { operation_id: format!("submit-{label}"), input: task_input(&label, &accepted) }).await;
+            api_task(&admin, Operation::SubmitTask { operation_id: format!("submit-{label}"), input: (task_input(&label, &accepted)).into() }).await;
         }
         let commands = command_list(f.client.call(wait_for(&w, ack.clone())).await.unwrap());
         assert_eq!(commands.len(), 8);
@@ -93,7 +93,7 @@ async fn retained_startup_await_loss_recovers_near_full_page_with_original_polic
         let label = format!("large-0-{n}"); // same byte length as the sample's agent ID
         let mut t = task_input(&label, &accepted);
         t.instruction = "x".repeat(instruction_len);
-        api_task(&admin, Operation::SubmitTask { operation_id: format!("submit-{label}"), input: t }).await;
+        api_task(&admin, Operation::SubmitTask { operation_id: format!("submit-{label}"), input: (t).into() }).await;
     }
     let op = wait_for(&w, ack);
     let id = identity(&op).unwrap().to_owned();

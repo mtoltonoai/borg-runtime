@@ -61,7 +61,7 @@ fn tool_reply(index: usize, revision: &str) -> Value {
 }
 async fn binding(api: &ApiClient, session: &str) -> EffectiveCharter {
     match api.call(Operation::QueryCharter { query: CharterQuery::Session { session_id:session.into() } }).await.unwrap().outcome {
-        Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Session(Some(value))) } => value,
+        Outcome::Ok { data: Data::CharterQuery(result) } => match *result { CharterQueryResult::Session(Some(value)) => value, other => panic!("binding {other:?}") },
         other => panic!("binding {other:?}"),
     }
 }
@@ -171,13 +171,13 @@ async fn worker_scenario(change_during_compaction:bool) {
     assert!(head.session.compaction_in_flight.is_none());
     let run_id=format!("{}-charter-compaction-3",accepted.attempt.as_ref().unwrap().id);
     let run=match api.call(Operation::QueryCharter {query:CharterQuery::Compaction {run_id}}).await.unwrap().outcome {
-        Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Compaction(value))}=>value,
+        Outcome::Ok{data:Data::CharterQuery(result)}=>match *result { CharterQueryResult::Compaction(value) => value, other => panic!("compaction {other:?}") },
         other=>panic!("compaction {other:?}"),
     };
     assert_eq!(run.effective.reference,reference("r4"));assert!(run.reply.is_some());assert!(run.summary.is_some());
     assert_eq!(run.disposition,Some(if change_during_compaction {CompactionDisposition::ObsoleteSourceSummary} else {CompactionDisposition::CurrentSourceSummary}));
     let turns=match api.call(Operation::QueryCharter {query:CharterQuery::Turns {session_id:task.session_id.clone(),after:None,limit:10}}).await.unwrap().outcome {
-        Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Turns(page))}=>page.items,
+        Outcome::Ok{data:Data::CharterQuery(result)}=>match *result { CharterQueryResult::Turns(page) => page.items, other => panic!("turns {other:?}") },
         other=>panic!("turns {other:?}"),
     };
     assert_eq!(turns.len(),3);assert!(turns.iter().all(|t|t.reply.is_some()&&t.completed_by.is_some()));

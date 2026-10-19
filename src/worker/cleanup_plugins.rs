@@ -310,7 +310,7 @@ pub(super) async fn attempt_at(
     let (_sender, cancel) = watch::channel(false);
     let control = Control {
         deadline_ms: add_ms(process::now_ms(), policy.operation_timeout_ms)?,
-        worker_limits: Arc::new(config.limits.worker.clone()),
+        worker_limits: Arc::from(config.limits.worker.clone()),
         runtime_limits: config.limits.clone(),
         validation_runtime: validation_runtime.clone(),
         cancel,

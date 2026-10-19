@@ -18,19 +18,19 @@ impl Lab{fn new()->Self{Self::with(limits())}fn with(p:RuntimeLimits)->Self{let 
 async fn released(path:&std::path::Path){let mut name=path.as_os_str().to_owned();name.push(".controller-lock");tokio::time::timeout(std::time::Duration::from_secs(3),async{loop{let file=std::fs::OpenOptions::new().read(true).write(true).open(PathBuf::from(&name)).unwrap();if file.try_lock().is_ok(){break}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}}).await.expect("previous controller owner released");}
 async fn call(c:&Controller,command:Operation)->Reply{let reply=Box::pin(c.handle(Request{protocol_revision:WIRE_REVISION,request_id:unique(),command:command.clone()})).await;reply.validate_for(&command).unwrap();reply}
 fn task(reply:Reply)->Task{match reply.outcome{Outcome::Ok{data:Data::Task(t)}=>*t,x=>panic!("expected task: {x:?}")}}
-fn changed(reply:&Reply)->QuestionMutationOutcome{assert!(reply.commit.is_some(),"{reply:?}");match &reply.outcome{Outcome::Ok{data:Data::QuestionMutation(v)}=>v.clone(),x=>panic!("expected committed question: {x:?}")}}
+fn changed(reply:&Reply)->QuestionMutationOutcome{assert!(reply.commit.is_some(),"{reply:?}");match &reply.outcome{Outcome::Ok{data:Data::QuestionMutation(v)}=>v.as_ref().clone(),x=>panic!("expected committed question: {x:?}")}}
 fn refused(reply:&Reply,code:&str){assert!(matches!(&reply.outcome,Outcome::Refused{code:c,..}if c==code),"{reply:?}");}
 async fn mutate(c:&Controller,op:&str,mutation:QuestionMutation)->Reply{call(c,Operation::MutateQuestion{operation_id:op.into(),mutation}).await}
-async fn query(c:&Controller,query:QuestionQuery)->QuestionQueryResult{match call(c,Operation::QueryQuestion{query}).await.outcome{Outcome::Ok{data:Data::QuestionQuery(q)}=>q,x=>panic!("expected question query: {x:?}")}}
+async fn query(c:&Controller,query:QuestionQuery)->QuestionQueryResult{match call(c,Operation::QueryQuestion{query}).await.outcome{Outcome::Ok{data:Data::QuestionQuery(q)}=>*q,x=>panic!("expected question query: {x:?}")}}
 async fn get(c:&Controller,id:&str)->QuestionView{match query(c,QuestionQuery::Get{question_id:id.into()}).await{QuestionQueryResult::Question(v)=>v,x=>panic!("{x:?}")}}
-async fn submit(c:&Controller,agent:&str)->Task{task(call(c,Operation::SubmitTask{operation_id:unique(),input:input(agent)}).await)}
+async fn submit(c:&Controller,agent:&str)->Task{task(call(c,Operation::SubmitTask{operation_id:unique(),input:(input(agent)).into()}).await)}
 fn pose_for(record:RecordRef,recipient:PrincipalRef)->PoseQuestion{PoseQuestion{record,recipient,prompt:"Choose one option. Recommended: keep.".into(),options:vec![QuestionOption{id:"keep".into(),label:"Keep".into(),explanation:"Preserve the current choice".into()},QuestionOption{id:"change".into(),label:"Change".into(),explanation:"Use the stated alternative".into()}],recommended_option_id:"keep".into()}}
 async fn pose(c:&Controller,task:&Task,recipient:PrincipalRef)->Question{changed(&mutate(c,&unique(),QuestionMutation::Pose{question:pose_for(RecordRef::Task{task_id:task.id.clone()},recipient)}).await).question.question}
 fn answer(q:&Question,option:&str)->QuestionMutation{QuestionMutation::Answer{question_id:q.id.clone(),expected_revision:q.revision,answer:QuestionAnswer{option_id:option.into(),explanation:"Explicit decision".into()}}}
 async fn queue(c:&Controller,viewer:PrincipalRef,after:Option<String>,limit:usize)->DecisionQueuePage{match query(c,QuestionQuery::DecisionQueue{viewer,after,limit}).await{QuestionQueryResult::DecisionQueue(v)=>v,x=>panic!("{x:?}")}}
 async fn actor(c:&Controller,agent:&str)->(Task,Caller){actor_profile(c,agent,ExecutionProfile::CollaborationV2{ publication: None,web_search:None}).await}
 async fn actor_profile(c:&Controller,agent:&str,profile:ExecutionProfile)->(Task,Caller){
-    let mut data=input(agent);data.definition.execution_profile=Some(profile);let t=task(call(c,Operation::SubmitTask{operation_id:unique(),input:data}).await);let w=Worker{id:unique(),incarnation:"inc".into(),coding_capacity:0,native_capacity:1};
+    let mut data=input(agent);data.definition.execution_profile=Some(profile);let t=task(call(c,Operation::SubmitTask{operation_id:unique(),input:(data).into()}).await);let w=Worker{id:unique(),incarnation:"inc".into(),coding_capacity:0,native_capacity:1};
     assert!(matches!(call(c,Operation::RegisterWorker{operation_id:unique(),worker:w.clone()}).await.outcome,Outcome::Ok{..}));
     let commands=call(c,Operation::AwaitCommands{operation_id:unique(),worker_id:w.id.clone(),incarnation:w.incarnation.clone(),acknowledged:vec![]}).await;
     let Outcome::Ok{data:Data::Commands(commands)}=commands.outcome else{panic!("{commands:?}")};
@@ -224,7 +224,7 @@ async fn operator_question_wire_shape_rejects_multiple_answers_without_deciding(
     let QuestionQueryResult::Answers(history)=query(&lab.c,QuestionQuery::Answers{question_id:q.id,after:None,limit:8}).await else{panic!()};assert_eq!(history.items,vec![answer.new_answer.unwrap()]);
 }
 async fn request_review(c:&Controller,target:ReviewTarget,reviewer:PrincipalRef)->ReviewView {
-    match call(c,Operation::MutateReview{operation_id:unique(),mutation:ReviewMutation::Request{target,reviewer,summary:"Review this exact version".into()}}).await.outcome{Outcome::Ok{data:Data::ReviewMutation(ReviewMutationOutcome::Review(v))}=>v,x=>panic!("{x:?}")}
+    match call(c,Operation::MutateReview{operation_id:unique(),mutation:ReviewMutation::Request{target,reviewer,summary:"Review this exact version".into()}}).await.outcome{Outcome::Ok{data:Data::ReviewMutation(v)}=>match *v {ReviewMutationOutcome::Review(v)=>v,x=>panic!("{x:?}")},x=>panic!("{x:?}")}
 }
 #[tokio::test]
 //= spec/impl/v2/implementation.md#the-supported-decision-queue-is-complete
@@ -251,7 +251,7 @@ async fn decision_queue_merges_all_supported_kinds_and_cursor_scopes_without_fal
 
 fn notice_delivery(reply: &Reply) -> borg_runtime::collaboration::notifications::DeliveryObservation {
     match &reply.outcome {
-        Outcome::Ok { data: Data::CollaborationDelivery(value) } => value.clone(),
+        Outcome::Ok { data: Data::CollaborationDelivery(value) } => value.as_ref().clone(),
         other => panic!("canonical notice delivery expected: {other:?}"),
     }
 }
@@ -309,7 +309,7 @@ async fn acknowledged_question_and_review_notices_preserve_owed_queue_entries_un
     assert_eq!(queue(&lab.c,viewer.clone(),None,8).await,owed);
     assert_eq!(get(&lab.c,&q.id).await.question,q);
     match call(&lab.c,Operation::QueryReview{query:ReviewQuery::Get{review_id:review.review.id.clone()}}).await.outcome {
-        Outcome::Ok{data:Data::ReviewQuery(ReviewQueryResult::Review(value))}=>assert_eq!(value,review),other=>panic!("{other:?}"),
+        Outcome::Ok{data:Data::ReviewQuery(value)}=>match *value {ReviewQueryResult::Review(value)=>assert_eq!(value,review),other=>panic!("{other:?}")},other=>panic!("{other:?}"),
     }
     assert_eq!(task(call(&lab.c,Operation::GetTask{task_id:accepted.id.clone()}).await).input,accepted.input);
 
@@ -337,7 +337,8 @@ async fn acknowledged_question_and_review_notices_preserve_owed_queue_entries_un
     let review_arguments=json!({"review_id":review.review.id,"expected_revision":review.review.revision,
         "verdict":"approved","explanation":"Explicit exact-version review after reading the notice"});
     let decided=tool(&lab.c,&caller,"notice-review","collab_review_decide",review_arguments.clone()).await;
-    match &decided.outcome {Outcome::Ok{data:Data::ReviewMutation(ReviewMutationOutcome::Review(value))}=>{
+    match &decided.outcome {Outcome::Ok{data:Data::ReviewMutation(value)}=>{
+        let ReviewMutationOutcome::Review(value)=value.as_ref() else {panic!("expected review")};
         assert_eq!(value.review.status,ReviewStatus::Decided);assert_eq!(value.decision.as_ref().unwrap().target,review.review.target);
     },other=>panic!("{other:?}")}
     assert!(queue(&lab.c,viewer.clone(),None,8).await.items.is_empty());
@@ -442,7 +443,7 @@ async fn actual_mcp_adapter_and_browser_share_one_question_answer_and_original_o
     let params=rpc_params("rpc-pose","collab_question_pose",json!({"question":posed}));let first=rpc_result(rpc(&lab.c,&caller,"tools/call",params.clone()).await);let q=changed(&first).question.question;assert_eq!(q.poser.principal,PrincipalRef::Agent{agent_id:"asking-agent".into()});
     let response=browser(&lab.c,"POST",&format!("/questions/{}/answer",q.id),form(&[("operation_id","browser-answer".into()),("expected_revision",q.revision.to_string()),("option_id","keep".into()),("explanation","One explicit operator decision".into())]),"http://local.invalid").await;assert_eq!(response.status,303,"{}",response.body);
     let read=rpc_result(rpc(&lab.c,&caller,"tools/call",rpc_params("rpc-read","collab_question_get",json!({"question_id":q.id}))).await);
-    let Outcome::Ok{data:Data::QuestionQuery(QuestionQueryResult::Question(v))}=read.outcome else{panic!("{read:?}")};assert_eq!(v,get(&lab.c,&q.id).await);assert!(matches!(v.active_answer.unwrap().author.provenance,ActorProvenance::TrustedHost{path:TrustedHostPath::Browser}));
+    let Outcome::Ok{data:Data::QuestionQuery(value)}=read.outcome else{panic!("{read:?}")};let QuestionQueryResult::Question(v)=*value else {panic!("expected question")};assert_eq!(v,get(&lab.c,&q.id).await);assert!(matches!(v.active_answer.unwrap().author.provenance,ActorProvenance::TrustedHost{path:TrustedHostPath::Browser}));
     let replay=rpc_result(rpc(&lab.c,&caller,"tools/call",params).await);assert_eq!(replay.outcome,first.outcome);assert_eq!(replay.commit,first.commit);
     let lookup=rpc_result(rpc(&lab.c,&caller,"borg/calls/get",json!({"call_id":"rpc-pose"})).await);assert_eq!(lookup.commit,first.commit);let Outcome::Ok{data:Data::Operation(original)}=lookup.outcome else{panic!()};assert_eq!(serde_json::from_value::<Outcome>(original.outcome.unwrap()).unwrap(),first.outcome);
 }
@@ -694,7 +695,7 @@ async fn competing_question_resolutions_keep_one_original_outcome_across_restart
         assert_eq!(originals.iter().filter(|(_, outcome)| matches!(outcome, Outcome::Ok { .. })).count(), 1);
         assert_eq!(originals.iter().filter(|(_, outcome)| matches!(outcome, Outcome::Refused { code, .. } if code == "stale_revision")).count(), 1);
         let winner = originals.iter().find_map(|(_, outcome)| match outcome {
-            Outcome::Ok { data: Data::QuestionMutation(value) } => Some(value.clone()), _ => None,
+            Outcome::Ok { data: Data::QuestionMutation(value) } => Some(value.as_ref().clone()), _ => None,
         }).unwrap();
         let after = get(&lab.c, &posed.id).await;
         assert_eq!(after, winner.question);

@@ -11,7 +11,7 @@ fn raw_json(value:&impl serde::Serialize)->String {format!("<pre>{}</pre>",escap
 fn area(name:&str,label:&str,value:&str,required:bool)->String {format!("<label>{}<textarea name=\"{}\" {}>{}</textarea></label>",escape(label),escape(name),if required{"required"}else{""},escape(value))}
 fn nav()->String {"<p><a href=\"/questions\">Questions</a> · <a href=\"/decisions\">Decision queue</a> · <a href=\"/questions/new\">Pose a question</a></p>".into()}
 fn continuation(body:&mut String,base:&str,after:Option<&str>) {if let Some(after)=after {let join=if base.contains('?'){"&"}else{"?"};let _=write!(body,"<p><a href=\"{}{join}after={}\">Next page</a></p>",escape(base),encode(after));}}
-async fn query(controller:&Controller,query:QuestionQuery)->Result<QuestionQueryResult,UiResponse> {
+async fn query(controller:&Controller,query:QuestionQuery)->Result<Box<QuestionQueryResult>,UiResponse> {
     let reply=call(controller,Operation::QueryQuestion{query}).await;
     match reply.outcome {Outcome::Ok{data:Data::QuestionQuery(value)}=>Ok(value),_=>Err(not_task(reply))}
 }
@@ -71,11 +71,12 @@ fn action_form(body:&mut String,q:&Question,action:&str,label:&str,answer:Option
     let _=write!(body,"<button>{}</button></fieldset></form>",escape(label));
 }
 async fn question_view(controller:&Controller,id:&str,after:Option<String>,actions:bool)->Result<UiResponse,UiResponse> {
-    let QuestionQueryResult::Question(v)=query(controller,QuestionQuery::Get{question_id:id.into()}).await? else{return Err(error(502,"Unexpected question projection"))};
+    let result=query(controller,QuestionQuery::Get{question_id:id.into()}).await?;
+    let QuestionQueryResult::Question(v)=result.as_ref() else{return Err(error(502,"Unexpected question projection"))};
     let q=&v.question;let mut body=nav();body.push_str("<p>This product decision does not authorize deployment, credentials or host changes.</p><dl>");term(&mut body,"Question",&q.id);term(&mut body,"Revision",&q.revision.to_string());term(&mut body,"Status",&format!("{:?}",q.status));term(&mut body,"Poser",&actor_label(&q.poser));term(&mut body,"Recipient",&principal_label(&q.posed.recipient));term(&mut body,"Current responsible owner",&principal_label(&v.current_responsible_owner));body.push_str("</dl><h2>Question</h2><pre>");body.push_str(&escape(&q.posed.prompt));body.push_str("</pre>");
     //= spec/impl/v2/implementation.md#shared-product-state
     //# The browser interface MUST present the information exposed through the shared agent interface.
-    body.push_str("<details id=\"question-record\"><summary>Exact question, current effect and provenance</summary>");body.push_str(&raw_json(&v));body.push_str("</details>");
+    body.push_str("<details id=\"question-record\"><summary>Exact question, current effect and provenance</summary>");body.push_str(&raw_json(v));body.push_str("</details>");
     body.push_str("<ul>");
     for option in &q.posed.options {let _=write!(body,"<li><strong>{}</strong>{}<p>{}</p></li>",escape(&option.label),if option.id==q.posed.recommended_option_id{" (recommended)"}else{""},escape(&option.explanation));}body.push_str("</ul>");
     for(label,id)in[("Replaces",&q.supersedes),("Replaced by",&q.superseded_by)]{if let Some(id)=id{let _=write!(body,"<p>{label}: <a href=\"{}\">{}</a></p>",question_path(id),escape(id));}}
@@ -87,7 +88,7 @@ async fn question_view(controller:&Controller,id:&str,after:Option<String>,actio
     if q.status==QuestionStatus::Answered {if let Some(answer)=q.latest_answer_id.as_deref(){if q.posed.recipient==PrincipalRef::TrustedHostOperator {action_form(&mut body,q,"replace-answer","Replace answer",Some(answer),true);if q.active_answer_id.is_some(){action_form(&mut body,q,"withdraw-answer","Withdraw answer effect",Some(answer),false);}}if q.active_answer_id.is_some(){action_form(&mut body,q,"moot","Mark answer moot",Some(answer),false);}}}
     let _=write!(body,"<h2>Immutable history</h2><p><a href=\"{}\">Answers</a> · <a href=\"{}?history=actions\">Actions</a></p>",question_path(id),question_path(id));
     let query_value=if actions{QuestionQuery::Actions{question_id:id.into(),after,limit:page_limit(controller)?}}else{QuestionQuery::Answers{question_id:id.into(),after,limit:page_limit(controller)?}};
-    match query(controller,query_value).await? {QuestionQueryResult::Answers(p)=>{for item in p.items{body.push_str(&raw_json(&item));}continuation(&mut body,&question_path(id),p.next_cursor.as_deref());},QuestionQueryResult::Actions(p)=>{for item in p.items{body.push_str(&raw_json(&item));}continuation(&mut body,&format!("{}?history=actions",question_path(id)),p.next_cursor.as_deref());},_=>return Err(error(502,"Unexpected history projection"))}
+    match query(controller,query_value).await?.as_ref() {QuestionQueryResult::Answers(p)=>{for item in &p.items{body.push_str(&raw_json(item));}continuation(&mut body,&question_path(id),p.next_cursor.as_deref());},QuestionQueryResult::Actions(p)=>{for item in &p.items{body.push_str(&raw_json(item));}continuation(&mut body,&format!("{}?history=actions",question_path(id)),p.next_cursor.as_deref());},_=>return Err(error(502,"Unexpected history projection"))}
     let comment_route=format!("{}/comments",question_path(id));
     let _=write!(body,"<h2>Comments</h2><p><a href=\"{}\">Read immutable comments</a></p>",comment_route);
     body.push_str(&super::documents_reviews::comment_form(&comment_route,q.revision));
@@ -102,7 +103,8 @@ async fn get_inner(controller:&Controller,path:&str,raw_query:&str)->Result<UiRe
     if path=="/decisions" {
         fields_only(&fields,&["after","recipient_agent_id"]).map_err(|e|error(400,&e))?;
         let viewer=fields.get("recipient_agent_id").filter(|v|!v.is_empty()).map(|agent_id|PrincipalRef::Agent{agent_id:agent_id.clone()}).unwrap_or(PrincipalRef::TrustedHostOperator);
-        let QuestionQueryResult::DecisionQueue(p)=query(controller,QuestionQuery::DecisionQueue{viewer:viewer.clone(),after:fields.get("after").cloned(),limit:page_limit(controller)?}).await? else{return Err(error(502,"Unexpected decision queue"))};
+        let result=query(controller,QuestionQuery::DecisionQueue{viewer:viewer.clone(),after:fields.get("after").cloned(),limit:page_limit(controller)?}).await?;
+        let QuestionQueryResult::DecisionQueue(p)=result.as_ref() else{return Err(error(502,"Unexpected decision queue"))};
         let mut body=nav();let _=write!(body,"<p>Decisions owed by {}. The queue is observed at product revision {}; later changes can remove resolved items. Product decisions confer no protected authority.</p>",escape(&principal_label(&viewer)),p.observed_product_revision);
         body.push_str("<form method=\"get\" action=\"/decisions\">");body.push_str(&field("recipient_agent_id","Agent ID (blank for trusted host operator)",fields.get("recipient_agent_id").map(String::as_str).unwrap_or(""),"text",false));body.push_str("<button>View queue</button></form><ul>");
         for item in &p.items {match item {DecisionQueueItem::Question{question_id,prompt,..}=>{let _=write!(body,"<li>Question <a href=\"{}\">{}</a><p>{}</p></li>",question_path(question_id),escape(question_id),escape(prompt));},DecisionQueueItem::Review{review_id,summary,..}=>{let _=write!(body,"<li>Review <a href=\"/reviews/{}\">{}</a><p>{}</p></li>",encode(review_id),escape(review_id),escape(summary));}}}body.push_str("</ul>");
@@ -116,14 +118,15 @@ async fn get_inner(controller:&Controller,path:&str,raw_query:&str)->Result<UiRe
             Some("cancelled")=>Some(QuestionStatus::Cancelled),Some("superseded")=>Some(QuestionStatus::Superseded),Some("moot")=>Some(QuestionStatus::Moot),
             _=>return Err(error(400,"Unsupported question status")),
         };
-        let QuestionQueryResult::Questions(p)=query(controller,QuestionQuery::List{record,status,after:fields.get("after").cloned(),limit:page_limit(controller)?}).await?else{return Err(error(502,"Unexpected questions list"))};
+        let result=query(controller,QuestionQuery::List{record,status,after:fields.get("after").cloned(),limit:page_limit(controller)?}).await?;
+        let QuestionQueryResult::Questions(p)=result.as_ref() else{return Err(error(502,"Unexpected questions list"))};
         let mut body=nav();body.push_str(&super::documents_reviews::list_filter_form("/questions",&fields,&[("open","Open"),("answered","Answered"),("cancelled","Cancelled"),("superseded","Superseded"),("moot","Moot")]));
-        body.push_str("<ul>");for v in p.items{let q=v.question;let _=write!(body,"<li><a href=\"{}\">{}</a> — {:?}: {}</li>",question_path(&q.id),escape(&q.id),q.status,escape(&q.posed.prompt));}body.push_str("</ul>");
+        body.push_str("<ul>");for v in &p.items{let q=&v.question;let _=write!(body,"<li><a href=\"{}\">{}</a> — {:?}: {}</li>",question_path(&q.id),escape(&q.id),q.status,escape(&q.posed.prompt));}body.push_str("</ul>");
         continuation(&mut body,&super::documents_reviews::list_filter_base("/questions",&fields),p.next_cursor.as_deref());return Ok(page(200,"Questions",body));
     }
     let raw=path.strip_prefix("/questions/").ok_or_else(||error(404,"Unknown question route"))?;
     let (raw_id,sub)=raw.split_once('/').unwrap_or((raw,""));let id=decode(raw_id,false).map_err(|e|error(400,&e))?;
-    if sub=="supersede" {if !fields.is_empty(){return Err(error(400,"Unexpected replacement query"))}let QuestionQueryResult::Question(v)=query(controller,QuestionQuery::Get{question_id:id}).await?else{return Err(error(502,"Unexpected question"))};if v.question.status!=QuestionStatus::Open{return Err(error(409,"Only an open question can be replaced"))}return Ok(pose_form(controller,Some(&v.question),v.question.posed.options.len()));}
+    if sub=="supersede" {if !fields.is_empty(){return Err(error(400,"Unexpected replacement query"))}let result=query(controller,QuestionQuery::Get{question_id:id}).await?;let QuestionQueryResult::Question(v)=result.as_ref() else{return Err(error(502,"Unexpected question"))};if v.question.status!=QuestionStatus::Open{return Err(error(409,"Only an open question can be replaced"))}return Ok(pose_form(controller,Some(&v.question),v.question.posed.options.len()));}
     if !sub.is_empty(){return Err(error(404,"Unknown question route"))}
     fields_only(&fields,&["after","history"]).map_err(|e|error(400,&e))?;let actions=match fields.get("history").map(String::as_str){None|Some("answers")=>false,Some("actions")=>true,_=>return Err(error(400,"Unknown history view"))};question_view(controller,&id,fields.get("after").cloned(),actions).await
 }

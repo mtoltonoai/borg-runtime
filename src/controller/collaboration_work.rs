@@ -204,7 +204,7 @@ fn view(q: &QueryContext<'_, '_>, task_id: &str) -> Result<WorkView> {
         else if open_waits != 0 { WorkState::Waiting { prior: h.resume.clone().unwrap() } }
         else { WorkState::Runnable { state: h.resume.clone().unwrap_or_else(|| ResumeState {
             status: task.status, assigned_agent_id: task.assigned_agent_id.clone() }) } };
-    Ok(WorkView { task, coordination_revision:h.revision, responsible_owner:h.owner,
+    Ok(WorkView { task: Box::new(task), coordination_revision:h.revision, responsible_owner:h.owner,
         state, open_waits, coordination_blocked:open_waits != 0,
         waits:page(q,task_id,None,q.limits.page_items)? })
 }

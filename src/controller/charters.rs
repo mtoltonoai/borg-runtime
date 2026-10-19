@@ -306,11 +306,11 @@ fn delegated_result(tx:&StoreContext<'_>,r:&RequestRecord,operation_id:&str,outc
     if parent!=r.caller().task_id||attempt!=r.caller().attempt_id||unsigned(generation)?!=r.caller().generation||state!="settled"{return refuse("reconciliation_required","original child wait not settled");}
     let child:Task=stored(&raw,tx.limits.transport.body_bytes)?;
     if child.id!=created.id||child.parent_task_id.as_deref()!=Some(&parent)||!terminal(child.status){return Err(corrupt("settled child outcome differs from original wait"));}
-    let expected=ChildOutcome{task_id:child.id,status:child.status,result:child.result.clone(),summary:child.result.as_ref().map(|v|v.summary.clone()).or(child.blocked_reason).unwrap_or_default()};
+    let expected=ChildOutcome{task_id:child.id,status:child.status,result:child.result.as_deref().cloned(),summary:child.result.as_ref().map(|v|v.summary.clone()).or(child.blocked_reason).unwrap_or_default()};
     let id=format!("run-{}",delivered_by.attempt_id);let raw=raw_body(tx,"SELECT CAST(substr(CAST(body AS BLOB),1,?2) AS TEXT) FROM commands WHERE id=?1",&id,tx.limits.controller.run_command_bytes)?.ok_or_else(||corrupt("resumed command absent"))?;
     let command:WorkerCommand=stored(&raw,tx.limits.controller.run_command_bytes)?;
     let WorkerCommand::RunAttempt{command_id,attempt,session,continuation:Some(actual),..}=command else{return refuse("reconciliation_required","resumed command lacks child result")};
-    if command_id!=id||attempt.id!=delivered_by.attempt_id||attempt.task_id!=delivered_by.task_id||attempt.generation!=delivered_by.generation||attempt.worker_id!=delivered_by.worker_id||attempt.worker_incarnation!=delivered_by.incarnation||session.id!=r.session()||actual!=expected{return refuse("reconciliation_required","delivered continuation differs from exact child result");}Ok(())
+    if command_id!=id||attempt.id!=delivered_by.attempt_id||attempt.task_id!=delivered_by.task_id||attempt.generation!=delivered_by.generation||attempt.worker_id!=delivered_by.worker_id||attempt.worker_incarnation!=delivered_by.incarnation||session.id!=r.session()||*actual!=expected{return refuse("reconciliation_required","delivered continuation differs from exact child result");}Ok(())
 }
 //= spec/impl/v2/implementation.md#charter-changes-apply-at-safe-boundaries
 //# A charter change MUST NOT apply between a tool call and the delivery of its result.

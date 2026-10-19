@@ -213,17 +213,17 @@ fn proposal(tx: &Connection, t: &StoredTask, worker: &Worker, remaining: u32, no
     // Read the old stopped owner before await_commands replaces its attempt.
     let completion_continuation = super::super::governance_completion::resume_for_admission(tx, t, now)?;
     let command = WorkerCommand::RunAttempt {
-        session,
+        session: (session).into(),
         command_id: format!("run-{}", attempt.id),
         attempt: attempt.clone(),
-        task: input,
+        task: (input).into(),
         // Executor conversation associations do not select recovery source.
         //= spec/impl/v2/implementation.md#accepted-state-has-one-durable-owner
         //# A recorded executor conversation identifier MUST NOT be treated as a durable checkpoint by itself.
         checkpoint: t.task.selected_checkpoint.clone(),
-        continuation: t.task.completed_child.clone(),
+        continuation: (t.task.completed_child.clone()).map(Into::into),
         workflow_continuation,
-        completion_continuation,
+        completion_continuation: (completion_continuation).map(Into::into),
     };
     if bounded_json_size(&command, tx.limits.controller.run_command_bytes).is_err() {
         return Ok(Decision::Blocked(

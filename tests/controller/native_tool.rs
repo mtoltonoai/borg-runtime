@@ -10,7 +10,7 @@ fn progress(v:&ToolObservation)->Observation{Observation::Progress{text:contract
 #[tokio::test]
 async fn native_tool_fixed_workflow_refuses_new_profile_before_dispatch(){
  let c=Controller::open_with_config(path(),config()).unwrap();
- for n in [1,2]{let mut t=native(&format!("inspect-{n}"));t.native_workflow=Some(Box::new(NativeWorkflow::InspectCurrentTaskThenContinue{}));t.limits.model_requests=n;let op=Operation::SubmitTask{operation_id:format!("fixed-{n}"),input:t};let first=call(&c,op.clone()).await;assert!(matches!(first,Outcome::Refused{..}));assert_eq!(call(&c,op).await,first);}
+ for n in [1,2]{let mut t=native(&format!("inspect-{n}"));t.native_workflow=Some(Box::new(NativeWorkflow::InspectCurrentTaskThenContinue{}));t.limits.model_requests=n;let op=Operation::SubmitTask{operation_id:format!("fixed-{n}"),input:(t).into()};let first=call(&c,op.clone()).await;assert!(matches!(first,Outcome::Refused{..}));assert_eq!(call(&c,op).await,first);}
  assert!(matches!(call(&c,Operation::ListTasks{after:None,limit:10}).await,Outcome::Ok{data:Data::Tasks(v)} if v.is_empty()));
 }
 #[tokio::test]
@@ -33,6 +33,6 @@ async fn native_tool_progress_replay_is_immutable_and_cancelled_session_cannot_p
 #[tokio::test]
 async fn native_tool_unbound_definition_refusal_replays_without_creating_task(){
  let c=Controller::open_with_config(path(),config()).unwrap();
- for (field,code_expected) in [("inference","template_inference_unbound"),("profile","template_profile_unbound")]{let mut t=native(field);if field=="inference"{t.definition.inference=None}else{t.definition.execution_profile=None};let op=Operation::SubmitTask{operation_id:format!("unbound-{field}"),input:t};let first=call(&c,op.clone()).await;assert_eq!(code(first.clone()),code_expected);assert_eq!(call(&c,op).await,first);}
+ for (field,code_expected) in [("inference","template_inference_unbound"),("profile","template_profile_unbound")]{let mut t=native(field);if field=="inference"{t.definition.inference=None}else{t.definition.execution_profile=None};let op=Operation::SubmitTask{operation_id:format!("unbound-{field}"),input:(t).into()};let first=call(&c,op.clone()).await;assert_eq!(code(first.clone()),code_expected);assert_eq!(call(&c,op).await,first);}
  assert!(matches!(call(&c,Operation::ListTasks{after:None,limit:10}).await,Outcome::Ok{data:Data::Tasks(v)} if v.is_empty()));
 }

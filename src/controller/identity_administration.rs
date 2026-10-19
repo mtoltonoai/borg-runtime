@@ -120,7 +120,7 @@ pub(super) fn admit_definition(
 fn validate_candidate(
     tx: &StoreContext<'_>,
     d: &Definition,
-) -> Result<crate::limits::ExecutionLimits> {
+) -> Result<Box<crate::limits::ExecutionLimits>> {
     if !valid_id(tx.limits, &d.id) || !valid_id(tx.limits, &d.revision) {
         return refuse("invalid_input", "invalid definition identity");
     }
@@ -502,7 +502,7 @@ pub(super) fn project(
             original.outcome = Outcome::Ok {
                 data: match value.effect {
                     IdentityEffect::Registered(a) | IdentityEffect::Retired(a) => Data::Agent(a),
-                    IdentityEffect::Charter(v) => Data::Charter(v),
+                    IdentityEffect::Charter(v) => Data::Charter(Box::new(v)),
                     _ => Data::IdentityAdministration(value),
                 },
             };

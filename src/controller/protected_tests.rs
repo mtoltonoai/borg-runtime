@@ -1292,7 +1292,7 @@ async fn agent_directory_pagination_preserves_canonical_identity() {
         &f.controller,
         Operation::SubmitTask {
             operation_id: "agent-first".into(),
-            input: make("agent-1"),
+            input: (make("agent-1")).into(),
         },
     )
     .await
@@ -1303,7 +1303,7 @@ async fn agent_directory_pagination_preserves_canonical_identity() {
         &f.controller,
         Operation::SubmitTask {
             operation_id: "agent-second".into(),
-            input: make("agent-2"),
+            input: (make("agent-2")).into(),
         },
     )
     .await

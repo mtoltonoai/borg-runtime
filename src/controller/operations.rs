@@ -71,16 +71,16 @@ fn apply_direct(
         Operation::MutateCharter { operation_id, mutation } => {
             let charter = limits.charter.as_ref().ok_or_else(|| Fault::Refused("not_configured", "charter policy is absent".into()))?;
             let context = super::charters::Context { tx, operation_id, now_ms: now, limits: charter };
-            Ok((Data::Charter(super::charters::mutate(&context, mutation)?), true))
+            Ok((Data::Charter(Box::new(super::charters::mutate(&context, mutation)?)), true))
         }
         Operation::ObserveCharter { operation_id, caller, observation } => {
             let charter = limits.charter.as_ref().ok_or_else(|| Fault::Refused("not_configured", "charter policy is absent".into()))?;
             let context = super::charters::Context { tx, operation_id, now_ms: now, limits: charter };
             // The producer distinguishes current new execution from retained
             // late audit. A blanket current-caller check would lose real replies.
-            Ok((Data::Charter(super::charters::observe(&context, caller, observation)?), true))
+            Ok((Data::Charter(Box::new(super::charters::observe(&context, caller, observation)?)), true))
         }
-        Operation::QueryCharter { query } => Ok((Data::CharterQuery(super::charters::query(tx, query)?), false)),
+        Operation::QueryCharter { query } => Ok((Data::CharterQuery(Box::new(super::charters::query(tx, query)?)), false)),
         Operation::EvaluateCompletion(_)
         | Operation::BeginCompletionContinuation(_)
         | Operation::AcknowledgeCompletionInput(_) => {
@@ -771,7 +771,7 @@ pub(super) fn submit(
     depth: u32,
     validation: &Context<'_>,
 ) -> Result<StoredTask> {
-    super::identity_administration::admit_definition(tx, &input.definition, parent.filter(|p| crate::delegation::template(&p.task.input).is_some()).map(|p| &p.task.input))?;
+    super::identity_administration::admit_definition(tx, &input.definition, parent.filter(|p| crate::delegation::template(&p.task.input).is_some()).map(|p| p.task.input.as_ref()))?;
     super::agents::require_active(tx, &input.definition.id)?;
     // This runs only after the original durable operation receipt lookup.
     // The receipt retains caller bytes; only the accepted task receives this
@@ -929,7 +929,7 @@ pub(super) fn submit(
             //# A task MUST retain the definition revision accepted at submission.
             //= spec/impl/v2/implementation.md#dependencies-and-admission-are-bounded
             //# A task's dependency set MUST remain immutable after submission.
-            input: input.clone(),
+            input: Box::new(input.clone()),
             //= spec/impl/v2/implementation.md#definitions-select-execution
             //# An agent identity MUST persist independently of any executor process.
             assigned_agent_id: input.definition.id.clone(),

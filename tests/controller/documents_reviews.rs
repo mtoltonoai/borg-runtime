@@ -16,7 +16,7 @@ fn workflow_config()->ControllerConfig {
     c
 }
 fn doc(o:Outcome)->DocumentView {match o{Outcome::Ok{data:Data::DocumentMutation(DocumentMutationOutcome::Document{view})}=>view,x=>panic!("expected document mutation: {x:?}")}}
-fn rev(o:Outcome)->ReviewView {match o{Outcome::Ok{data:Data::ReviewMutation(ReviewMutationOutcome::Review(view))}=>view,x=>panic!("expected review mutation: {x:?}")}}
+fn rev(o:Outcome)->ReviewView {match o{Outcome::Ok{data:Data::ReviewMutation(boxed_result)}=>match *boxed_result { ReviewMutationOutcome::Review(view) => view },x=>panic!("expected review mutation: {x:?}")}}
 async fn create(c:&Controller,id:&str,body:&str)->DocumentView {
     doc(call(c,Operation::MutateDocument{operation_id:id.into(),mutation:DocumentMutation::Create{content:DocumentContent{title:"Working note".into(),body:body.into()},supplied_content_id:None,responsible_owner:PrincipalRef::TrustedHostOperator}}).await)
 }
@@ -24,7 +24,7 @@ async fn read(c:&Controller,id:&str,version:Option<u64>)->DocumentView {
     match call(c,Operation::QueryDocument{query:DocumentQuery::Get{document_id:id.into(),version}}).await{Outcome::Ok{data:Data::DocumentQuery(DocumentQueryResult::Document(v))}=>v,x=>panic!("expected document read: {x:?}")}
 }
 async fn get_review(c:&Controller,id:&str)->ReviewView {
-    match call(c,Operation::QueryReview{query:ReviewQuery::Get{review_id:id.into()}}).await{Outcome::Ok{data:Data::ReviewQuery(ReviewQueryResult::Review(v))}=>v,x=>panic!("expected review read: {x:?}")}
+    match call(c,Operation::QueryReview{query:ReviewQuery::Get{review_id:id.into()}}).await{Outcome::Ok{data:Data::ReviewQuery(boxed_result)}=>match *boxed_result { ReviewQueryResult::Review(v) => v, other => panic!("unexpected ReviewQuery result: {other:?}") },x=>panic!("expected review read: {x:?}")}
 }
 fn append(id:&str,view:&DocumentView,body:&str)->Operation {
     Operation::MutateDocument{operation_id:id.into(),mutation:DocumentMutation::AppendVersion{document_id:view.document.id.clone(),expected_revision:view.document.revision,content:DocumentContent{title:format!("Version {}",view.document.current.version+1),body:body.into()},supplied_content_id:None}}
@@ -298,7 +298,7 @@ async fn accepted_result_selector_is_controller_owned_and_not_a_current_revision
     let t=submit(&c,"accepted-target-task",native("accepted-target-agent")).await;let w=worker("accepted-target-worker","one",1,0);register(&c,&w).await;
     let attempt=run(&commands(&c,&w,vec![]).await);let accepted=finish_native(&c,&attempt,"accepted-target").await;
     let target=match call(&c,Operation::QueryReview{query:ReviewQuery::AcceptedTarget{task_id:t.id.clone(),scope:AcceptedReviewScope::Result}}).await {
-        Outcome::Ok{data:Data::ReviewQuery(ReviewQueryResult::AcceptedTarget(target))}=>target,x=>panic!("canonical accepted target expected {x:?}")};
+        Outcome::Ok{data:Data::ReviewQuery(boxed_result)}=>match *boxed_result { ReviewQueryResult::AcceptedTarget(target) => target, other => panic!("unexpected ReviewQuery result: {other:?}") },x=>panic!("canonical accepted target expected {x:?}")};
     let ReviewTarget::AcceptedTaskResult{result}=target.clone() else{panic!("result target expected")};
     assert_eq!(result.task_id,t.id);assert_eq!(result.attempt_id,attempt.id);assert!(result.checkpoint.is_none());
     let mut forged=target.clone();if let ReviewTarget::AcceptedTaskResult{result}=&mut forged{result.acceptance_history_sequence+=1;}
@@ -307,16 +307,16 @@ async fn accepted_result_selector_is_controller_owned_and_not_a_current_revision
     // Task comments CAS the separate WORK header, not execution Task.revision.
     let before=match call(&c,Operation::QueryWork{query:WorkQuery::Get{task_id:t.id.clone()}}).await {
         Outcome::Ok{data:Data::WorkQuery(WorkQueryResult::Task(view))}=>view,x=>panic!("work view expected {x:?}")};
-    assert_eq!(before.coordination_revision,0);assert_eq!(before.task,accepted);
+    assert_eq!(before.coordination_revision,0);assert_eq!(before.task.as_ref(),&accepted);
     let comment=call(&c,Operation::MutateDocument{operation_id:"accepted-task-comment".into(),mutation:DocumentMutation::PostComment{record:RecordRef::Task{task_id:t.id.clone()},expected_revision:before.coordination_revision,body:"After acceptance".into()}}).await;
     match comment {
         Outcome::Ok{data:Data::DocumentMutation(DocumentMutationOutcome::Comment{record_revision,..})}=>assert_eq!(record_revision,before.coordination_revision+1),x=>panic!("committed comment expected {x:?}")};
     let after=match call(&c,Operation::QueryWork{query:WorkQuery::Get{task_id:t.id.clone()}}).await {
         Outcome::Ok{data:Data::WorkQuery(WorkQueryResult::Task(view))}=>view,x=>panic!("work view expected {x:?}")};
     assert_eq!(after.coordination_revision,before.coordination_revision+1);
-    assert_eq!(after.task,accepted);assert_eq!(get(&c,&t.id).await,accepted);
+    assert_eq!(after.task.as_ref(),&accepted);assert_eq!(get(&c,&t.id).await,accepted);
     let current_target=match call(&c,Operation::QueryReview{query:ReviewQuery::AcceptedTarget{task_id:t.id.clone(),scope:AcceptedReviewScope::Result}}).await {
-        Outcome::Ok{data:Data::ReviewQuery(ReviewQueryResult::AcceptedTarget(value))}=>value,x=>panic!("canonical accepted target expected {x:?}")};
+        Outcome::Ok{data:Data::ReviewQuery(boxed_result)}=>match *boxed_result { ReviewQueryResult::AcceptedTarget(value) => value, other => panic!("unexpected ReviewQuery result: {other:?}") },x=>panic!("canonical accepted target expected {x:?}")};
     assert_eq!(current_target,target);
     let review=request(&c,"actual-result-review",target.clone(),PrincipalRef::TrustedHostOperator).await;
     assert_eq!(review.review.target,target);
@@ -509,7 +509,7 @@ async fn valid_retained_versions_comments_and_review_outcomes_reopen_beyond_a_pa
     let mut after=None;let mut reviews=0;
     loop {
         let page=match call(&c,Operation::QueryReview{query:ReviewQuery::List{record:None,status:None,after,limit:4}}).await {
-            Outcome::Ok{data:Data::ReviewQuery(ReviewQueryResult::Reviews(page))}=>page,x=>panic!("reviews expected {x:?}")};
+            Outcome::Ok{data:Data::ReviewQuery(boxed_result)}=>match *boxed_result { ReviewQueryResult::Reviews(page) => page, other => panic!("unexpected ReviewQuery result: {other:?}") },x=>panic!("reviews expected {x:?}")};
         reviews+=page.items.len();after=page.next_cursor;if after.is_none(){break}
     }
     assert_eq!(reviews,7);
@@ -718,7 +718,7 @@ async fn accepted_checkpoint_review_checks_every_original_tuple_and_does_not_qua
     let c=Controller::open_with_config(path(),workflow_config()).unwrap();
     let t=accepted_release_task(&c,"checkpoint-review").await;
     let selected=match call(&c,Operation::QueryReview{query:ReviewQuery::AcceptedTarget{task_id:t.id.clone(),scope:AcceptedReviewScope::Checkpoint}}).await {
-        Outcome::Ok{data:Data::ReviewQuery(ReviewQueryResult::AcceptedTarget(target))}=>target,x=>panic!("accepted checkpoint target expected {x:?}")};
+        Outcome::Ok{data:Data::ReviewQuery(boxed_result)}=>match *boxed_result { ReviewQueryResult::AcceptedTarget(target) => target, other => panic!("unexpected ReviewQuery result: {other:?}") },x=>panic!("accepted checkpoint target expected {x:?}")};
     let ReviewTarget::AcceptedTaskCheckpoint{result}=&selected else{panic!("checkpoint scope expected")};
     assert_eq!(result.checkpoint,t.result.as_ref().unwrap().checkpoint);
     for field in ["registration","repository","commit","remote_ref","publication","attempt","terminal_revision"] {
@@ -779,7 +779,7 @@ async fn docs_browser(c: &Controller, method: &str, path: &str, body: Vec<u8>) -
 }
 fn docs_queue(outcome: Outcome) -> borg_runtime::collaboration::questions::DecisionQueuePage {
     match outcome {
-        Outcome::Ok { data: Data::QuestionQuery(borg_runtime::collaboration::questions::QuestionQueryResult::DecisionQueue(page)) } => page,
+        Outcome::Ok { data: Data::QuestionQuery(boxed_result) } => match *boxed_result { borg_runtime::collaboration::questions::QuestionQueryResult::DecisionQueue(page) => page, other => panic!("unexpected QuestionQuery result: {other:?}") },
         other => panic!("expected decision queue: {other:?}"),
     }
 }
@@ -838,7 +838,7 @@ async fn browser_and_mcp_mixed_queue_project_the_same_records_and_resolution() {
     assert_eq!(browser_document.status, 200);
     assert!(browser_document.body.contains("Shared &lt;subject&gt; &amp; exact bytes"));
     assert_eq!(call(&c, tool(&caller, "mixed-review-read", "collab_review_get", json!({"review_id":review.review.id}))).await,
-        Outcome::Ok { data: Data::ReviewQuery(ReviewQueryResult::Review(review.clone())) });
+        Outcome::Ok { data: Data::ReviewQuery(Box::new(ReviewQueryResult::Review(review.clone()))) });
     // Selecting an agent queue is a read; it does not impersonate that reviewer.
     let denied = docs_browser(&c, "POST", &format!("/reviews/{}/decide", review.review.id), docs_form(&[
         ("operation_id", "mixed-browser-wrong-reviewer".into()), ("expected_revision", review.review.revision.to_string()),
@@ -1332,7 +1332,7 @@ async fn answered_product_question_preserves_original_release_and_unconfigured_r
         c: &Controller,
         id: &str,
     ) -> (
-        TaskInput,
+        Box<TaskInput>,
         String,
         String,
         borg_runtime::repository_catalogue::Entry,
@@ -1430,8 +1430,8 @@ async fn answered_product_question_preserves_original_release_and_unconfigured_r
     .await
     {
         Outcome::Ok {
-            data: Data::QuestionQuery(QuestionQueryResult::Question(value)),
-        } => value,
+            data: Data::QuestionQuery(boxed_result),
+        } => match *boxed_result { QuestionQueryResult::Question(value) => value, other => panic!("unexpected QuestionQuery result: {other:?}") },
         other => panic!("answered question expected: {other:?}"),
     };
     assert_eq!(answered.question.status, QuestionStatus::Answered);
@@ -1532,7 +1532,7 @@ async fn answered_product_question_preserves_original_release_and_unconfigured_r
         )
         .await,
         Outcome::Ok {
-            data: Data::QuestionQuery(QuestionQueryResult::Question(answered))
+            data: Data::QuestionQuery(Box::new(QuestionQueryResult::Question(answered)))
         }
     );
     assert_eq!(stage(&c, &original.id).await, before);
@@ -1574,8 +1574,8 @@ async fn successful_question_and_review_preserve_owned_access_configuration() {
         .await
         {
             Outcome::Ok {
-                data: Data::QuestionQuery(QuestionQueryResult::Question(value)),
-            } => value,
+                data: Data::QuestionQuery(boxed_result),
+            } => match *boxed_result { QuestionQueryResult::Question(value) => value, other => panic!("unexpected QuestionQuery result: {other:?}") },
             other => panic!("question view expected: {other:?}"),
         }
     }
@@ -1809,8 +1809,8 @@ async fn successful_question_and_review_preserve_owned_access_configuration() {
     .await
     {
         Outcome::Ok {
-            data: Data::ReviewQuery(ReviewQueryResult::AcceptedTarget(value)),
-        } => value,
+            data: Data::ReviewQuery(boxed_result),
+        } => match *boxed_result { ReviewQueryResult::AcceptedTarget(value) => value, other => panic!("unexpected ReviewQuery result: {other:?}") },
         other => panic!("accepted review target expected: {other:?}"),
     };
     let requested = Box::pin(request(

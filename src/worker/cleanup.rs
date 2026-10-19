@@ -773,7 +773,7 @@ async fn workspace_attempt_at(
     });
     let control = Control {
         deadline_ms: add_ms(process::now_ms(), policy.operation_timeout_ms)?,
-        worker_limits: Arc::new(config.limits.worker.clone()),
+        worker_limits: Arc::from(config.limits.worker.clone()),
         runtime_limits: Arc::new(cleanup_limits),
         validation_runtime: validation_runtime.clone(),
         cancel,
@@ -1144,7 +1144,7 @@ async fn historical_stopped(
     else {
         return Ok(false);
     };
-    if current.input != *input
+    if *current.input != *input
         || current.session_id != original.session_id
         || current.assigned_agent_id != input.definition.id
     {

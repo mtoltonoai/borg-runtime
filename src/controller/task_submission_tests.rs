@@ -96,7 +96,7 @@ fn draft_omission_is_distinct_from_null_and_explicit_input_stays_canonical() {
             &decode::<Operation>(
                 &encode(&Operation::SubmitTask {
                     operation_id: "explicit".into(),
-                    input: explicit
+                    input: (explicit).into()
                 })
                 .unwrap()
             )
@@ -105,7 +105,7 @@ fn draft_omission_is_distinct_from_null_and_explicit_input_stays_canonical() {
         .unwrap(),
         encode(&Operation::SubmitTask {
             operation_id: "explicit".into(),
-            input: selected.resolve(selected.definition.clone().unwrap())
+            input: (selected.resolve(selected.definition.clone().unwrap())).into()
         })
         .unwrap()
     );
@@ -226,11 +226,11 @@ fn schema23_refuses_draft_and_claimed_metadata_in_refused_original_without_tasks
     for operation in [
         Operation::SubmitTaskDraft {
             operation_id: "draft-refused".into(),
-            input: draft(),
+            input: (draft()).into(),
         },
         Operation::SubmitTask {
             operation_id: "claim-refused".into(),
-            input: claimed,
+            input: (claimed).into(),
         },
     ] {
         let sql = db(23);
@@ -309,7 +309,7 @@ fn schema23_to24_lineage_migration_is_atomic_and_preserves_session_columns_and_i
     let task = Task {
         id: session.task_id.clone(),
         session_id: session.id.clone(),
-        input: input.clone(),
+        input: (input.clone()).into(),
         assigned_agent_id: session.agent_id.clone(),
         pending_assignment: None,
         status: TaskStatus::Queued,
@@ -362,7 +362,7 @@ fn schema23_to24_lineage_migration_is_atomic_and_preserves_session_columns_and_i
         &sql,
         &Operation::SubmitTask {
             operation_id: "original-submit".into(),
-            input: requested,
+            input: (requested).into(),
         },
         &Outcome::Ok {
             data: Data::Task(Box::new(task.clone())),
@@ -406,8 +406,8 @@ fn schema23_to24_lineage_migration_is_atomic_and_preserves_session_columns_and_i
     validate_existing(&Connection::new(&sql, &cfg.limits), &cfg, 23).unwrap();
     compatibility::validate_shape(&sql, 23).unwrap();
     assert_eq!(
-        super::super::sessions::input(&Connection::new(&sql, &cfg.limits), &session).unwrap(),
-        input
+        super::super::sessions::input(&Connection::new(&sql, &cfg.limits), &session).unwrap().as_ref(),
+        &input
     );
 
     // The actual SQLite commit veto must undo the rebuilt sessions table,
@@ -468,8 +468,8 @@ fn schema23_to24_lineage_migration_is_atomic_and_preserves_session_columns_and_i
         (session.id.clone(), task.id.clone(), input_bytes, None, None)
     );
     assert_eq!(
-        super::super::sessions::input(&Connection::new(&sql, &cfg.limits), &session).unwrap(),
-        input
+        super::super::sessions::input(&Connection::new(&sql, &cfg.limits), &session).unwrap().as_ref(),
+        &input
     );
     assert_eq!(
         sql.query_row("SELECT count(*) FROM task_assignments", [], |r| r

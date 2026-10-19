@@ -389,7 +389,7 @@ async fn native_submission_finalization_rechecks_original_deadline_after_real_he
     let (ready, release) = lab.controller().qualification_pause_next_finalization();
     let controller = lab.controller().clone();
     let result = tokio::spawn(async move { Box::pin(controller.handle(request("native-phase", Operation::SubmitTask {
-        operation_id: "native-phase-original".into(), input,
+        operation_id: "native-phase-original".into(), input: (input).into(),
     }))).await });
     tokio::time::timeout(Duration::from_secs(10), ready).await.expect("genuine local validation helper must complete").unwrap();
     let reader = lab.reader();

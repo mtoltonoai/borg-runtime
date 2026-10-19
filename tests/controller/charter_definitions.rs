@@ -81,8 +81,11 @@ async fn selected(c: &Controller, id: &str) -> Definition {
 fn outcome(r: &Reply) -> CharterDefinitionOutcome {
     match &r.outcome {
         Outcome::Ok {
-            data: Data::Charter(CharterOutcome::Definition(v)),
-        } => v.clone(),
+            data: Data::Charter(value),
+        } => match value.as_ref() {
+            CharterOutcome::Definition(v) => v.clone(),
+            x => panic!("definition result {x:?}"),
+        },
         x => panic!("definition result {x:?}"),
     }
 }
@@ -250,7 +253,7 @@ async fn charter_publish_select_same_agent_preserves_tasks_and_original_receipts
     )
     .await;
     assert!(
-        matches!(&source,Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Session(Some(e)))} if e.charter.reference==published.source&&e.session.initial==published.source&&e.session.pending.is_none())
+        matches!(&source,Outcome::Ok{data:Data::CharterQuery(value)} if matches!(value.as_ref(), CharterQueryResult::Session(Some(e)) if e.charter.reference==published.source&&e.session.initial==published.source&&e.session.pending.is_none()))
     );
     drop(c);
     controller_owner_released(&p).await;

@@ -71,7 +71,7 @@ async fn step(config:&WorkerConfig,state:&Path,client:&ApiClient,active:&BTreeMa
     if task.definition.executor==ExecutorKind::Native && handoff::path(state,attempt).exists() {return Err("native handoff retains body consumer".into())}
     let current=canonical_task(client,&receipt.command,state,policy).await?;
     let (_sender,cancel)=watch::channel(false);
-    let control=Control{deadline_ms:add_ms(process::now_ms(),policy.operation_timeout_ms)?,cancel,worker_limits:Arc::new(config.limits.worker.clone()),
+    let control=Control{deadline_ms:add_ms(process::now_ms(),policy.operation_timeout_ms)?,cancel,worker_limits:Arc::from(config.limits.worker.clone()),
         runtime_limits:config.limits.clone(),validation_runtime:runtime.clone()};
     let custody=match native_custody {
         Some(custody)=>custody,

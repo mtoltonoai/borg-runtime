@@ -27,7 +27,9 @@ pub(super) async fn start(session:&mut Session,scope:&InitialCharterScope,state:
     }
     let client=crate::client::ApiClient::new(&scope.controller_url,control.runtime_limits.clone())?;
     let delivery=match crate::worker::controller_call(&client,Operation::QueryCharter{query:CharterQuery::SuppliedContext{delivery_id:context_id(scope)}},control).await?{
-        Data::CharterQuery(CharterQueryResult::SuppliedContext(v))=>v,_=>return Err("original supplied context absent".into()),
+        Data::CharterQuery(v)=>match *v {
+            CharterQueryResult::SuppliedContext(v)=>v,_=>return Err("original supplied context absent".into()),
+        },_=>return Err("original supplied context absent".into()),
     };
     if delivery.caller!=scope.caller||delivery.session_id!=scope.session_id
         ||delivery.acknowledgment.as_ref().map(|a|a.thread_id.as_str())!=Some(thread_id){return Err("supplied outer context differs".into());}
@@ -42,9 +44,9 @@ pub(super) async fn start(session:&mut Session,scope:&InitialCharterScope,state:
         caller:scope.caller.clone(),outer_index:index,effective:delivery.effective,request_id,thread_id:thread_id.into(),output_schema:supplied_result_schema()};
     let operation=Operation::ObserveCharter{operation_id:id.clone(),caller:scope.caller.clone(),observation:CharterObservation::BeginSuppliedTurn{
         delivery_id:delivery.delivery_id,outer_index:index,request_id,thread_id:thread_id.into(),output_schema:supplied_result_schema()}};
-    let begun=charter_delivery::mutation_outcome(&client,&dir.join("intent.json"),operation,control,credentials).await?;
-    let CharterOutcome::SuppliedTurn(mut begun)=begun else{return Err("supplied turn intent response differs".into())};
-    if begun.boundary!=expected||begun.acknowledgment.is_some()||begun.reply.is_some()||begun.terminal.is_some(){return Err("supplied turn original intent differs".into());}
+    let mut begun=charter_delivery::mutation_outcome(&client,&dir.join("intent.json"),operation,control,credentials).await?;
+    let CharterOutcome::SuppliedTurn(begun_turn)=begun.as_ref() else{return Err("supplied turn intent response differs".into())};
+    if begun_turn.boundary!=expected||begun_turn.acknowledgment.is_some()||begun_turn.reply.is_some()||begun_turn.terminal.is_some(){return Err("supplied turn original intent differs".into());}
     control.check()?;
     // Marker and original request are ordered without an intervening await.
     process::atomic_json(&marker,&json!({"turn_id":id,"request_id":request_id,"thread_id":thread_id}))?;
@@ -55,8 +57,9 @@ pub(super) async fn start(session:&mut Session,scope:&InitialCharterScope,state:
     let result=charter_delivery::mutation_outcome(&client,&dir.join("ack.json"),Operation::ObserveCharter{
         operation_id:ack_id.clone(),caller:scope.caller.clone(),observation:CharterObservation::AckSuppliedTurn{
             turn_id:id,request_id,response:response.clone()}},control,credentials).await?;
-    begun.acknowledgment=Some(CharterSuppliedTurnAck{operation_id:ack_id,request_id,turn_id:turn_id.clone(),response:response.clone()});
-    if result!=CharterOutcome::SuppliedTurn(begun){return Err("supplied turn original ACK differs; no resend".into());}
+    let CharterOutcome::SuppliedTurn(begun_turn)=begun.as_mut() else{return Err("supplied turn intent response differs".into())};
+    begun_turn.acknowledgment=Some(CharterSuppliedTurnAck{operation_id:ack_id,request_id,turn_id:turn_id.clone(),response:response.clone()});
+    if result!=begun{return Err("supplied turn original ACK differs; no resend".into());}
     Ok((response,Capture{boundary:expected,turn_id,items:vec![],frame_bytes:session.limits.frame_bytes}))
 }
 impl Capture {

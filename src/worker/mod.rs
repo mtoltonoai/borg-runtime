@@ -2817,7 +2817,7 @@ fn coding_recovery_binding(current: &Task, input: &TaskInput, prior: &Attempt) -
     current.id == prior.task_id
         && current.session_id == prior.session_id
         && current.assigned_agent_id == input.definition.id
-        && current.input == *input
+        && *current.input == *input
         && current.attempt.as_ref().is_some_and(|attempt| {
             attempt.id == prior.id
                 && attempt.task_id == prior.task_id
@@ -3395,7 +3395,7 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
     let selected_limits = config.limits.clone();
     config.limits = retained_worker_limits(&state, &selected_limits)?;
     let policy_changed = !same_execution_policy(&config.limits, &selected_limits);
-    let worker_limits = Arc::new(config.limits.worker.clone());
+    let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(config.limits.worker.clone());
     let validation_runtime = Arc::new(crate::native::ValidationRuntime::new(
         worker_limits.clone(),
     )?);
@@ -3904,8 +3904,8 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                                         &task,
                                         &control,
                                         &reporter,
-                                        continuation.as_ref(),
-                                        completion_continuation.as_ref(),
+                                        continuation.as_deref(),
+                                        completion_continuation.as_deref(),
                                         &attempt_state,
                                         validation_owner,
                                     ))
@@ -3992,7 +3992,7 @@ pub async fn run_with_machine_resources(mut config: WorkerConfig, host_profile: 
                             let (cancel, cancelled) = watch::channel(false);
                             let metadata = request.input.resolved_limits.as_ref().ok_or("publication command policy absent")?.global_metadata.clone();
                             let control = Control { deadline_ms: request.input.limits.deadline_unix_ms.min(request.attempt.deadline_unix_ms),
-                                worker_limits: Arc::new(metadata.worker.clone()), runtime_limits: Arc::new((*metadata).clone()),
+                                worker_limits: Arc::from(metadata.worker.clone()), runtime_limits: Arc::from(metadata),
                                 validation_runtime: validation_runtime.clone(), cancel: cancelled };
                             let (cfg, root, resource, done, id) = (config.clone(), state.clone(), envelope.clone(), finished.clone(), command_id.clone());
                             let task_id = request.caller().task_id.clone();
@@ -4096,7 +4096,7 @@ pub(crate) fn test_limits() -> Arc<RuntimeLimits> {
 #[cfg(test)]
 pub(crate) fn test_control(deadline_ms: u64, cancel: watch::Receiver<bool>) -> Control {
     let runtime_limits = test_limits();
-    let worker_limits = Arc::new(runtime_limits.worker.clone());
+    let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(runtime_limits.worker.clone());
     Control {
         deadline_ms,
         cancel,

@@ -24,9 +24,9 @@ async fn original(c: &Controller, id: &str) -> Reply {
         request_id:format!("assignment-ui-lookup-{}",NEXT.fetch_add(1,Ordering::Relaxed)),command:op.clone()})).await;
     r.validate_for(&op).unwrap(); r
 }
-async fn lineage(c: &Controller, id: &str) -> (Session,TaskInput,bool) {
+async fn lineage(c: &Controller, id: &str) -> (Session,Box<TaskInput>,bool) {
     match call(c,Operation::QueryCollaboration {query:Query::SessionInput {session_id:id.into()}}).await {
-        Data::Collaboration(QueryResult::SessionInput {session,input,current}) => (session,*input,current),
+        Data::Collaboration(QueryResult::SessionInput {session,input,current}) => (session,input,current),
         other => panic!("session input {other:?}"),
     }
 }
@@ -192,7 +192,7 @@ async fn descendant_assignment_cancellation_journey() {
     let child_input=borg_runtime::delegation::coding_child(&parent.input,"retain descendant work").unwrap();
     let Data::Task(child)=call(&f.controller,Operation::DelegateTask {
         operation_id:"assignment-tree-delegate".into(),parent_task_id:parent_id.clone(),
-        parent_attempt_id:parent_attempt.id.clone(),generation:parent_attempt.generation,child:child_input,
+        parent_attempt_id:parent_attempt.id.clone(),generation:parent_attempt.generation,child:(child_input).into(),
     }).await else {panic!("actual delegated child")};
     assert_eq!(child.parent_task_id.as_deref(),Some(parent_id.as_str()));
     report(&f.controller,&parent_attempt,Observation::ProcessTreeStopped).await;

@@ -36,8 +36,8 @@ pub struct IdentityAdministrationOutcome {
     pub governance_revision: String,
     pub comparison_rule: String,
     pub before: Option<Definition>,
-    pub before_limits: Option<crate::limits::ExecutionLimits>,
-    pub after_limits: Option<crate::limits::ExecutionLimits>,
+    pub before_limits: Option<Box<crate::limits::ExecutionLimits>>,
+    pub after_limits: Option<Box<crate::limits::ExecutionLimits>>,
     pub classification: ConfigurationChangeClass,
     /// A manager may remove its own usable selection, but cannot appoint one.
     pub manager_unusable_for_future_tasks: bool,
@@ -239,7 +239,10 @@ pub fn outcome_requires_publication(outcome: &Outcome) -> bool {
         Data::Agent(a) => definition_requires_publication(&a.definition),
         Data::Agents(a) => a.iter().any(|a| definition_requires_publication(&a.definition)),
         Data::DefinitionUpdate(v) => definition_requires_publication(&v.selected_definition),
-        Data::Charter(crate::charter::CharterOutcome::Definition(v)) => definition_requires_publication(&v.definition),
+        Data::Charter(value) => match value.as_ref() {
+            crate::charter::CharterOutcome::Definition(v) => definition_requires_publication(&v.definition),
+            _ => false,
+        },
         Data::IdentityAdministration(v) => v.before.as_ref().is_some_and(definition_requires_publication)
             || match &v.effect { IdentityEffect::Registered(a) | IdentityEffect::Retired(a) | IdentityEffect::Replaced(a) => definition_requires_publication(&a.definition), IdentityEffect::Charter(crate::charter::CharterOutcome::Definition(v)) => definition_requires_publication(&v.definition), _ => false },
         Data::Commands(cs) => cs.iter().any(|c| match c {

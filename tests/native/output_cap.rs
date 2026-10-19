@@ -44,7 +44,7 @@ fn host(program: &LinkedProgram, limits: &RuntimeLimits) -> ValidationHost {
         program.path.clone(),
         program.directory.join("processes"),
         Arc::new(limits.execution.native.clone()),
-        Arc::new(ValidationRuntime::new(Arc::new(limits.worker.clone())).unwrap()),
+        Arc::new(ValidationRuntime::new(Arc::from(limits.worker.clone())).unwrap()),
     )
 }
 

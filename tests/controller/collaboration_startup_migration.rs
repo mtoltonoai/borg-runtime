@@ -348,7 +348,7 @@ async fn historical_fixture(p: &std::path::Path) -> HistoricalFixture {
     for (index, agent) in ["historical-owner-one", "historical-owner-two"].into_iter().enumerate() {
         let mut input = native(agent);
         input.limits.result_bytes = limits.task_defaults.result_bytes;
-        let operation = Operation::SubmitTask { operation_id: format!("historical-submit-{index}"), input };
+        let operation = Operation::SubmitTask { operation_id: format!("historical-submit-{index}"), input: (input).into() };
         let r = tokio::time::timeout(Duration::from_secs(10), client.call(operation.clone())).await.unwrap().unwrap();
         assert!(r.commit.is_some());
         tasks.push(task(r.outcome.clone()));

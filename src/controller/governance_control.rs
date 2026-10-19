@@ -655,7 +655,7 @@ mod tests {
                     // Genuine bounded schema validation, followed by exact
                     // original-request finalization. No synthetic proof/token.
                     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                    let proof = runtime.block_on(Box::pin((*ticket).execute(&db.validation_host, &db.config.repository_read)));
+                    let proof = runtime.block_on(Box::pin(ticket.execute(&db.validation_host, &db.config.repository_read)));
                     db.handle(OriginalRequest { request, invocation_path: TrustedHostPath::OperatorApi,
                         validation: Some(ExternalProof::Native(proof)) }).0
                 }
@@ -706,7 +706,7 @@ mod tests {
             output_schema: Some(serde_json::json!({"type":"integer"})), limits: p.task_defaults.at(NOW).unwrap(),
             dependencies: vec![], native_workflow: None,
         };
-        let queued = task(call(&mut db, "agent-submit", Operation::SubmitTask { operation_id: "agent-submit".into(), input }));
+        let queued = task(call(&mut db, "agent-submit", Operation::SubmitTask { operation_id: "agent-submit".into(), input: (input).into() }));
         assert_eq!(queued.assigned_agent_id, OPERATOR_LABEL);
         let worker = Worker { id: "agent-worker".into(), incarnation: "agent-incarnation".into(), native_capacity: 1, coding_capacity: 0 };
         let registered = call(&mut db, "agent-register", Operation::RegisterWorker { operation_id: "agent-register".into(), worker: worker.clone() });

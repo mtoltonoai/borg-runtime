@@ -2,7 +2,7 @@
 //! The original send marker survives loss of the executor or controller ACK.
 use super::*;
 use crate::charter::{CharterObservation, CharterOutcome, CharterQuery, CharterQueryResult,
-    CharterSuppliedContext, supplied_context_instructions};
+    supplied_context_instructions};
 use crate::protocol::{Data, Operation, Outcome, bounded_json_size};
 use serde::Deserialize;
 use std::io::Read;
@@ -53,7 +53,7 @@ fn clean(value: &Value, credentials: &[String], control: &Control) -> std::resul
 }
 
 pub(super) async fn mutation_outcome(client: &crate::client::ApiClient, path: &Path, operation: Operation,
-    control: &Control, credentials: &[String]) -> std::result::Result<CharterOutcome, String> {
+    control: &Control, credentials: &[String]) -> std::result::Result<Box<CharterOutcome>, String> {
     let value = serde_json::to_value(&operation).map_err(|_| "supplied charter operation encoding")?;
     clean(&value, credentials, control)?;
     let mut journal = match crate::worker::mutations::read(path, &control.runtime_limits)? {
@@ -85,14 +85,6 @@ pub(super) async fn mutation_outcome(client: &crate::client::ApiClient, path: &P
     }
 }
 
-async fn mutation(client: &crate::client::ApiClient, path: &Path, operation: Operation,
-    control: &Control, credentials: &[String]) -> std::result::Result<CharterSuppliedContext, String> {
-    match mutation_outcome(client,path,operation,control,credentials).await? {
-        CharterOutcome::SuppliedContext(v)=>Ok(v),
-        _=>Err("supplied charter original context response kind differs".into()),
-    }
-}
-
 // Traceability scope: initial new-thread delivery only. No mid-turn boundary or
 // every-inner-response observability is inferred from an outer thread receipt.
 //= spec/impl/v2/implementation.md#definitions-carry-reusable-charters
@@ -111,7 +103,10 @@ pub(super) async fn start_thread(session: &mut Session, scope: &Scope, state: &P
     let before = match crate::worker::controller_call(&client, Operation::QueryCharter {
         query: CharterQuery::Session { session_id: scope.session_id.clone() },
     }, control).await? {
-        Data::CharterQuery(CharterQueryResult::Session(Some(value))) => value,
+        Data::CharterQuery(value) => match *value {
+            CharterQueryResult::Session(Some(value)) => value,
+            _ => return Err("accepted supplied charter session is absent".into()),
+        },
         _ => return Err("accepted supplied charter session is absent".into()),
     };
     if before.session.session_id != scope.session_id { return Err("supplied charter session differs".into()); }
@@ -120,7 +115,10 @@ pub(super) async fn start_thread(session: &mut Session, scope: &Scope, state: &P
         match crate::worker::controller_call(&client, Operation::QueryCharter {
             query: CharterQuery::Source { source: selected.clone() },
         }, control).await? {
-            Data::CharterQuery(CharterQueryResult::Source(value)) if value.reference == selected => value,
+            Data::CharterQuery(value) => match *value {
+                CharterQueryResult::Source(value) if value.reference == selected => value,
+                _ => return Err("supplied charter source differs".into()),
+            },
             _ => return Err("supplied charter source differs".into()),
         }
     };
@@ -134,15 +132,18 @@ pub(super) async fn start_thread(session: &mut Session, scope: &Scope, state: &P
     clean(&config, credentials, control)?;
     let delivery_id = format!("{}-charter-supplied-initial", scope.caller.attempt_id);
     let expected_revision = before.session.revision.checked_add(1).ok_or("supplied charter binding overflow")?;
-    let intent = mutation(&client, &directory.join("intent.json"), Operation::ObserveCharter {
+    let mut intent = mutation_outcome(&client, &directory.join("intent.json"), Operation::ObserveCharter {
         operation_id: delivery_id.clone(), caller: scope.caller.clone(),
         observation: CharterObservation::BeginSuppliedContext { session_id: scope.session_id.clone(),
             expected_revision: before.session.revision, source: selected, request_id,
             developer_instructions: instructions.clone() },
     }, control, credentials).await?;
-    if intent.delivery_id != delivery_id || intent.caller != scope.caller || intent.session_id != scope.session_id
-        || intent.binding_revision != expected_revision || intent.effective != source
-        || intent.request_id != request_id || intent.developer_instructions != instructions || intent.acknowledgment.is_some() {
+    let CharterOutcome::SuppliedContext(context) = intent.as_ref() else {
+        return Err("supplied charter original context response kind differs".into());
+    };
+    if context.delivery_id != delivery_id || context.caller != scope.caller || context.session_id != scope.session_id
+        || context.binding_revision != expected_revision || context.effective != source
+        || context.request_id != request_id || context.developer_instructions != instructions || context.acknowledgment.is_some() {
         return Err("supplied charter original intent acknowledgment differs".into());
     }
     control.check()?;
@@ -160,15 +161,20 @@ pub(super) async fn start_thread(session: &mut Session, scope: &Scope, state: &P
         check_association_ids(thread, None, credentials)?;
         clean(&response, credentials, control)?;
         let ack_id = format!("{}-charter-supplied-ack", scope.caller.attempt_id);
-        let acknowledged = mutation(&client, &directory.join("ack.json"), Operation::ObserveCharter {
+        let acknowledged = mutation_outcome(&client, &directory.join("ack.json"), Operation::ObserveCharter {
             operation_id: ack_id.clone(), caller: scope.caller.clone(),
             observation: CharterObservation::AckSuppliedContext { delivery_id: delivery_id.clone(), request_id, response: response.clone() },
         }, control, credentials).await?;
-        let mut expected = intent;
+        let CharterOutcome::SuppliedContext(expected) = intent.as_mut() else {
+            return Err("supplied charter original context response kind differs".into());
+        };
         expected.acknowledgment = Some(crate::charter::CharterSuppliedAcknowledgment {
             operation_id: ack_id, request_id, thread_id: thread.to_owned(), response: response.clone(),
         });
-        if acknowledged != expected { return Err("supplied charter original result acknowledgment differs".into()); }
+        if !matches!(acknowledged.as_ref(), CharterOutcome::SuppliedContext(_)) {
+            return Err("supplied charter original context response kind differs".into());
+        }
+        if acknowledged != intent { return Err("supplied charter original result acknowledgment differs".into()); }
         dispatch.thread_id = Some(thread.to_owned());
         process::atomic_json(&dispatch_path, &dispatch)?;
         control.check()?;

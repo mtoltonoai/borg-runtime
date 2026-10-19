@@ -6,7 +6,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot};
 
 fn host(sink: Arc<request_observation::Sink>) -> ValidationHost {
     let limits = crate::limits::RuntimeLimits::seed().unwrap();
-    let runtime = ValidationRuntime::new(Arc::new(limits.worker)).unwrap();
+    let runtime = ValidationRuntime::new(Arc::from(limits.worker)).unwrap();
     let mut host = ValidationHost::new("/unused-program".into(), "/unused-registry".into(),
         Arc::new(limits.execution.native), Arc::new(runtime));
     host.request_capture = Some(sink);

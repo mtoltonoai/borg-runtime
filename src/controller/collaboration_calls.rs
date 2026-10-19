@@ -421,8 +421,7 @@ pub(super) fn apply(
     let original = caller(tx, &call.caller, now)?;
     original.task.input.execution_limits().map_err(|reason| Fault::Store(reason))?;
     let selected = original.task.input.resolved_limits.as_ref().ok_or_else(|| Fault::Store("accepted caller limits absent".into()))?;
-    let limits = selected.global_metadata.as_ref();
-    let mut selected_limits=limits.clone();
+    let mut selected_limits=selected.global_metadata.clone();
     selected_limits.execution.collaboration=original.task.input.execution_limits().map_err(Fault::Store)?.collaboration.clone();
     let limits=&selected_limits;
     let mut bound_tx = tx.with_limits(limits);
@@ -664,7 +663,7 @@ pub(super) fn apply_inner(
                 parent_task_id: actor.task_id.clone(),
                 parent_attempt_id: actor.attempt_id.clone(),
                 generation: actor.generation,
-                child,
+                child: (child).into(),
             }
         }
         ToolArgs::Assign {
@@ -799,13 +798,13 @@ pub(super) fn safe(limits: &crate::limits::RuntimeLimits, mut value: (Data, bool
     let safe = match &value.0 {
         Data::Task(t) => !super::credential_admission::rejected(&Operation::SubmitTask {
             operation_id: "read-projection".into(),
-            input: t.input.clone(),
+            input: (t.input.clone()).into(),
         }),
         Data::WorkMutation(result) => !super::credential_admission::rejected(&Operation::SubmitTask {
-            operation_id: "read-projection".into(), input: result.view.task.input.clone(),
+            operation_id: "read-projection".into(), input: (result.view.task.input.clone()).into(),
         }),
         Data::WorkQuery(crate::collaboration::work::WorkQueryResult::Task(view)) => !super::credential_admission::rejected(&Operation::SubmitTask {
-            operation_id: "read-projection".into(), input: view.task.input.clone(),
+            operation_id: "read-projection".into(), input: (view.task.input.clone()).into(),
         }),
         Data::Release(r) => {
             !crate::credential::repository_contains_credentials(&r.checkpoint.repository)

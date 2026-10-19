@@ -428,7 +428,7 @@ fn save(tx:&Connection,s:&Session,st:&State,old:&Option<String>)->Result<()> {
 fn observed(tx:&Connection,st:State,available:Option<DeliveryPage>)->Result<Data> {
     let v=DeliveryObservation{acknowledged_cursor:st.acknowledged_cursor,pending:st.pending,available,routing_cursor:st.routing_cursor,routing_turn:st.routing_turn,superseded:st.superseded};
     bounded_json_size(&v,policy(tx)?.pending_delivery_bytes).map_err(|_|Fault::Refused("response_bound","workflow observation exceeds bound".into()))?;
-    Ok(Data::CollaborationDelivery(v))
+    Ok(Data::CollaborationDelivery(Box::new(v)))
 }
 pub(super) fn validate_existing(tx:&Connection,s:&Session)->Result<()> {
     let present:bool=tx.query_row("SELECT workflow_delivery IS NOT NULL FROM sessions WHERE id=?1",[&s.id],|r|r.get(0))?;
@@ -557,7 +557,8 @@ fn validate_review_resolution(tx:&Connection,event:&WorkflowActivity,review:&cra
             &&expected_revision.checked_add(1)==Some(event.subject_revision)&&view.withdrawal.as_ref().is_some_and(|w|&w.reason==reason),
         _=>false,
     };
-    let Outcome::Ok{data:Data::ReviewMutation(ReviewMutationOutcome::Review(changed))}=outcome else{return Err(fail())};
+    let Outcome::Ok{data:Data::ReviewMutation(changed)}=outcome else{return Err(fail())};
+    let ReviewMutationOutcome::Review(changed)=*changed;
     let closed=&changed.review;
     if !exact||closed.id!=review.id||closed.revision!=event.subject_revision||closed.changed_product_revision!=event.id.product_revision
         ||closed.target!=review.target||closed.reviewer!=review.reviewer||closed.requested_by!=review.requested_by

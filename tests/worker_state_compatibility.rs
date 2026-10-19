@@ -210,7 +210,7 @@ async fn genuine_schema15_migrates_in_place_and_old_reader_refuses_schema16_with
             definition:Definition {charter:None,limit_overrides:None,execution_profile:Some(ExecutionProfile::CollaborationV1{web_search:None}),inference:Some(InferenceSettings::selected()),id:"schema15-owner".into(),revision:"original-1".into(),executor:ExecutorKind::Native},
             repository:None,acceptance_commands:vec![],output_schema:Some(serde_json::json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false})),
             limits:Limits {deadline_unix_ms:process::now_ms()+600000,model_requests:3,output_bytes:16384,result_bytes:limits.task_defaults.result_bytes,max_delegation_depth:4},dependencies:vec![],native_workflow:None};
-        let submit=Operation::SubmitTask {operation_id:"schema15-submit".into(),input};
+        let submit=Operation::SubmitTask {operation_id:"schema15-submit".into(),input: (input).into()};
         let submitted=old_call(&client,&address,submit.clone()).await;
         let task=match &submitted.outcome {Outcome::Ok{data:Data::Task(t)}=>t,_=>panic!("{submitted:?}")};
         let cancel=Operation::CancelTask {operation_id:"schema15-cancel".into(),task_id:task.id.clone(),expected_revision:task.revision};

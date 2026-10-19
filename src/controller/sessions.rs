@@ -136,7 +136,7 @@ pub(super) fn is_successor(tx: &Connection<'_>, id: &str) -> Result<bool> {
 }
 /// Immutable controller-resolved input for this exact instantiation. Older
 /// stores have one session/task and are read without adding or rewriting rows.
-pub(super) fn input(tx: &Connection<'_>, session: &Session) -> Result<TaskInput> {
+pub(super) fn input(tx: &Connection<'_>, session: &Session) -> Result<Box<TaskInput>> {
     let maximum=tx.limits.transport.body_bytes;
     let value=if lineage_schema(tx)? {
         let row:Option<(String,String)>=tx.query_row(
@@ -144,7 +144,7 @@ pub(super) fn input(tx: &Connection<'_>, session: &Session) -> Result<TaskInput>
             params![session.id,sql_bound(maximum.saturating_add(1))?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let (task,raw)=row.ok_or_else(||Fault::Store("session accepted input absent".into()))?;
         if task!=session.task_id || raw.len()>maximum {return Err(Fault::Store("session input identity/bound differs".into()))}
-        decode::<TaskInput>(&raw)?
+        decode::<Box<TaskInput>>(&raw)?
     } else {
         let raw:String=tx.query_row("SELECT CAST(substr(CAST(body AS BLOB),1,?2) AS TEXT) FROM tasks WHERE id=?1",params![session.task_id,sql_bound(maximum.saturating_add(1))?],|r|r.get(0))?;
         if raw.len()>maximum{return Err(Fault::Store("historical task input exceeds bound".into()))}
@@ -175,7 +175,7 @@ pub(super) fn historical_task(tx:&Connection<'_>,task_id:&str,session_id:&str)->
     if task.attempt.as_ref().is_some_and(|a|a.session_id!=session_id){task.attempt=None;task.result=None;}
     Ok(task)
 }
-pub(super) fn initial_input(tx:&Connection<'_>,task_id:&str)->Result<TaskInput> {
+pub(super) fn initial_input(tx:&Connection<'_>,task_id:&str)->Result<Box<TaskInput>> {
     let id:String=tx.query_row("SELECT id FROM sessions WHERE task_id=?1 ORDER BY seq LIMIT 1",[task_id],|r|r.get(0))?;
     input(tx,&get(tx,&id)?)
 }

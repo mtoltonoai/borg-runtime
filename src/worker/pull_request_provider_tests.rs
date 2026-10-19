@@ -142,7 +142,7 @@ fn policy() -> RuntimeLimits {
 }
 fn control(limits: Arc<RuntimeLimits>) -> (watch::Sender<bool>, Control) {
     let (send, cancel) = watch::channel(false);
-    let worker_limits = Arc::new(limits.worker.clone());
+    let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(limits.worker.clone());
     let validation_runtime = Arc::new(crate::native::ValidationRuntime::new(worker_limits.clone()).unwrap());
     (send, Control { deadline_ms: process::now_ms() + 15_000, worker_limits,
         runtime_limits: limits, validation_runtime, cancel })

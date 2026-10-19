@@ -104,7 +104,7 @@ async fn genuine_schema18_migrates_without_rewriting_and_old_reader_refuses_new_
     .unwrap();
     let op = Operation::SubmitTask {
         operation_id: "schema18-original-submit".into(),
-        input: native("schema18-original-agent"),
+        input: (native("schema18-original-agent")).into(),
     };
     let original = client.call_at(op.clone(), 16).await.unwrap();
     let task = task(original.outcome.clone());

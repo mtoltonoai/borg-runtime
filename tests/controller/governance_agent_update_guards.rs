@@ -360,8 +360,9 @@ async fn mandatory_validation_stays_enforcing(mode: &str) {
     )
     .await;
     assert!(
-        matches!(admitted, Outcome::Ok { data: Data::Completion(CompletionOutcome::Evaluated(ref value)) }
-        if value.state.disposition == CompletionDisposition::Admit),
+        matches!(&admitted, Outcome::Ok { data: Data::Completion(completion) }
+        if matches!(completion.as_ref(), CompletionOutcome::Evaluated(value)
+            if value.state.disposition == CompletionDisposition::Admit)),
         "{admitted:?}"
     );
     task(

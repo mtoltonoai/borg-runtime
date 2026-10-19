@@ -153,7 +153,7 @@ async fn accepted_snapshot_and_original_receipt_survive_changed_global_defaults(
     let original = coding(&first, "agent-snapshot");
     let op = Operation::SubmitTask {
         operation_id: "submit-original".into(),
-        input: original.clone(),
+        input: (original.clone()).into(),
     };
     let c = Controller::open_with_config(&p, config(first.clone())).unwrap();
     register_fixture(&c).await;
@@ -187,7 +187,7 @@ async fn accepted_snapshot_and_original_receipt_survive_changed_global_defaults(
             &c,
             Operation::SubmitTask {
                 operation_id: "submit-later".into(),
-                input: coding(&later, "agent-later"),
+                input: (coding(&later, "agent-later")).into(),
             },
         )
         .await,
@@ -226,7 +226,7 @@ async fn supplied_snapshot_refuses_and_agent_override_is_exact_immutable_revisio
         &c,
         Operation::SubmitTask {
             operation_id: "forged".into(),
-            input: forged,
+            input: (forged).into(),
         },
     )
     .await;
@@ -244,7 +244,7 @@ async fn supplied_snapshot_refuses_and_agent_override_is_exact_immutable_revisio
             &c,
             Operation::SubmitTask {
                 operation_id: "override".into(),
-                input: input.clone(),
+                input: (input.clone()).into(),
             },
         )
         .await,
@@ -273,7 +273,7 @@ async fn supplied_snapshot_refuses_and_agent_override_is_exact_immutable_revisio
         &c,
         Operation::SubmitTask {
             operation_id: "same-revision-other-policy".into(),
-            input,
+            input: (input).into(),
         },
     )
     .await;
@@ -293,7 +293,7 @@ async fn explicit_admission_metadata_changes_effective_command_bound() {
         &c,
         Operation::SubmitTask {
             operation_id: "two-commands".into(),
-            input: input.clone(),
+            input: (input.clone()).into(),
         },
     )
     .await;
@@ -303,7 +303,7 @@ async fn explicit_admission_metadata_changes_effective_command_bound() {
         &c,
         Operation::SubmitTask {
             operation_id: "one-command".into(),
-            input,
+            input: (input).into(),
         },
     )
     .await;
@@ -327,7 +327,7 @@ async fn retained_call_replay_ignores_new_mcp_policy_and_limits_view_separates_c
             &c,
             Operation::SubmitTask {
                 operation_id: "mcp-task".into(),
-                input: coding(&first, "agent-mcp"),
+                input: (coding(&first, "agent-mcp")).into(),
             },
         )
         .await,
@@ -428,7 +428,7 @@ async fn list_tasks_uses_list_page_bytes_independently_of_command_page_bytes() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: "list-policy-task".into(),
-                    input: coding(&selected, "list-policy-agent"),
+                    input: (coding(&selected, "list-policy-agent")).into(),
                 },
             )
             .await,
@@ -521,7 +521,7 @@ async fn admission_refusals_identify_the_exact_limiting_metadata_field() {
         register_fixture(&c).await;
         let op = Operation::SubmitTask {
             operation_id: "field-submit".into(),
-            input,
+            input: (input).into(),
         };
         let original = command(&c, op.clone()).await;
         assert_limiting_field(&original, code, field);
@@ -598,12 +598,12 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         input.repository = None;
         input.output_schema = Some(serde_json::json!({"type":"object","required":["answer"],
             "properties":{"answer":{"type":"integer"}},"additionalProperties":false}));
-        let submit = Operation::SubmitTask { operation_id:"maximum-profile-submit".into(), input };
+        let submit = Operation::SubmitTask { operation_id:"maximum-profile-submit".into(), input: (input).into() };
         let submitted = command(&c, submit.clone()).await;
         let initial = task(&submitted);
         let pinned = serde_json::to_vec(&initial.input).unwrap();
         assert_eq!(*initial.input.resolved_limits.as_ref().unwrap().global_metadata, selected);
-        assert_eq!(initial.input.execution_limits().unwrap(), &selected.execution);
+        assert_eq!(initial.input.execution_limits().unwrap(), selected.execution.as_ref());
         let w = Worker { id:"maximum-profile-worker".into(), incarnation:"original".into(), coding_capacity:0, native_capacity:1 };
         assert!(matches!(command(&c, Operation::RegisterWorker {
             operation_id:"maximum-profile-register".into(), worker:w.clone()
@@ -633,7 +633,10 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         let binding = match command(&c, Operation::QueryCharter {
             query: CharterQuery::Session { session_id: a.session_id.clone() },
         }).await.outcome {
-            Outcome::Ok { data: Data::CharterQuery(CharterQueryResult::Session(Some(value))) } => value,
+            Outcome::Ok { data: Data::CharterQuery(value) } => match *value {
+                CharterQueryResult::Session(Some(value)) => value,
+                other => panic!("expected accepted charter binding: {other:?}"),
+            },
             other => panic!("expected accepted charter binding: {other:?}"),
         };
         let caller = crate::mcp::Caller {
@@ -649,7 +652,10 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         });
         let begun = command(&c, begin.clone()).await;
         let boundary = match &begun.outcome {
-            Outcome::Ok { data: Data::Charter(CharterOutcome::Boundary(value)) } => value.clone(),
+            Outcome::Ok { data: Data::Charter(value) } => match value.as_ref() {
+                CharterOutcome::Boundary(value) => value.clone(),
+                other => panic!("expected original charter boundary: {other:?}"),
+            },
             other => panic!("expected original charter boundary: {other:?}"),
         };
         assert_eq!(boundary.effective, binding.charter);
@@ -680,8 +686,10 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         });
         let replied = command(&c, reply.clone()).await;
         match &replied.outcome {
-            Outcome::Ok { data: Data::Charter(CharterOutcome::Reply(value)) } =>
-                assert!(value.audit.findings.is_empty()),
+            Outcome::Ok { data: Data::Charter(value) } => match value.as_ref() {
+                CharterOutcome::Reply(value) => assert!(value.audit.findings.is_empty()),
+                other => panic!("expected retained charter reply: {other:?}"),
+            },
             other => panic!("expected retained charter reply: {other:?}"),
         }
         let close = charter("maximum-profile-charter-close", CharterObservation::CompleteTurn {
@@ -689,8 +697,8 @@ async fn maximum_session_profile_small_progress_result_and_restart_remain_durabl
         });
         let closed = command(&c, close.clone()).await;
         assert!(matches!(&closed.outcome, Outcome::Ok {
-            data: Data::Charter(CharterOutcome::Turn(value))
-        } if value.completed_by.as_deref() == Some("maximum-profile-charter-close")), "{closed:?}");
+            data: Data::Charter(value)
+        } if matches!(value.as_ref(),CharterOutcome::Turn(value) if value.completed_by.as_deref() == Some("maximum-profile-charter-close"))), "{closed:?}");
         task(&command(&c, report(crate::native_loop_contract::completion_id(&a.id), Observation::NativeLoopCompleted {
             model_requests:1, calls:vec![], requests:vec![], final_response_index:None
         })).await);

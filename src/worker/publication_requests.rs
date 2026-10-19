@@ -147,7 +147,7 @@ async fn current(client: &ApiClient, request: &p::Command, control: &Control) ->
     let reply = pull_request::call(client, Operation::GetTask { task_id: caller.task_id.clone() }, control).await.map_err(|_| p::Refusal::StaleCaller)?;
     let Outcome::Ok { data: Data::Task(task) } = reply.outcome else { return Err(p::Refusal::StaleCaller); };
     if task.status == TaskStatus::Cancelled { return Err(p::Refusal::Cancelled); }
-    if task.status != TaskStatus::Active || task.input != request.input || task.session_id != request.session.id
+    if task.status != TaskStatus::Active || *task.input != request.input || task.session_id != request.session.id
         || task.attempt.as_ref().is_none_or(|a| a.id != caller.attempt_id || a.generation != caller.generation || a.worker_id != caller.worker_id
             || a.worker_incarnation != caller.incarnation || a.stopped || a.uncertain || a.phase == AttemptPhase::StopRequested)
         || process::now_ms() >= task.input.limits.deadline_unix_ms { return Err(p::Refusal::StaleCaller); }
@@ -280,7 +280,7 @@ pub(super) async fn recover(config: &WorkerConfig, state: &Path, resource: &Opti
         let limits = &request.input.resolved_limits.as_ref().ok_or("publication limits absent")?.global_metadata;
         let (_sender, cancel) = watch::channel(false);
         let control = Control { deadline_ms: process::now_ms().checked_add(limits.worker.publication_recovery_timeout_ms).ok_or("publication recovery deadline overflow")?,
-            worker_limits: Arc::new(limits.worker.clone()), runtime_limits: Arc::new((**limits).clone()), validation_runtime: runtime.clone(), cancel };
+            worker_limits: Arc::from(limits.worker.clone()), runtime_limits: Arc::from(limits.clone()), validation_runtime: runtime.clone(), cancel };
         boxed_execution(|| execute(config, state, &receipt.command, resource, &control, true)).await?;
     }
     Ok(())
@@ -294,7 +294,7 @@ pub(super) fn validate_saved_settlement(state: &Path, run: &WorkerCommand, opera
         let WorkerCommand::PublishRepository { request, .. } = &receipt.command else { continue; };
         let expected = request.effect(limits)?;
         if &expected.id != operation_id { continue; }
-        if request.attempt.id != attempt.id || request.input != *task { return Err("publication settlement original run differs".into()); }
+        if request.attempt.id != attempt.id || request.input != **task { return Err("publication settlement original run differs".into()); }
         let phase = read(state, &receipt.command)?.ok_or("publication settlement phase absent")?;
         if serde_json::to_value(operation).map_err(|_| "publication settlement invalid")? == serde_json::to_value(unknown_request(&phase)?).map_err(|_| "publication settlement invalid")? {
             if !phase.effect.may_have_started { return Err("publication unknown precedes possible dispatch".into()); }

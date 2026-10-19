@@ -77,7 +77,7 @@ fn validation_policy() -> std::sync::Arc<borg_runtime::limits::NativeLimits> {
 }
 fn validation_runtime() -> std::sync::Arc<borg_runtime::native::ValidationRuntime> {
     std::sync::Arc::new(
-        borg_runtime::native::ValidationRuntime::new(std::sync::Arc::new(metadata().worker))
+        borg_runtime::native::ValidationRuntime::new(std::sync::Arc::from(metadata().worker))
             .unwrap(),
     )
 }

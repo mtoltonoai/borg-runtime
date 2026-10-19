@@ -178,7 +178,7 @@ pub(super) async fn post(controller: &Controller, fields: Form, operation_id: St
         }
     };
     let reply = boxed_route(|| call(controller, Operation::SubmitTaskDraft {
-        operation_id: operation_id.clone(), input,
+        operation_id: operation_id.clone(), input: (input).into(),
     })).await;
     mutation_reply(reply, &operation_id, None)
 }

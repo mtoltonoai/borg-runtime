@@ -367,7 +367,7 @@ impl ScanFixture {
                 client
                     .call(Operation::SubmitTask {
                         operation_id: format!("scan-submit-{label}"),
-                        input,
+                        input: (input).into(),
                     })
                     .await
                     .unwrap()
@@ -423,7 +423,7 @@ impl ScanFixture {
         assert_eq!(attempts.len(), 2);
         let writer = attempts.remove(0);
         let reader = attempts.remove(0);
-        let worker_limits = Arc::new(limits.worker.clone());
+        let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(limits.worker.clone());
         let control = Control {
             deadline_ms: reader.deadline_unix_ms,
             cancel: rx,

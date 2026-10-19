@@ -56,7 +56,7 @@ pub struct CompletionScope {
     pub controller_url: String,
     pub caller: crate::mcp::Caller,
     pub session_id: String,
-    pub resume: Option<crate::governance_completion::CompletionResume>,
+    pub resume: Option<Box<crate::governance_completion::CompletionResume>>,
 }
 
 /// A sent turn remains unresolved through its start acknowledgment and process
@@ -674,7 +674,7 @@ pub(super) async fn execute_with_profile_observed(
                 state: state.to_owned(),
                 runtime_limits: (*control.runtime_limits).clone(),
                 limits: limits.collaboration.clone(),
-                worker_limits: (*control.worker_limits).clone(),
+                worker_limits: Box::new((*control.worker_limits).clone()),
             };
             if matches!(
                 super::codex_mcp::outcome_disposition(&config),
@@ -862,7 +862,7 @@ async fn execute_observed(
         context_config(&mut thread_config, &limits.coding);
         if let Some(host)=collaboration {
             if !host.bridge_binary.is_absolute() {return Err("collaboration bridge executable must be host absolute path".into());}
-            let config=super::codex_mcp::Config{instruction_source:host.instruction_source.clone(),execution_profile:accepted_profile.cloned().filter(|p| matches!(p, ExecutionProfile::CollaborationV2 { .. })).or_else(|| host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None })),controller_url:host.controller_url.clone(),caller:host.caller.clone(),deadline_unix_ms:control.deadline_ms,state:state.to_owned(),runtime_limits:(*control.runtime_limits).clone(),limits:limits.collaboration.clone(),worker_limits:(*control.worker_limits).clone()};
+            let config=super::codex_mcp::Config{instruction_source:host.instruction_source.clone(),execution_profile:accepted_profile.cloned().filter(|p| matches!(p, ExecutionProfile::CollaborationV2 { .. })).or_else(|| host.workflow_enabled.then_some(ExecutionProfile::CollaborationV2 { publication: None, web_search: None })),controller_url:host.controller_url.clone(),caller:host.caller.clone(),deadline_unix_ms:control.deadline_ms,state:state.to_owned(),runtime_limits:(*control.runtime_limits).clone(),limits:limits.collaboration.clone(),worker_limits:Box::new((*control.worker_limits).clone())};
             config.validate()?;super::codex_mcp::check_stop(&config)?;
             if super::value_contains_credential(&serde_json::to_value(&config).map_err(|_|"bridge configuration encoding failed")?,credentials, &control.worker_limits)? {return Err("bridge identity contains configured credential".into());}
             let config_path=state.join("borg-collaboration-config.json");
@@ -1115,7 +1115,7 @@ async fn execute_observed(
             state: state.to_owned(),
             runtime_limits: (*control.runtime_limits).clone(),
             limits: limits.collaboration.clone(),
-            worker_limits: (*control.worker_limits).clone(),
+            worker_limits: Box::new((*control.worker_limits).clone()),
         };
         let disposition = super::codex_mcp::outcome_disposition(&config);
         let unresolved = matches!(
@@ -1396,12 +1396,12 @@ for line in sys.stdin:
                 admitted.state.disposition=CompletionDisposition::Admit;
                 admitted.state.reasons.clear();
                 fixture::receipt(&state,&limits,&completed,"evaluate.json",crate::protocol::Operation::EvaluateCompletion(EvaluateCompletion {operation_id:id,caller,boundary:completed.clone(),intervening_requests:vec![]}),
-                    crate::protocol::Outcome::Ok {data:crate::protocol::Data::Completion(CompletionOutcome::Evaluated(admitted))});
+                    crate::protocol::Outcome::Ok {data:crate::protocol::Data::Completion(Box::new(CompletionOutcome::Evaluated(admitted)))});
             }
             let (_cancel,rx)=tokio::sync::watch::channel(false);
             let mut control=crate::worker::test_control(process::now_ms()+10_000,rx);
             control.runtime_limits=Arc::new(limits.clone());
-            control.worker_limits=Arc::new(limits.worker.clone());
+            control.worker_limits=Arc::from(limits.worker.clone());
             let (events,mut received)=mpsc::channel(8);
             let observer=tokio::spawn(async move {
                 let mut started=0; let mut barriers=0;let mut outer=Vec::new();
@@ -1443,7 +1443,7 @@ for line in sys.stdin:
                     fixture::decision_record(&feedback,&limits),&limits).await)
             };
             let controller_url=decision_peer.as_ref().map(|peer|peer.url.clone()).unwrap_or_else(||"http://127.0.0.1:9".into());
-            let scope=CompletionScope {controller_url,caller:feedback.continuation.caller.clone(),session_id:"completion-session".into(),resume};
+            let scope=CompletionScope {controller_url,caller:feedback.continuation.caller.clone(),session_id:"completion-session".into(),resume:resume.map(Box::new)};
             let result=execute_with_credentials_and_collaboration(&binary,&root,&state,&root.join("processes"),
                 &InferenceSettings::selected(),&limits.execution,"original task",&control,events,&[],None,None,Some(&scope)).await;
             let observations=observer.await.unwrap();
@@ -1528,7 +1528,7 @@ for line in sys.stdin:
             let mut session = Session::start_with_key(
                 &binary, &root, &root.join("state"), &root.join("processes"),
                 &InferenceSettings::selected(), &limits.execution,
-                Arc::new(limits.worker.clone()), None,
+                Arc::from(limits.worker.clone()), None,
             ).await.unwrap();
             let (_cancel, rx) = tokio::sync::watch::channel(false);
             let control = crate::worker::test_control(process::now_ms() + 5000, rx);
@@ -1588,9 +1588,9 @@ for line in sys.stdin:
                 deadline_ms: process::now_ms() + 60_000,
                 cancel: rx,
                 runtime_limits: crate::worker::test_limits(),
-                worker_limits: Arc::new(crate::worker::test_limits().worker.clone()),
+                worker_limits: Arc::from(crate::worker::test_limits().worker.clone()),
                 validation_runtime: Arc::new(
-                    crate::native::ValidationRuntime::new(Arc::new(
+                    crate::native::ValidationRuntime::new(Arc::from(
                         crate::worker::test_limits().worker.clone(),
                     ))
                     .unwrap(),
@@ -1713,9 +1713,9 @@ for line in sys.stdin:
                 deadline_ms: process::now_ms() + 30_000,
                 cancel: rx,
                 runtime_limits: crate::worker::test_limits(),
-                worker_limits: Arc::new(crate::worker::test_limits().worker.clone()),
+                worker_limits: Arc::from(crate::worker::test_limits().worker.clone()),
                 validation_runtime: Arc::new(
-                    crate::native::ValidationRuntime::new(Arc::new(
+                    crate::native::ValidationRuntime::new(Arc::from(
                         crate::worker::test_limits().worker.clone(),
                     ))
                     .unwrap(),
@@ -1826,7 +1826,7 @@ for line in sys.stdin:
                 &root.join("registry"),
                 &settings,
                 &crate::worker::test_limits().execution,
-                Arc::new(crate::worker::test_limits().worker.clone()),
+                Arc::from(crate::worker::test_limits().worker.clone()),
                 None,
             )
             .await
@@ -1866,9 +1866,9 @@ for line in sys.stdin:
                 deadline_ms: process::now_ms() + 30_000,
                 cancel: rx,
                 runtime_limits: crate::worker::test_limits(),
-                worker_limits: Arc::new(crate::worker::test_limits().worker.clone()),
+                worker_limits: Arc::from(crate::worker::test_limits().worker.clone()),
                 validation_runtime: Arc::new(
-                    crate::native::ValidationRuntime::new(Arc::new(
+                    crate::native::ValidationRuntime::new(Arc::from(
                         crate::worker::test_limits().worker.clone(),
                     ))
                     .unwrap(),
@@ -2063,12 +2063,12 @@ for raw in sys.stdin.buffer:
             let (_cancel, rx) = tokio::sync::watch::channel(false);
             let mut control = crate::worker::test_control(process::now_ms() + 10_000, rx);
             control.runtime_limits = Arc::new(limits.clone());
-            control.worker_limits = Arc::new(limits.worker.clone());
+            control.worker_limits = Arc::from(limits.worker.clone());
             let registry = root.join("processes");
             let mut session = Session::start_with_key(
                 &binary, &root, &root.join("state"), &registry,
                 &InferenceSettings::selected(), &limits.execution,
-                Arc::new(limits.worker.clone()), None,
+                Arc::from(limits.worker.clone()), None,
             ).await.unwrap();
             let second_text = if mode == "incoming-refused" {
                 "small continuation input"

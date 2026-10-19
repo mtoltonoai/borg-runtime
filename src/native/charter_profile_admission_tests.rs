@@ -50,10 +50,12 @@ fn task(reply: Reply) -> Task {
     match reply.outcome {Outcome::Ok{data:Data::Task(t)}=>*t, other=>panic!("expected task: {other:?}")}
 }
 async fn get(c: &Controller, id: &str) -> Task {task(call(c,Operation::GetTask{task_id:id.into()}).await)}
-async fn submit(c:&Controller,id:&str,input:TaskInput)->Task {task(call(c,Operation::SubmitTask{operation_id:id.into(),input}).await)}
+async fn submit(c:&Controller,id:&str,input:TaskInput)->Task {task(call(c,Operation::SubmitTask{operation_id:id.into(),input: (input).into()}).await)}
 async fn effective(c:&Controller,t:&Task)->EffectiveCharter {
     match call(c,Operation::QueryCharter{query:CharterQuery::Session{session_id:t.session_id.clone()}}).await.outcome {
-        Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Session(Some(v)))}=>v, other=>panic!("session: {other:?}")
+        Outcome::Ok{data:Data::CharterQuery(value)} => match *value {
+            CharterQueryResult::Session(Some(v)) => v, other => panic!("session: {other:?}"),
+        }, other=>panic!("session: {other:?}")
     }
 }
 fn input(label:&str,p:&RuntimeLimits)->TaskInput {
@@ -93,7 +95,7 @@ fn request_projection(t:&TaskInput,p:&NativeLoopProfile,source:&ResolvedCharter)
 }
 async fn preflight(t:&TaskInput,source:Option<&ResolvedCharter>,old:&RuntimeLimits,dir:&Path,expected:&str,reached:bool) {
     let p=profile(t);let n=&t.execution_limits().unwrap().native;
-    let mut host=ValidationHost::new(helper(),dir.to_path_buf(),Arc::new(n.clone()),Arc::new(ValidationRuntime::new(Arc::new(old.worker.clone())).unwrap()));
+    let mut host=ValidationHost::new(helper(),dir.to_path_buf(),Arc::new(n.clone()),Arc::new(ValidationRuntime::new(Arc::from(old.worker.clone())).unwrap()));
     let capture=source.map(|source|Arc::new(exchange(source,n)));
     if let Some(c)=&capture {host=host.with_charter(c.clone())}
     const MISSING:&str="BORG_CHARTER_PROFILE_PREFLIGHT_NO_CREDENTIAL";
@@ -112,7 +114,7 @@ async fn global_v2_maximum_charter_reuse_admits_and_preflights_without_changing_
     let (old,new)=policies();let dir=root("charter-global");let db=dir.join("state.sqlite");
     let c=open(&db,&old);let t=submit(&c,"old-submit",input("historical-v1",&old)).await;let historical=get(&c,&t.id).await;
     drop(c);release(&db).await;let c=open(&db,&new);assert_eq!(get(&c,&t.id).await,historical);
-    let rejected=call(&c,Operation::SubmitTask{operation_id:"old-unchartered-reuse".into(),input:input("historical-v1",&new)}).await;
+    let rejected=call(&c,Operation::SubmitTask{operation_id:"old-unchartered-reuse".into(),input:(input("historical-v1",&new)).into()}).await;
     assert!(matches!(rejected.outcome,Outcome::Refused{ref code,..} if code=="charter_required"));
     let source=maximum_source(&new);let mut seed=input("charter-source",&new);seed.definition.charter=Some(DefinitionCharter::Inline{source:source.clone()});
     let seed=submit(&c,"source-submit",seed).await;let original=effective(&c,&seed).await;
@@ -129,9 +131,9 @@ async fn global_v2_maximum_charter_reuse_admits_and_preflights_without_changing_
     println!("GLOBAL_CHARTER_PROFILE {}",json!({"functions":p.functions.len(),"source_bytes":serde_json::to_vec(&source).unwrap().len(),"clauses":source.clauses.len(),"validation_bytes":serde_json::to_vec(&v).unwrap().len(),"validation_key_nodes":key_nodes(&v),"request_projection_bytes":encoded.len(),"request_projection_key_nodes":key_nodes(&projected),"schema_bound":new.execution.native.schema_bytes,"nodes_bound":new.execution.native.json_nodes}));
     preflight(&t.input,Some(&bound.charter),&old,&dir.join("native"),"native_api_key_unavailable",true).await;
     let mut conflict=next.clone();conflict.definition.charter=Some(DefinitionCharter::Inline{source:source.clone()});
-    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"same-definition-different-body".into(),input:conflict}).await.outcome,Outcome::Refused{ref code,..} if code=="definition_conflict"));
+    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"same-definition-different-body".into(),input:(conflict).into()}).await.outcome,Outcome::Refused{ref code,..} if code=="definition_conflict"));
     let mut excessive=input("charter-too-large",&new);let mut oversized=source;oversized.files[0].text.push('x');excessive.definition.charter=Some(DefinitionCharter::Inline{source:oversized});
-    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"source-one-over".into(),input:excessive}).await.outcome,Outcome::Refused{ref code,..} if code=="input_bound"));
+    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"source-one-over".into(),input:(excessive).into()}).await.outcome,Outcome::Refused{ref code,..} if code=="input_bound"));
     assert_eq!(get(&c,&historical.id).await,historical);assert_eq!(get(&c,&t.id).await,accepted);assert_eq!(effective(&c,&t).await,bound);
     drop(c);release(&db).await;
 }

@@ -761,7 +761,7 @@ impl Lab {
             self.client
                 .call(Operation::SubmitTask {
                     operation_id: operation.into(),
-                    input: self.input(agent),
+                    input: (self.input(agent)).into(),
                 })
                 .await
                 .unwrap(),
@@ -988,7 +988,7 @@ async fn lost_submission_reply_restart_and_duplicate_launch_execute_once() {
     .await;
     let request = Operation::SubmitTask {
         operation_id: "lost-submit".into(),
-        input: lab.input("agent-a"),
+        input: (lab.input("agent-a")).into(),
     };
     assert!(
         ApiClient::new(&loss.url, lab.limits.clone())
@@ -1360,7 +1360,7 @@ async fn checkpoint_ack_loss_replays_exact_publication_and_fences_old_attempt() 
         lab.client
             .call(Operation::SubmitTask {
                 operation_id: "independent-check-interruption".into(),
-                input: interrupted_input,
+                input: (interrupted_input).into(),
             })
             .await
             .unwrap(),
@@ -1968,7 +1968,7 @@ async fn native_coding_continuation_survives_lost_delegation_reply_and_fresh_pro
         lab.client
             .call(Operation::SubmitTask {
                 operation_id: "native-parent-submit".into(),
-                input,
+                input: (input).into(),
             })
             .await
             .unwrap(),
@@ -2045,8 +2045,8 @@ async fn native_coding_continuation_survives_lost_delegation_reply_and_fresh_pro
         child.session_id
     );
     assert_eq!(
-        accepted.completed_child.as_ref().unwrap().result,
-        child_accepted.result
+        accepted.completed_child.as_ref().unwrap().result.as_ref(),
+        child_accepted.result.as_deref()
     );
     assert_eq!(lab.starts.len(), 1);
     assert!(
@@ -2247,7 +2247,7 @@ async fn native_helper_hard_loss_reconciles_before_new_work() {
         lab.client
             .call(Operation::SubmitTask {
                 operation_id: "interrupted-native".into(),
-                input: input("held-native"),
+                input: (input("held-native")).into(),
             })
             .await
             .unwrap(),
@@ -2368,7 +2368,7 @@ async fn native_helper_hard_loss_reconciles_before_new_work() {
         lab.client
             .call(Operation::SubmitTask {
                 operation_id: "fresh-native".into(),
-                input: input("fresh-native"),
+                input: (input("fresh-native")).into(),
             })
             .await
             .unwrap(),

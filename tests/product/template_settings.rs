@@ -85,7 +85,7 @@ async fn forms_bind_selected_settings_to_immutable_template_and_preserve_exact_r
             request_id: "settings-conflict".into(),
             command: Operation::SubmitTask {
                 operation_id: "settings-conflict".into(),
-                input: different,
+                input: (different).into(),
             },
         })
         .await;

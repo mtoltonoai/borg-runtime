@@ -166,16 +166,16 @@ COMPACT_RECEIPT_SOURCES = {'src/controller/application_schema.rs': 'f177e8ca7839
 # Exact current union decoder; the historical recovered family stays intact.
 PUBLICATION_UNION_COMPACT_RECEIPT_SOURCES = {
     'src/controller/application_schema.rs': '5797006d361ff3370e64f371ec871e2f8226cd0d091bfd42a7226923c3090c45',
-    'src/controller/database.rs': 'fe0e8a880017b5bca70bcd61ec1083f9670d79438350ea9a66dffc33a03755e3',
+    'src/controller/database.rs': '28e2667b764edb51cfe57c1d56acdf3fbc34ec589e9b257b64564aec62ffc83e',
     'src/controller/metadata.rs': '0c2edca4afa187de2867b538ce7c15fcf69f6ba948467810356ca572a5e930b2',
     'src/controller/operations/effects.rs': '9d7647d45f99ebb346a37f2bec0150ec87532f2454d3bd686df3f875d610846d',
-    'src/controller/operations/reports.rs': '299c8630b98b053a6e50c33a313e4e78026d3cbc760326943769446869c909c7',
+    'src/controller/operations/reports.rs': '488115cf01161e2ab5ec1295fa9af2118b6c02ed294088557a24fbbe2bcbb9a7',
     'src/controller/read_retention.rs': '22b2eeb67dfb7402a72a97dd1eef9a81d891aea1f2da6446e65d421ee63b155a',
     'src/limits/retention.rs': 'd69614214efd380d62c7a6f5970a46f484b03c54943d8e18dcb0e7b4b972835d',
     'src/mcp/mod.rs': '6c1efc59c9cc296c240c7a2b7cece9efb3ae597d8a74b4af960538b84e4bc6d7',
-    'src/protocol.rs': 'b615c7929db85c93c6df32537fb544ec7f9a342f4936aea90dc835dbce0bfaa7',
+    'src/protocol.rs': '1cf2097fe4268ecf3d9c654d8dce4f8cbaaa50402661405cf892978519e0fc34',
     'src/read_page.rs': 'd386b2f8a310788e2bfe116878f47892382b5360ea89ca5a713754430c6e9a54',
-    'src/read_retention.rs': 'c1a069d41f3ff8d133b7929680d2b3f094e4d07a4331e6784427c64d9cc6a811',
+    'src/read_retention.rs': '297a634ddbc1b1f41f83a8fdc55bf8d93c40660ebdec9df80cb0a5858278aac6',
     'src/repository_view.rs': '08c9a14c273502223bed3888292e38d468280a6474169b00f33838f4ea2bb949',
 }
 COMPACT_READ_KINDS = {'collab_read_continue': 'page', 'collab_task_get': 'task', 'collab_memory_get': 'memory', 'collab_agent_get': 'agent', 'collab_tasks_list': 'list', 'collab_agents_list': 'list', 'collab_task_releases_list': 'list', 'collab_repository_tree': 'repository', 'collab_repository_read': 'repository', 'collab_repository_search': 'repository', 'collab_repository_diff': 'repository', 'collab_repository_history': 'repository', 'collab_document_get': 'document', 'collab_documents_list': 'document', 'collab_document_versions_list': 'document', 'collab_comments_list': 'document', 'collab_question_get': 'question', 'collab_questions_list': 'question', 'collab_question_answers': 'question', 'collab_question_actions': 'question', 'collab_decisions_list': 'question', 'collab_review_get': 'review', 'collab_reviews_list': 'review', 'collab_review_target_get': 'review', 'collab_task_coordination_get': 'work', 'collab_task_waits': 'work', 'collab_limits_get': 'collaboration', 'collab_session_get': 'collaboration', 'collab_sessions_list': 'collaboration', 'collab_definition_get': 'collaboration', 'collab_memory_list': 'collaboration', 'collab_task_history_list': 'collaboration', 'collab_workers_list': 'collaboration', 'collab_worker_get': 'collaboration', 'collab_machines_list': 'collaboration', 'collab_machine_get': 'collaboration', 'collab_task_attempts_list': 'collaboration', 'collab_task_checkpoints_list': 'collaboration', 'collab_release_get': 'collaboration', 'collab_release_checks_list': 'collaboration', 'collab_repositories_list': 'collaboration', 'collab_repository_get': 'collaboration'}

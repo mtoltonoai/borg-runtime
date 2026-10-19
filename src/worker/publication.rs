@@ -532,7 +532,7 @@ async fn recover_one(
         deadline_ms: process::now_ms()
             .checked_add(config.limits.worker.publication_recovery_timeout_ms)
             .ok_or("recovery clock exhausted (worker.publication_recovery_timeout_ms)")?,
-        worker_limits: Arc::new(config.limits.worker.clone()),
+        worker_limits: Arc::from(config.limits.worker.clone()),
         runtime_limits: Arc::new(command_limits(&phase.command)?.clone()),
         validation_runtime: validation_runtime.clone(),
         cancel: receiver,
@@ -775,8 +775,8 @@ mod catalogue_tests {
         let completion = proof("completed-executor", Observation::ExecutorOutcome { success: true, summary: "controlled".into() }, 2);
         let checkpoint = git::checkpoint(&repository, &attempt.task_id, &attempt.id, "b".repeat(40)).unwrap();
         let prepared = intent(&attempt, &checkpoint);
-        Phase { revision: 2, command: WorkerCommand::RunAttempt { command_id: "run".into(), session, attempt,
-                task: input, checkpoint: None, continuation: None, workflow_continuation: None, completion_continuation: None },
+        Phase { revision: 2, command: WorkerCommand::RunAttempt { command_id: "run".into(), session: (session).into(), attempt,
+                task: (input).into(), checkpoint: None, continuation: None, workflow_continuation: None, completion_continuation: None },
             association, completion, prepare_commit: MutationCommit { operation_id: checkpoint.operation_id.clone(), controller_revision: 3 },
             prepared, checkpoint, settlement_id: "settlement".into(), retired_for_checks: false, publish_may_have_started: false }
     }
@@ -816,7 +816,7 @@ mod catalogue_tests {
     fn terminal_refusal_requires_original_stopped_owner_not_just_expiry_or_status() {
         let phase = retained_phase();
         let WorkerCommand::RunAttempt { session, attempt, task: input, .. } = &phase.command else { unreachable!() };
-        let mut task = Task { id: attempt.task_id.clone(), session_id: session.id.clone(), input: input.clone(),
+        let mut task = Task { id: attempt.task_id.clone(), session_id: session.id.clone(), input: (input.clone()).into(),
             assigned_agent_id: session.agent_id.clone(), status: TaskStatus::Active, revision: 1,
             attempt: Some(attempt.clone()), selected_checkpoint: None, result: None, blocked_reason: None,
             pending_assignment: None, native_retry_block: None, progress: String::new(), recent_output: String::new(), output_truncated: false,

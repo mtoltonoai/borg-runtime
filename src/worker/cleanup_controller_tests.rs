@@ -29,7 +29,7 @@ struct Lab {
     server: tokio::task::JoinHandle<Result<(), String>>,
     command: WorkerCommand,
     attempt: Attempt,
-    input: TaskInput,
+    input: Box<TaskInput>,
     control: Control,
     _cancel: watch::Sender<bool>,
     command_path: PathBuf,
@@ -114,7 +114,7 @@ impl Lab {
             dependencies: vec![], native_workflow: None,
         };
         let submitted = task_value(Box::pin(call(Operation::SubmitTask {
-            operation_id: "cleanup-submit".into(), input,
+            operation_id: "cleanup-submit".into(), input: (input).into(),
         })).await.unwrap());
         assert!(matches!(Box::pin(call(Operation::RegisterWorker {
             operation_id: "cleanup-register-worker".into(), worker: Worker {
@@ -133,9 +133,9 @@ impl Lab {
         let command_path = state.join("commands").join(format!("{}.json", component(command_id)));
         atomic_json(&command_path, &Receipt { command: command.clone(), completed: true, effects_started: true }).unwrap();
         let (cancel, receive) = watch::channel(false);
-        let validation = Arc::new(crate::native::ValidationRuntime::new(Arc::new(metadata.worker.clone())).unwrap());
+        let validation = Arc::new(crate::native::ValidationRuntime::new(Arc::from(metadata.worker.clone())).unwrap());
         let control = Control { deadline_ms: input.limits.deadline_unix_ms, runtime_limits: metadata.clone(),
-            worker_limits: Arc::new(metadata.worker.clone()), validation_runtime: validation, cancel: receive };
+            worker_limits: Arc::from(metadata.worker.clone()), validation_runtime: validation, cancel: receive };
         let workspace = Box::pin(git::checkout_cached(&config.workspace_root.join("repositories"),
             &config.workspace_root.join("workspaces"), &attempt.id, input.repository.as_ref().unwrap(), None,
             &state.join("processes").join(component(&attempt.id)), &control)).await.unwrap();
@@ -719,7 +719,7 @@ async fn cleanup_one_shared_cache_survives_active_and_retained_failed_peer() {
     let first=process::now_ms();let original_due=cache_observe(&lab,first).await.unwrap();let cache=cache_directory(&lab);
     let mut input=lab.input.clone();input.resolved_limits=None;input.definition.id="cleanup-shared-peer".into();
     let repo=input.repository.as_mut().unwrap();repo.url.clear();repo.checkpoint_remote.clear();
-    let submitted=task_value(lab.call(Operation::SubmitTask{operation_id:"cleanup-peer-submit".into(),input}).await);
+    let submitted=task_value(lab.call(Operation::SubmitTask{operation_id:"cleanup-peer-submit".into(),input: (input).into()}).await);
     let WorkerCommand::RunAttempt{command_id:first_command,..}=&lab.command else{unreachable!()};
     let reply=lab.call(Operation::AwaitCommands{operation_id:"cleanup-peer-command".into(),worker_id:lab.config.id.clone(),
         incarnation:lab.config.incarnation.clone(),acknowledged:vec![first_command.clone()]}).await;

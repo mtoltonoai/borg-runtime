@@ -27,7 +27,7 @@ fn attempt() -> Attempt {
 }
 fn host(sink: Arc<Sink>) -> ValidationHost {
     let limits = crate::limits::RuntimeLimits::seed().unwrap();
-    let mut runtime = crate::native::ValidationRuntime::new(Arc::new(limits.worker)).unwrap();
+    let mut runtime = crate::native::ValidationRuntime::new(Arc::from(limits.worker)).unwrap();
     runtime.request_process.sink = (*sink).clone();
     let runtime = Arc::new(runtime);
     let mut host = ValidationHost::new(

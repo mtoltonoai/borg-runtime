@@ -109,7 +109,7 @@ fn repo(root: &Path) -> Repository {
 fn control() -> (Control, watch::Sender<bool>) {
     let limits = Arc::new(crate::limits::RuntimeLimits::seed().unwrap());
     let (tx, rx) = watch::channel(false);
-    let worker = Arc::new(limits.worker.clone());
+    let worker: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(limits.worker.clone());
     (
         Control {
             deadline_ms: process::now_ms() + 90_000,

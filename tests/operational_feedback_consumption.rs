@@ -279,7 +279,7 @@ impl Lab {
             self.api
                 .call(Operation::SubmitTask {
                     operation_id: name.into(),
-                    input,
+                    input: (input).into(),
                 })
                 .await
                 .unwrap(),
@@ -611,7 +611,7 @@ async fn native_case(field: Field, old_bound: usize, new_bound: usize, error: &s
                 .api
                 .call(Operation::SubmitTask {
                     operation_id: "old-output-ceiling-refusal".into(),
-                    input: oversized,
+                    input: (oversized).into(),
                 })
                 .await
                 .unwrap();

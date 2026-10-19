@@ -343,7 +343,7 @@ fn retained_task(tx: &StoreContext<'_>, task: &Task, version: i64) -> Result<()>
         if let Some(result) = &child.result {
             if result.pull_request.is_some() {
                 let original = load(tx, &child.task_id)?.task;
-                if version < 20 || original.result.as_ref() != Some(result) {
+                if version < 20 || original.result.as_deref() != Some(result) {
                     return Err(invalid("completed child publication result differs"));
                 }
             }
@@ -359,7 +359,7 @@ fn receipt_task(tx: &StoreContext<'_>, task: &Task, request: &Operation) -> Resu
         // Public absence is intentional redaction, not an absent accepted
         // authority. Compare the exact projection before borrowing authority
         // from the independently validated canonical admission record.
-        if task.input != crate::pull_request_view::input(&canonical.input) {
+        if *task.input != crate::pull_request_view::input(&canonical.input) {
             return Err(invalid("original public task projection differs"));
         }
         subject.input = canonical.input;
@@ -390,7 +390,7 @@ fn configured_admission(tx: &StoreContext<'_>, task: &Task, request: &Operation)
     super::repositories::resolve_input(&tx.with_limits(limits), &mut expected, true)?;
     let wait: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM waits WHERE child=?1 AND parent=?2 AND parent_attempt=?3 AND parent_generation=?4 AND operation_id=?5)",
         params![task.id, parent.id, attempt.id, integer(attempt.generation)?, call.operation_id], |r| r.get(0))?;
-    if task.input != expected || !wait { return Err(invalid("original configured child/wait differs")); }
+    if *task.input != expected || !wait { return Err(invalid("original configured child/wait differs")); }
     Ok(true)
 }
 
@@ -415,7 +415,7 @@ pub(super) fn validate_existing(tx: &StoreContext<'_>, cfg: &super::ControllerCo
         count += 1; if count > cfg.max_tasks { return Err(invalid("task inventory exceeds bound")); }
         let task = load(tx, &row.get::<_, String>(0)?)?.task;
         retained_task(tx, &task, version)?;
-        if has_selection(&super::sessions::initial_input(tx,&task.id)?) { selected.insert(task.id.clone()); }
+        if has_selection(super::sessions::initial_input(tx,&task.id)?.as_ref()) { selected.insert(task.id.clone()); }
         if task.result.as_ref().is_some_and(|r| r.pull_request.is_some()) { accepted.insert(task.id); }
     }
     let mut q = tx.prepare("SELECT body FROM external_operations ORDER BY id")?;
@@ -522,7 +522,7 @@ pub(super) fn validate_existing(tx: &StoreContext<'_>, cfg: &super::ControllerCo
                     }
                     if let Some(child) = continuation {
                         if child.result.as_ref().is_some_and(|r| r.pull_request.is_some())
-                            && (version < 20 || child.result != load(tx, &child.task_id)?.task.result) {
+                            && (version < 20 || child.result.as_ref() != load(tx, &child.task_id)?.task.result.as_deref()) {
                             return Err(invalid("original continuation publication differs"));
                         }
                     }

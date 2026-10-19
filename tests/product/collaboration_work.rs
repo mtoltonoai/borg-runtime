@@ -146,7 +146,8 @@ async fn coordination_owner_forms_keep_accepted_identity_and_exact_receipts_afte
     let original_body = owner_form("work-owner-original", initial.coordination_revision, &original_owner);
     let first_page = ui(&f.controller, "POST", &format!("{path}/owner"), original_body.clone()).await;
     let original = decode_receipt(&first_page);
-    let Data::QuestionQuery(QuestionQueryResult::Question(question_view)) = call(&f.controller, Operation::QueryQuestion { query: QuestionQuery::Get { question_id: question.id.clone() } }).await else { panic!("expected linked question"); };
+    let Data::QuestionQuery(result) = call(&f.controller, Operation::QueryQuestion { query: QuestionQuery::Get { question_id: question.id.clone() } }).await else { panic!("expected linked question"); };
+    let QuestionQueryResult::Question(question_view) = *result else { panic!("expected linked question"); };
     assert_eq!(question_view.question, question);
     assert_eq!(question_view.question.status, QuestionStatus::Open);
     assert_eq!(question_view.current_responsible_owner, original_owner);
@@ -156,7 +157,8 @@ async fn coordination_owner_forms_keep_accepted_identity_and_exact_receipts_afte
     let later = ui(&f.controller, "POST", &format!("{path}/owner"), owner_form("work-owner-later", original.view.coordination_revision, &latest_owner)).await;
     let later = decode_receipt(&later);
     assert_eq!(later.view.responsible_owner, latest_owner);
-    let Data::QuestionQuery(QuestionQueryResult::Question(question_view)) = call(&f.controller, Operation::QueryQuestion { query: QuestionQuery::Get { question_id: question.id.clone() } }).await else { panic!("expected linked question"); };
+    let Data::QuestionQuery(result) = call(&f.controller, Operation::QueryQuestion { query: QuestionQuery::Get { question_id: question.id.clone() } }).await else { panic!("expected linked question"); };
+    let QuestionQueryResult::Question(question_view) = *result else { panic!("expected linked question"); };
     assert_eq!(question_view.question, question);
     assert_eq!(question_view.current_responsible_owner, latest_owner);
     let unchanged = task(&f.controller, &accepted.id).await;

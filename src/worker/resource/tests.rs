@@ -3,7 +3,7 @@ use serde_json::json;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 fn limits() -> Arc<WorkerLimits> {
-    Arc::new(crate::worker::test_limits().worker.clone())
+    Arc::from(crate::worker::test_limits().worker.clone())
 }
 fn area() -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -50,7 +50,7 @@ async fn shared_read_pagination_task_instruction_result_stable_identity() {
     let completed=finish_native(&c,&a,"pagination-finish").await;
     assert_eq!(completed.status,TaskStatus::Succeeded);
     let result=query(&c,task_selection(&completed,TaskPart::Result),None).await;
-    assert!(result.complete);assert_eq!(serde_json::from_str::<AcceptedResult>(&result.content).unwrap(),completed.result.unwrap());
+    assert!(result.complete);assert_eq!(&serde_json::from_str::<AcceptedResult>(&result.content).unwrap(),completed.result.as_deref().unwrap());
 }
 #[tokio::test]
 async fn shared_read_pagination_original_replay_conflict_and_restart() {
@@ -167,7 +167,7 @@ async fn shared_read_pagination_redaction_and_mutations_unchanged() {
     // Existing safe projection removes credential-bearing repository operands
     // before page identity is computed; unsupported credential-bearing admission remains refused.
     let mut unsafe_input=native("credential-read");unsafe_input.repository_read=Some(RepositoryReadSource{registration:None,repository:"https://user:password@example.invalid/repo".into(),start_commit:"a".repeat(40)});
-    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"unsafe-read-source".into(),input:unsafe_input}).await,Outcome::Refused{..}));
+    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"unsafe-read-source".into(),input:(unsafe_input).into()}).await,Outcome::Refused{..}));
     let tiny=invoke(&c,&invocation(&actor,"tiny-page","collab_task_get",json!({"task_id":t.id,"part":"instruction","max_bytes":1}))).await;
     assert!(matches!(tiny.outcome,Outcome::Refused{code,message} if code=="response_bound"&&message.contains("requested max_bytes")));
 }
@@ -305,7 +305,7 @@ async fn operator_directory_journey() {
         let value:AgentSummary=serde_json::from_value(page.items[0].clone()).unwrap();assert_eq!(value.id,"adapter-b");assert!(!value.retired);
     }
     assert!(matches!(call(&c,Operation::GetAgent{agent_id:selected.id.clone()}).await,Outcome::Ok{data:Data::Agent(a)} if a.retired));
-    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"operator-retired-new-task".into(),input}).await,Outcome::Refused{code,..} if code=="agent_retired"));
+    assert!(matches!(call(&c,Operation::SubmitTask{operation_id:"operator-retired-new-task".into(),input: (input).into()}).await,Outcome::Refused{code,..} if code=="agent_retired"));
     assert_eq!(get(&c,&first.id).await.input,first.input,"read and retirement do not alter accepted work");
 }
 
@@ -371,7 +371,7 @@ async fn oversized_accepted_result_journey() {
     assert_eq!(query(&c,selection,None).await,first);
     let reconstructed=reconstruct_operator(&c,first).await;
     assert_eq!(reconstructed,exact);
-    assert_eq!(serde_json::from_str::<AcceptedResult>(&reconstructed).unwrap(),accepted);
+    assert_eq!(&serde_json::from_str::<AcceptedResult>(&reconstructed).unwrap(),accepted.as_ref());
     assert_eq!(get(&c,&completed.id).await,completed);
     let replay=Box::pin(c.handle(Request{protocol_revision:WIRE_REVISION,
         request_id:"large-result-reopened-receipt".into(),command:operation.clone()})).await;

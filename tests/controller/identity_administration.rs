@@ -118,7 +118,7 @@ async fn implicit_creation_cannot_bypass_manager_policy() {
         parent_task_id: h.caller.task_id.clone(),
         parent_attempt_id: h.caller.attempt_id.clone(),
         generation: h.caller.generation,
-        child: child.clone(),
+        child: (child.clone()).into(),
     };
     assert_eq!(
         refused(api(&h.c, command).await),
@@ -135,7 +135,7 @@ async fn implicit_creation_cannot_bypass_manager_policy() {
                     parent_task_id: h.caller.task_id.clone(),
                     parent_attempt_id: h.caller.attempt_id.clone(),
                     generation: h.caller.generation,
-                    child
+                    child: (child).into()
                 }
             )
             .await
@@ -474,7 +474,7 @@ fn native_host(h: &Harness, input: &TaskInput) -> borg_runtime::native::Validati
         root,
         Arc::new(input.execution_limits().unwrap().native.clone()),
         Arc::new(
-            borg_runtime::native::ValidationRuntime::new(Arc::new(h.cfg.limits.worker.clone()))
+            borg_runtime::native::ValidationRuntime::new(Arc::from(h.cfg.limits.worker.clone()))
                 .unwrap(),
         ),
     )

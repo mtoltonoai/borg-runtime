@@ -168,7 +168,7 @@ async fn event(api: &ApiClient, id: &EventId) -> WorkflowActivity {
     panic!("original terminal event absent")
 }
 fn delivery(reply: Reply) -> DeliveryObservation {
-    let Outcome::Ok { data: Data::CollaborationDelivery(value) } = reply.outcome else { panic!("{reply:?}") }; value
+    let Outcome::Ok { data: Data::CollaborationDelivery(value) } = reply.outcome else { panic!("{reply:?}") }; *value
 }
 fn recovered(exchanges: &[Exchange], original: &Exchange) -> Exchange {
     let id = original.reply.commit.as_ref().unwrap().operation_id.clone();

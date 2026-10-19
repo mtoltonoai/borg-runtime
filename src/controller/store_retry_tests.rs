@@ -246,7 +246,7 @@ fn acknowledged_transient_retains_the_genuine_native_proof_for_manual_reentry() 
         limits: db.config.limits.task_defaults.at(NOW).unwrap(),
         dependencies: vec![], native_workflow: None,
     };
-    let command = Operation::SubmitTask { operation_id: "native-original".into(), input };
+    let command = Operation::SubmitTask { operation_id: "native-original".into(), input: (input).into() };
     let request = original("native-exact", command.clone(), TrustedHostPath::Browser);
     let exact = serde_json::to_value(&request.request).unwrap();
     let ticket = match db.handle(request) {
@@ -259,7 +259,7 @@ fn acknowledged_transient_retains_the_genuine_native_proof_for_manual_reentry() 
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(Box::pin((*ticket).execute(&db.validation_host, &db.config.repository_read)))
+        runtime.block_on(Box::pin(ticket.execute(&db.validation_host, &db.config.repository_read)))
     };
     contendible(&db);
     let reader = area.contender();

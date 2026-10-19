@@ -71,8 +71,8 @@ fn project_repository_fixture(input: &mut TaskInput, registration: &borg_runtime
         project(&mut child.repository);
     }
 }
-fn accepted_input(controller:&Controller, input:&TaskInput)->TaskInput {
-    let mut accepted=input.clone();
+fn accepted_input(controller:&Controller, input:&TaskInput)->Box<TaskInput> {
+    let mut accepted=Box::new(input.clone());
     if accepted.resolved_limits.is_none() { accepted.resolved_limits=Some(controller.limits().resolve_task(input).unwrap()); }
     project_repository_fixture(&mut accepted, &fixture_repository_registration());
     accepted
@@ -186,7 +186,8 @@ fn code(o: Outcome) -> String {
         x => panic!("expected refusal, got {x:?}"),
     }
 }
-async fn submit(c: &Controller, id: &str, input: TaskInput) -> Task {
+async fn submit(c: &Controller, id: &str, input: impl Into<Box<TaskInput>>) -> Task {
+    let input = input.into();
     // Only this named positive fixture is registered here. Arbitrary inputs and
     // raw call()/handle() paths are never inferred, repaired, or registered.
     let fixed = fixture_repository_binding();
@@ -204,7 +205,7 @@ async fn submit(c: &Controller, id: &str, input: TaskInput) -> Task {
             c,
             Operation::SubmitTask {
                 operation_id: id.into(),
-                input,
+                input: (input).into(),
             },
         )
         .await,
@@ -482,7 +483,7 @@ async fn real_sqlite_task_result_history_memory_and_restart() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: "submit-a".into(),
-                    input: changed
+                    input: (changed).into()
                 }
             )
             .await
@@ -566,7 +567,7 @@ async fn dropped_acknowledgment_replays_one_durable_submission() {
         request_id: "lost-http".into(),
         command: Operation::SubmitTask {
             operation_id: "lost-submit".into(),
-            input: input.clone(),
+            input: (input.clone()).into(),
         },
     }));
     poll_fn(|cx| {
@@ -1187,12 +1188,12 @@ async fn delegation_rejects_transitive_cycle_and_keeps_parent_budget() {
     child.limits.deadline_unix_ms = p.input.limits.deadline_unix_ms;
     child.limits.model_requests = 3;
     child.dependencies = vec![d.id];
-    let delegate = |id: &str, child| Operation::DelegateTask {
+    let delegate = |id: &str, child: TaskInput| Operation::DelegateTask {
         operation_id: id.into(),
         parent_task_id: p.id.clone(),
         parent_attempt_id: a.id.clone(),
         generation: a.generation,
-        child,
+        child: (child).into(),
     };
     assert_eq!(
         code(call(&c, delegate("cycle", child.clone())).await),
@@ -1302,7 +1303,7 @@ async fn child_result_survives_restart_and_resumes_parent_once_without_refund() 
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: a.id.clone(),
                 generation: a.generation,
-                child,
+                child: (child).into(),
             },
         )
         .await,
@@ -1322,7 +1323,7 @@ async fn child_result_survives_restart_and_resumes_parent_once_without_refund() 
     assert!(ready.waiting_child_id.is_none());
     let settled = ready.completed_child.as_ref().unwrap();
     assert_eq!(settled.task_id, child.id);
-    assert_eq!(settled.result, complete.result);
+    assert_eq!(settled.result.as_ref(), complete.result.as_deref());
     task(
         report(
             &c,
@@ -1617,7 +1618,7 @@ async fn receipt_exhaustion_reserves_cancellation_and_actual_cleanup() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: "overflow".into(),
-                    input: native("other")
+                    input: (native("other")).into()
                 }
             )
             .await
@@ -1710,7 +1711,7 @@ async fn child_uncertainty_cannot_start_parent_on_another_free_worker() {
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: a.id.clone(),
                 generation: a.generation,
-                child: input,
+                child: (input).into(),
             },
         )
         .await,
@@ -1808,7 +1809,7 @@ async fn oversized_child_handoff_refuses_without_stranding_parent_assignment() {
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: a.id.clone(),
                 generation: a.generation,
-                child: input,
+                child: (input).into(),
             },
         )
         .await,
@@ -1923,7 +1924,7 @@ async fn oversized_result_refusal_does_not_withhold_an_unrelated_stop_command() 
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: a.id.clone(),
                 generation: a.generation,
-                child: input,
+                child: (input).into(),
             },
         )
         .await,
@@ -2254,7 +2255,7 @@ async fn native_schema_preflight_rechecks_delegation_and_replays_refusals() {
                     parent_task_id: id,
                     parent_attempt_id: a.id,
                     generation: a.generation,
-                    child,
+                    child: (child).into(),
                 },
             )
             .await
@@ -2283,7 +2284,7 @@ async fn native_schema_preflight_rechecks_delegation_and_replays_refusals() {
     unsupported.output_schema = Some(json!({"type":"definitely-not-a-json-type"}));
     let op = Operation::SubmitTask {
         operation_id: "bad-schema".into(),
-        input: unsupported,
+        input: (unsupported).into(),
     };
     let first = call(&c, op.clone()).await;
     assert_eq!(code(first.clone()), "invalid_input");
@@ -2291,7 +2292,7 @@ async fn native_schema_preflight_rechecks_delegation_and_replays_refusals() {
     let (ready, release) = c.qualification_pause_next_finalization();
     let op = Operation::SubmitTask {
         operation_id: "concurrent-same-submit".into(),
-        input: native("same"),
+        input: (native("same")).into(),
     };
     let running = {
         let (c, op) = (c.clone(), op.clone());
@@ -2322,7 +2323,7 @@ async fn validation_helper_failure_drop_and_timeout_do_not_hold_sql_or_accept() 
     .unwrap();
     let op = Operation::SubmitTask {
         operation_id: "bad-helper".into(),
-        input: native("bad-helper"),
+        input: (native("bad-helper")).into(),
     };
     let refused = call(&c, op.clone()).await;
     assert_eq!(code(refused.clone()), "validation_unavailable");
@@ -2354,7 +2355,7 @@ async fn validation_helper_failure_drop_and_timeout_do_not_hold_sql_or_accept() 
         input.limits.deadline_unix_ms = if mode == "timeout" { 1200 } else { 6000 };
         let op = Operation::SubmitTask {
             operation_id: "helper-operation".into(),
-            input,
+            input: (input).into(),
         };
         let ready = borg_runtime::native::qualification_hold_next_validation(&program);
         let running = {
@@ -2885,7 +2886,7 @@ async fn current_schema_reopens_and_old_wire_has_explicit_original_refusal() {
                 request_id: "old-wire".into(),
                 command: Operation::SubmitTask {
                     operation_id: "old-submit".into(),
-                    input: input.clone()
+                    input: (input.clone()).into()
                 }
             })
             .await
@@ -3003,7 +3004,7 @@ async fn full_accepted_result_bound_counts_escaped_fields_at_exact_boundary() {
     assert!(get(&c, &t.id).await.result.is_none());
     let accepted = task(report(&c, &a, "exact-result-bound", candidate(&result)).await);
     assert_eq!(accepted.status, TaskStatus::Succeeded);
-    assert_eq!(accepted.result, Some(result));
+    assert_eq!(accepted.result.as_deref(), Some(&result));
 }
 
 #[tokio::test]
@@ -3050,7 +3051,7 @@ async fn configured_workflow_validates_fixed_child_sources_before_native_dispatc
                     &c,
                     Operation::SubmitTask {
                         operation_id: label.into(),
-                        input
+                        input: (input).into()
                     }
                 )
                 .await
@@ -3107,7 +3108,7 @@ async fn configured_workflow_validates_fixed_child_sources_before_native_dispatc
                     parent_task_id: parent.id.clone(),
                     parent_attempt_id: a.id.clone(),
                     generation: a.generation,
-                    child: no_depth
+                    child: (no_depth).into()
                 }
             )
             .await
@@ -3129,7 +3130,7 @@ async fn configured_workflow_validates_fixed_child_sources_before_native_dispatc
                     parent_task_id: parent.id.clone(),
                     parent_attempt_id: a.id.clone(),
                     generation: a.generation,
-                    child: nested
+                    child: (nested).into()
                 }
             )
             .await
@@ -3177,7 +3178,7 @@ async fn configured_child_matches_template_and_continuation_survives_replay_rest
         parent_task_id: parent.id.clone(),
         parent_attempt_id: a.id.clone(),
         generation: a.generation,
-        child,
+        child: (child).into(),
     };
     for mode in [
         "repository",
@@ -3256,7 +3257,7 @@ async fn configured_child_matches_template_and_continuation_survives_replay_rest
     assert_eq!(next.task_id, parent.id);
     assert_eq!(remaining, 1);
     assert_eq!(resumed_deadline, parent.input.limits.deadline_unix_ms);
-    assert_eq!(recorded.result, complete.result);
+    assert_eq!(recorded.result.as_ref(), complete.result.as_deref());
     assert_eq!(
         code(
             call(
@@ -3266,7 +3267,7 @@ async fn configured_child_matches_template_and_continuation_survives_replay_rest
                     parent_task_id: parent.id.clone(),
                     parent_attempt_id: next.id.clone(),
                     generation: next.generation,
-                    child
+                    child: (child).into()
                 }
             )
             .await
@@ -3335,7 +3336,7 @@ async fn configured_delegation_reserves_last_request_and_cancellation_remains_fi
             parent_task_id: parent.id.clone(),
             parent_attempt_id: a.id.clone(),
             generation: a.generation,
-            child: child.clone(),
+            child: (child.clone()).into(),
         };
         if mode == "no-room" {
             assert_eq!(code(call(&c, op()).await), "capacity");
@@ -3375,7 +3376,7 @@ async fn configured_delegation_reserves_last_request_and_cancellation_remains_fi
                             parent_task_id: parent.id.clone(),
                             parent_attempt_id: a.id.clone(),
                             generation: a.generation,
-                            child
+                            child: (child).into()
                         }
                     )
                     .await
@@ -3501,7 +3502,7 @@ async fn helper_owner_excludes_second_controller_after_database_error_and_drop()
                 &c,
                 Operation::SubmitTask {
                     operation_id: "held-submit".into(),
-                    input,
+                    input: (input).into(),
                 },
             )
             .await
@@ -3758,7 +3759,7 @@ fn controller_crash_helper_fixture() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: "crashed-submit".into(),
-                    input: native("crash-helper"),
+                    input: (native("crash-helper")).into(),
                 },
             )
             .await
@@ -4655,7 +4656,7 @@ async fn controlled_delegate(
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: attempt.id.clone(),
                 generation: attempt.generation,
-                child: input,
+                child: (input).into(),
             },
         )
         .await,
@@ -4752,7 +4753,7 @@ async fn task_recovery_cancel_traverses_settled_child_at_receipt_capacity() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: format!("fill-{index}"),
-                    input: malformed,
+                    input: (malformed).into(),
                 },
             )
             .await;
@@ -5574,7 +5575,7 @@ async fn ordinary_prerequisites_refuse_missing_and_remain_original() {
     missing_input.dependencies = vec!["nonexistent-prerequisite".into()];
     let missing = Operation::SubmitTask {
         operation_id: "dependency-missing".into(),
-        input: missing_input.clone(),
+        input: (missing_input.clone()).into(),
     };
     let refused = call(&c, missing.clone()).await;
     assert_eq!(code(refused.clone()), "not_found");
@@ -5633,7 +5634,7 @@ async fn ordinary_prerequisites_refuse_missing_and_remain_original() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: "dependency-missing".into(),
-                    input: original_input.clone(),
+                    input: (original_input.clone()).into(),
                 }
             )
             .await
@@ -5649,7 +5650,7 @@ async fn ordinary_prerequisites_refuse_missing_and_remain_original() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: "dependency-valid".into(),
-                    input: changed,
+                    input: (changed).into(),
                 }
             )
             .await
@@ -5686,7 +5687,7 @@ async fn ordinary_prerequisites_refuse_missing_and_remain_original() {
                 parent_task_id: parent.id.clone(),
                 parent_attempt_id: parent_attempt.id.clone(),
                 generation: parent_attempt.generation,
-                child: child_input.clone(),
+                child: (child_input.clone()).into(),
             },
         )
         .await,
@@ -5714,8 +5715,8 @@ async fn ordinary_prerequisites_refuse_missing_and_remain_original() {
     assert!(ready.waiting_child_id.is_none());
     assert_eq!(ready.input, accepted_input(&c, &original_input));
     assert_eq!(
-        ready.completed_child.as_ref().unwrap().result,
-        completed_child.result
+        ready.completed_child.as_ref().unwrap().result.as_ref(),
+        completed_child.result.as_deref()
     );
     drop(c);
     let c = Controller::open_with_config(&p, config()).unwrap();

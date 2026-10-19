@@ -480,7 +480,7 @@ async fn submit_identified(api: &ApiClient, input: TaskInput, operation_id: &str
     match api
         .call(Operation::SubmitTask {
             operation_id: operation_id.into(),
-            input,
+            input: (input).into(),
         })
         .await
         .unwrap()

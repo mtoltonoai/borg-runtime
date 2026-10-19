@@ -100,7 +100,7 @@ async fn observe_delivery(api: &ApiClient, task: &Task) -> borg_runtime::collabo
     let reply=api.call(operation.clone()).await.unwrap();
     reply.validate_for(&operation).unwrap();
     let Outcome::Ok {data:Data::CollaborationDelivery(observation)}=reply.outcome else {panic!("delivery observation: {reply:?}")};
-    observation
+    *observation
 }
 
 async fn reported_requests(api: &ApiClient, task_id: &str, attempt_id: &str) -> u32 {

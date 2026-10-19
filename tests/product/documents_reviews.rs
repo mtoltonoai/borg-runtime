@@ -19,9 +19,10 @@ async fn document_read(c:&Controller,id:&str,version:Option<u64>)->DocumentView 
     }
 }
 async fn review_read(c:&Controller,id:&str)->ReviewView {
-    match call(c,Operation::QueryReview{query:ReviewQuery::Get{review_id:id.into()}}).await {
-        Data::ReviewQuery(ReviewQueryResult::Review(v))=>v,x=>panic!("review expected {x:?}")
-    }
+    let Data::ReviewQuery(result)=call(c,Operation::QueryReview{query:ReviewQuery::Get{review_id:id.into()}}).await
+        else {panic!("review expected")};
+    let ReviewQueryResult::Review(view)=*result else {panic!("review expected")};
+    view
 }
 
 #[tokio::test]
@@ -266,11 +267,12 @@ async fn browser_exposes_exact_document_comment_and_closed_review_identities_as_
     assert!(details.contains("Comment &lt;tag&gt; &amp; retained"));
     assert!(details.contains("&quot;path&quot;:&quot;operator_api&quot;"));
     let target = ReviewTarget::DocumentVersion { version: d.version.reference.clone() };
-    let Data::ReviewMutation(ReviewMutationOutcome::Review(review)) = call(&f.controller, Operation::MutateReview {
+    let Data::ReviewMutation(result) = call(&f.controller, Operation::MutateReview {
         operation_id: "exact-visible-review".into(), mutation: ReviewMutation::Request {
             target: target.clone(), reviewer: PrincipalRef::TrustedHostOperator, summary: "Review the original".into(),
         },
     }).await else { panic!("expected review") };
+    let ReviewMutationOutcome::Review(review) = *result else { panic!("expected review") };
     let decided = ui(&f.controller, "POST", &format!("/reviews/{}/decide", review.review.id), form(&[
         ("operation_id", "exact-visible-decision".into()), ("expected_revision", review.review.revision.to_string()),
         ("verdict", "approved".into()), ("explanation", "Product decision <only>".into()),
@@ -399,11 +401,12 @@ async fn browser_question_and_review_filters_preserve_canonical_scope_through_co
                 ],recommended_option_id:"keep".into(),
             }},
         }).await else{panic!("question expected")};questions.push(value.question);
-        let Data::ReviewMutation(ReviewMutationOutcome::Review(value))=call(&f.controller,Operation::MutateReview {
+        let Data::ReviewMutation(result)=call(&f.controller,Operation::MutateReview {
             operation_id:format!("filter-review-{label}"),mutation:ReviewMutation::Request {
                 target:ReviewTarget::DocumentVersion{version:document.version.reference.clone()},reviewer:PrincipalRef::TrustedHostOperator,summary:format!("Review {label}"),
             },
-        }).await else{panic!("review expected")};reviews.push(value);
+        }).await else{panic!("review expected")};
+        let ReviewMutationOutcome::Review(value)=*result else{panic!("review expected")};reviews.push(value);
     }
     call(&f.controller,Operation::MutateQuestion {operation_id:"filter-question-close".into(),mutation:QuestionMutation::Cancel {
         question_id:questions[3].question.id.clone(),expected_revision:questions[3].question.revision,reason:"This item is closed".into(),
@@ -425,14 +428,16 @@ async fn browser_question_and_review_filters_preserve_canonical_scope_through_co
         let mut finished=false;
         for page_number in 0..=ids.len() {
             let (expected_ids,next_cursor)=if route=="questions" {
-                let Data::QuestionQuery(QuestionQueryResult::Questions(page))=call(&f.controller,Operation::QueryQuestion {
+                let Data::QuestionQuery(result)=call(&f.controller,Operation::QueryQuestion {
                     query:QuestionQuery::List{record:record.clone(),status:Some(QuestionStatus::Open),after:after.clone(),limit:1},
                 }).await else{panic!("canonical question page expected")};
+                let QuestionQueryResult::Questions(page)=*result else{panic!("canonical question page expected")};
                 (page.items.into_iter().map(|q|q.question.id).collect::<Vec<_>>(),page.next_cursor)
             } else {
-                let Data::ReviewQuery(ReviewQueryResult::Reviews(page))=call(&f.controller,Operation::QueryReview {
+                let Data::ReviewQuery(result)=call(&f.controller,Operation::QueryReview {
                     query:ReviewQuery::List{record:record.clone(),status:Some(ReviewStatus::Open),after:after.clone(),limit:1},
                 }).await else{panic!("canonical review page expected")};
+                let ReviewQueryResult::Reviews(page)=*result else{panic!("canonical review page expected")};
                 (page.items.into_iter().map(|review|review.id).collect::<Vec<_>>(),page.next_cursor)
             };
             assert!(expected_ids.len()<=1);

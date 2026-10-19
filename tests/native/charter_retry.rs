@@ -137,8 +137,9 @@ async fn scenario(case:Case){
                 if let Some(row)=receipt(&api,&operation_id).await {
                     assert_eq!(row.id,operation_id);
                     assert_eq!(row.intended,serde_json::to_value(&expected).unwrap());
-                    let Outcome::Ok {data:Data::Charter(CharterOutcome::Compaction(original))}=
+                    let Outcome::Ok {data:Data::Charter(result)}=
                         serde_json::from_value::<Outcome>(row.outcome.unwrap()).unwrap() else {panic!("original compaction rejection did not commit")};
+                    let CharterOutcome::Compaction(original) = *result else { panic!("original compaction rejection did not commit") };
                     assert_eq!(original.run_id,run_id);assert_eq!(original.request_index,3);
                     assert!(original.reply.is_none()&&original.summary.is_none()&&original.disposition.is_none());
                     break;
@@ -198,7 +199,7 @@ async fn scenario(case:Case){
     }
     if case==Case::OrdinaryRetry {
         let turns=match api.call(Operation::QueryCharter{query:CharterQuery::Turns{session_id:task.session_id.clone(),after:None,limit:10}}).await.unwrap().outcome {
-            Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Turns(page))}=>page.items,other=>panic!("turns {other:?}"),
+            Outcome::Ok{data:Data::CharterQuery(result)}=>match *result { CharterQueryResult::Turns(page) => page.items, other => panic!("turns {other:?}") },other=>panic!("turns {other:?}"),
         };
         let rejected=turns.iter().find(|t|t.boundary.request_index==2).unwrap();
         let successor=turns.iter().find(|t|t.boundary.request_index==3).unwrap();
@@ -218,7 +219,7 @@ async fn scenario(case:Case){
     }
     let first_compaction=if case==Case::OrdinaryRetry{4}else{3};
     let run=match api.call(Operation::QueryCharter{query:CharterQuery::Compaction{run_id:format!("{}-charter-compaction-{first_compaction}",attempt.id)}}).await.unwrap().outcome{
-        Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Compaction(run))}=>run,other=>panic!("run {other:?}"),
+        Outcome::Ok{data:Data::CharterQuery(result)}=>match *result { CharterQueryResult::Compaction(run) => run, other => panic!("compaction {other:?}") },other=>panic!("run {other:?}"),
     };
     if case!=Case::OrdinaryRetry{assert!(run.reply.is_none()&&run.summary.is_none()&&run.disposition.is_none());}
     let head=binding(&api,&task.session_id).await;
@@ -227,7 +228,7 @@ async fn scenario(case:Case){
     if successes{
         assert_eq!(done.result.as_ref().unwrap().output,Some(json!(7)));assert!(head.session.compaction_due.is_none());
         let success=match api.call(Operation::QueryCharter{query:CharterQuery::Compaction{run_id:format!("{}-charter-compaction-4",attempt.id)}}).await.unwrap().outcome{
-            Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::Compaction(run))}=>run,other=>panic!("successful run {other:?}"),
+            Outcome::Ok{data:Data::CharterQuery(result)}=>match *result { CharterQueryResult::Compaction(run) => run, other => panic!("compaction {other:?}") },other=>panic!("successful run {other:?}"),
         };
         assert!(success.reply.is_some());assert_eq!(success.disposition,Some(CompactionDisposition::CurrentSourceSummary));
         assert!(receipt(&api,&contract::completion_id(&attempt.id)).await.is_some());

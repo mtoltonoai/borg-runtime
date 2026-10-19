@@ -669,7 +669,7 @@ pub(super) async fn recover(config: &WorkerConfig, state: &Path,
             // Readback cleanup budget only, never new task/model allowance.
             deadline_ms:process::now_ms().checked_add(limits.worker.publication_recovery_timeout_ms)
                 .ok_or("PR recovery clock overflow")?,
-            worker_limits:Arc::new(limits.worker.clone()), runtime_limits:Arc::new(limits.clone()),
+            worker_limits:Arc::from(limits.worker.clone()), runtime_limits:Arc::new(limits.clone()),
             validation_runtime:validation_runtime.clone(), cancel,
         };
         let final_request = phase.final_report.as_ref().map(|_|final_request(&phase,attempt)).transpose()?;

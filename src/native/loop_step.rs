@@ -2647,7 +2647,7 @@ mod policy_tests {
             "/unused-program".into(),
             "/unused-registry".into(),
             Arc::new(limits.execution.native),
-            Arc::new(ValidationRuntime::new(Arc::new(limits.worker)).unwrap()),
+            Arc::new(ValidationRuntime::new(Arc::from(limits.worker)).unwrap()),
         );
         let config = NativeConfig {
             endpoint: "http://127.0.0.1:1/v1/responses".into(),

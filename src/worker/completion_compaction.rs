@@ -96,21 +96,22 @@ pub(super) async fn compact_if_due(
         let operation_id=format!("{}-charter-compaction-{index}",reporter.attempt.id);
         let prepared=boxed_execution(|| async {
             boxed_execution(|| reserve(reporter,input,control,usage,index,&mut request_diagnostic)).await?;
-            let original=match boxed_execution(|| charter::mutate(reporter,state,control,operation_id.clone(),
+            let original=boxed_execution(|| charter::mutate(reporter,state,control,operation_id.clone(),
                 CharterObservation::BeginCompaction {session_id:reporter.attempt.session_id.clone(),
-                    expected_revision:binding.session.revision,request_index:index})).await? {
+                    expected_revision:binding.session.revision,request_index:index})).await?;
+            let admitted=match original.as_ref() {
                 CharterOutcome::Compaction(value) if value.caller==charter::caller(&reporter.attempt)
                     && value.session_id==reporter.attempt.session_id && value.request_index==index
                     && value.run_id==operation_id && value.reply.is_none()=>value,
                 _=>return Err("charter compaction admission differs".to_string()),
             };
-            if original_source.as_ref().is_some_and(|source|source!=&original.effective.reference) {
+            if original_source.as_ref().is_some_and(|source|source!=&admitted.effective.reference) {
                 return Err("compaction retry admitted another source; POST withheld".into());
             }
-            let exchange=charter::exchange(&original.effective,true,input)?;
+            let exchange=charter::exchange(&admitted.effective,true,input)?;
             Ok((original,exchange))
         }).await;
-        let (original,exchange)=match prepared {
+        let (original_outcome,exchange)=match prepared {
             Ok(value)=>value,
             Err(error)=>{
                 let retained=request_diagnostic.unstarted(reporter);
@@ -119,6 +120,10 @@ pub(super) async fn compact_if_due(
                 return with_secondary(primary,boxed_execution(|| acknowledge_native_diagnostic(reporter,control,retained)).await,
                     "native terminal diagnostic failed");
             },
+        };
+        // Keep the full receipt in its heap allocation across provider awaits.
+        let CharterOutcome::Compaction(original)=original_outcome.as_ref() else {
+            unreachable!("prepared compaction admission was checked")
         };
         if original_source.is_none() {original_source=Some(original.effective.reference.clone());}
         let request_host=host.for_request(retry_binding.clone()).with_charter(exchange.clone());
@@ -163,7 +168,7 @@ pub(super) async fn compact_if_due(
             let report_id=contract::rejection_id(&reporter.attempt.id,index);
             let reconciliation=boxed_execution(|| async {
                 match boxed_execution(|| charter::mutate(reporter,state,control,format!("{operation_id}-rejected"),
-                    CharterObservation::CompactionRejected {run_id:operation_id.clone(),report_id:report_id.clone()})).await? {
+                    CharterObservation::CompactionRejected {run_id:operation_id.clone(),report_id:report_id.clone()})).await?.as_ref() {
                     CharterOutcome::Compaction(value) if value.run_id==original.run_id
                         && value.caller==original.caller && value.effective==original.effective
                         && value.reply.is_none() && value.summary.is_none() && value.disposition.is_none()=>Ok(()),
@@ -206,10 +211,10 @@ pub(super) async fn compact_if_due(
             if let Some(reply)=charter::capture(&exchange)? {
                 let summary=observed.result.as_ref().ok().map(|value|value.summary.clone());
                 match boxed_execution(|| charter::record_original(reporter,input,state,control,format!("{operation_id}-reply"),
-                    CharterObservation::CompactionReply {run_id:operation_id.clone(),reply,summary})).await? {
+                    CharterObservation::CompactionReply {run_id:operation_id.clone(),reply,summary})).await?.as_ref() {
                     CharterOutcome::Compaction(value) if value.run_id==original.run_id
                         && value.caller==original.caller && value.effective==original.effective=>{
-                        if value.disposition==Some(CompactionDisposition::CurrentSourceSummary) {accepted=value.summary;}
+                        if value.disposition==Some(CompactionDisposition::CurrentSourceSummary) {accepted=value.summary.clone();}
                     },
                     _=>return Err("charter compaction result differs".into()),
                 }

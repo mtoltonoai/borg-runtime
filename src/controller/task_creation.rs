@@ -292,7 +292,7 @@ pub(super) fn validate_original(
             super::repositories::revision(tx, r.registration.as_ref().unwrap())?.source_endpoint;
     }
     expected.resolved_limits = Some(global.resolve_task(&expected).map_err(Fault::Store)?);
-    if expected != input || crate::pull_request_view::input(&input) != task.input {
+    if expected != *input || crate::pull_request_view::input(&input) != *task.input {
         return Err(Fault::Store(
             "created task differs from original frozen input".into(),
         ));

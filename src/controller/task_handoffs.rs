@@ -103,7 +103,7 @@ pub(super) fn request(tx:&Connection<'_>,operation_id:&str,task_id:&str,expected
     let session=Session{id:format!("session-{database_id}-{session_sequence:020}"),agent_id:target.id.clone(),definition:target.clone(),task_id:task_id.into()};
     let intent=Intent{operation_id:operation_id.into(),task_id:task_id.into(),from_session_id:task.task.session_id.clone(),expected_revision,session_sequence,session,input};
     let mut projected=load(tx,task_id)?;
-    projected.task.input=intent.input.clone();
+    projected.task.input=Box::new(intent.input.clone());
     projected.task.session_id=intent.session.id.clone();
     projected.task.assigned_agent_id=intent.session.agent_id.clone();
     projected.task.attempt=None;
@@ -112,7 +112,7 @@ pub(super) fn request(tx:&Connection<'_>,operation_id:&str,task_id:&str,expected
     let body=encode(&intent)?;
     if body.len()>tx.limits.transport.body_bytes{return refuse("capacity","handoff intent exceeds transport.body_bytes")}
     tx.execute("INSERT INTO task_assignments(operation_id,task_id,from_session_id,state,body) VALUES(?1,?2,?3,'pending',?4)",params![operation_id,task_id,intent.from_session_id,body])?;
-    task.task.pending_assignment=Some(PendingAssignment{operation_id:intent.operation_id.clone(),from_session_id:intent.from_session_id.clone(),session:intent.session.clone()});
+    task.task.pending_assignment=Some(Box::new(PendingAssignment{operation_id:intent.operation_id.clone(),from_session_id:intent.from_session_id.clone(),session:intent.session.clone()}));
     task.task.status=TaskStatus::Blocked;
     task.task.blocked_reason=Some("handoff_waiting_for_stop".into());
     stop(tx,&mut task)?;
@@ -166,7 +166,7 @@ fn activate(tx:&Connection<'_>,intent:&Intent,cfg:&ControllerConfig,now:u64)->Re
     task.task.pending_assignment=None;
     task.task.session_id=session.id.clone();
     task.task.assigned_agent_id=session.agent_id.clone();
-    task.task.input=intent.input.clone();
+    task.task.input=Box::new(intent.input.clone());
     task.task.attempt=None; // All old attempts and their aggregate debit remain.
     task.task.status=TaskStatus::Queued;
     task.task.blocked_reason=None;
@@ -232,7 +232,7 @@ pub(super) fn validate_existing(tx:&Connection<'_>,cfg:&ControllerConfig,version
         }
         expected.definition=intent.input.definition.clone();
         expected.resolved_limits=Some(old.resolved_limits.as_ref().unwrap().global_metadata.resolve_task(&expected).map_err(Fault::Store)?);
-        if expected!=intent.input || old.definition.id==intent.input.definition.id {return Err(Fault::Store("handoff immutable execution projection differs".into()))}
+        if expected.as_ref()!=&intent.input || old.definition.id==intent.input.definition.id {return Err(Fault::Store("handoff immutable execution projection differs".into()))}
         let receipt=super::metadata::read(tx,&id)?.ok_or_else(||Fault::Store("handoff original receipt absent".into()))?;
         let matched=match &receipt.request {
             Operation::AssignTask{task_id,expected_revision,agent_id,..}=>task_id==&intent.task_id&&*expected_revision==intent.expected_revision&&agent_id==&intent.input.definition.id,
@@ -241,12 +241,12 @@ pub(super) fn validate_existing(tx:&Connection<'_>,cfg:&ControllerConfig,version
         };
         let expected_pending=PendingAssignment{operation_id:id.clone(),from_session_id:from.clone(),session:intent.session.clone()};
         let recorded=match &receipt.outcome {Outcome::Ok{data:Data::Task(task)}=>task,_=>return Err(Fault::Store("handoff original admission differs".into()))};
-        let accepted_target=recorded.pending_assignment.as_ref()==Some(&expected_pending)
+        let accepted_target=recorded.pending_assignment.as_deref()==Some(&expected_pending)
             ||(recorded.session_id==intent.session.id&&recorded.pending_assignment.is_none());
         if !matched||recorded.id!=task_id||!accepted_target{return Err(Fault::Store("handoff original admission differs".into()))}
         match (state.as_str(),to) {
-            ("activated",Some(to))=>{let next=super::sessions::get(tx,&to)?;let links:(Option<String>,Option<String>)=tx.query_row("SELECT previous_session_id,operation_id FROM session_inputs WHERE session_id=?1",[&to],|r|Ok((r.get(0)?,r.get(1)?)))?;if next!=intent.session||to!=intent.session.id||super::sessions::input(tx,&next)?!=intent.input||links!=(Some(from),Some(id)){return Err(Fault::Store("activated handoff lineage differs".into()))}}
-            ("pending",None)=>{let task=load(tx,&task_id)?;if task.task.session_id!=from||task.task.status!=TaskStatus::Blocked||task.task.pending_assignment.as_ref()!=Some(&expected_pending){return Err(Fault::Store("pending handoff current owner differs".into()))}}
+            ("activated",Some(to))=>{let next=super::sessions::get(tx,&to)?;let links:(Option<String>,Option<String>)=tx.query_row("SELECT previous_session_id,operation_id FROM session_inputs WHERE session_id=?1",[&to],|r|Ok((r.get(0)?,r.get(1)?)))?;if next!=intent.session||to!=intent.session.id||*super::sessions::input(tx,&next)?!=intent.input||links!=(Some(from),Some(id)){return Err(Fault::Store("activated handoff lineage differs".into()))}}
+            ("pending",None)=>{let task=load(tx,&task_id)?;if task.task.session_id!=from||task.task.status!=TaskStatus::Blocked||task.task.pending_assignment.as_deref()!=Some(&expected_pending){return Err(Fault::Store("pending handoff current owner differs".into()))}}
             ("cancelled",None)=>{},
             _=>return Err(Fault::Store("handoff state differs".into())),
         }
@@ -289,7 +289,7 @@ pub(super) fn validate_existing(tx:&Connection<'_>,cfg:&ControllerConfig,version
         if !initial {continue}
         if let Outcome::Ok{data:Data::Task(task)}=&receipt.outcome {
             let (session,input)=original_inputs.get(&task.id).ok_or_else(||Fault::Store("original accepted input absent".into()))?;
-            let expected=if matches!(&receipt.request,Operation::CallCollaboration{..}){crate::pull_request_view::input(input)}else{input.clone()};
+            let expected=if matches!(&receipt.request,Operation::CallCollaboration{..}){Box::new(crate::pull_request_view::input(input))}else{input.clone()};
             if &task.session_id!=session||task.input!=expected||!admissions.insert(task.id.clone()){return Err(Fault::Store("original admission/session input differs".into()))}
         }
     }

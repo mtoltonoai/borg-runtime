@@ -81,8 +81,9 @@ async fn turns(api: &ApiClient, session: &str) -> Vec<CharterTurn> {
         .outcome
     {
         Outcome::Ok {
-            data: Data::CharterQuery(CharterQueryResult::Turns(page)),
+            data: Data::CharterQuery(result),
         } => {
+            let CharterQueryResult::Turns(page) = *result else { panic!("turns: {result:?}") };
             assert!(
                 page.next_cursor.is_none(),
                 "fixture exceeded one bounded page"
@@ -485,7 +486,7 @@ async fn charter_does_not_reopen_unbound_or_retired_native_admission() {
         let reply = api
             .call(Operation::SubmitTask {
                 operation_id: format!("refuse-{retired}"),
-                input: value,
+                input: (value).into(),
             })
             .await
             .unwrap();

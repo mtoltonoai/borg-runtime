@@ -258,7 +258,7 @@ async fn actors(c: &Api) -> (Task, Attempt, Task, Attempt, Attempt) {
             c,
             Operation::SubmitTask {
                 operation_id: "actor-a".into(),
-                input: input("shared"),
+                input: (input("shared")).into(),
             },
         )
         .await,
@@ -268,7 +268,7 @@ async fn actors(c: &Api) -> (Task, Attempt, Task, Attempt, Attempt) {
             c,
             Operation::SubmitTask {
                 operation_id: "actor-b".into(),
-                input: input("shared"),
+                input: (input("shared")).into(),
             },
         )
         .await,
@@ -278,7 +278,7 @@ async fn actors(c: &Api) -> (Task, Attempt, Task, Attempt, Attempt) {
             c,
             Operation::SubmitTask {
                 operation_id: "actor-c".into(),
-                input: input("unrelated"),
+                input: (input("unrelated")).into(),
             },
         )
         .await,

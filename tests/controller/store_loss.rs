@@ -190,7 +190,7 @@ async fn genuinely_fresh_active_and_restarted_roots_keep_original_task_and_recei
     register_repository_fixture(&c, &fixture_repository_registration()).await;
     let command = Operation::SubmitTask {
         operation_id: "fresh-source".into(),
-        input: coding("fresh-agent"),
+        input: (coding("fresh-agent")).into(),
     };
     let request = |id: &str| Request {
         protocol_revision: WIRE_REVISION,

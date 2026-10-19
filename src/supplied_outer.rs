@@ -244,9 +244,10 @@ pub fn outcome_uses(outcome: &crate::protocol::Outcome) -> bool {
             }
             _ => false,
         },
-        Data::Charter(crate::charter::CharterOutcome::Definition(v)) => {
-            definition_uses(&v.definition)
-        }
+        Data::Charter(value) => match value.as_ref() {
+            crate::charter::CharterOutcome::Definition(v) => definition_uses(&v.definition),
+            _ => false,
+        },
         _ => false,
     }
 }

@@ -382,7 +382,7 @@ pub(super) async fn current(reporter: &Reporter, input: &TaskInput, control: &Co
     let Outcome::Ok { data: Data::Task(task) } = reply.outcome else { return Err("native retry current task unavailable".into()) };
     let mut expected=input.clone();
     expected.limits.model_requests=task.input.limits.model_requests;
-    if task.status!=TaskStatus::Active || task.input!=expected
+    if task.status!=TaskStatus::Active || *task.input!=expected
         || task.session_id!=reporter.attempt.session_id || task.assigned_agent_id!=input.definition.id
         || task.waiting_child_id.is_some() || !task.attempt.as_ref().is_some_and(|a|
             a.id==reporter.attempt.id && a.generation==reporter.attempt.generation

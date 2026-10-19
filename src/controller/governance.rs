@@ -348,7 +348,7 @@ fn validate_original_detail(tx:&StoreContext<'_>,record:&DecisionRecord,request:
                                 &&matches!(&prior.request,Operation::EvaluateCompletion(value)
                                     if value.caller.task_id==assessment.subject.task_id&&value.caller.attempt_id==assessment.subject.attempt_id
                                         &&value.caller.generation==assessment.subject.generation)
-                                &&matches!(prior.outcome,Outcome::Ok{data:crate::protocol::Data::Completion(crate::governance_completion::CompletionOutcome::NotEnforced)});
+                                &&matches!(prior.outcome,Outcome::Ok{data:crate::protocol::Data::Completion(completion)} if matches!(completion.as_ref(),crate::governance_completion::CompletionOutcome::NotEnforced));
                         }
                     }
                     agrees
@@ -413,8 +413,8 @@ fn validate_completion_original(tx:&StoreContext<'_>,record:&DecisionRecord,deci
             if !actor_matches_caller(&record.actor,&value.caller)||value.caller.task_id!=subject.task_id
                 ||value.caller.attempt_id!=subject.attempt_id||value.caller.generation!=subject.generation {return Ok(false)}
             match outcome {
-                Outcome::Ok{data:crate::protocol::Data::Completion(crate::governance_completion::CompletionOutcome::Evaluated(evaluation))}=>
-                    evaluation.decision==record.id&&evaluation.state==*decision&&evaluation.boundary==value.boundary,
+                Outcome::Ok{data:crate::protocol::Data::Completion(evaluation)}=>
+                    matches!(evaluation.as_ref(),crate::governance_completion::CompletionOutcome::Evaluated(evaluation) if evaluation.decision==record.id&&evaluation.state==*decision&&evaluation.boundary==value.boundary),
                 Outcome::Refused{..}=>true,
                 _=>false,
             }
@@ -526,8 +526,11 @@ fn evaluate_shadow(tx:&StoreContext<'_>,original:&DecisionRecord,candidate:&Rule
 //# A shadow evaluation MUST NOT delay or change the enforcing decision or its effects.
 fn shadow_input(tx:&StoreContext<'_>,original:&DecisionRef,candidate:&RuleVersion,configuration:&ConfigurationVersion,now:u64)->Result<ShadowResult> {
     let receipt=original_receipt(tx,&original.operation_id)?.ok_or_else(||Fault::Refused("not_found","original shadow receipt absent".into()))?;
-    if let (DecisionPoint::Completion,Operation::EvaluateCompletion(value),Outcome::Ok{data:crate::protocol::Data::Completion(crate::governance_completion::CompletionOutcome::NotEnforced)})=
+    if let (DecisionPoint::Completion,Operation::EvaluateCompletion(value),Outcome::Ok{data:crate::protocol::Data::Completion(completion)})=
         (&original.point,&receipt.request,&receipt.outcome) {
+        if !matches!(completion.as_ref(),crate::governance_completion::CompletionOutcome::NotEnforced) {
+            return evaluate_shadow(tx,&read_decision(tx,original)?,candidate,configuration);
+        }
         let RuleBody::Completion{allow_continuation}=&candidate.body else{return refuse("invalid_input","completion shadow requires a completion rule")};
         if candidate.reference!=configuration.completion{return refuse("configuration_conflict","completion candidate is not the selected configuration rule")}
         let cap=if *allow_continuation {limits(tx)?.completion_continuations}else{0};

@@ -483,7 +483,7 @@ impl Database {
             tracking.registry.clone(),
             tracking.lock.clone(),
             std::sync::Arc::new(config.limits.execution.native.clone()),
-            std::sync::Arc::new(crate::native::ValidationRuntime::new(std::sync::Arc::new(
+            std::sync::Arc::new(crate::native::ValidationRuntime::new(std::sync::Arc::from(
                 config.limits.worker.clone(),
             ))?),
         ));
@@ -1310,10 +1310,10 @@ pub(crate) fn settle_parent(tx: &Connection, t: &StoredTask) -> Result<()> {
         let mut p = load(tx, &parent)?;
         if p.task.waiting_child_id.as_deref() == Some(&t.task.id) {
             p.task.waiting_child_id = None;
-            p.task.completed_child = Some(ChildOutcome {
+            p.task.completed_child = Some(Box::new(ChildOutcome {
                 task_id: t.task.id.clone(),
                 status: t.task.status,
-                result: t.task.result.clone(),
+                result: t.task.result.as_deref().cloned(),
                 summary: t
                     .task
                     .result
@@ -1321,7 +1321,7 @@ pub(crate) fn settle_parent(tx: &Connection, t: &StoredTask) -> Result<()> {
                     .map(|r| r.summary.clone())
                     .or_else(|| t.task.blocked_reason.clone())
                     .unwrap_or_default(),
-            });
+            }));
             if bounded_json_size(&p.task, tx.limits.controller.outcome_bytes).is_err() {
                 return refuse(
                     "capacity",

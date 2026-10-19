@@ -211,7 +211,7 @@ async fn evidence_with_subject(c: &Controller, label: &str, candidate: &Configur
     let reply = governance_reply(c, original.clone()).await;
     assert!(reply.commit.is_some(), "completion observation must retain its original receipt: {reply:?}");
     let supported = match &reply.outcome {
-        Outcome::Ok { data: Data::Completion(CompletionOutcome::NotEnforced | CompletionOutcome::Evaluated(_)) } => true,
+        Outcome::Ok { data: Data::Completion(value) } => matches!(value.as_ref(), CompletionOutcome::NotEnforced | CompletionOutcome::Evaluated(_)),
         Outcome::Refused { code, .. } => code == "governance_completion_blocked",
         _ => false,
     };
@@ -309,7 +309,8 @@ async fn real_shadow_promotion_and_original_receipts_survive_restart_and_replay(
     let p = path(); let cfg = governance_config();
     let c = Controller::open_with_config(&p, cfg.clone()).unwrap();
     let promoted = promote(&c, "real-proof", false).await;
-    assert!(matches!(promoted.completion_reply.outcome, Outcome::Ok { data: Data::Completion(CompletionOutcome::NotEnforced) }));
+    assert!(matches!(&promoted.completion_reply.outcome, Outcome::Ok { data: Data::Completion(value) }
+        if matches!(value.as_ref(), CompletionOutcome::NotEnforced)));
     let before = decision(&c, promoted.request.mutation_id().unwrap(), DecisionPoint::RuleAdministration).await;
     let mut shadows = Vec::new();
     for id in &promoted.shadow_operations { shadows.push(decision(&c, id, DecisionPoint::RuleAdministration).await); }

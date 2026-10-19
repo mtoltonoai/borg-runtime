@@ -92,8 +92,11 @@ async fn active_admitted(c: &Controller) -> (Task, Attempt, Worker, Question, Op
         operation_id: evaluation_id(&caller, &boundary).unwrap(), caller, boundary, intervening_requests: vec![],
     });
     let admitted = reply(c, evaluation.clone()).await;
-    let Outcome::Ok { data: Data::Completion(CompletionOutcome::Evaluated(value)) } = &admitted.outcome else {
+    let Outcome::Ok { data: Data::Completion(completion) } = &admitted.outcome else {
         panic!("actual active completion admission expected: {admitted:?}")
+    };
+    let CompletionOutcome::Evaluated(value) = completion.as_ref() else {
+        panic!("actual active completion evaluation expected: {admitted:?}")
     };
     assert_eq!(value.state.disposition, CompletionDisposition::Admit); assert!(value.state.reasons.is_empty());
     assert_eq!(value.state.consecutive_count, 0);

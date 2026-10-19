@@ -89,7 +89,7 @@ async fn query(c: &Controller, query: Query) -> QueryResult {
         other => panic!("query: {other:?}"),
     }
 }
-async fn session_input(c: &Controller, id: &str) -> (Session, TaskInput, bool) {
+async fn session_input(c: &Controller, id: &str) -> (Session, Box<TaskInput>, bool) {
     match query(
         c,
         Query::SessionInput {
@@ -102,7 +102,7 @@ async fn session_input(c: &Controller, id: &str) -> (Session, TaskInput, bool) {
             session,
             input,
             current,
-        } => (session, *input, current),
+        } => (session, input, current),
         other => panic!("session input: {other:?}"),
     }
 }
@@ -137,7 +137,7 @@ async fn charter_state(c: &Controller, id: &str) -> CharterQueryResult {
     {
         Outcome::Ok {
             data: Data::CharterQuery(value),
-        } => value,
+        } => *value,
         other => panic!("charter: {other:?}"),
     }
 }
@@ -165,7 +165,7 @@ async fn registered_input(c: &Controller, label: &str) -> (Task, Definition, Ope
     // explicit request tests the new carrier without silently patching inputs.
     let command = Operation::SubmitTask {
         operation_id: format!("{label}-submit"),
-        input,
+        input: (input).into(),
     };
     let receipt = reply(c, command.clone()).await;
     (task(receipt.outcome.clone()), target, command, receipt)
@@ -173,7 +173,7 @@ async fn registered_input(c: &Controller, label: &str) -> (Task, Definition, Ope
 fn launch(
     values: &[WorkerCommand],
     task_id: &str,
-) -> (String, Session, Attempt, TaskInput, Option<Checkpoint>) {
+) -> (String, Box<Session>, Attempt, Box<TaskInput>, Option<Checkpoint>) {
     let values: Vec<_> = values
         .iter()
         .filter_map(|v| match v {
@@ -400,7 +400,7 @@ async fn running_native_self_handoff_waits_for_stop_and_freezes_target_and_task_
     );
     let (_, session, next, input, checkpoint) =
         launch(&commands(&c, &w, vec![]).await, &accepted.id);
-    assert_eq!(session, reserved.session);
+    assert_eq!(session.as_ref(), &reserved.session);
     assert_eq!(next.session_id, active.session_id);
     assert!(next.generation > a.generation);
     assert_ne!(next.id, a.id);

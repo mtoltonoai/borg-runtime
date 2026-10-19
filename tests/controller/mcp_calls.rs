@@ -192,7 +192,7 @@ async fn mcp_calls_refuse_stale_worker_deadline_and_unconfigured_without_effect(
     let _ = a;
     // Missing profile now refuses at new admission; no grafted legacy state.
     let mut input=native("disabled");input.definition.execution_profile=None;
-    assert_eq!(code(super::call(&c,Operation::SubmitTask{operation_id:"disabled".into(),input}).await),"template_profile_unbound");
+    assert_eq!(code(super::call(&c,Operation::SubmitTask{operation_id:"disabled".into(),input: (input).into()}).await),"template_profile_unbound");
 
 }
 #[tokio::test]
@@ -571,8 +571,8 @@ async fn mcp_calls_configured_child_is_exact_and_requires_parent_quiescence() {
         panic!("{reply:?}")
     };
     assert_eq!(
-        child.input,
-        borg_runtime::delegation::coding_child(&t.input, "make the configured change").unwrap()
+        child.input.as_ref(),
+        &borg_runtime::delegation::coding_child(&t.input, "make the configured change").unwrap()
     );
     assert_eq!(child.parent_task_id, Some(t.id.clone()));
     let parent = get(&c, &t.id).await;

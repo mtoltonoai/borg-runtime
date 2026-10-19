@@ -82,7 +82,7 @@ fn fixture_outcome(task: &Task, call: &mcp::Invocation) -> Outcome {
     } else if call.tool == "collab_task_assign" {
         let mut target=task.input.definition.clone();target.id="assigned-agent".into();
         task.status=TaskStatus::Blocked;
-        task.pending_assignment=Some(PendingAssignment{operation_id:call.operation_id.clone(),from_session_id:task.session_id.clone(),session:Session{id:"reserved-assignment".into(),task_id:task.id.clone(),agent_id:target.id.clone(),definition:target}});
+        task.pending_assignment=Some(Box::new(PendingAssignment{operation_id:call.operation_id.clone(),from_session_id:task.session_id.clone(),session:Session{id:"reserved-assignment".into(),task_id:task.id.clone(),agent_id:target.id.clone(),definition:target}}));
     } else if call.tool == "collab_task_wait" {
         return Outcome::Ok {data:Data::WorkMutation(serde_json::from_value(json!({
             "view":{"task":task,"coordination_revision":1,
@@ -326,7 +326,7 @@ impl Fixture {
             uncertainty_retained:Arc::new(AtomicBool::new(false)),output_limit:input.limits.output_bytes,
             result_limit:input.limits.result_bytes,coding_limits:input.execution_limits().unwrap().coding.clone(),
             outbox_lock:Arc::new(tokio::sync::Mutex::new(()))};
-        let worker_limits = Arc::new(limits.worker.clone());
+        let worker_limits: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(limits.worker.clone());
         let control = Control {deadline_ms:input.limits.deadline_unix_ms,cancel:rx,runtime_limits:limits,
             validation_runtime:Arc::new(native::ValidationRuntime::new(worker_limits.clone()).unwrap()),worker_limits};
         Self {peer,root,input,reporter,control,cancel,call,task}

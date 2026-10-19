@@ -11,8 +11,8 @@ fn source(label:&str)->CharterSource {
 }
 fn input(label:&str)->TaskInput {let mut t=native(label);t.definition.charter=Some(DefinitionCharter::Inline{source:source(label)});t}
 async fn exchange(c:&Controller,command:Operation)->Reply {let r=c.handle(Request{protocol_revision:WIRE_REVISION,request_id:"charter-test".into(),command:command.clone()}).await;r.validate_for(&command).unwrap();r}
-fn outcome(reply:&Reply)->CharterOutcome {match &reply.outcome {Outcome::Ok{data:Data::Charter(v)}=>v.clone(),x=>panic!("expected charter result: {x:?}")}}
-async fn query(c:&Controller,query:CharterQuery)->CharterQueryResult {match call(c,Operation::QueryCharter{query}).await {Outcome::Ok{data:Data::CharterQuery(v)}=>v,x=>panic!("charter query: {x:?}")}}
+fn outcome(reply:&Reply)->CharterOutcome {match &reply.outcome {Outcome::Ok{data:Data::Charter(v)}=>v.as_ref().clone(),x=>panic!("expected charter result: {x:?}")}}
+async fn query(c:&Controller,query:CharterQuery)->CharterQueryResult {match call(c,Operation::QueryCharter{query}).await {Outcome::Ok{data:Data::CharterQuery(v)}=>*v,x=>panic!("charter query: {x:?}")}}
 async fn session(c:&Controller,id:&str)->EffectiveCharter {match query(c,CharterQuery::Session{session_id:id.into()}).await {CharterQueryResult::Session(Some(v))=>v,x=>panic!("session: {x:?}")}}
 async fn turn(c:&Controller,id:&str)->CharterTurn {match query(c,CharterQuery::Turn{turn_id:id.into()}).await {CharterQueryResult::Turn(v)=>v,x=>panic!("turn: {x:?}")}}
 async fn observe(c:&Controller,who:&Caller,id:&str,observation:CharterObservation)->Reply {exchange(c,Operation::ObserveCharter{operation_id:id.into(),caller:who.clone(),observation}).await}
@@ -179,9 +179,9 @@ async fn charter_enabled_admission_requires_source_and_preserves_historical_no_c
     let p=path();let c=Controller::open_with_config(&p,config()).unwrap();let accepted=submit(&c,"historical-no-charter",native("historical")).await;let old=get(&c,&accepted.id).await;drop(c);controller_owner_released(&p).await;
     let c=Controller::open_with_config(&p,charter_config()).unwrap();assert_eq!(get(&c,&accepted.id).await,old);
     assert!(matches!(query(&c,CharterQuery::Session{session_id:accepted.session_id}).await,CharterQueryResult::Session(None)));
-    assert_eq!(code(call(&c,Operation::SubmitTask{operation_id:"new-unchartered".into(),input:native("new")}).await),"charter_required");
+    assert_eq!(code(call(&c,Operation::SubmitTask{operation_id:"new-unchartered".into(),input:(native("new")).into()}).await),"charter_required");
     // Reusing an old retained definition is not a bypass for a new acceptance.
-    let mut reused=old.input.clone();reused.resolved_limits=None;reused.limits.deadline_unix_ms=future();assert_eq!(code(call(&c,Operation::SubmitTask{operation_id:"old-definition-new-task".into(),input:reused}).await),"charter_required");
+    let mut reused=old.input.clone();reused.resolved_limits=None;reused.limits.deadline_unix_ms=future();assert_eq!(code(call(&c,Operation::SubmitTask{operation_id:"old-definition-new-task".into(),input:(reused).into()}).await),"charter_required");
     let forbidden=Operation::UpdateDefinition{operation_id:"old-definition-limit-clone".into(),update:DefinitionUpdate{agent_id:old.assigned_agent_id.clone(),expected_revision:old.input.definition.revision.clone(),expected_global_revision:c.limits().revision.clone(),expected_policy_revision:c.limits().definition_updates.as_ref().unwrap().revision.clone(),changes:std::collections::BTreeMap::from([(DefinitionLimitField::NativeMaxOutputTokens,1024)])}};
     assert_eq!(code(call(&c,forbidden).await),"charter_required");
     assert_eq!(get(&c,&old.id).await,old);

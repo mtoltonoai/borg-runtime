@@ -459,7 +459,7 @@ impl Lab {
             self.client
                 .call(Operation::SubmitTask {
                     operation_id: operation.into(),
-                    input,
+                    input: (input).into(),
                 })
                 .await
                 .unwrap(),

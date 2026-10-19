@@ -538,7 +538,7 @@ impl Host {
         atomic_json(&path, &record)
     }
 
-    async fn observe(&mut self, control: &Control) -> Result<DeliveryObservation, String> {
+    async fn observe(&mut self, control: &Control) -> Result<Box<DeliveryObservation>, String> {
         control.check()?;
         let request = Operation::ObserveCollaborationDelivery {
             caller: self.caller.clone(),

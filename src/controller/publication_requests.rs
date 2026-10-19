@@ -73,7 +73,7 @@ pub(super) fn validate_head(tx: &StoreContext<'_>, head: &pr::HeadIntent) -> Res
     let original = command(tx, &binding.publication_id)?;
     if original.head != *head || original.create.is_some() { return refuse("publication_binding", "original publication command differs"); }
     let requester = super::sessions::historical_task(tx, &binding.requester.caller.task_id, &binding.requester.session_id)?;
-    if requester.input != original.input || requester.session_id != original.session.id
+    if *requester.input != original.input || requester.session_id != original.session.id
         || p::selection(requester.input.definition.execution_profile.as_ref()) != Some(&binding.selection) {
         return refuse("publication_binding", "accepted requesting session differs");
     }
@@ -202,7 +202,7 @@ pub(super) fn apply(tx: &StoreContext<'_>, call: &Invocation, cfg: &ControllerCo
     }
     let attempt = requester.attempt.clone().ok_or_else(|| Fault::Store("publication caller attempt missing".into()))?;
     let request = p::Command { invocation: call.clone(), session: super::sessions::get(tx, &requester.session_id)?,
-        attempt: attempt.clone(), input: requester.input.clone(), head, create };
+        attempt: attempt.clone(), input: requester.input.as_ref().clone(), head, create };
     request.validate(&id).map_err(|e| Fault::Refused("publication_binding", e))?;
     let command = WorkerCommand::PublishRepository { command_id: id.clone(), request: Box::new(request.clone()) };
     preflight(tx, cfg, &command)?;

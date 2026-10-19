@@ -124,7 +124,7 @@ async fn native_call(
         },
     )
     .await);
-    let Data::CharterQuery(CharterQueryResult::Session(Some(effective))) = ok(api(
+    let Data::CharterQuery(result) = ok(api(
         &h.c,
         Operation::QueryCharter {
             query: CharterQuery::Session {
@@ -135,8 +135,9 @@ async fn native_call(
     .await) else {
         panic!("accepted charter session")
     };
+    let CharterQueryResult::Session(Some(effective)) = *result else { panic!("accepted charter session") };
     let turn_id = id("native-boundary");
-    let Data::Charter(CharterOutcome::Boundary(boundary)) = ok(api(
+    let Data::Charter(result) = ok(api(
         &h.c,
         Operation::ObserveCharter {
             operation_id: turn_id.clone(),
@@ -151,6 +152,7 @@ async fn native_call(
     .await) else {
         panic!("actual native turn admission")
     };
+    let CharterOutcome::Boundary(boundary) = *result else { panic!("actual native turn admission") };
     let source = &boundary.effective.source;
     let exchange = Arc::new(
         CharterExchange::new(
@@ -167,7 +169,7 @@ async fn native_call(
         env!("CARGO_BIN_EXE_borg-runtime").into(),
         path,
         Arc::new(bounds),
-        Arc::new(ValidationRuntime::new(Arc::new(h.cfg.limits.worker.clone())).unwrap()),
+        Arc::new(ValidationRuntime::new(Arc::from(h.cfg.limits.worker.clone())).unwrap()),
     )
     .with_charter(exchange.clone());
     let prior = previous.as_ref().map(|(call, output)| {
@@ -312,7 +314,7 @@ async fn native_call(
     )
     .await);
     assert!(
-        matches!(closed,Data::Charter(CharterOutcome::Turn(ref turn)) if turn.completed_by.is_some())
+        matches!(closed,Data::Charter(ref result) if matches!(result.as_ref(), CharterOutcome::Turn(turn) if turn.completed_by.is_some()))
     );
     assert_eq!(
         native::validation_cleanup_pending(),

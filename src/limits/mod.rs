@@ -169,13 +169,13 @@ pub struct RuntimeLimits {
     pub constraints: RepresentationConstraints,
     pub schema_version: u32,
     pub revision: String,
-    pub controller: ControllerLimits,
+    pub controller: Box<ControllerLimits>,
     pub transport: TransportLimits,
-    pub worker: WorkerLimits,
+    pub worker: Box<WorkerLimits>,
     pub product: ProductLimits,
     pub repository: RepositoryLimits,
     pub interface: InterfaceLimits,
-    pub execution: ExecutionLimits,
+    pub execution: Box<ExecutionLimits>,
     pub task_defaults: TaskDefaults,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,7 +186,7 @@ pub struct LimitSnapshot {
     /// Exact selected source data, not a weak hash or a pointer to mutable defaults.
     pub global_metadata: Box<RuntimeLimits>,
     pub agent_revision: String,
-    pub values: ExecutionLimits,
+    pub values: Box<ExecutionLimits>,
 }
 impl RuntimeLimits {
     /// Explicit shipped seed data. Maintained startup loads the selected metadata file.
@@ -308,11 +308,11 @@ impl RuntimeLimits {
     // Traceability scope: Starts from explicit global execution metadata and replaces only agent override groups that are present.
     //= spec/impl/v2/implementation.md#limits-are-versioned-metadata
     //# Global metadata MUST provide explicit defaults for limits without a more specific configured value.
-    fn effective(&self, input: &crate::protocol::TaskInput) -> Result<ExecutionLimits, String> {
+    fn effective(&self, input: &crate::protocol::TaskInput) -> Result<Box<ExecutionLimits>, String> {
         self.resolve_definition(&input.definition)
     }
     /// Complete validation for a future definition without inventing a task.
-    pub fn resolve_definition(&self, definition: &crate::protocol::Definition) -> Result<ExecutionLimits, String> {
+    pub fn resolve_definition(&self, definition: &crate::protocol::Definition) -> Result<Box<ExecutionLimits>, String> {
         if let Some(publication) = crate::mcp::publication::selection(definition.execution_profile.as_ref()) { publication.validate(self)?; }
         let mut v = self.execution.clone();
         if let Some(o) = &definition.limit_overrides {
@@ -484,7 +484,7 @@ mod tests {
         old.revision = "rev-new".into();
         old.execution.native.context_bytes /= 2;
         assert_eq!(*input.execution_limits().unwrap(), retained);
-        assert_ne!(old.resolve_task(&input).unwrap().values, retained);
+        assert_ne!(old.resolve_task(&input).unwrap().values.as_ref(), &retained);
     }
     #[test]
     fn agent_override_survives_exact_snapshot_binding() {

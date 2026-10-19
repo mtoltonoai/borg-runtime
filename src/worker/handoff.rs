@@ -26,7 +26,7 @@ fn request(attempt: &Attempt, input: &TaskInput, instruction: &str) -> Result<Op
         parent_task_id: attempt.task_id.clone(),
         parent_attempt_id: attempt.id.clone(),
         generation: attempt.generation,
-        child: crate::delegation::coding_child(input, instruction)?,
+        child: (crate::delegation::coding_child(input, instruction)?).into(),
     })
 }
 
@@ -705,13 +705,13 @@ mod tests {
         std::fs::create_dir(&path).expect("delegation fixture must be new");
         path
     }
-    fn task(id: &str, input: TaskInput, attempt: Option<Attempt>) -> Task {
+    fn task(id: &str, input: Box<TaskInput>, attempt: Option<Attempt>) -> Task {
         Task {
             pending_assignment: None,
             session_id: format!("session-{id}"),
             id: id.into(),
             assigned_agent_id: input.definition.id.clone(),
-            input,
+            input: input.into(),
             status: if attempt.is_some() {
                 TaskStatus::Active
             } else {
@@ -815,7 +815,7 @@ mod tests {
             uncertain: false,
         };
         let store = Arc::new(Mutex::new(Store {
-            parent: task("parent", input.clone(), Some(attempt.clone())),
+            parent: task("parent", Box::new(input.clone()), Some(attempt.clone())),
             operation: None,
             sent: vec![],
             reports: vec![],
@@ -1059,14 +1059,14 @@ mod tests {
                 .join(format!("{}.json", component("launch"))),
             &WorkerCommand::RunAttempt {
                 command_id: "launch".into(),
-                session: crate::protocol::Session {
+                session: (crate::protocol::Session {
                     id: attempt.session_id.clone(),
                     agent_id: input.definition.id.clone(),
                     definition: input.definition.clone(),
                     task_id: attempt.task_id.clone(),
-                },
+                }).into(),
                 attempt,
-                task: input.clone(),
+                task: (input.clone()).into(),
                 checkpoint: None,
                 continuation: None,
                 workflow_continuation: None, completion_continuation: None,
@@ -1112,7 +1112,7 @@ mod tests {
             panic!("not a delegation")
         };
         assert_eq!(
-            child,
+            *child,
             crate::delegation::coding_child(&f.input, "do the fixed work").unwrap()
         );
         assert_eq!(store.parent.status, TaskStatus::Active);
@@ -1915,9 +1915,9 @@ mod tests {
         };
         WorkerCommand::RunAttempt {
             command_id: "format-command".into(),
-            session: Session { id: attempt.session_id.clone(), agent_id: input.definition.id.clone(),
-                definition: input.definition.clone(), task_id: attempt.task_id.clone() },
-            attempt, task: input, checkpoint: None, continuation: None,
+            session: (Session { id: attempt.session_id.clone(), agent_id: input.definition.id.clone(),
+                definition: input.definition.clone(), task_id: attempt.task_id.clone() }).into(),
+            attempt, task: (input).into(), checkpoint: None, continuation: None,
             workflow_continuation: None, completion_continuation: None,
         }
     }
@@ -2085,11 +2085,11 @@ mod tests {
         let Operation::DelegateTask { child, .. } = &saved.request else { unreachable!() };
         let mut retained = task("child", child.clone(), None);
         retained.parent_task_id = Some(attempt.task_id.clone());
-        retained.pending_assignment = Some(PendingAssignment {
+        retained.pending_assignment = Some(Box::new(PendingAssignment {
             operation_id: "retained-handoff".into(), from_session_id: retained.session_id.clone(),
             session: Session { id: "next-session".into(), task_id: retained.id.clone(),
                 agent_id: retained.input.definition.id.clone(), definition: retained.input.definition.clone() },
-        });
+        }));
         saved.outcome = Some(Outcome::Ok { data: Data::Task(Box::new(retained)) });
         saved.outcome_context = Some(CommitContext {
             commit: MutationCommit { operation_id: saved.request.mutation_id().unwrap().to_owned(), controller_revision: 1 },
@@ -2149,7 +2149,7 @@ mod tests {
             } else { state.join("collaboration").join(component(&attempt.id)) };
             process::private_directory(&directory).unwrap();
             let path = directory.join(if coding {"calls.json"} else {"0000000001.json"});
-            let mut retained = task(&attempt.task_id, input.clone(), Some(attempt.clone()));
+            let mut retained = task(&attempt.task_id, input.clone().into(), Some(attempt.clone()));
             retained.session_id = attempt.session_id.clone();
             let persist = |retained: &Task| {
                 let outcome = Outcome::Ok { data: Data::Task(Box::new(retained.clone())) };
@@ -2176,9 +2176,9 @@ mod tests {
             crate::worker::admit_default_assignment(&state, &metadata).unwrap();
             if coding { assert!(crate::worker::coding_collaboration_closed(&config, input, attempt, &state).unwrap()); }
             assert_eq!(std::fs::read(&path).unwrap(), original);
-            retained.pending_assignment = Some(PendingAssignment { operation_id: "pending-handoff".into(),
+            retained.pending_assignment = Some(Box::new(PendingAssignment { operation_id: "pending-handoff".into(),
                 from_session_id: retained.session_id.clone(), session: Session { id: "next-session".into(),
-                    task_id: retained.id.clone(), agent_id: retained.input.definition.id.clone(), definition: retained.input.definition.clone() } });
+                    task_id: retained.id.clone(), agent_id: retained.input.definition.id.clone(), definition: retained.input.definition.clone() } }));
             persist(&retained);
             let originals: Vec<_> = [&path, &command_path, &policy].into_iter()
                 .map(|p| (p.clone(), std::fs::read(p).unwrap())).collect();

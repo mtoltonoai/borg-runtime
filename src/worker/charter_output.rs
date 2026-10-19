@@ -165,7 +165,7 @@ fn verify_files(state:&Path,limits:&RuntimeLimits,maximum:usize,manifest:&Manife
 fn chunk_frames(manifest:&Manifest,chunk:&CharterOutputChunk,ack:&crate::charter::CharterOutputChunkReceipt)->Result<[Reply;2],String>{
     let id=chunk_operation(&chunk.reference,chunk.index);
     let request=operation(manifest,CharterObservation::OutputChunk{chunk:chunk.clone()},id.clone());
-    let outcome=Outcome::Ok{data:Data::Charter(CharterOutcome::OutputChunk(ack.clone()))};
+    let outcome=Outcome::Ok{data:Data::Charter(Box::new(CharterOutcome::OutputChunk(ack.clone())))};
     let lookup=Outcome::Ok{data:Data::Operation(OperationRecord{id:id.clone(),task_id:String::new(),attempt_id:String::new(),generation:0,kind:"application_mutation".into(),intended:serde_json::to_value(&request).map_err(|e|e.to_string())?,state:"settled".into(),outcome:Some(serde_json::to_value(&outcome).map_err(|e|e.to_string())?)})};
     Ok([outcome,lookup].map(|outcome|Reply{request_id:String::new(),outcome,commit:Some(MutationCommit{operation_id:id.clone(),controller_revision:i64::MAX as u64}),observed_controller_revision:Some(i64::MAX as u64)}))
 }
@@ -178,7 +178,7 @@ fn chunk_preflight(limits:&RuntimeLimits,manifest:&Manifest,chunk:&CharterOutput
     mutations::prepare(operation(manifest,CharterObservation::OutputChunk{chunk:chunk.clone()},chunk_operation(&chunk.reference,chunk.index)),0,limits)?;
     Ok(())
 }
-pub(super) async fn upload(client:&ApiClient,state:&Path,limits:&RuntimeLimits,maximum:usize,manifest:&Manifest)->Result<CharterOutcome,String>{
+pub(super) async fn upload(client:&ApiClient,state:&Path,limits:&RuntimeLimits,maximum:usize,manifest:&Manifest)->Result<Box<CharterOutcome>,String>{
     verify_files(state,limits,maximum,manifest)?;
     // Re-establish manifest durability before authorizing any outbound record.
     let dir=directory(state,&manifest.operation_id);atomic_json(&dir.join("manifest.json"),manifest)?;
@@ -189,15 +189,15 @@ pub(super) async fn upload(client:&ApiClient,state:&Path,limits:&RuntimeLimits,m
             let expected=crate::charter::CharterOutputChunkReceipt{reference:reference.clone(),index,sha256:sha(&bytes),bytes:u32::try_from(bytes.len()).map_err(|_|"output chunk count overflow")?};
             let chunk=CharterOutputChunk{reference:reference.clone(),index,data:hex(&bytes)};
             chunk_preflight(limits,manifest,&chunk,&expected)?;
-            match mutate_original(client,state,limits,manifest.caller.clone(),chunk_operation(reference,index),CharterObservation::OutputChunk{chunk}).await?{
-                CharterOutcome::OutputChunk(actual) if actual==expected=>{},
+            match mutate_original(client,state,limits,manifest.caller.clone(),chunk_operation(reference,index),CharterObservation::OutputChunk{chunk}).await?.as_ref(){
+                CharterOutcome::OutputChunk(actual) if actual==&expected=>{},
                 _=>return Err("original output chunk acknowledgment differs".into()),
             }
         }
     }
     let result=mutate_original(client,state,limits,manifest.caller.clone(),manifest.operation_id.clone(),manifest.observation.clone()).await?;
     let (id,original)=request(&manifest.observation)?;
-    let reply=match &result{CharterOutcome::Reply(v)=>v,CharterOutcome::Compaction(v)=>v.reply.as_ref().ok_or("original compaction reply absent")?,_=>return Err("original reply outcome differs".into())};
+    let reply=match result.as_ref(){CharterOutcome::Reply(v)=>v,CharterOutcome::Compaction(v)=>v.reply.as_ref().ok_or("original compaction reply absent")?,_=>return Err("original reply outcome differs".into())};
     if reply.turn_id!=id||reply.reply_id!=manifest.operation_id||reply.observation!=*original{return Err("original reply acknowledgment association differs".into())}
     Ok(result)
 }

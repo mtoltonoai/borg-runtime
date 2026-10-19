@@ -1929,7 +1929,7 @@ async fn agent_directory_uses_distinct_bindings_and_all_bounded_pages() {
 //# The browser interface MUST provide an agent list.
 async fn agent_sessions_handoff_keeps_original_inputs_replay_revision_and_failure_facts() {
     use borg_runtime::collaboration::{Query, QueryResult};
-    async fn session_input(c: &Controller, id: &str) -> (Session, TaskInput, bool) {
+    async fn session_input(c: &Controller, id: &str) -> (Session, Box<TaskInput>, bool) {
         let Data::Collaboration(QueryResult::SessionInput {
             session,
             input,
@@ -1946,7 +1946,7 @@ async fn agent_sessions_handoff_keeps_original_inputs_replay_revision_and_failur
         else {
             panic!("exact accepted session input")
         };
-        (session, *input, current)
+        (session, input, current)
     }
     async fn history(
         c: &Controller,
@@ -2421,7 +2421,7 @@ async fn delegation_views_follow_committed_wait_child_and_parent_continuation() 
             parent_task_id: parent_id.clone(),
             parent_attempt_id: attempt.id.clone(),
             generation: attempt.generation,
-            child: child_input,
+            child: (child_input).into(),
         },
     )
     .await

@@ -49,14 +49,16 @@ pub fn read_kind(call: &Invocation, outcome: &Outcome) -> Option<ReadKind> {
         | ("collab_documents_list", Data::DocumentQuery(crate::collaboration::documents::DocumentQueryOutcome::Documents(_)))
         | ("collab_document_versions_list", Data::DocumentQuery(crate::collaboration::documents::DocumentQueryOutcome::Versions(_)))
         | ("collab_comments_list", Data::DocumentQuery(crate::collaboration::documents::DocumentQueryOutcome::Comments(_))) => Some(K::Document),
-        ("collab_question_get", Data::QuestionQuery(crate::collaboration::questions::QuestionQueryResult::Question(_)))
-        | ("collab_questions_list", Data::QuestionQuery(crate::collaboration::questions::QuestionQueryResult::Questions(_)))
-        | ("collab_question_answers", Data::QuestionQuery(crate::collaboration::questions::QuestionQueryResult::Answers(_)))
-        | ("collab_question_actions", Data::QuestionQuery(crate::collaboration::questions::QuestionQueryResult::Actions(_)))
-        | ("collab_decisions_list", Data::QuestionQuery(crate::collaboration::questions::QuestionQueryResult::DecisionQueue(_))) => Some(K::Question),
-        ("collab_review_get", Data::ReviewQuery(crate::collaboration::documents::ReviewQueryOutcome::Review(_)))
-        | ("collab_reviews_list", Data::ReviewQuery(crate::collaboration::documents::ReviewQueryOutcome::Reviews(_)))
-        | ("collab_review_target_get", Data::ReviewQuery(crate::collaboration::documents::ReviewQueryOutcome::AcceptedTarget(_))) => Some(K::Review),
+        (tool, Data::QuestionQuery(value)) if matches!((tool, value.as_ref()),
+            ("collab_question_get", crate::collaboration::questions::QuestionQueryResult::Question(_))
+            | ("collab_questions_list", crate::collaboration::questions::QuestionQueryResult::Questions(_))
+            | ("collab_question_answers", crate::collaboration::questions::QuestionQueryResult::Answers(_))
+            | ("collab_question_actions", crate::collaboration::questions::QuestionQueryResult::Actions(_))
+            | ("collab_decisions_list", crate::collaboration::questions::QuestionQueryResult::DecisionQueue(_))) => Some(K::Question),
+        (tool, Data::ReviewQuery(value)) if matches!((tool, value.as_ref()),
+            ("collab_review_get", crate::collaboration::documents::ReviewQueryOutcome::Review(_))
+            | ("collab_reviews_list", crate::collaboration::documents::ReviewQueryOutcome::Reviews(_))
+            | ("collab_review_target_get", crate::collaboration::documents::ReviewQueryOutcome::AcceptedTarget(_))) => Some(K::Review),
         ("collab_task_coordination_get", Data::WorkQuery(crate::collaboration::work::WorkQueryResult::Task(_)))
         | ("collab_task_waits", Data::WorkQuery(crate::collaboration::work::WorkQueryResult::Waits(_))) => Some(K::Work),
         _ => None,

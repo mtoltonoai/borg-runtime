@@ -61,7 +61,7 @@ impl Lab {
             limits: Limits { deadline_unix_ms: self.clock.load(Ordering::SeqCst) + 600_000,
                 model_requests: 4, output_bytes: 16_384, result_bytes: self.config.limits.task_defaults.result_bytes,
                 max_delegation_depth: 4 }, dependencies: vec![], native_workflow: None, resolved_limits: None };
-        let submitted = task(self.call(Operation::SubmitTask { operation_id: unique("submit"), input }).await);
+        let submitted = task(self.call(Operation::SubmitTask { operation_id: unique("submit"), input: (input).into() }).await);
         let worker = Worker { id: unique("worker"), incarnation: "original".into(), coding_capacity: 0, native_capacity: 1 };
         assert!(matches!(self.call(Operation::RegisterWorker { operation_id: unique("register"), worker: worker.clone() }).await.outcome,
             Outcome::Ok { data: Data::Worker(_) }));

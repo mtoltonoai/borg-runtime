@@ -89,7 +89,7 @@ async fn joined(cut:bool) {
     assert!(matches!(lab.client.call(Operation::RegisterRepository{operation_id:"register-pr-fixture".into(),registration:registration.clone()}).await.unwrap().outcome,Outcome::Ok{..}));
     lab.repository.registration=Some(registration.binding());
     let mut input=lab.input("pr-agent");input.pull_request=Some(pr::Request{title:"Controlled requested change".into(),body:"Exact initial task request.".into()});
-    let submitted=task(lab.client.call(Operation::SubmitTask{operation_id:"submit-requested-pr".into(),input}).await.unwrap());
+    let submitted=task(lab.client.call(Operation::SubmitTask{operation_id:"submit-requested-pr".into(),input: (input).into()}).await.unwrap());
     assert_eq!(submitted.input.repository.as_ref().unwrap().pull_request_target,Some(target));
     fs::write(lab.root.join("requested-task-id"),&submitted.id).unwrap();
     let original_worker=worker(&mut lab,"original");let gate=lab.gate().await;let observed=gate.observed.clone();gate.release().await;

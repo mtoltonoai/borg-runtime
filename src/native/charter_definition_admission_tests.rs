@@ -38,10 +38,13 @@ async fn ordinary_charter_head_selection_reaches_current_native_constructor_for_
         };
         let published = call(&c, publish).await;
         let Outcome::Ok {
-            data: Data::Charter(CharterOutcome::Definition(published)),
+            data: Data::Charter(published),
         } = published.outcome
         else {
             panic!("publish: {published:?}")
+        };
+        let CharterOutcome::Definition(published) = *published else {
+            panic!("expected charter definition")
         };
         let selected = call(
             &c,
@@ -58,10 +61,13 @@ async fn ordinary_charter_head_selection_reaches_current_native_constructor_for_
         )
         .await;
         let Outcome::Ok {
-            data: Data::Charter(CharterOutcome::Definition(selected)),
+            data: Data::Charter(selected),
         } = selected.outcome
         else {
             panic!("select: {selected:?}")
+        };
+        let CharterOutcome::Definition(selected) = *selected else {
+            panic!("expected charter definition")
         };
         let mut next = input("same-agent", &new);
         next.definition = selected.definition.clone();

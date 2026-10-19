@@ -104,7 +104,7 @@ async fn inference_profile_is_immutable_per_revision_across_dispatch_and_restart
         changed.definition.execution_profile = profile;
         let op = Operation::SubmitTask {
             operation_id: format!("profile-conflict-{label}"),
-            input: changed,
+            input: (changed).into(),
         };
         let result = reply(&c, op.clone()).await;
         assert_eq!(code(result.outcome.clone()), "definition_conflict");
@@ -160,7 +160,7 @@ async fn inference_child_profile_is_its_own_definition_without_inheritance() {
     external_child.repository.as_mut().unwrap().url.clear();
     external_child.repository.as_mut().unwrap().checkpoint_remote.clear();
     let declared = submit(&c, "declared-child-definition", external_child).await;
-    assert_eq!(declared.input, child);
+    assert_eq!(declared.input.as_ref(), &child);
     let mut changed = input.clone();
     configured_template_mut(&mut changed)
         .definition
@@ -171,7 +171,7 @@ async fn inference_child_profile_is_its_own_definition_without_inheritance() {
                 &c,
                 Operation::SubmitTask {
                     operation_id: "child-profile-conflict".into(),
-                    input: changed.clone()
+                    input: (changed.clone()).into()
                 }
             )
             .await
@@ -227,7 +227,7 @@ async fn inference_new_submissions_require_explicit_selection_with_immutable_ref
             }
             let op = Operation::SubmitTask {
                 operation_id: format!("refusal-{kind:?}-{mode}"),
-                input,
+                input: (input).into(),
             };
             let first = reply(&c, op.clone()).await;
             assert_eq!(
@@ -351,7 +351,7 @@ async fn inference_configured_child_requires_its_own_explicit_definition_binding
             &c,
             Operation::SubmitTask {
                 operation_id: format!("child-{mode}"),
-                input,
+                input: (input).into(),
             },
         )
         .await;
@@ -424,7 +424,7 @@ async fn inference_repository_read_association_is_explicit_read_only_and_immutab
                     &c,
                     Operation::SubmitTask {
                         operation_id: format!("read-{mode}"),
-                        input: invalid
+                        input: (invalid).into()
                     }
                 )
                 .await
@@ -442,7 +442,7 @@ async fn inference_repository_read_association_is_explicit_read_only_and_immutab
         &c,
         Operation::SubmitTask {
             operation_id: "credential-read-source".into(),
-            input: credential,
+            input: (credential).into(),
         },
     )
     .await;
@@ -507,7 +507,7 @@ async fn profile_semantics_refuse_before_new_task_and_replay_the_refusal() {
     cases.push(("child-search", child_input, "coding_profile_has_native_provider_settings"));
     let mut refusals = Vec::new();
     for (id, input, reason) in cases {
-        let op = Operation::SubmitTask { operation_id: id.into(), input };
+        let op = Operation::SubmitTask { operation_id: id.into(), input: (input).into() };
         let first = reply(&c, op.clone()).await;
         assert_eq!(code(first.outcome.clone()), "invalid_input");
         assert!(format!("{:?}", first.outcome).contains(reason));

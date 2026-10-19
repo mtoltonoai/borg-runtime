@@ -31,9 +31,9 @@ fn dispatch(tx: &StoreContext<'_>, op: &Operation, actor: &RecordedActor, now: u
     workflow::validate_recorded_actor(tx, actor)?;
     let query = QueryContext { tx, actor, now_ms: now, limits };
     match op {
-        Operation::QueryQuestion { query: value } => return Ok((Data::QuestionQuery(super::collaboration_questions::query(&query, value)?), false)),
+        Operation::QueryQuestion { query: value } => return Ok((Data::QuestionQuery(Box::new(super::collaboration_questions::query(&query, value)?)), false)),
         Operation::QueryDocument { query: value } => return Ok((Data::DocumentQuery(super::collaboration_documents::query_document(&query, value)?), false)),
-        Operation::QueryReview { query: value } => return Ok((Data::ReviewQuery(super::collaboration_reviews::query_review(&query, value)?), false)),
+        Operation::QueryReview { query: value } => return Ok((Data::ReviewQuery(Box::new(super::collaboration_reviews::query_review(&query, value)?)), false)),
         Operation::QueryWork { query: value } => return Ok((Data::WorkQuery(super::collaboration_work::query(&query, value)?), false)),
         _ => (),
     }
@@ -43,9 +43,9 @@ fn dispatch(tx: &StoreContext<'_>, op: &Operation, actor: &RecordedActor, now: u
         .ok_or_else(|| Fault::Refused("capacity", "workflow revision exhausted".into()))?;
     let ctx = Context { tx, actor, operation_id, product_revision, now_ms: now, limits };
     match op {
-        Operation::MutateQuestion { mutation, .. } => complete(&ctx, super::collaboration_questions::apply(&ctx, mutation)?, Data::QuestionMutation),
+        Operation::MutateQuestion { mutation, .. } => complete(&ctx, super::collaboration_questions::apply(&ctx, mutation)?, |value| Data::QuestionMutation(Box::new(value))),
         Operation::MutateDocument { mutation, .. } => complete(&ctx, super::collaboration_documents::apply_document(&ctx, mutation)?, Data::DocumentMutation),
-        Operation::MutateReview { mutation, .. } => complete(&ctx, super::collaboration_reviews::apply_review(&ctx, mutation)?, Data::ReviewMutation),
+        Operation::MutateReview { mutation, .. } => complete(&ctx, super::collaboration_reviews::apply_review(&ctx, mutation)?, |value| Data::ReviewMutation(Box::new(value))),
         Operation::MutateWork { mutation, .. } => complete(&ctx, super::collaboration_work::apply(&ctx, mutation)?, Data::WorkMutation),
         _ => refuse("invalid_input", "operation is outside the closed workflow interface"),
     }

@@ -41,16 +41,16 @@ impl Peer {
             Operation::GetOperation {..} => return Reply::refused(request.request_id,"not_found","controlled original absent"),
             Operation::QueryCharter {query:CharterQuery::Session {session_id}} => {
                 assert_eq!(session_id,"supplied-session");
-                Data::CharterQuery(CharterQueryResult::Session(Some(EffectiveCharter {
+                Data::CharterQuery(Box::new(CharterQueryResult::Session(Some(EffectiveCharter {
                     session:CharterSession {session_id:session_id.clone(),revision:1,
                         initial:original.reference.clone(),effective:original.reference.clone(),
                         pending:self.pending.then(||self.source.reference.clone()),last_turn_id:None,
                         compaction_due:None,compaction_in_flight:None},charter:original,
-                })))
+                }))))
             }
             Operation::QueryCharter {query:CharterQuery::Source {source}} => {
                 assert_eq!(source,&self.source.reference);
-                Data::CharterQuery(CharterQueryResult::Source(self.source.clone()))
+                Data::CharterQuery(Box::new(CharterQueryResult::Source(self.source.clone())))
             }
             Operation::ObserveCharter {operation_id,caller:actual,observation:CharterObservation::BeginSuppliedContext {
                 session_id,expected_revision,source:reference,request_id,developer_instructions }} => {
@@ -64,7 +64,7 @@ impl Peer {
                     developer_instructions:developer_instructions.clone(),acknowledgment:None};
                 self.intent=Some(intent.clone());
                 std::fs::write(root.join("intent-ack"),b"original acknowledged").unwrap();
-                Data::Charter(CharterOutcome::SuppliedContext(intent))
+                Data::Charter(Box::new(CharterOutcome::SuppliedContext(intent)))
             }
             Operation::ObserveCharter {operation_id,caller:actual,observation:CharterObservation::AckSuppliedContext {
                 delivery_id,request_id,response }} => {
@@ -78,33 +78,33 @@ impl Peer {
                     thread_id:THREAD.into(),response:response.clone()});
                 std::fs::write(root.join("context-ack"),b"original result durably acknowledged").unwrap();
                 self.intent=Some(result.clone());
-                Data::Charter(CharterOutcome::SuppliedContext(result))
+                Data::Charter(Box::new(CharterOutcome::SuppliedContext(result)))
             }
             Operation::QueryCharter{query:CharterQuery::SuppliedContext{delivery_id}}=>{
                 let v=self.intent.clone().unwrap();assert_eq!(delivery_id,&v.delivery_id);
-                Data::CharterQuery(CharterQueryResult::SuppliedContext(v))
+                Data::CharterQuery(Box::new(CharterQueryResult::SuppliedContext(v)))
             }
             Operation::ObserveCharter{operation_id,caller,observation:CharterObservation::BeginSuppliedTurn{delivery_id,outer_index,request_id,thread_id,output_schema}}=>{
                 let c=self.intent.as_ref().unwrap();assert!(c.acknowledgment.is_some());assert_eq!(output_schema,&supplied_result_schema());
                 let v=CharterSuppliedTurn{boundary:CharterSuppliedBoundary{turn_id:operation_id.clone(),delivery_id:delivery_id.clone(),
                     session_id:c.session_id.clone(),caller:caller.clone(),outer_index:*outer_index,effective:c.effective.clone(),
                     request_id:*request_id,thread_id:thread_id.clone(),output_schema:output_schema.clone()},acknowledgment:None,reply:None,terminal:None};
-                self.outer=Some(v.clone());Data::Charter(CharterOutcome::SuppliedTurn(v))
+                self.outer=Some(v.clone());Data::Charter(Box::new(CharterOutcome::SuppliedTurn(v)))
             }
             Operation::ObserveCharter{operation_id,observation:CharterObservation::AckSuppliedTurn{turn_id,request_id,response},..}=>{
                 let v=self.outer.as_mut().unwrap();assert_eq!(turn_id,&v.boundary.turn_id);
                 v.acknowledgment=Some(CharterSuppliedTurnAck{operation_id:operation_id.clone(),request_id:*request_id,turn_id:response["turn"]["id"].as_str().unwrap().into(),response:response.clone()});
-                Data::Charter(CharterOutcome::SuppliedTurn(v.clone()))
+                Data::Charter(Box::new(CharterOutcome::SuppliedTurn(v.clone())))
             }
             Operation::ObserveCharter{observation:CharterObservation::OutputChunk{chunk},..}=>{
                 let bytes:Vec<u8>=chunk.data.as_bytes().chunks_exact(2).map(|p|u8::from_str_radix(std::str::from_utf8(p).unwrap(),16).unwrap()).collect();
                 let sha=aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256,&bytes).as_ref().iter().map(|b|format!("{b:02x}")).collect();
-                Data::Charter(CharterOutcome::OutputChunk(CharterOutputChunkReceipt{reference:chunk.reference.clone(),index:chunk.index,sha256:sha,bytes:bytes.len() as u32}))
+                Data::Charter(Box::new(CharterOutcome::OutputChunk(CharterOutputChunkReceipt{reference:chunk.reference.clone(),index:chunk.index,sha256:sha,bytes:bytes.len() as u32})))
             }
             Operation::ObserveCharter{operation_id,observation:CharterObservation::SuppliedReply{turn_id,reply,..},..}=>{
                 assert!(reply.declaration.is_none(),"this original stub has no final declaration");
-                Data::Charter(CharterOutcome::Reply(CharterReplyRecord{reply_id:operation_id.clone(),turn_id:turn_id.clone(),
-                    effective:self.source.reference.clone(),observation:reply.clone(),audit:CharterAudit{findings:vec![CharterAuditFinding::MissingMetadata]}}))
+                Data::Charter(Box::new(CharterOutcome::Reply(CharterReplyRecord{reply_id:operation_id.clone(),turn_id:turn_id.clone(),
+                    effective:self.source.reference.clone(),observation:reply.clone(),audit:CharterAudit{findings:vec![CharterAuditFinding::MissingMetadata]}})))
             }
             other=>panic!("unexpected controlled operation {other:?}"),
         };
@@ -157,14 +157,14 @@ impl Fixture {
         Self {root,binary,runtime,scope:InitialCharterScope {worker_state,controller_url:url,caller:caller(),session_id:"supplied-session".into()},peer,server}
     }
     fn control(&self)->(watch::Sender<bool>,Control) {
-        let (send,cancel)=watch::channel(false);let worker_limits=Arc::new(self.runtime.worker.clone());
+        let (send,cancel)=watch::channel(false);let worker_limits: Arc<crate::limits::WorkerLimits>=Arc::from(self.runtime.worker.clone());
         (send,Control {deadline_ms:process::now_ms()+30_000,cancel,worker_limits:worker_limits.clone(),runtime_limits:self.runtime.clone(),
             validation_runtime:Arc::new(crate::native::ValidationRuntime::new(worker_limits).unwrap())})
     }
     fn state(&self)->PathBuf {self.root.join("state")}
     async fn session(&self)->Session {
         Session::start_with_key(&self.binary,&self.root,&self.state(),&self.root.join("processes"),
-            &InferenceSettings::selected(),&self.runtime.execution,Arc::new(self.runtime.worker.clone()),None).await.unwrap()
+            &InferenceSettings::selected(),&self.runtime.execution,Arc::from(self.runtime.worker.clone()),None).await.unwrap()
     }
     fn config(&self)->Value {json!({"model":crate::protocol::SELECTED_MODEL,"cwd":self.root,
         "approvalPolicy":"never","sandbox":"workspace-write","ephemeral":false,

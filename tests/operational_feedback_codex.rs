@@ -205,7 +205,7 @@ impl Lab {
             self.api
                 .call(Operation::SubmitTask {
                     operation_id: format!("submit-{id}"),
-                    input,
+                    input: (input).into(),
                 })
                 .await
                 .unwrap(),
@@ -788,8 +788,8 @@ async fn codex_definition_update_lost_reply_and_fresh_bridge_keep_old_pin_and_ap
     assert_eq!(
         lab.limits
             .resolve_definition(&update.selected_definition)
-            .unwrap(),
-        expected
+            .unwrap().as_ref(),
+        &expected
     );
     assert_eq!(update.selected_definition.executor, ExecutorKind::Coding);
     assert_eq!(
@@ -1061,8 +1061,8 @@ async fn codex_definition_update_refusals_keep_head_counter_and_old_caller() {
             assert_eq!(
                 lab.limits
                     .resolve_definition(&update.selected_definition)
-                    .unwrap(),
-                *first.input.execution_limits().unwrap()
+                    .unwrap().as_ref(),
+                first.input.execution_limits().unwrap()
             );
 
             // Rollback did not consume a generated definition revision.
@@ -1166,8 +1166,8 @@ async fn codex_bridge_carries_each_allowed_field_without_changing_accepted_execu
         assert_eq!(
             lab.limits
                 .resolve_definition(&update.selected_definition)
-                .unwrap(),
-            effective
+                .unwrap().as_ref(),
+            &effective
         );
         selected = update.selected_definition.clone();
         assert_eq!(lab.selected().await, selected);

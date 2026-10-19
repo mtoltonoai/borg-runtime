@@ -355,8 +355,9 @@ async fn active_override_cannot_bypass_mandatory_native_result_validation() {
     )
     .await;
     assert!(
-        matches!(admitted, Outcome::Ok { data: Data::Completion(CompletionOutcome::Evaluated(ref value)) }
-        if value.state.disposition == borg_runtime::governance::CompletionDisposition::Admit),
+        matches!(&admitted, Outcome::Ok { data: Data::Completion(completion) }
+        if matches!(completion.as_ref(), CompletionOutcome::Evaluated(value)
+            if value.state.disposition == borg_runtime::governance::CompletionDisposition::Admit)),
         "{admitted:?}"
     );
     task(

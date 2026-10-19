@@ -35,8 +35,9 @@ async fn work(api: &ApiClient, id: &str) -> WorkView {
 async fn question(api: &ApiClient, id: &str) -> borg_runtime::collaboration::questions::QuestionView {
     let op = Operation::QueryQuestion { query: QuestionQuery::Get { question_id: id.into() } };
     let reply = api.call(op.clone()).await.unwrap(); reply.validate_for(&op).unwrap();
-    let Outcome::Ok { data: Data::QuestionQuery(QuestionQueryResult::Question(view)) } = reply.outcome
-    else { panic!("question: {reply:?}") }; view
+    let Outcome::Ok { data: Data::QuestionQuery(result) } = reply.outcome
+    else { panic!("question: {reply:?}") };
+    let QuestionQueryResult::Question(view) = *result else { panic!("question: {result:?}") }; view
 }
 async fn entered(signal: &tokio::sync::Notify) {
     tokio::time::timeout(Duration::from_secs(30), signal.notified()).await.unwrap();
@@ -199,8 +200,9 @@ async fn journey() {
                         "reviewer":PrincipalRef::TrustedHostOperator,"summary":"Review the exact document describing the accepted child checkpoint."}))
                 },
                 5 => {
-                    let Outcome::Ok { data: Data::ReviewMutation(ReviewMutationOutcome::Review(view)) } = tool_outcome(&request, "call-4")
+                    let Outcome::Ok { data: Data::ReviewMutation(result) } = tool_outcome(&request, "call-4")
                     else { panic!("actual review request failed") };
+                    let ReviewMutationOutcome::Review(view) = *result else { panic!("actual review request failed") };
                     *review.lock().unwrap() = Some(view); review_entered.notify_one(); review_release.notified().await;
                     final_value()
                 },
@@ -241,7 +243,7 @@ async fn journey() {
     let second = continued.attempt.clone().unwrap(); assert_eq!(second.generation, first.generation + 1);
     assert_eq!(continued.completed_child.as_ref().unwrap().task_id, child_id);
     assert_eq!(continued.completed_child.as_ref().unwrap().status, TaskStatus::Succeeded);
-    assert_eq!(continued.completed_child.as_ref().unwrap().result, accepted_child.result);
+    assert_eq!(continued.completed_child.as_ref().unwrap().result.as_ref(), accepted_child.result.as_deref());
     let expected_instruction = borg_runtime::delegation::continuation_instruction(&parent.input,
         continued.completed_child.as_ref().unwrap()).unwrap();
     assert_eq!(peer.requests.lock().unwrap()[1]["input"][0]["content"], expected_instruction);
@@ -314,7 +316,7 @@ async fn journey() {
         document_id:doc.document.id.clone(), version:Some(doc.version.reference.version) } }).await.unwrap();
     assert!(matches!(read_doc.outcome, Outcome::Ok { data:Data::DocumentQuery(DocumentQueryOutcome::Document(ref actual)) } if actual == &doc));
     let read_review = api.call(Operation::QueryReview { query:ReviewQuery::Get { review_id:rev.review.id.clone() } }).await.unwrap();
-    assert!(matches!(read_review.outcome, Outcome::Ok { data:Data::ReviewQuery(ReviewQueryOutcome::Review(ref actual)) } if actual == &rev));
+    assert!(matches!(read_review.outcome, Outcome::Ok { data:Data::ReviewQuery(ref result) } if matches!(result.as_ref(), ReviewQueryOutcome::Review(actual) if actual == &rev)));
     for (path, needle) in [(format!("/documents/{}?version={}", segment(&doc.document.id), doc.version.reference.version), doc.version.reference.content_id.clone()),
         (format!("/reviews/{}", segment(&rev.review.id)), doc.version.reference.content_id.clone()), ("/decisions".into(), rev.review.id.clone())] {
         let response = browser.get(format!("{}{path}", lab.url)).send().await.unwrap();

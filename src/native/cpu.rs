@@ -1244,7 +1244,7 @@ mod diagnostic_cleanup_source_tests {
         std::fs::create_dir(&area.0).unwrap();
         let registry = area.0.join("processes");
         let limits = crate::limits::RuntimeLimits::seed().unwrap();
-        let worker = Arc::new(limits.worker);
+        let worker: std::sync::Arc<crate::limits::WorkerLimits> = Arc::from(limits.worker);
         let runtime = Arc::new(super::super::ValidationRuntime::new(worker.clone()).unwrap());
         let slots = runtime.slots.clone();
         let available_before = slots.available_permits();

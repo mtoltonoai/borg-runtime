@@ -80,7 +80,7 @@ async fn original_commit_survives_replay_lookup_restart_and_recorded_refusal() {
     assert_eq!(position(&c).await, 1);
     let submit = Operation::SubmitTask {
         operation_id: "metadata-submit".into(),
-        input: coding("metadata-agent"),
+        input: (coding("metadata-agent")).into(),
     };
     let accepted = exchange(&c, "first", submit.clone()).await;
     stamp(&accepted, "metadata-submit", 2);
@@ -253,7 +253,7 @@ async fn uncommitted_capacity_and_idle_wait_have_no_stamp_or_counter_churn() {
         "full",
         Operation::SubmitTask {
             operation_id: "full-submit".into(),
-            input: coding("full-agent"),
+            input: (coding("full-agent")).into(),
         },
     )
     .await;
@@ -326,7 +326,7 @@ async fn expiry_transaction_advances_once_without_fabricating_a_mutation_receipt
     first.limits.deadline_unix_ms = 2000;
     let original = Operation::SubmitTask {
         operation_id: "expiry-one".into(),
-        input: first,
+        input: (first).into(),
     };
     let one = exchange(&c, "first", original.clone()).await;
     let mut second = coding("expiry-two");
@@ -367,7 +367,7 @@ async fn actual_commit_hook_failure_rolls_back_receipt_state_and_revision() {
     register_repository_fixture(&c, &fixture_repository_registration()).await;
     let command = Operation::SubmitTask {
         operation_id: "commit-failed".into(),
-        input: coding("commit-agent"),
+        input: (coding("commit-agent")).into(),
     };
     // Refuse the real owned connection's COMMIT, after valid startup. The
     // consumed flag distinguishes an actual COMMIT from pre-transaction refusal.
@@ -757,9 +757,9 @@ async fn large_ack_exchange_keeps_lookup_and_maximum_correlation_replay_bounded(
             };
             WorkerCommand::RunAttempt {
                 command_id: format!("run-{}", a.id),
-                session: Session { id: t.session_id.clone(), agent_id:t.input.definition.id.clone(), definition:t.input.definition.clone(), task_id:t.id.clone() },
+                session: (Session { id: t.session_id.clone(), agent_id:t.input.definition.id.clone(), definition:t.input.definition.clone(), task_id:t.id.clone() }).into(),
                 attempt: a,
-                task: t.input.clone(),
+                task: (t.input.clone()).into(),
                 checkpoint: None,
                 continuation: None,
                 workflow_continuation: None, completion_continuation: None,

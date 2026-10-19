@@ -101,7 +101,7 @@ impl Fixture {
     async fn new(requested: bool) -> Self {
         let path = path(); let c = Controller::open_with_config(&path, config()).unwrap();
         data(call(&c, Operation::RegisterRepository { operation_id: "register-repository".into(), registration: registration(true) }).await);
-        let t = task(call(&c, Operation::SubmitTask { operation_id: "submit".into(), input: input(requested) }).await);
+        let t = task(call(&c, Operation::SubmitTask { operation_id: "submit".into(), input: (input(requested)).into() }).await);
         data(call(&c, Operation::RegisterWorker { operation_id: "register-worker".into(), worker: Worker {
             id: "worker".into(), incarnation: "incarnation".into(), coding_capacity: 1, native_capacity: 0 } }).await);
         let Data::Commands(commands) = data(call(&c, Operation::AwaitCommands { operation_id: "await".into(),
@@ -137,13 +137,13 @@ impl Fixture {
 async fn publication_request_requires_coding_registered_target_and_rejects_endpoint_override() {
     let c = Controller::open_with_config(path(), config()).unwrap();
     data(call(&c, Operation::RegisterRepository { operation_id: "register".into(), registration: registration(false) }).await);
-    refused(call(&c, Operation::SubmitTask { operation_id: "unconfigured".into(), input: input(true) }).await, "pull_request_invalid");
+    refused(call(&c, Operation::SubmitTask { operation_id: "unconfigured".into(), input: (input(true)).into() }).await, "pull_request_invalid");
     let mut forged = input(true);
     forged.repository.as_mut().unwrap().pull_request_target = Some(target());
-    refused(call(&c, Operation::SubmitTask { operation_id: "forged-target".into(), input: forged }).await, "invalid_input");
+    refused(call(&c, Operation::SubmitTask { operation_id: "forged-target".into(), input: (forged).into() }).await, "invalid_input");
     let mut native = input(true); native.definition.executor = ExecutorKind::Native;
     native.repository = None; native.acceptance_commands.clear(); native.output_schema = Some(json!({"type":"object"}));
-    refused(call(&c, Operation::SubmitTask { operation_id: "noncoding".into(), input: native }).await, "invalid_input");
+    refused(call(&c, Operation::SubmitTask { operation_id: "noncoding".into(), input: (native).into() }).await, "invalid_input");
     let Data::Tasks(tasks) = data(call(&c, Operation::ListTasks { after: None, limit: 10 }).await) else { panic!("tasks") };
     assert!(tasks.is_empty(), "refused requests cannot create tasks or external effects");
 }
@@ -372,7 +372,7 @@ async fn startup_accepts_actual_projected_configured_coding_child_admission_and_
     parent.native_workflow=Some(Box::new(NativeWorkflow::CodingThenContinue{child:CodingTaskTemplate { instruction_source: None,
         pull_request:child.pull_request,instruction_prefix:"Configured prefix".into(),definition:child.definition,repository:child.repository.unwrap(),
         acceptance_commands:child.acceptance_commands,dependencies:child.dependencies,limits:child.limits }}));
-    let parent=task(call(&c,Operation::SubmitTask{operation_id:"configured-submit".into(),input:parent}).await);
+    let parent=task(call(&c,Operation::SubmitTask{operation_id:"configured-submit".into(),input:(parent).into()}).await);
     data(call(&c,Operation::RegisterWorker{operation_id:"configured-worker".into(),worker:Worker{id:"configured-worker".into(),incarnation:"one".into(),coding_capacity:0,native_capacity:1}}).await);
     let Data::Commands(commands)=data(call(&c,Operation::AwaitCommands{operation_id:"configured-launch".into(),worker_id:"configured-worker".into(),incarnation:"one".into(),acknowledged:vec![]}).await) else {panic!("commands")};
     let a=commands.into_iter().find_map(|c|match c{WorkerCommand::RunAttempt{attempt,..}=>Some(attempt),_=>None}).unwrap();
@@ -383,7 +383,7 @@ async fn startup_accepts_actual_projected_configured_coding_child_admission_and_
     assert!(public_child.input.repository.as_ref().unwrap().pull_request_target.is_none());
     let canonical=get(&c,&public_child.id).await;
     assert_eq!(canonical.input.repository.as_ref().unwrap().pull_request_target,Some(target()));assert!(canonical.input.pull_request.is_some());
-    assert_eq!(public_child.input,crate::pull_request_view::input(&canonical.input));
+    assert_eq!(*public_child.input,crate::pull_request_view::input(&canonical.input));
     assert!(original.commit.is_some());
     let lookup=Operation::GetOperation{operation_id:"configured-delegation".into()};
     let saved=record(call(&c,lookup.clone()).await);

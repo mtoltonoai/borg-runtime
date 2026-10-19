@@ -412,7 +412,7 @@ impl Harness {
                 &c,
                 Operation::SubmitTask {
                     operation_id: id("submit-caller"),
-                    input,
+                    input: (input).into(),
                 },
             )
             .await,

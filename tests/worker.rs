@@ -44,7 +44,7 @@ fn area(label: &str) -> PathBuf {
 fn control() -> (Control, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
     let runtime_limits = limits();
-    let worker_limits = Arc::new(runtime_limits.worker.clone());
+    let worker_limits: Arc<borg_runtime::limits::WorkerLimits> = Arc::from(runtime_limits.worker.clone());
     let validation_runtime = Arc::new(borg_runtime::native::ValidationRuntime::new(worker_limits.clone()).unwrap());
     (
         Control {
@@ -217,7 +217,7 @@ fn launch() -> WorkerCommand {
             };
     let mut command = WorkerCommand::RunAttempt {
         command_id: "command-1".into(),
-        session: Session { id: "session-1".into(), agent_id: definition.id.clone(), definition: definition.clone(), task_id: "task-1".into() },
+        session: (Session { id: "session-1".into(), agent_id: definition.id.clone(), definition: definition.clone(), task_id: "task-1".into() }).into(),
         attempt: Attempt {
             session_id: "session-1".into(),
             id: "attempt-1".into(),
@@ -230,7 +230,7 @@ fn launch() -> WorkerCommand {
             stopped: false,
             uncertain: false,
         },
-        task: TaskInput { instruction_source: None,
+        task: (TaskInput { instruction_source: None,
             pull_request: None,
             resolved_limits: None,
             instruction: "edit the source".into(),
@@ -248,7 +248,7 @@ fn launch() -> WorkerCommand {
             },
             dependencies: vec![],
             native_workflow: None,
-        },
+        }).into(),
         checkpoint: None,
         continuation: None,
                 workflow_continuation: None, completion_continuation: None,
@@ -480,7 +480,7 @@ async fn actual_pinned_codex_handshake_without_a_model_turn() {
         &root.join("processes"),
         &borg_runtime::protocol::InferenceSettings::selected(),
         &limits().execution,
-        Arc::new(limits().worker.clone()),
+        Arc::from(limits().worker.clone()),
         &limits(),
     )
     .await
@@ -621,7 +621,7 @@ async fn codex_oversized_or_interrupted_protocol_never_succeeds() {
         &root.join("processes"),
         &borg_runtime::protocol::InferenceSettings::selected(),
         &limits().execution,
-        Arc::new(limits().worker.clone()),
+        Arc::from(limits().worker.clone()),
         &limits(),
     )
     .await
@@ -1041,7 +1041,7 @@ async fn registered_validator_journals_before_input_and_cleans_normal_exit() {
     let mut owner = process::ManagedProcess::spawn_registered(
         Path::new(env!("CARGO_BIN_EXE_borg-runtime")),
         &registry,
-        Arc::new(limits().worker.clone()),
+        Arc::from(limits().worker.clone()),
     )
     .unwrap();
     assert_eq!(process_records(&registry), 1);
@@ -1132,7 +1132,7 @@ async fn failed_registration_keeps_actual_child_owned_and_closes_input() {
     let failure = match process::ManagedProcess::spawn_registered(
         Path::new(env!("CARGO_BIN_EXE_borg-runtime")),
         &registry,
-        Arc::new(limits().worker.clone()),
+        Arc::from(limits().worker.clone()),
     ) {
         Ok(_) => panic!("registration failure not injected"),
         Err(failure) => failure,
@@ -1156,7 +1156,7 @@ async fn recovery_refuses_wrong_boot_legacy_corrupt_and_oversized_records() {
     let mut owner = process::ManagedProcess::spawn_registered(
         Path::new(env!("CARGO_BIN_EXE_borg-runtime")),
         &registry,
-        Arc::new(limits().worker.clone()),
+        Arc::from(limits().worker.clone()),
     )
     .unwrap();
     let path = std::fs::read_dir(&registry)
@@ -1711,7 +1711,7 @@ mod task_recovery {
         match api
             .call(Operation::SubmitTask {
                 operation_id: "native-recovery-submit".into(),
-                input,
+                input: (input).into(),
             })
             .await
             .unwrap()
@@ -1991,7 +1991,7 @@ mod task_recovery {
         } = api
             .call(Operation::SubmitTask {
                 operation_id: "old-coding-submit".into(),
-                input,
+                input: (input).into(),
             })
             .await
             .unwrap()

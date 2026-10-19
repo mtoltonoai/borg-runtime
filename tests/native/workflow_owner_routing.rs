@@ -165,8 +165,9 @@ async fn document_question(api: &ApiClient, document: &DocumentView) -> Question
     let reply = call_ok(api, Operation::QueryQuestion { query: QuestionQuery::List {
         record: Some(RecordRef::Document { document_id: document.document.id.clone() }), status: None, after: None, limit: 8,
     }}).await;
-    let Outcome::Ok { data: Data::QuestionQuery(QuestionQueryResult::Questions(page)) } = reply.outcome
+    let Outcome::Ok { data: Data::QuestionQuery(result) } = reply.outcome
     else { panic!("question query outcome") };
+    let QuestionQueryResult::Questions(page) = *result else { panic!("question query outcome") };
     assert_eq!(page.items.len(), 1); assert!(page.next_cursor.is_none());
     page.items[0].question.clone()
 }

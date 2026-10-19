@@ -50,8 +50,10 @@ async fn completion_begin_requires_an_actual_batch_intersecting_original_unconsu
             batch.as_ref().map(|batch|batch.batch_id.clone()));
         let begun = reply(&c, begin.clone()).await;
         if mode == "required" {
-            let Outcome::Ok { data:Data::Completion(CompletionOutcome::Begun(feedback)) } = &begun.outcome
+            let Outcome::Ok { data:Data::Completion(completion) } = &begun.outcome
                 else { panic!("exact required batch must permit the original next input: {begun:?}") };
+            let CompletionOutcome::Begun(feedback) = completion.as_ref()
+                else { panic!("exact required batch must begin the original next input: {begun:?}") };
             assert_eq!(feedback.evaluation.state, state);
             assert_eq!(feedback.evaluation.decision, original.id);
             assert_eq!(feedback.continuation.delivery_batch_id.as_deref(), batch.as_ref().map(|b|b.batch_id.as_str()));
@@ -93,8 +95,10 @@ async fn completion_begin_accepts_one_required_page_without_dropping_other_origi
     assert!(prepared.page.routing.as_ref().unwrap().has_more);
     let begin = begin_completion(&actor, &decision_ref(&evaluation), 2, Some(prepared.batch_id.clone()));
     let begun = reply(&c, begin.clone()).await;
-    let Outcome::Ok { data:Data::Completion(CompletionOutcome::Begun(feedback)) } = &begun.outcome
+    let Outcome::Ok { data:Data::Completion(completion) } = &begun.outcome
         else { panic!("a bounded page intersecting required work must permit progress: {begun:?}") };
+    let CompletionOutcome::Begun(feedback) = completion.as_ref()
+        else { panic!("a bounded page intersecting required work must begin progress: {begun:?}") };
     assert_eq!(feedback.evaluation.state, state);
     assert!(has_input(&feedback.evaluation.state, &first_event.id));
     assert!(has_input(&feedback.evaluation.state, &second_event.id));

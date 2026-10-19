@@ -105,7 +105,7 @@ impl Drop for Area {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-fn limits() -> WorkerLimits {
+fn limits() -> Box<WorkerLimits> {
     crate::worker::test_limits().worker.clone()
 }
 fn stale_owner(path: &Path) -> Vec<u8> {

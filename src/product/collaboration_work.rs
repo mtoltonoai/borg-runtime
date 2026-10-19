@@ -291,20 +291,20 @@ mod tests {
     fn observed() -> WorkView {
         let task = Task {
             id: "task-observed".into(), session_id: "session-original".into(),
-            input: TaskInput { instruction_source: None,
+            input: Box::new(TaskInput { instruction_source: None,
                 pull_request: None,
                 resolved_limits: None, repository_read: None, instruction: "Original instruction".into(),
                 definition: Definition { charter: None, id: "agent-original".into(), revision: "r1".into(), executor: ExecutorKind::Native, inference: None, execution_profile: None, limit_overrides: None },
                 repository: None, acceptance_commands: vec![], output_schema: None,
                 limits: Limits { deadline_unix_ms: 9999, model_requests: 1, output_bytes: 100, result_bytes: 100, max_delegation_depth: 0 },
                 dependencies: vec!["accepted-prerequisite".into()], native_workflow: None,
-            },
+            }),
             assigned_agent_id: "agent-original".into(), status: TaskStatus::Cancelled, revision: 19,
             attempt: Some(Attempt { id: "attempt-original".into(), task_id: "task-observed".into(), session_id: "session-original".into(), generation: 1, worker_id: "worker".into(), worker_incarnation: "incarnation".into(), phase: AttemptPhase::StopRequested, deadline_unix_ms: 9999, stopped: false, uncertain: true }),
             selected_checkpoint: None, result: None, blocked_reason: Some("Uncertain <effect>".into()), pending_assignment: None, native_retry_block: None, progress: String::new(), recent_output: String::new(), output_truncated: false,
             parent_task_id: None, waiting_child_id: None, completed_child: None,
         };
-        WorkView { task, coordination_revision: 4, responsible_owner: PrincipalRef::TrustedHostOperator, state: WorkState::Terminal { status: TaskStatus::Cancelled }, open_waits: 0, coordination_blocked: false, waits: crate::collaboration::Page { items: vec![], next_cursor: None } }
+        WorkView { task: Box::new(task), coordination_revision: 4, responsible_owner: PrincipalRef::TrustedHostOperator, state: WorkState::Terminal { status: TaskStatus::Cancelled }, open_waits: 0, coordination_blocked: false, waits: crate::collaboration::Page { items: vec![], next_cursor: None } }
     }
 
     #[test]

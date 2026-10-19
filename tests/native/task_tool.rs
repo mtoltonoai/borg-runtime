@@ -35,7 +35,7 @@ fn host() -> ValidationHost {
         PathBuf::from(env!("CARGO_BIN_EXE_borg-runtime")),
         root,
         Arc::new(limits.execution.native),
-        Arc::new(ValidationRuntime::new(Arc::new(limits.worker)).unwrap()),
+        Arc::new(ValidationRuntime::new(Arc::from(limits.worker)).unwrap()),
     )
 }
 fn function() -> Value {

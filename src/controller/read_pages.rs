@@ -115,7 +115,7 @@ fn task(tx: &StoreContext<'_>, selection: &Selection, cfg: &ControllerConfig, no
     let session = super::sessions::get(tx,session_id.as_deref().unwrap_or(&current.session_id))?;
     if session.task_id != *task_id { return Err(invalid("session does not belong to the requested task")); }
     let input = super::sessions::input(tx,&session)?;
-    if super::credential_admission::rejected(&Operation::SubmitTask {operation_id:"read-projection".into(),input:input.clone()}) {
+    if super::credential_admission::rejected(&Operation::SubmitTask {operation_id:"read-projection".into(),input:(input.clone()).into()}) {
         return database::refuse("credential_metadata","credential-bearing input is not exposed");
     }
     let input = crate::pull_request_view::input(&input);
@@ -316,9 +316,10 @@ fn list(value:&Data) -> Option<(Vec<Value>,Option<String>)> {
     use crate::collaboration::{QueryResult as Q,questions::QuestionQueryResult as Questions,documents::{DocumentQueryOutcome as Documents,ReviewQueryOutcome as Reviews},work::WorkQueryResult as Work};
     if !matches!(value,Data::CollaborationPage(_) | Data::RepositoryRegistrations(_)
         | Data::Collaboration(Q::Repositories(_)|Q::Sessions(_)|Q::Tasks(_)|Q::MemoryKeys(_)|Q::Workers(_)|Q::Machines(_)|Q::TaskHistory(_)|Q::TaskAttempts(_)|Q::TaskCheckpoints(_)|Q::ReleaseChecks(_))
-        | Data::QuestionQuery(Questions::Questions(_)|Questions::Answers(_)|Questions::Actions(_)|Questions::DecisionQueue(_))
         | Data::DocumentQuery(Documents::Documents(_)|Documents::Versions(_)|Documents::Comments(_))
-        | Data::ReviewQuery(Reviews::Reviews(_)) | Data::WorkQuery(Work::Waits(_))) {return None;}
+        | Data::WorkQuery(Work::Waits(_)))
+        && !matches!(value,Data::QuestionQuery(query) if matches!(query.as_ref(),Questions::Questions(_)|Questions::Answers(_)|Questions::Actions(_)|Questions::DecisionQueue(_)))
+        && !matches!(value,Data::ReviewQuery(query) if matches!(query.as_ref(),Reviews::Reviews(_))) {return None;}
     let value=serde_json::to_value(value).ok()?;
     let outer=value.get("value")?;
     let page=if outer.get("items").is_some(){outer}else{outer.get("value")?};

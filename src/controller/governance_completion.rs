@@ -376,7 +376,7 @@ pub(super) fn shadow_assess_original(tx:&StoreContext<'_>,original:&crate::gover
     let receipt=super::governance::original_receipt(tx,&original.operation_id)?.ok_or_else(||Fault::Refused("not_found","shadow original completion receipt absent".into()))?;
     if receipt.commit.controller_revision!=super::metadata::current(tx)?
         ||!matches!(receipt.request,crate::protocol::Operation::EvaluateCompletion(ref value) if value==original)
-        ||!matches!(receipt.outcome,crate::protocol::Outcome::Ok {data:crate::protocol::Data::Completion(crate::governance_completion::CompletionOutcome::NotEnforced)}) {
+        ||!matches!(receipt.outcome,crate::protocol::Outcome::Ok {data:crate::protocol::Data::Completion(completion)} if matches!(completion.as_ref(),crate::governance_completion::CompletionOutcome::NotEnforced)) {
         return refuse("stale_revision","shadow cannot reconstruct a moved completion input view");
     }
     let stored=super::collaboration_calls::caller(tx,&original.caller,now)?;

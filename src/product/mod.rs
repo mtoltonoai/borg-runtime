@@ -1931,7 +1931,7 @@ async fn post_other(controller: &Controller, path: &str, fields: Form, operation
             controller,
             Operation::SubmitTask {
                 operation_id: operation_id.clone(),
-                input,
+                input: (input).into(),
             },
         ))
         .await;
@@ -2243,7 +2243,7 @@ mod tests {
         let task = Task {
             pending_assignment: None,
             id: "task-view".into(),
-            input: TaskInput { instruction_source: None,
+            input: Box::new(TaskInput { instruction_source: None,
                 pull_request: None,
                 resolved_limits: None,
                 instruction: "<img src=x onerror=alert(1)>".into(),
@@ -2269,7 +2269,7 @@ mod tests {
                 },
                 dependencies: vec!["prerequisite".into()],
                 native_workflow: None,
-            },
+            }),
             session_id: "session".into(),
             assigned_agent_id: "template".into(),
             status: TaskStatus::Active,

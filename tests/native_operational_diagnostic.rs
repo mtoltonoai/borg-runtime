@@ -302,11 +302,11 @@ impl Lab {
         .unwrap()
     }
 }
-async fn submit_identified(api: &ApiClient, input: TaskInput, operation_id: &str) -> Task {
+async fn submit_identified(api: &ApiClient, input: impl Into<Box<TaskInput>>, operation_id: &str) -> Task {
     match api
         .call(Operation::SubmitTask {
             operation_id: operation_id.into(),
-            input,
+            input: (input).into(),
         })
         .await
         .unwrap()
@@ -424,7 +424,7 @@ async fn diagnostic_schema_one_byte_under_refuses_before_any_helper_or_provider(
             let absent = lab.root.join("absent-validation-program");
             assert!(!absent.exists());
             let host = borg_runtime::native::ValidationHost::new(absent, lab.root.join("no-helper-registry"),
-                Arc::new(accepted.native.clone()), Arc::new(borg_runtime::native::ValidationRuntime::new(Arc::new(lab.limits.worker.clone())).unwrap()));
+                Arc::new(accepted.native.clone()), Arc::new(borg_runtime::native::ValidationRuntime::new(Arc::from(lab.limits.worker.clone())).unwrap()));
             let config = borg_runtime::native::NativeConfig { endpoint: "http://127.0.0.1:1/v1/responses".into(), api_key_env: "BORG_UNUSED_PREFLIGHT_KEY".into(), model: candidate.definition.required_inference().unwrap().model.clone() };
             let observed = borg_runtime::native::execute_loop_step(&candidate, &config, &diagnostic_native_profile(&lab.limits), None, &host,
                 async { panic!("preflight must not reach provider-send admission") }, std::future::pending::<()>()).await;

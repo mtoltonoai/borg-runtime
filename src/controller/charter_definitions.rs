@@ -254,7 +254,7 @@ pub(super) fn apply(
             mutation: input.clone(),
         },
         &Outcome::Ok {
-            data: Data::Charter(result.clone()),
+            data: Data::Charter(Box::new(result.clone())),
         },
     )?;
     let encoded = encode(&definition)?;
@@ -315,15 +315,18 @@ pub(super) fn validate_decision(
     }
     match outcome {
         Outcome::Ok {
-            data: Data::Charter(CharterOutcome::Definition(value)),
-        } => Ok(value
+            data: Data::Charter(value),
+        } => {
+            let CharterOutcome::Definition(value) = value.as_ref() else { return Ok(false); };
+            Ok(value
             == &CharterDefinitionOutcome {
                 previous_revision: expected.into(),
                 definition: after.clone(),
                 source: target,
                 effect,
             }
-            && charters::definition(tx, &reference(&after))? == after),
+            && charters::definition(tx, &reference(&after))? == after)
+        },
         Outcome::Refused { .. } => Ok(true),
         _ => Ok(false),
     }
@@ -376,8 +379,9 @@ pub(super) fn validate_selected_heads(tx: &StoreContext<'_>) -> Result<()> {
         let original = super::identity_administration::project(charters::receipt(tx, &id)?)?;
         let (before, after, charter) = match original.outcome {
             Outcome::Ok {
-                data: Data::Charter(CharterOutcome::Definition(value)),
+                data: Data::Charter(value),
             } => {
+                let CharterOutcome::Definition(value) = *value else { continue; };
                 let before = CharterSourceRef {
                     definition_id: value.definition.id.clone(),
                     definition_revision: value.previous_revision,

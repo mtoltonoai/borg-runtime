@@ -55,13 +55,15 @@ async fn supplied_final_result_original_ack_loss_reconciles_without_second_start
     assert_eq!(peer_requests(&f.root).iter().filter(|v|v["method"]=="turn/start").count(),1);
     let id=format!("{}-charter-outer-1",f.scope.caller.attempt_id);
     let result=f.call(Operation::QueryCharter{query:CharterQuery::SuppliedTurn{turn_id:id.clone()}}).await;
-    let Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::SuppliedTurn(value))}=result.outcome else{panic!("{result:?}")};
+    let Outcome::Ok{data:Data::CharterQuery(value)}=result.outcome else{panic!("{result:?}")};
+    let CharterQueryResult::SuppliedTurn(value)=*value else{panic!("{value:?}")};
     let reply=value.reply.unwrap();assert!(reply.audit.findings.is_empty());assert_eq!(reply.observation.declaration,Some(declaration));
     assert!(reply.observation.output.is_none());assert!(reply.observation.response_id.is_none());assert!(reply.observation.tool_call_ids.is_empty());
     let reference=reply.observation.output_reference.unwrap();let mut bytes=Vec::new();
     for index in 0..reference.chunks{
         let result=f.call(Operation::QueryCharter{query:CharterQuery::OutputChunk{request_id:id.clone(),index}}).await;
-        let Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::OutputChunk(chunk))}=result.outcome else{panic!("{result:?}")};
+        let Outcome::Ok{data:Data::CharterQuery(value)}=result.outcome else{panic!("{result:?}")};
+        let CharterQueryResult::OutputChunk(chunk)=*value else{panic!("{value:?}")};
         for pair in chunk.data.as_bytes().chunks_exact(2){bytes.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(),16).unwrap());}
     }
     let raw:Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(raw["terminal"],serde_json::from_slice::<Value>(&std::fs::read(f.root.join("terminal.json")).unwrap()).unwrap());
@@ -77,7 +79,7 @@ async fn supplied_lost_public_start_stays_one_original_occurrence_without_final_
     let error=run_outer(&f,&control).await.unwrap_err();assert!(error.message.contains("uncertain"));f.closed();
     let id=format!("{}-charter-outer-1",f.scope.caller.attempt_id);
     let result=f.call(Operation::QueryCharter{query:CharterQuery::SuppliedTurn{turn_id:id}}).await;
-    assert!(matches!(result.outcome,Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::SuppliedTurn(v))} if v.acknowledgment.is_none()&&v.reply.is_none()));
+    assert!(matches!(result.outcome,Outcome::Ok{data:Data::CharterQuery(value)} if matches!(value.as_ref(),CharterQueryResult::SuppliedTurn(v) if v.acknowledgment.is_none()&&v.reply.is_none())));
     assert_eq!(peer_requests(&f.root).iter().filter(|v|v["method"]=="turn/start").count(),1);
     assert!(error.execution_uncertain);f.evidence();
 }
@@ -90,7 +92,8 @@ async fn supplied_failed_public_turn_retains_error_and_missing_final_without_com
     assert!(!result.success);assert_eq!(result.summary,"Executor turn failed");f.closed();
     let id=format!("{}-charter-outer-1",f.scope.caller.attempt_id);
     let queried=f.call(Operation::QueryCharter{query:CharterQuery::SuppliedTurn{turn_id:id.clone()}}).await;
-    let Outcome::Ok{data:Data::CharterQuery(CharterQueryResult::SuppliedTurn(v))}=queried.outcome else{panic!("{queried:?}")};
+    let Outcome::Ok{data:Data::CharterQuery(value)}=queried.outcome else{panic!("{queried:?}")};
+    let CharterQueryResult::SuppliedTurn(v)=*value else{panic!("{value:?}")};
     let terminal=v.terminal.unwrap();assert_eq!(terminal.status,"failed");
     assert_eq!(terminal.error,Some(json!({"message":"controlled rate limit","codexErrorInfo":"usageLimitExceeded"})));
     let reply=v.reply.unwrap();assert_eq!(reply.audit.findings,vec![crate::charter::CharterAuditFinding::MissingMetadata]);

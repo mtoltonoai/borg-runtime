@@ -123,7 +123,7 @@ async fn charter_native_final_before_compaction_requires_original_governed_bound
         if with_evaluation {
             let boundary=CompletionBoundary::NativeResponse{request_index:1};
             let evaluated=exchange(&c,Operation::EvaluateCompletion(EvaluateCompletion{operation_id:evaluation_id(&who,&boundary).unwrap(),caller:who.clone(),boundary,intervening_requests:gap.clone()})).await;
-            assert!(matches!(evaluated.outcome,Outcome::Ok{data:Data::Completion(CompletionOutcome::NotEnforced)}),"{evaluated:?}");
+            assert!(matches!(&evaluated.outcome,Outcome::Ok{data:Data::Completion(value)} if matches!(value.as_ref(),CompletionOutcome::NotEnforced)),"{evaluated:?}");
         }
         let mut operation=completion(&a,2,vec![],gap);
         let Operation::ObserveWorker{report}=&mut operation else{unreachable!()};

@@ -31,7 +31,7 @@ async fn journey() {
     let registration=borg_runtime::repository_catalogue::Registration{repository_id:"browser-page-repo".into(),registration_revision:"r1".into(),display_name:"Page fixture".into(),source_endpoint:"source".into(),checkpoint_endpoint:"source".into(),source_store_key:"read.git".into(),checkpoint_store_key:"read.git".into(),pull_request_target:None};
     call(&c,Operation::RegisterRepository{operation_id:"browser-page-registration".into(),registration:registration.clone()}).await;
     let input=TaskInput {instruction_source:None,pull_request:None,resolved_limits:None,instruction:full.clone(),definition:Definition{charter:None,limit_overrides:None,id:"browser-page-agent".into(),revision:"r1".into(),executor:ExecutorKind::Native,inference:Some(InferenceSettings::selected()),execution_profile:Some(ExecutionProfile::CollaborationV1{web_search:None})},repository_read:Some(RepositoryReadSource{registration:Some(registration.binding()),repository:String::new(),start_commit:commit}),repository:None,acceptance_commands:vec![],output_schema:Some(serde_json::json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false})),limits:c.limits().task_defaults.at(now()).unwrap(),dependencies:vec![],native_workflow:None};
-    let Data::Task(task)=call(&c,Operation::SubmitTask{operation_id:"browser-page-task".into(),input}).await else{panic!("task expected")};
+    let Data::Task(task)=call(&c,Operation::SubmitTask{operation_id:"browser-page-task".into(),input: (input).into()}).await else{panic!("task expected")};
     let selected_task=selected(&c,Selection::Task{task_id:task.id.clone(),session_id:None,part:TaskPart::Instruction}).await;
     let task_html=ui(&c,"GET",&format!("/tasks/{}?part=instruction&max_bytes=8192",task.id),vec![]).await;assert_page(&task_html,&selected_task,&full);
     let Data::DocumentMutation(DocumentMutationOutcome::Document{view:doc})=call(&c,Operation::MutateDocument{operation_id:"browser-page-document".into(),mutation:DocumentMutation::Create{content:DocumentContent{title:"Exact large body".into(),body:full.clone()},supplied_content_id:None,responsible_owner:PrincipalRef::TrustedHostOperator}}).await else{panic!("document expected")};
@@ -166,8 +166,8 @@ async fn browser_directory_journey() {
     limits.controller.list_page_bytes=64;limits.product.page_items=1;limits.validate().unwrap();
     let c=Controller::open_with_config(f.path.parent().unwrap().join("directory-lists.sqlite"),cfg).unwrap();
     let input=directory_input(&c,"browser-adapter-a",&"long accepted instruction ".repeat(800));
-    let Data::Task(first)=call(&c,Operation::SubmitTask{operation_id:"browser-directory-a".into(),input:input.clone()}).await else{panic!("first task")};
-    let Data::Task(second)=call(&c,Operation::SubmitTask{operation_id:"browser-directory-b".into(),input:directory_input(&c,"browser-adapter-b","second")}).await else{panic!("second task")};
+    let Data::Task(first)=call(&c,Operation::SubmitTask{operation_id:"browser-directory-a".into(),input:(input.clone()).into()}).await else{panic!("first task")};
+    let Data::Task(second)=call(&c,Operation::SubmitTask{operation_id:"browser-directory-b".into(),input:(directory_input(&c,"browser-adapter-b","second")).into()}).await else{panic!("second task")};
     assert!(serde_json::to_vec(&first).unwrap().len()>c.limits().controller.list_page_bytes);
     assert!(matches!(call(&c,Operation::ListTasks{after:None,limit:1}).await,Data::Tasks(v) if v.is_empty()));
     assert!(matches!(call(&c,Operation::ListAgents{after:None,limit:1}).await,Data::Agents(v) if v.is_empty()));
@@ -199,7 +199,7 @@ async fn browser_directory_journey() {
         assert!(href(&active.body,"Next agent page").is_none());
     }
     assert_eq!(ui(&c,"GET",&format!("{agent_next}&after=browser-adapter-a"),vec![]).await.status,400);
-    let refused=browser_outcome(&c,Operation::SubmitTask{operation_id:"browser-retired-new-task".into(),input}).await;
+    let refused=browser_outcome(&c,Operation::SubmitTask{operation_id:"browser-retired-new-task".into(),input: (input).into()}).await;
     assert!(matches!(refused,Outcome::Refused{code,..} if code=="agent_retired"));
     assert_eq!(super::task(&c,&first.id).await.input,first.input);
     // Normal fitting pages keep their existing progress/definition presentation.
