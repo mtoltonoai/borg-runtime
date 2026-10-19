@@ -234,6 +234,37 @@ pub struct Session {
     collaboration: Option<super::codex_mcp::Config>,
     lifecycle: ExecutionLifecycle,
 }
+// Keep this allowlist local to the supplied executor. Native inference and
+// ordinary Git/build children have separate credential requirements.
+const CODEX_AUTH_ENVIRONMENT: [&str; 4] = [
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    "OPENAI_STAGING_FEDERATION_RULE_ID",
+];
+
+fn codex_auth_environment() -> std::result::Result<Vec<(String, String)>, String> {
+    codex_auth_environment_from(|name| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(()),
+    })
+}
+
+fn codex_auth_environment_from(
+    mut value: impl FnMut(&str) -> std::result::Result<Option<String>, ()>,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut environment = Vec::new();
+    for name in CODEX_AUTH_ENVIRONMENT {
+        if let Some(value) = value(name).map_err(|_| "Codex authentication environment is not valid Unicode")? {
+            environment.push((name.into(), value));
+        }
+    }
+    // Preserve partial configuration so Codex rejects it instead of silently
+    // falling back to another authentication method.
+    Ok(environment)
+}
+
 impl Session {
     pub async fn start(
         binary: &Path,
@@ -249,8 +280,8 @@ impl Session {
         limits.coding.validate()?;
         worker_limits.validate()?;
         super::configured_credentials(runtime_limits)?;
-        let key = std::env::var("OPENAI_API_KEY").ok();
-        Self::start_with_key(
+        let auth_environment = codex_auth_environment()?;
+        Self::start_with_auth(
             binary,
             cwd,
             state,
@@ -258,11 +289,11 @@ impl Session {
             inference,
             limits,
             worker_limits,
-            key.as_deref(),
+            Some(&auth_environment),
         )
         .await
     }
-    async fn start_with_key(
+    async fn start_with_auth(
         binary: &Path,
         cwd: &Path,
         state: &Path,
@@ -270,7 +301,7 @@ impl Session {
         inference: &InferenceSettings,
         limits: &ExecutionLimits,
         worker_limits: Arc<WorkerLimits>,
-        inference_key: Option<&str>,
+        inference_auth: Option<&[(String, String)]>,
     ) -> std::result::Result<Self, String> {
         validate_inference(inference)?;
         limits.coding.validate()?;
@@ -287,23 +318,13 @@ impl Session {
                 serde_json::to_string(model).map_err(|e| e.to_string())?
             ),
             "-c".into(),
-            "model_provider=\"borg_openai\"".into(),
+            "model_provider=\"openai\"".into(),
             "-c".into(),
             format!(
                 "model_reasoning_effort={}",
                 serde_json::to_string(&inference.reasoning_effort)
                     .map_err(|_| "invalid selected effort")?
             ),
-            "-c".into(),
-            "model_providers.borg_openai.name=\"OpenAI\"".into(),
-            "-c".into(),
-            "model_providers.borg_openai.base_url=\"https://api.openai.com/v1\"".into(),
-            "-c".into(),
-            "model_providers.borg_openai.env_key=\"OPENAI_API_KEY\"".into(),
-            "-c".into(),
-            "model_providers.borg_openai.wire_api=\"responses\"".into(),
-            "-c".into(),
-            "model_providers.borg_openai.requires_openai_auth=false".into(),
             // Resolve thread defaults against this task, rather than inheriting
             // unrelated host-user writable roots from system configuration.
             // Managed requirements and workspace-write/tmp/network semantics
@@ -316,9 +337,11 @@ impl Session {
         ];
         context_args(&mut args, &limits.coding);
         let mut environment = vec![("CODEX_HOME".into(), state.to_string_lossy().into_owned())];
-        // The Codex server alone needs its configured inference credential. Ordinary acceptance/Git children do not inherit it.
-        if let Some(key) = inference_key {
-            environment.push(("OPENAI_API_KEY".into(), key.to_owned()));
+        // Codex owns workload-identity exchange and refresh. Pass the environment's
+        // references only to this server; retain task-local state and never select
+        // the native worker's API key as a Codex inference credential.
+        if let Some(auth) = inference_auth {
+            environment.extend_from_slice(auth);
         }
         let mut process =
             ManagedProcess::spawn(binary, &args, cwd, registry, &environment, worker_limits)
@@ -640,7 +663,7 @@ pub(super) async fn execute_with_profile_observed(
     let result = async {
         validate_inference(inference)?;
         let credentials = super::configured_credentials(&control.runtime_limits)?;
-        let key = std::env::var("OPENAI_API_KEY").ok();
+        let auth_environment = codex_auth_environment()?;
         execute_observed(
             binary,
             cwd,
@@ -652,7 +675,7 @@ pub(super) async fn execute_with_profile_observed(
             control,
             events,
             &credentials,
-            key.as_deref(),
+            Some(&auth_environment),
             collaboration,
             completion_scope,
             initial_charter,
@@ -691,7 +714,7 @@ pub(super) async fn execute_with_profile_observed(
     })
 }
 
-// The private fixture supplies only synthetic values and no inference key.
+// The private fixture supplies only synthetic values and no ambient auth.
 // Production always collects the finite named configuration before any spawn.
 async fn execute_with_credentials(
     binary: &Path,
@@ -704,7 +727,7 @@ async fn execute_with_credentials(
     control: &Control,
     events: mpsc::Sender<Event>,
     credentials: &[String],
-    inference_key: Option<&str>,
+    inference_auth: Option<&[(String, String)]>,
 ) -> std::result::Result<Result, String> {
     execute_with_credentials_and_collaboration(
         binary,
@@ -717,7 +740,7 @@ async fn execute_with_credentials(
         control,
         events,
         credentials,
-        inference_key,
+        inference_auth,
         None,
         None,
     )
@@ -771,12 +794,12 @@ async fn execute_with_credentials_and_collaboration(
     control: &Control,
     events: mpsc::Sender<Event>,
     credentials: &[String],
-    inference_key: Option<&str>,
+    inference_auth: Option<&[(String, String)]>,
     collaboration: Option<&Collaboration>,
     completion_scope: Option<&CompletionScope>,
 ) -> std::result::Result<Result, ExecutionFailure> {
     execute_with_credentials_collaboration_and_charter(binary,cwd,state,registry,inference,limits,
-        instruction,control,events,credentials,inference_key,collaboration,completion_scope,None).await
+        instruction,control,events,credentials,inference_auth,collaboration,completion_scope,None).await
 }
 
 async fn execute_with_credentials_collaboration_and_charter(
@@ -790,20 +813,20 @@ async fn execute_with_credentials_collaboration_and_charter(
     control: &Control,
     events: mpsc::Sender<Event>,
     credentials: &[String],
-    inference_key: Option<&str>,
+    inference_auth: Option<&[(String, String)]>,
     collaboration: Option<&Collaboration>,
     completion_scope: Option<&CompletionScope>,
     initial_charter: Option<&InitialCharterScope>,
 ) -> std::result::Result<Result, ExecutionFailure> {
     super::boxed_execution(|| execute_observed(binary,cwd,state,registry,inference,limits,instruction,control,events,
-        credentials,inference_key,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default(),None)).await
+        credentials,inference_auth,collaboration,completion_scope,initial_charter,ExecutionLifecycle::default(),None)).await
 }
 
 async fn execute_observed(
     binary: &Path, cwd: &Path, state: &Path, registry: &Path,
     inference: &InferenceSettings, limits: &ExecutionLimits, instruction: &str,
     control: &Control, events: mpsc::Sender<Event>, credentials: &[String],
-    inference_key: Option<&str>, collaboration: Option<&Collaboration>,
+    inference_auth: Option<&[(String, String)]>, collaboration: Option<&Collaboration>,
     completion_scope: Option<&CompletionScope>, initial_charter: Option<&InitialCharterScope>,
     lifecycle: ExecutionLifecycle,
     accepted_profile: Option<&ExecutionProfile>,
@@ -832,7 +855,7 @@ async fn execute_observed(
     if retry::read(state,control)?.is_some() {
         return Err("retained supplied occurrence requires original recovery; no replacement thread or workspace".into());
     }
-    let mut session = Session::start_with_key(
+    let mut session = Session::start_with_auth(
         binary,
         cwd,
         state,
@@ -840,7 +863,7 @@ async fn execute_observed(
         inference,
         limits,
         control.worker_limits.clone(),
-        inference_key,
+        inference_auth,
     )
     .await?;
     session.lifecycle = lifecycle.clone();
@@ -1027,8 +1050,8 @@ async fn execute_observed(
                             session.stderr.abort();
                             let bridge=session.collaboration.clone();
                             if let Some(config)=bridge.as_ref(){super::codex_mcp::reopen_after_known_stop(config)?;}
-                            session=Session::start_with_key(binary,cwd,state,registry,inference,limits,
-                                control.worker_limits.clone(),inference_key).await?;
+                            session=Session::start_with_auth(binary,cwd,state,registry,inference,limits,
+                                control.worker_limits.clone(),inference_auth).await?;
                             session.lifecycle=lifecycle.clone();
                             session.progress=Some(events.clone());
                             session.collaboration=bridge;
@@ -1322,6 +1345,56 @@ mod credential_tests {
         root
     }
 
+    #[test]
+    fn codex_auth_environment_is_finite_and_preserves_configuration_errors() {
+        let mut read = Vec::new();
+        let auth = codex_auth_environment_from(|name| {
+            read.push(name.to_owned());
+            Ok((name == "OPENAI_IDENTITY_TOKEN_FILE").then(|| "/fixture/identity-token".into()))
+        }).unwrap();
+        assert_eq!(read, CODEX_AUTH_ENVIRONMENT);
+        assert_eq!(auth, vec![("OPENAI_IDENTITY_TOKEN_FILE".into(), "/fixture/identity-token".into())]);
+        assert!(codex_auth_environment_from(|_| Ok(None)).unwrap().is_empty());
+        assert_eq!(codex_auth_environment_from(|_| Err(())).unwrap_err(),
+            "Codex authentication environment is not valid Unicode");
+    }
+
+    #[tokio::test]
+    async fn codex_server_uses_environment_auth_without_native_api_key() {
+        let root = area();
+        let state = root.join("state");
+        let binary = root.join("auth-peer.py");
+        std::fs::write(&binary, r#"#!/usr/bin/python3
+import json,os,pathlib,sys
+overrides=[sys.argv[i+1] for i,x in enumerate(sys.argv[:-1]) if x=='-c']
+assert 'model_provider="openai"' in overrides
+assert not any(x.startswith('model_providers.borg_openai.') for x in overrides)
+for name in ['OPENAI_FEDERATION_RULE_ID','OPENAI_IDENTITY_TOKEN_FILE','OPENAI_WORKLOAD_IDENTITY_CONTEXT','OPENAI_STAGING_FEDERATION_RULE_ID']:
+    assert os.environ[name]=='fixture-'+name
+for name in ['OPENAI_API_KEY','CODEX_API_KEY','GITHUB_TOKEN','GH_TOKEN']:
+    assert name not in os.environ
+assert pathlib.Path(os.environ['CODEX_HOME'])==pathlib.Path.cwd()/'state'
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' in request:
+        print(json.dumps({'id':request['id'],'result':{}}),flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let auth = codex_auth_environment_from(|name| Ok(Some(format!("fixture-{name}")))).unwrap();
+        let (_cancel, rx) = tokio::sync::watch::channel(false);
+        let control = crate::worker::test_control(process::now_ms() + 10_000, rx);
+        let registry = root.join("processes");
+        let mut session = Session::start_with_auth(
+            &binary, &root, &state, &registry, &InferenceSettings::selected(),
+            &control.runtime_limits.execution, control.worker_limits.clone(), Some(&auth),
+        ).await.unwrap();
+        let initialized = session.initialize(&control).await;
+        session.shutdown().await.unwrap();
+        initialized.unwrap();
+        assert!(std::fs::read_dir(&registry).unwrap().all(|entry|
+            entry.unwrap().path().extension().is_none_or(|extension| extension != "json")));
+    }
+
     #[tokio::test]
     async fn completion_continuation_keeps_thread_usage_and_initial_association_without_replay() {
         completion_journeys(&["continue","exhausted","lost-start","initial","initial-refused","initial-lost"]).await;
@@ -1525,7 +1598,7 @@ for line in sys.stdin:
             let mut limits = (*crate::worker::test_limits()).clone();
             limits.execution.coding.pending_notifications = 1;
             if input_bound { limits.execution.coding.frame_bytes = 16; }
-            let mut session = Session::start_with_key(
+            let mut session = Session::start_with_auth(
                 &binary, &root, &root.join("state"), &root.join("processes"),
                 &InferenceSettings::selected(), &limits.execution,
                 Arc::from(limits.worker.clone()), None,
@@ -1767,7 +1840,7 @@ for line in sys.stdin:
                 let server = &config["config"]["mcp_servers"][super::super::codex_mcp::SERVER_NAME];
                 assert_eq!(server["command"], "/host/selected/borg-runtime");
                 assert_eq!(server["required"], true);
-                assert_eq!(server["env_vars"], json!(["OPENAI_API_KEY"]));
+                assert_eq!(server["env_vars"], json!([]));
                 assert_eq!(server["args"][0], "__collaboration_mcp");
                 let retained: super::super::codex_mcp::Config = serde_json::from_slice(
                     &std::fs::read(state.join("borg-collaboration-config.json")).unwrap(),
@@ -1819,7 +1892,7 @@ for line in sys.stdin:
         ] {
             let root = area();
             let state = root.join("uncreated-state");
-            let error = Session::start_with_key(
+            let error = Session::start_with_auth(
                 Path::new("/nonexistent-codex"),
                 &root,
                 &state,
@@ -2065,7 +2138,7 @@ for raw in sys.stdin.buffer:
             control.runtime_limits = Arc::new(limits.clone());
             control.worker_limits = Arc::from(limits.worker.clone());
             let registry = root.join("processes");
-            let mut session = Session::start_with_key(
+            let mut session = Session::start_with_auth(
                 &binary, &root, &root.join("state"), &registry,
                 &InferenceSettings::selected(), &limits.execution,
                 Arc::from(limits.worker.clone()), None,

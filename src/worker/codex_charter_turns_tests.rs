@@ -33,7 +33,49 @@ fn supplied_new_contract_leaves_historical_native_and_initial_observation_bytes_
     let value:CharterObservation=serde_json::from_value(native.clone()).unwrap();assert_eq!(serde_json::to_value(value).unwrap(),native);
     let initial=json!({"kind":"ack_supplied_context","delivery_id":"initial","request_id":2,"response":{"thread":{"id":"original"}}});
     let value:CharterObservation=serde_json::from_value(initial.clone()).unwrap();assert_eq!(serde_json::to_value(value).unwrap(),initial);
-    assert!(supplied_output_bytes(usize::MAX,1).is_err());
+    assert_eq!(supplied_output_bytes(usize::MAX,1).unwrap(),isize::MAX as usize);
+}
+
+// The installed maximum metadata must admit actual small public frames while
+// retaining the same item-count and serialized-size checks as ordinary caps.
+#[test]
+fn maximum_frame_policy_keeps_small_public_items_and_terminals_bounded(){
+    let limits:crate::limits::RuntimeLimits=serde_json::from_str(include_str!("../../tests/fixtures/maximum-session-controller-metadata-04.json")).unwrap();
+    assert!(limits.execution.coding.frame_bytes.checked_mul(25).is_none());
+    let (_cancel,cancelled)=tokio::sync::watch::channel(false);
+    let mut control=crate::worker::test_control(u64::MAX,cancelled);
+    control.runtime_limits=std::sync::Arc::new(limits);
+    let mut c=capture();c.frame_bytes=control.runtime_limits.execution.coding.frame_bytes;
+    let final_item=item("maximum-small",Some("final_answer"),json!({"result":"kept","charter_references":null}));
+    let message=json!({"method":"item/completed","params":{"threadId":"thread","turnId":"public-turn","item":final_item}});
+    c.item(&message,&control).unwrap();
+    c.item(&message,&control).unwrap();
+    assert_eq!(c.items,vec![message]);
+    let terminal=terminal(vec![final_item]);
+    bounded_json_size(&terminal,supplied_frame_bytes(c.frame_bytes)).unwrap();
+    let maximum=supplied_output_bytes(c.frame_bytes,control.runtime_limits.charter.as_ref().unwrap().reply_items).unwrap();
+    assert_eq!(maximum,isize::MAX as usize);
+    bounded_json_size(&json!({"items":c.items,"terminal":terminal}),maximum).unwrap();
+    assert_eq!(c.projection(&terminal).2.as_deref(),Some("kept"));
+}
+
+#[test]
+fn ordinary_public_frame_and_item_count_limits_still_refuse(){
+    let limits:crate::limits::RuntimeLimits=serde_json::from_str(include_str!("../../tests/fixtures/maximum-session-controller-metadata-04.json")).unwrap();
+    let (_cancel,cancelled)=tokio::sync::watch::channel(false);
+    let mut control=crate::worker::test_control(u64::MAX,cancelled);
+    control.runtime_limits=std::sync::Arc::new(limits);
+    std::sync::Arc::make_mut(&mut control.runtime_limits).charter.as_mut().unwrap().reply_items=1;
+    let message=json!({"method":"item/completed","params":{"threadId":"thread","turnId":"public-turn","item":item("first",Some("final_answer"),json!({"result":"kept"}))}});
+    let mut c=capture();c.frame_bytes=1;
+    assert!(c.item(&message,&control).is_err());assert!(c.items.is_empty());
+    assert!(bounded_json_size(&terminal(vec![]),supplied_frame_bytes(c.frame_bytes)).is_err());
+    c.frame_bytes=1024;c.item(&message,&control).unwrap();
+    let mut another=message.clone();another["params"]["item"]["id"]=json!("second");
+    assert_eq!(c.item(&another,&control).unwrap_err(),"supplied public items exceed accepted charter.reply_items");
+    assert_eq!(c.items,vec![message]);
+    assert_eq!(supplied_frame_bytes(1024),25_600);
+    assert_eq!(supplied_output_bytes(1024,1).unwrap(),51_266);
 }
 
 #[test]

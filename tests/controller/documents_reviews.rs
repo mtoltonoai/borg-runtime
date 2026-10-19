@@ -1734,7 +1734,7 @@ async fn successful_question_and_review_preserve_owned_access_configuration() {
             profile,
             60,
         );
-        assert_eq!(server["env_vars"], json!(["OPENAI_API_KEY"]));
+        assert_eq!(server["env_vars"], json!([]));
         for forbidden in ["default_tools_approval_mode", "approval_policy", "sandbox"] {
             assert!(server.get(forbidden).is_none(), "{forbidden}");
         }

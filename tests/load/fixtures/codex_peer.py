@@ -9,7 +9,7 @@ import sys
 import time
 
 config = json.loads(Path(__file__).with_suffix('.json').read_text())
-assert os.environ.get('OPENAI_API_KEY') == 'local-load-synthetic-key'
+assert 'OPENAI_API_KEY' not in os.environ
 assert all(k not in os.environ for k in ['CODEX_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN'])
 thread = 'load-thread-' + str(os.getpid())
 turn = 'load-turn-' + str(os.getpid())

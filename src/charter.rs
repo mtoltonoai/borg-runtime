@@ -262,9 +262,16 @@ pub fn supplied_result_instructions() -> &'static str {
 /// terminal frame. Canonical finite JSON numbers can expand to 24 bytes; the
 /// extra factor bounds parsed encoding without enlarging any received frame.
 /// This derives from accepted limits, not a new policy default.
+pub(crate) fn supplied_frame_bytes(frame_bytes: usize) -> usize {
+    // A derived maximum beyond the addressable byte extent cannot exclude a
+    // representable value. Keep checking the actual serialization at that
+    // extent instead of rejecting small values under a large configured cap.
+    frame_bytes.saturating_mul(25).min(isize::MAX as usize)
+}
 pub(crate) fn supplied_output_bytes(frame_bytes: usize, reply_items: usize) -> Result<usize, String> {
-    frame_bytes.checked_mul(25).and_then(|n|n.checked_add(1)).and_then(|n|reply_items.checked_add(1).and_then(|k|n.checked_mul(k)))
-        .and_then(|n|n.checked_add(64)).filter(|n|*n<=isize::MAX as usize).ok_or_else(||"supplied original output extent overflow".into())
+    Ok(supplied_frame_bytes(frame_bytes).saturating_add(1)
+        .saturating_mul(reply_items.saturating_add(1)).saturating_add(64)
+        .min(isize::MAX as usize))
 }
 
 /// One deterministic source projection shared by the trusted producer and store.

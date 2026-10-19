@@ -163,7 +163,7 @@ impl Fixture {
     }
     fn state(&self)->PathBuf {self.root.join("state")}
     async fn session(&self)->Session {
-        Session::start_with_key(&self.binary,&self.root,&self.state(),&self.root.join("processes"),
+        Session::start_with_auth(&self.binary,&self.root,&self.state(),&self.root.join("processes"),
             &InferenceSettings::selected(),&self.runtime.execution,Arc::from(self.runtime.worker.clone()),None).await.unwrap()
     }
     fn config(&self)->Value {json!({"model":crate::protocol::SELECTED_MODEL,"cwd":self.root,

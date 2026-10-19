@@ -559,6 +559,7 @@ async fn actual_pinned_codex_handshake_without_a_model_turn() {
     );
     let selected_inference = borg_runtime::protocol::InferenceSettings::selected();
     assert_eq!(observed["model"], selected_inference.model);
+    assert_eq!(observed["model_provider"], "openai");
     assert_eq!(observed["model_reasoning_effort"], selected_inference.reasoning_effort);
     let compact = observed.get("model_auto_compact_token_limit").cloned();
     assert!(compact.as_ref().is_none_or(|value| {
@@ -642,8 +643,8 @@ import sys,json,pathlib
 overrides=[sys.argv[i+1] for i,x in enumerate(sys.argv[:-1]) if x=='-c']
 roots=[x.split('=',1)[1] for x in overrides if x.startswith('sandbox_workspace_write.writable_roots=')]
 assert len(roots)==1 and json.loads(roots[0])==[str(pathlib.Path.cwd())]
-assert 'model_providers.borg_openai.env_key="OPENAI_API_KEY"' in overrides
-assert 'model_providers.borg_openai.requires_openai_auth=false' in overrides
+assert 'model_provider="openai"' in overrides
+assert not any(x.startswith('model_providers.borg_openai.') for x in overrides)
 assert not any('danger-full-access' in x or 'dangerFullAccess' in x for x in sys.argv)
 def send(value):
  print(json.dumps(value),flush=True)

@@ -67,7 +67,7 @@ async fn fixture(mode: &str) -> (PathBuf, Session, Control, tokio::sync::watch::
     limits.execution.coding.progress_chars = 32;
     let (cancel, rx) = tokio::sync::watch::channel(false);
     let control = crate::worker::test_control(process::now_ms() + 10_000, rx);
-    let mut session = Session::start_with_key(&binary, &root, &root.join("state"), &root.join("processes"),
+    let mut session = Session::start_with_auth(&binary, &root, &root.join("state"), &root.join("processes"),
         &InferenceSettings::selected(), &limits.execution, Arc::from(limits.worker.clone()), None).await.unwrap();
     let (events, received) = mpsc::channel(512);
     session.progress = Some(events);

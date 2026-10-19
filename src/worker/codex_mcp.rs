@@ -1425,7 +1425,9 @@ pub fn server_config_for_profile(
             }
         }
     }
-    json!({"command":binary,"args":["__collaboration_mcp","--config",config_path,"--config-bytes",limits.config_bytes.to_string()],"env_vars":["OPENAI_API_KEY"],"required":true,"startup_timeout_sec":(limits.startup_timeout_ms as f64 / 1000.0),"tool_timeout_sec":timeout_seconds,"enabled_tools":enabled,"tools":tools})
+    // The bridge calls the private controller, not the inference provider.
+    // Keep both native API credentials and Codex workload identity out of it.
+    json!({"command":binary,"args":["__collaboration_mcp","--config",config_path,"--config-bytes",limits.config_bytes.to_string()],"env_vars":[],"required":true,"startup_timeout_sec":(limits.startup_timeout_ms as f64 / 1000.0),"tool_timeout_sec":timeout_seconds,"enabled_tools":enabled,"tools":tools})
 }
 
 /// Parent reads only this small static marker while supervising the entire

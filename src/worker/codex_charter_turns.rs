@@ -72,7 +72,7 @@ impl Capture {
         }
         let policy=control.runtime_limits.charter.as_ref().ok_or("supplied result policy absent")?;
         if self.items.len()>=policy.reply_items{return Err("supplied public items exceed accepted charter.reply_items".into());}
-        bounded_json_size(message,self.frame_bytes.checked_mul(25).ok_or("public item canonical bound overflow")?)?;
+        bounded_json_size(message,supplied_frame_bytes(self.frame_bytes))?;
         self.items.push(message.clone());Ok(())
     }
     fn projection(&self,terminal:&Value)->(Option<Value>,Vec<String>,Option<String>,Vec<String>){
@@ -109,7 +109,7 @@ impl Capture {
             ||terminal["params"]["turn"]["id"]!=self.turn_id||!matches!(status,"completed"|"failed"|"interrupted"){
             return Err("supplied final event differs from actual outer occurrence".into());
         }
-        bounded_json_size(terminal,self.frame_bytes.checked_mul(25).ok_or("public terminal canonical bound overflow")?)?;
+        bounded_json_size(terminal,supplied_frame_bytes(self.frame_bytes))?;
         let (declaration,output_item_ids,result,conflicts)=self.projection(terminal);
         let metadata=CharterSuppliedTerminal{thread_id:self.boundary.thread_id,turn_id:self.turn_id,status:status.into(),error:terminal["params"]["turn"].get("error").cloned()};
         let id=self.boundary.turn_id;
