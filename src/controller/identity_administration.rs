@@ -334,8 +334,10 @@ pub(super) fn apply(
     Ok((Data::IdentityAdministration(Box::new(outcome)), true))
 }
 // The full typed definition operation is not an escape from the existing
-// governed resource-field selection. Extra Native fields are the explicit
-// complete NativeLimits class; other unknown effective changes fail closed.
+// governed resource-field selection. Extra Native fields and the six explicit
+// collaboration allowances belong to the complete-definition mechanism; every
+// changed complete definition still requires its configured widening rule.
+// Other unknown effective changes fail closed.
 fn validate_effective_change(
     tx: &StoreContext<'_>,
     before: &crate::limits::ExecutionLimits,
@@ -411,6 +413,17 @@ fn validate_effective_change(
         continuation_envelope_bytes,
         task_tool_identity_bytes
     );
+    // These existing encoding, queue and startup allowances can be selected by
+    // complete definitions, under complete_definitions and require_widening.
+    // Keep the closed numeric-update vocabulary and its per-field checks above
+    // unchanged. Do not classify cadence, retry or future fields by copying the
+    // whole collaboration group.
+    known.collaboration.config_bytes = after.collaboration.config_bytes;
+    known.collaboration.frame_bytes = after.collaboration.frame_bytes;
+    known.collaboration.channel_items = after.collaboration.channel_items;
+    known.collaboration.startup_timeout_ms = after.collaboration.startup_timeout_ms;
+    known.collaboration.gate_bytes = after.collaboration.gate_bytes;
+    known.collaboration.boundary_bytes = after.collaboration.boundary_bytes;
     // Version-one capabilities are a closed set of ordinary collaboration
     // mechanisms. They cannot carry governance, repositories or host authority.
     known.collaboration.capabilities = after.collaboration.capabilities.clone();
