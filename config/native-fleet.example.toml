@@ -12,7 +12,8 @@ workspace_mcp_url = "http://127.0.0.1:8791/mcp/{session_id}"
 capacity = 4
 ttl_seconds = 60
 poll_seconds = 5
-project_id = 1
+# Omit project_id for the shared fleet: new Board projects need no host edits.
+# project_id = 1 # optional only for an intentionally scoped test worker
 
 # Task/agent metadata.workspace {repo,ref} overrides these host defaults.
 # Each session gets its own clone and native/session-<UUID> branch, never a shared
