@@ -208,7 +208,38 @@ fn ok(v: Value) -> Result<CallToolResult, McpError> {
 }
 
 fn err(e: anyhow::Error) -> McpError {
+    if let Some(rejection) = e.downcast_ref::<core::ContentRejection>() {
+        return McpError::invalid_params(
+            rejection.to_string(),
+            Some(serde_json::json!({"borg/pre_execution_rejection": true})),
+        );
+    }
     McpError::internal_error(e.to_string(), None)
+}
+
+/// Convert ONLY typed, definite pre-execution refusals to model-visible tool
+/// errors. An ordinary -32603 may have followed a committed write: keep it an
+/// RPC error so native preserves unknown-effect reconciliation.
+fn application_result(
+    result: Result<CallToolResponse, McpError>,
+) -> Result<CallToolResponse, McpError> {
+    match result {
+        Err(e)
+            if e.data
+                .as_ref()
+                .and_then(|v| v.get("borg/pre_execution_rejection"))
+                == Some(&Value::Bool(true)) =>
+        {
+            Ok(
+                CallToolResult::error(vec![ContentBlock::text(j(&serde_json::json!({
+                    "kind": "content_policy_rejection", "committed": false,
+                    "message": e.message, "correct_input_and_retry": true
+                })))])
+                .into(),
+            )
+        }
+        other => other,
+    }
 }
 
 // --- Parameter structs (one per tool that takes args) ---
@@ -5459,7 +5490,7 @@ impl ServerHandler for Board {
             }
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        application_result(self.tool_router.call(tcc).await)
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -5590,6 +5621,92 @@ mod tests {
     use super::*;
     use rmcp::schemars::schema_for;
     use serde_json::{from_value, json};
+
+    // Live regression: GET, PM and U+2013 stranded native sessions because a
+    // style refusal was emitted as -32603. Ordinary prose now commits by default;
+    // explicit policy refusal is a durable tool error with no write to reconcile.
+    #[tokio::test]
+    async fn content_policy_comments_accept_technical_unicode_by_default() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool.clone(), None);
+        let project = core::create_project(&pool, "Recovery", None, None, None).await?;
+        let task = core::create_task(
+            &pool,
+            project["id"].as_i64().unwrap(),
+            "Repair",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let task_id = task["id"].as_i64().unwrap();
+        for body in [
+            "GET /api/sessions",
+            "PM owns repair",
+            "progress – preserved",
+        ] {
+            let args = from_value::<CommentTaskArgs>(json!({"task_id":task_id,"body":body}))?;
+            let result = board
+                .comment_task(Parameters(args))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            assert_ne!(result.is_error, Some(true));
+        }
+        assert_eq!(core::get_task(&pool, task_id).await?["comment_count"], 3);
+        // The same policy is metadata, hot reloaded and persisted, not a compile flag.
+        core::set_content_policy(&pool, true, Some("test")).await?;
+        for body in [
+            "GET /api/sessions",
+            "PM owns repair",
+            "progress – preserved",
+        ] {
+            let args = from_value::<CommentTaskArgs>(json!({"task_id":task_id,"body":body}))?;
+            let result =
+                application_result(board.comment_task(Parameters(args)).await.map(Into::into))
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let CallToolResponse::Complete(result) = result else {
+                panic!("a known rejection must complete the tool call");
+            };
+            let value = serde_json::to_value(result)?;
+            assert_eq!(value["isError"], true);
+            let diagnostic: Value =
+                serde_json::from_str(value["content"][0]["text"].as_str().unwrap())?;
+            assert_eq!(diagnostic["committed"], false);
+            assert_eq!(diagnostic["kind"], "content_policy_rejection");
+            assert!(diagnostic["message"]
+                .as_str()
+                .unwrap()
+                .contains("acknowledge_banned"));
+        }
+        assert_eq!(
+            core::get_task(&pool, task_id).await?["comment_count"],
+            3,
+            "the refused calls did not commit comments"
+        );
+        let args = from_value::<CommentTaskArgs>(json!({"task_id":task_id,
+            "body":"GET and PM – intentional", "acknowledge_banned":true}))?;
+        assert!(board.comment_task(Parameters(args)).await.is_ok());
+        core::set_content_policy(&pool, false, Some("test")).await?;
+        assert_eq!(core::content_policy(&pool).await?["enforce_style"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn content_policy_unknown_internal_effects_stay_rpc_errors() {
+        // Text matching must not misclassify an ambiguous server/DB failure.
+        let error = err(anyhow::anyhow!(
+            "non-ASCII: database failed after possible commit"
+        ));
+        let code = error.code;
+        let result = application_result(Err(error));
+        assert_eq!(result.unwrap_err().code, code);
+        assert!(application_result(Err(err(anyhow::anyhow!("lost database connection")))).is_err());
+    }
 
     /// Arg structs reject unknown/misnamed params instead of silently dropping them (task 759 /
     /// task_914): the historical bite was set_status(note=...) when the field is status_message, and

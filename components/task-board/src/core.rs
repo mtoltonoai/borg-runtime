@@ -10268,11 +10268,11 @@ pub async fn check_banned_phrases(
             .collect();
         if !un_acked.is_empty() {
             let list = quote_join(&un_acked);
-            anyhow::bail!(
+            anyhow::bail!(ContentRejection(format!(
                 "banned phrase(s) found that you did not acknowledge: {list}. These are on the \
                  fleet banned-phrases list -- that is not how we write here. Rewrite to remove \
                  them, or add them to acknowledged_phrases to submit anyway."
-            );
+            )));
         }
         return Ok(hits);
     }
@@ -10280,11 +10280,11 @@ pub async fn check_banned_phrases(
         return Ok(hits);
     }
     let list = quote_join(&hits);
-    anyhow::bail!(
+    anyhow::bail!(ContentRejection(format!(
         "banned phrase(s) found: {list}. These are on the fleet banned-phrases list -- that is not \
          how we write here. Rewrite to remove them, or list them in acknowledged_phrases (or pass \
          acknowledge_banned=true) to submit anyway."
-    );
+    )));
 }
 
 /// Pre-submit FORMAT lint (task 368, the ASCII-only ruling): bail if `text` contains any non-ASCII
@@ -10298,12 +10298,12 @@ pub fn check_non_ascii(text: &str, acknowledge: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(&(ch, line, col)) = scan_non_ascii(text).first() {
-        anyhow::bail!(
+        anyhow::bail!(ContentRejection(format!(
             "non-ASCII character {ch:?} (U+{:04X}) at line {line}, column {col}. Board content \
              must be ASCII — replace it (an em dash with '-', curly quotes with straight quotes, \
              an arrow with '<->', drop emoji), or pass acknowledge_banned=true to submit anyway.",
             ch as u32
-        );
+        )));
     }
     Ok(())
 }
@@ -10400,17 +10400,61 @@ pub fn check_caps_emphasis(text: &str, acknowledge: bool) -> anyhow::Result<()> 
         .map(|w| format!("\"{w}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    anyhow::bail!(
+    anyhow::bail!(ContentRejection(format!(
         "caps-for-emphasis: {list}. That is not how we write here -- use normal sentence case and \
          let the words carry the emphasis (or markdown emphasis), not capitals. Write a code \
          identifier, SQL keyword, or env var in `backticks` so it reads as code, or pass \
          acknowledge_banned=true to submit anyway."
-    );
+    )));
 }
 
-/// Combined pre-submit content lint for authored free text (task/document comments + document
-/// versions): the ASCII-format check, the caps-for-emphasis check, then the banned-phrase check. One
-/// funnel so every authored surface runs the same checks and a new check only has to be added here.
+/// A content-policy refusal is a definite pre-execution application result, not
+/// an ambiguous RPC/transport failure. Only the side-effect-free lint uses this
+/// type; database, network and post-commit errors must NOT be converted to it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ContentRejection(pub String);
+
+/// Style is advisory by default. The explicit shared metadata switch is stored
+/// in board_settings and re-read on each write; no binary/restart is needed.
+pub async fn content_policy(pool: &Pool) -> anyhow::Result<Value> {
+    let value: Option<String> =
+        sqlx::query("SELECT value FROM board_settings WHERE key='content_style_enforcement'")
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get("value"))
+            .transpose()?;
+    Ok(json!({"enforce_style": value.as_deref() == Some("true"),
+        "default": "advisory", "version": policy_version(pool, "content_style").await?}))
+}
+
+pub async fn set_content_policy(
+    pool: &Pool,
+    enforce_style: bool,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks = Vec::new();
+    sqlx::query(
+        "INSERT INTO board_settings(key,value,updated_at,updated_by) VALUES('content_style_enforcement',?,?,?) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,updated_by=excluded.updated_by",
+    )
+    .bind(if enforce_style { "true" } else { "false" })
+    .bind(&ts)
+    .bind(actor)
+    .execute(&mut *tx)
+    .await?;
+    let version = bump_policy_version(&mut tx, "content_style", &ts).await?;
+    emit_policy_changed(&mut tx, &mut hooks, "content_style", version, actor).await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    content_policy(pool).await
+}
+
+/// Optional pre-submit style lint for authored text. The default is advisory:
+/// callers can query /lint, but ordinary prose is never rejected. An explicit
+/// metadata opt-in runs ASCII, caps and banned-phrase checks before any mutation.
 ///
 /// `acknowledge` is the blanket soft-block waiver for the format and caps rules (unchanged).
 /// `acknowledged_phrases` is the SCOPED banned-phrase acknowledgement (task_1534): only those
@@ -10423,6 +10467,11 @@ pub async fn check_content(
     acknowledge: bool,
     acknowledged_phrases: &[String],
 ) -> anyhow::Result<Vec<String>> {
+    if content_policy(pool).await?["enforce_style"] != true {
+        // /lint remains available for advisory diagnostics. Technical acronyms,
+        // Unicode and an old banned-word list must not interrupt ordinary work.
+        return Ok(Vec::new());
+    }
     check_non_ascii(text, acknowledge)?;
     check_caps_emphasis(text, acknowledge)?;
     check_banned_phrases(pool, text, acknowledged_phrases, acknowledge).await
@@ -11786,9 +11835,7 @@ pub async fn create_document(
     content_type: Option<&str>,
     content: Option<&str>,
 ) -> anyhow::Result<Value> {
-    // A document title renders as the page h1, so it is in scope for the ASCII-only ruling. Hard
-    // rule (no acknowledge): a non-ASCII title is never legitimate.
-    check_non_ascii(title, false)?;
+    check_content(pool, title, false, &[]).await?;
     let ts = now_iso();
     let ct = content_type.unwrap_or("text/markdown");
     let mut tx = pool.begin().await?;
@@ -13312,8 +13359,7 @@ pub async fn update_document(
     if title.is_empty() {
         anyhow::bail!("give a non-empty title");
     }
-    // Titles are in scope for the ASCII-only ruling (they render as the page h1). Hard rule.
-    check_non_ascii(title, false)?;
+    check_content(pool, title, false, &[]).await?;
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -16812,6 +16858,48 @@ pub async fn review_improvement_trend(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn content_policy_is_durable_opt_in_and_lint_stays_advisory() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("policy.db");
+        let pool = crate::db::init(path.to_str().unwrap()).await?;
+        assert_eq!(content_policy(&pool).await?["enforce_style"], false);
+        add_banned_phrase(&pool, "robust", None, None).await?;
+        assert!(check_content(&pool, "GET PM – robust", false, &[])
+            .await
+            .is_ok());
+        let lint = lint_text(&pool, "GET PM – robust").await?;
+        assert_ne!(lint["non_ascii"], json!([]));
+        assert_ne!(lint["caps_emphasis"], json!([]));
+        // Titles must not retain an unwaivable ASCII-only back door.
+        let doc = create_document(
+            &pool,
+            "PM – GET",
+            None,
+            "test-cid",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(doc["title"], "PM – GET");
+        set_content_policy(&pool, true, None).await?;
+        let refused = check_content(&pool, "GET PM – robust", false, &[])
+            .await
+            .unwrap_err();
+        assert!(refused.downcast_ref::<ContentRejection>().is_some());
+        pool.close().await;
+        let reopened = crate::db::init(path.to_str().unwrap()).await?;
+        assert_eq!(content_policy(&reopened).await?["enforce_style"], true);
+        set_content_policy(&reopened, false, None).await?;
+        assert!(check_content(&reopened, "GET PM – robust", false, &[])
+            .await
+            .is_ok());
+        Ok(())
+    }
 
     /// task_1462 (doc_3426 ask 7): attach is reference-counted and emits a durable control item to
     /// the agent only on the attach-state transitions (first-attach / last-detach), and steer/abort
@@ -25711,12 +25799,12 @@ mod tests {
         assert!(check_non_ascii("em dash \u{2014} acked", true).is_ok());
     }
 
-    /// A document title is in scope for the ASCII-only ruling: create_document and update_document
-    /// reject a non-ASCII title (hard rule, no acknowledge), so new non-ASCII titles can't enter.
+    /// Explicit opt-in applies the style policy to titles as well as body text.
     #[tokio::test]
-    async fn document_title_must_be_ascii() -> anyhow::Result<()> {
+    async fn document_title_style_enforcement_requires_opt_in() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        set_content_policy(&pool, true, None).await?;
         // Create with a non-ASCII (em dash) title is rejected before any DB write.
         let e = create_document(
             &pool,
