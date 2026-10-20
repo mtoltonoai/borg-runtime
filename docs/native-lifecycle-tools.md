@@ -205,3 +205,10 @@ never enqueues, steers, resumes or resolves a session. It refuses to infer
 concurrent execution from timestamps alone, or pass based only on model claims.
 A waiting/blocked/failed proof exits 2 and retains evidence; this is not an
 inference deadline or an instruction to restart a slow live session.
+
+Workspace helper URLs are host-local to their native runtime. For a cross-host
+observer, supply `--workspace-origin HOST=http://127.0.0.1:FORWARDED_PORT` for
+each owner host, using explicit temporary SSH forwards to that host's helper.
+The collector preserves the session path but routes to the actual owner, not
+its own identically numbered local helper. Native runtime routing and services
+are not changed by this read-only observation.

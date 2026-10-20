@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import io
 from pathlib import Path
 import unittest
 import urllib.parse
@@ -93,6 +94,22 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(sample["state"], "blocked")
         self.assertEqual(len(fixture.reads), 3)
         self.assertNotIn("child", sample)
+
+    def test_cross_host_marker_read_uses_explicit_owner_route_and_only_read_tool(self):
+        captured = []
+        marker = {"role": "child", "session_id": "child", "token": "public-token"}
+        class Opener:
+            def open(self, request, timeout):
+                captured.append(request)
+                return io.BytesIO(json.dumps({"result": result({"content": json.dumps(marker)})}).encode())
+        client = proof.Client(workspace_origins={"other-host": "http://127.0.0.1:18793"})
+        client.opener = Opener()
+        actual = client.marker({"id": "child", "agent_id": "same", "host_id": "other-host",
+                                "workspace_mcp_url": "http://127.0.0.1:8791/mcp/{session_id}"})
+        self.assertEqual(actual, marker)
+        self.assertEqual(captured[0].full_url, "http://127.0.0.1:18793/mcp/child")
+        self.assertEqual(captured[0].get_header("X-fleet-agent"), "same")
+        self.assertEqual(json.loads(captured[0].data)["params"], {"name": "workspace_read", "arguments": {"path": proof.MARKER}})
 
     def test_text_only_mcp_result_supported_and_failed_result_rejected(self):
         original = result({"session_id": "child"})

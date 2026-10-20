@@ -28,8 +28,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Client:
-    def __init__(self, token=None):
+    def __init__(self, token=None, workspace_origins=None):
         self.token = token
+        self.workspace_origins = workspace_origins or {}
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def request(self, url, body=None, agent=None):
@@ -50,6 +51,13 @@ class Client:
         url = url.replace("{session_id}", urllib.parse.quote(session["id"], safe=""))
         url = url.replace("{agent_id}", urllib.parse.quote(session["agent_id"], safe=""))
         url = url.replace("{runtime_url}", session.get("runtime_url", "").rstrip("/").removesuffix("/api"))
+        # Workspace URLs are intentionally host-local for the executing native
+        # runtime. A cross-host observer must use an explicit owner-host route,
+        # never silently read a different host's identically numbered helper.
+        origin = self.workspace_origins.get(session.get("host_id"))
+        if origin is not None:
+            parsed = urllib.parse.urlsplit(url)
+            url = origin.rstrip("/") + parsed.path
         response = self.request(url, {"jsonrpc": "2.0", "id": "read-proof", "method": "tools/call",
                                      "params": {"name": "workspace_read", "arguments": {"path": MARKER}}},
                                 agent=session["agent_id"])
@@ -150,13 +158,22 @@ def main():
     parser.add_argument("--token", required=True, help="Public marker proof token, not an authentication credential")
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--bearer-token-env")
+    parser.add_argument("--workspace-origin", action="append", default=[], metavar="HOST=ORIGIN",
+                        help="Explicit owner-host helper route, e.g. agent-lab=http://127.0.0.1:18791 via an SSH forward")
     parser.add_argument("--watch-seconds", type=float, default=0)
     parser.add_argument("--interval", type=float, default=2)
     args = parser.parse_args()
     if args.watch_seconds < 0 or args.interval <= 0:
         parser.error("watch duration must be nonnegative; interval must be positive")
     bearer = os.environ[args.bearer_token_env] if args.bearer_token_env else None
-    client = Client(bearer)
+    origins = {}
+    for binding in args.workspace_origin:
+        host, sep, origin = binding.partition("=")
+        parsed = urllib.parse.urlsplit(origin)
+        if not host or not sep or parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            parser.error("workspace routes must be HOST=http(s)://host:port without credentials/path/query/fragment")
+        origins[host] = origin
+    client = Client(bearer, origins)
     overlap = False
     if args.trace.exists():
         for line in args.trace.read_text().splitlines():
