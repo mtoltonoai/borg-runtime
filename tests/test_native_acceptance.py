@@ -203,6 +203,15 @@ class AcceptanceTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(next(c for c in result["checks"] if c["check"] == "expected_revision")["status"], "fail")
 
+    def test_paused_profile_fixtures_are_not_admitted_runtime_identities(self):
+        self.snapshot["board"]["agents"].append({"id": "paused-fixture", "lifecycle_intent": "paused", "metadata": {"harness": "native"}})
+        self.assertEqual(self.checks()["profiles:agent-lab"]["status"], "pass")
+
+    def test_native_readiness_drain_overrules_recent_cached_fleet_heartbeat(self):
+        self.snapshot["runtimes"]["agent-lab"]["health"]["ready"] = False
+        self.snapshot["runtimes"]["agent-lab"]["health"]["draining"] = True
+        self.fail("host:agent-lab")
+
     def test_epoch_seconds_milliseconds_iso_and_task_refs(self):
         self.assertEqual(audit.epoch(NOW), NOW)
         self.assertEqual(audit.epoch(NOW * 1000), NOW)

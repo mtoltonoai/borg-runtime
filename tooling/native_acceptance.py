@@ -264,7 +264,7 @@ def collect(board_url, runtimes, project=1, reader=None, board_token=None, nativ
     for host, url in runtimes.items():
         runtime = snapshot["runtimes"][host] = {}
         runtime["health"] = read(f"{host}.health", url, "/health", native_token,
-                                  lambda v: pick(obj(v), ("status", "service", "host_id", "revision", "instance_id", "config_source")))
+                                  lambda v: pick(obj(v), ("status", "service", "host_id", "revision", "instance_id", "config_source", "ready", "draining")))
         runtime["agents"] = read(f"{host}.agents", url, "/api/agents", native_token,
                                   lambda v: [sanitize_profile(r) for r in rows(v, "agents")])
         runtime["sessions"] = read(f"{host}.sessions", url, "/api/sessions", native_token,
@@ -307,7 +307,7 @@ def audit(snapshot, expected_hosts=HOSTS, revision=None, now=None, max_host_age=
           "The host registry cannot contain duplicate/missing host IDs.")
     runtimes = obj(snapshot.get("runtimes"))
     agents = {a.get("id"): a for a in board.get("agents") or []}
-    required_agents = {a for a, v in agents.items() if obj(v.get("metadata")).get("harness") == "native" and not v.get("retired")}
+    required_agents = {a for a, v in agents.items() if obj(v.get("metadata")).get("harness") == "native" and not v.get("retired") and v.get("lifecycle_intent") not in {"paused", "retired"}}
     check("native_identities", bool(required_agents), sorted(required_agents))
     all_sessions = []
     for host, runtime in runtimes.items():
@@ -321,7 +321,8 @@ def audit(snapshot, expected_hosts=HOSTS, revision=None, now=None, max_host_age=
         h = obj(runtime.get("health"))
         capacity = row.get("capacity")
         valid_capacity = isinstance(capacity, int) and not isinstance(capacity, bool) and capacity > 0
-        ready = h.get("status") == "ok" and h.get("host_id") == host
+        ready = (h.get("status") == "ok" and h.get("host_id") == host
+                 and h.get("ready", True) is True and h.get("draining", False) is False)
         host_age = row.get("ttl_seconds", max_host_age)
         if not isinstance(host_age, (int, float)) or isinstance(host_age, bool) or not math.isfinite(host_age) or host_age <= 0:
             host_age = 0
