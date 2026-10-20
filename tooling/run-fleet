@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export FLEET_REPO="${FLEET_REPO:-$repo/components/fleet}"
+cd "$repo/components/fleet"
+exec "$repo/components/fleet/target/debug/fleet" "$@"

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
+mkdir -p .runtime
+exec "$repo/components/task-board/target/debug/task-board" \
+  --config "$repo/config/task-board.example.toml" \
+  --web-dir "$repo/components/task-board/web/dist" "$@"

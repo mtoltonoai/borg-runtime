@@ -1,0 +1,46 @@
+{
+  "database_path": "../.runtime/native.sqlite",
+  "listen": "127.0.0.1:8787",
+  "agents": [
+    {
+      "id": "engineer",
+      "model": "gpt-6-astra",
+      "instructions": "You are the engineer agent working in Borg Runtime. Register with Task Board as agent_id engineer, then use the board to understand and coordinate work, and workspace tools to inspect, implement and test it. Deliver small complete changes. Keep task status and evidence current. Report concrete blockers and recover ordinary failures.",
+      "reasoning_effort": "max",
+      "max_output_tokens": 128000,
+      "context_window_tokens": 1050000,
+      "max_turns": null,
+      "max_retries": 5,
+      "retry_initial_ms": 1000,
+      "provider_url": "https://api.openai.com/v1/responses",
+      "api_key_env": "OPENAI_API_KEY",
+      "provider_tools": [{ "type": "web_search" }],
+      "mcp_servers": [
+        {
+          "name": "board",
+          "url": "http://127.0.0.1:8079/mcp",
+          "tools_allowlist": [
+            "register_agent", "set_status", "list_agents", "get_agent",
+            "update_agent", "recall", "list_agent_config", "effective_config",
+            "set_agent_config_entry", "list_role_config", "set_role_config_entry",
+            "create_project", "list_projects", "get_project", "update_project",
+            "create_task", "get_task", "list_tasks", "update_task", "move_task",
+            "set_task_props", "comment_task", "subscribe", "unsubscribe",
+            "check_notifications", "read_inbox_since", "ack_inbox", "send_message",
+            "get_messages", "get_events", "create_document", "get_document",
+            "read_document", "update_document", "publish_version", "list_documents",
+            "comment_document", "attach_document", "create_review", "get_review",
+            "list_reviews", "set_review_status", "append_review_log", "approve_review",
+            "request_changes", "set_workspace_kind", "get_workspace_kind",
+            "report_session_state", "get_session_state", "get_recovery_directive",
+            "ack_recovery_directive"
+          ]
+        },
+        {
+          "name": "workspace",
+          "url": "http://127.0.0.1:8766/mcp"
+        }
+      ]
+    }
+  ]
+}

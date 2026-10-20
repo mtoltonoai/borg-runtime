@@ -1,0 +1,43 @@
+name: Check
+on: [push, pull_request]
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - component: "."
+            args: ""
+          - component: "components/fleet"
+            args: "--bin fleet"
+          - component: "components/task-board"
+            args: ""
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.component }}
+      - run: cargo test --locked ${{ matrix.args }}
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -v
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: components/task-board/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: components/task-board/web/package-lock.json
+      - run: npm ci
+      - run: npm run build

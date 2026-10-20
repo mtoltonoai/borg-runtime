@@ -1,0 +1,99 @@
+# task-board configuration.
+#
+# Pass this file with `--config <path>`; with no flag the built-in defaults below apply.
+# Every key is optional — omit one to keep its default.
+
+# Path to the SQLite database file. Its parent directory is created on startup.
+# Opening a database from an older version is fine (the schema is migrated in place).
+db_path = "/data/task-board/board.db"
+
+# Address to bind. "0.0.0.0" listens on all interfaces; "127.0.0.1" is local-only.
+host = "0.0.0.0"
+
+# Port for all three surfaces: MCP (/mcp), the REST API (/api), and the web UI (/).
+port = 8079
+
+# Timeout, in seconds, for best-effort webhook POSTs to agents that registered a
+# webhook_url. Delivery is fire-and-forget; this just bounds how long each attempt waits.
+webhook_timeout_secs = 5
+
+# Trusted CIDRs whose webhook_url hosts are accepted (task_1492). The board POSTs event data to each
+# agent's self-registered webhook_url, so the host is attacker-influencable. The guard is
+# ALLOWLIST-ONLY: a webhook_url whose host IP falls within one of these CIDRs is ACCEPTED and every
+# other host is REJECTED -- public/external IPs, link-local 169.254.0.0/16 (incl the cloud-metadata
+# target 169.254.169.254), IPv6 fe80::/10, and non-IP DNS names. The fleet is private-only and
+# CO-RESIDENT with the board (workers on a private LAN, same-host agents on loopback), so a legitimate
+# webhook target is only ever a fleet-internal host -- that is why the default is the loopback +
+# RFC1918 private ranges below. If your fleet LAN uses different ranges, list them here. An entry
+# that is not a valid <ip>/<prefix> CIDR fails startup loudly. Link-local/metadata is intentionally
+# NOT in the default, so the cloud-metadata SSRF target stays rejected.
+webhook_allowed_cidrs = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# Retention window, in seconds, for ACKED (read) inbox rows (task_1491). A bounded, LOSSLESS sweep
+# deletes inbox rows whose read_at is set AND older than this window, so the inbox table does not
+# grow without bound. UNREAD rows (read_at IS NULL) are NEVER deleted regardless of age -- an unread
+# row is a pending wake, and unread rows are the sole driver of wake + replay-on-reconnect (the
+# no-lost-wake invariant). The full audit trail stays in the events table (never pruned here), so
+# dropping old acked rows loses nothing. Default 604800 (7 days); set to 0 to disable the prune.
+inbox_acked_retention_secs = 604800
+
+# Host authorities the MCP endpoint (/mcp) accepts in the inbound `Host` header. rmcp guards
+# streamable-HTTP against DNS rebinding by accepting only loopback hosts by default, so a
+# LAN-exposed or reverse-proxied deployment must list the authorities clients actually send.
+# Empty (the default) keeps the safe loopback-only behavior. A single "*" disables the check
+# entirely (any Host accepted) — only for closed networks, never public deployments.
+#   mcp_allowed_hosts = ["board.lan:8079", "board.example.com"]
+mcp_allowed_hosts = []
+
+# Optional IPFS HTTP API base URL. When set, the board can content-address raw document
+# `content` server-side (pin via /api/v0/add and store the returned CID), so a client with no
+# local IPFS can author a document by sending content instead of a precomputed CID. When unset
+# (the default), the board stays CID-only: callers must supply a bare CID. Typically the
+# loopback Kubo API on the host running the board.
+#   ipfs_api_url = "http://127.0.0.1:5001"
+
+# Authenticated DB-snapshot download endpoint (GET /api/admin/db-snapshot). Off by default: the
+# endpoint 404s unless db_snapshot_enabled = true. When on, it serves a point-in-time-CONSISTENT
+# copy of the SQLite database (produced via VACUUM INTO, so never a torn mid-write byte stream)
+# behind HTTP Basic auth -- the daemon owns db_path, so an authed GET is the extraction primitive
+# for host migration + DR without stopping the daemon or a cross-user root file-copy.
+#
+# SECURITY: the whole fleet's data lives in that file (including secret-broker records), so this is
+# a full-exfil surface. Keep it loopback/LAN-bound and OFF any public tunnel at the proxy, and
+# deliver db_snapshot_password via your secret manager (agenix), never in a plaintext role file.
+# Both the user and password are required when enabled (otherwise the endpoint returns 503).
+#   db_snapshot_enabled = true
+#   db_snapshot_user = "ops"
+#   db_snapshot_password = "set-via-agenix"
+
+# The deployment's operator person. When set, startup adds that person, the `operator -> <id>`
+# identity alias, and the person's membership in the "operator" team, each only if absent, so an
+# edit made later is kept. Unset (the default) seeds no person: the "operator" team starts empty.
+# operator_display_name defaults to the id.
+#   operator_person = "alice"
+#   operator_display_name = "Alice"
+
+# Per-host trusted-front-door auth, keyed by the inbound `Host` authority's hostname (port stripped,
+# case-insensitive). A host whose section sets `auth_header` FORCES the acting user of a write to
+# that request header's value -- the client cannot attribute the write to anyone else (actor /
+# author / sender / created_by / from_agent / invited_by are overwritten), and a write missing the
+# header is rejected (401). A host with no `auth_header`, or any host not listed, stays permissive:
+# the client sets its own actor. So a tunnel-fronted public hostname can force the username from the
+# tunnel's authenticated-user header while localhost stays open for dev. (Named `hosts` plural
+# because `host` above is the bind address.)
+#   [hosts.'127.0.0.1']            # permissive -- no auth_header, client sets the actor
+#   [hosts.'board.example.com']
+#   auth_header = "x-tunnel-user"
+
+# Link-tag rules (task_1243): regex pattern -> URL template, served read-only at
+# GET /api/system/link-rules for the UI to linkify custom references (e.g. CR-NNNN) in rendered
+# content, generalizing the built-in typed-ref linkification. `$1`, `$2`, ... in the template are
+# the pattern's capture groups. These patterns live HERE in the deployment config, never in the
+# task-board / fleet source, so each deployment defines its own tags and the platform stays
+# org-agnostic. A pattern that is not a valid regex fails startup loudly. Empty by default.
+#   [[link_rules]]
+#   pattern = "CR-(\\d+)"
+#   url_template = "https://code.example.com/reviews/CR-$1"
+#   [[link_rules]]
+#   pattern = "SIM-(\\d+)"
+#   url_template = "https://sim.example.com/issues/SIM-$1"

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
+cargo test --locked
+python3 -m unittest discover -s tests -v
+(
+  cd components/fleet
+  cargo test --locked --bin fleet
+)
+(
+  cd components/task-board
+  cargo test --locked
+  cd web
+  npm ci
+  npm run build
+)

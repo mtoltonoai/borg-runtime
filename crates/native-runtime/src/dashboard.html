@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Native sessions</title>
+  <style>
+    :root { color-scheme: light; --bg:#f3f5f4; --card:#fff; --ink:#20332f; --muted:#63736e; --line:#dce5e0; --accent:#176b50; --tint:#eaf5ee; --danger:#a63132; --danger-bg:#fff1f0; --warning:#895b0c; --warning-bg:#fff5dd; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    button,input,select,textarea { font:inherit; }
+    button { cursor:pointer; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); padding:8px 13px; font-weight:600; }
+    button:hover:not(:disabled) { border-color:var(--accent); background:var(--tint); }
+    button.primary { color:#fff; background:var(--accent); border-color:var(--accent); }
+    button.primary:hover:not(:disabled) { background:#12553f; }
+    button.danger { color:var(--danger); }
+    button:disabled { opacity:.5; cursor:default; }
+    :focus-visible { outline:3px solid #63a98c; outline-offset:3px; }
+    input,select,textarea { width:100%; border:1px solid #bdcdc4; border-radius:8px; padding:9px 11px; background:var(--card); color:var(--ink); }
+    textarea { resize:vertical; min-height:92px; }
+    label { display:block; font-weight:600; margin:0 0 6px; }
+    a { color:var(--accent); text-decoration-thickness:1px; text-underline-offset:3px; overflow-wrap:anywhere; }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:24px; font-weight:680; letter-spacing:-.6px; }
+    h2 { font-size:17px; font-weight:650; }
+    h3 { font-size:14px; }
+    header { background:var(--card); border-bottom:1px solid var(--line); }
+    .header-inner { max-width:1480px; margin:auto; padding:23px 28px; display:flex; justify-content:space-between; align-items:center; gap:20px; flex-wrap:wrap; }
+    .eyebrow { color:var(--accent); font-size:11px; text-transform:uppercase; font-weight:750; letter-spacing:1.5px; margin-bottom:3px; }
+    .subtle,.hint { color:var(--muted); }
+    .hint { font-size:12px; margin-top:6px; }
+    .toolbar { display:flex; gap:9px; align-items:center; flex-wrap:wrap; }
+    .connection { max-width:1480px; margin:auto; padding:10px 28px; }
+    summary { cursor:pointer; font-weight:600; }
+    .connection form { display:flex; gap:10px; align-items:end; flex-wrap:wrap; padding:13px 0; }
+    .connection .token-field { flex:1; min-width:200px; max-width:440px; }
+    .layout { max-width:1480px; margin:auto; padding:10px 28px 32px; display:grid; grid-template-columns:260px minmax(0,1fr); gap:20px; align-items:start; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:13px; box-shadow:0 2px 5px #20332f03; overflow:hidden; }
+    .card-head { padding:17px 19px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .pad { padding:19px; }
+    .stack { display:grid; gap:18px; min-width:0; }
+    .agent { padding:16px 19px; border-top:1px solid var(--line); overflow-wrap:anywhere; }
+    .agent:first-child { border-top:0; }
+    .agent .name { font-weight:700; }
+    .agent .model { font-size:12px; color:var(--muted); margin:3px 0 12px; }
+    .agent dl { margin:0; display:grid; grid-template-columns:1fr auto; gap:5px 10px; font-size:12px; }
+    dt { color:var(--muted); }
+    dd { margin:0; }
+    .agent details { margin-top:13px; font-size:12px; }
+    .agent details p { white-space:pre-wrap; margin-top:8px; }
+    .sessions { max-height:330px; overflow:auto; padding:8px; }
+    .session { display:block; width:100%; text-align:left; border:1px solid transparent; border-radius:8px; padding:12px; margin:2px 0; font-weight:400; }
+    .session[aria-pressed="true"] { border-color:#9ec6af; background:var(--tint); }
+    .session-top { display:flex; align-items:center; gap:10px; justify-content:space-between; }
+    .session-title { font-weight:650; overflow-wrap:anywhere; }
+    .session-meta { color:var(--muted); font-size:12px; margin:4px 0; }
+    .preview { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; color:var(--muted); font-size:13px; }
+    .badge { display:inline-block; white-space:nowrap; border-radius:99px; padding:3px 9px; background:#edf1ef; color:#58665f; font-size:11px; font-weight:650; }
+    .badge.active { color:#176144; background:#def1e5; }
+    .badge.attention { color:var(--warning); background:var(--warning-bg); }
+    .badge.failed { color:var(--danger); background:#ffe7e5; }
+    .badge.done { color:#326795; background:#e8f2fa; }
+    .empty { padding:28px 19px; color:var(--muted); text-align:center; }
+    .detail-title { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+    .mono { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12px; overflow-wrap:anywhere; }
+    .metadata { display:flex; flex-wrap:wrap; gap:14px 30px; margin:17px 0; font-size:12px; }
+    .metadata dt { margin-bottom:3px; }
+    .progress { white-space:pre-wrap; overflow-wrap:anywhere; max-height:280px; overflow:auto; background:#f7f9f7; padding:14px; border-radius:8px; margin-top:8px; }
+    .error { color:var(--danger); background:var(--danger-bg); border-radius:8px; padding:11px 13px; white-space:pre-wrap; overflow-wrap:anywhere; margin-top:12px; }
+    .notice { color:var(--accent); margin-top:10px; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .controls { padding-top:18px; margin-top:18px; border-top:1px solid var(--line); display:grid; gap:18px; }
+    .form-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:9px; }
+    .section { border-top:1px solid var(--line); padding:16px 19px; }
+    .section > summary { font-size:14px; }
+    .entries { display:grid; gap:8px; margin-top:12px; }
+    .entry { border:1px solid var(--line); border-radius:8px; padding:10px 12px; min-width:0; }
+    .entry summary { font-size:12px; overflow-wrap:anywhere; }
+    .entry pre { background:#f7f9f7; white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; padding:12px; max-height:360px; overflow:auto; border-radius:6px; margin:10px 0 0; }
+    .entry button { margin-top:10px; font-size:12px; }
+    .resolve-form { border-top:1px solid var(--line); margin-top:15px; padding-top:15px; display:grid; gap:12px; }
+    .filter { width:auto; max-width:220px; font-size:12px; padding:6px 9px; }
+    dialog { width:min(560px,calc(100vw - 32px)); border:1px solid var(--line); border-radius:14px; padding:24px; color:var(--ink); box-shadow:0 20px 80px #132a3426; }
+    dialog::backdrop { background:#15352c55; backdrop-filter:blur(3px); }
+    dialog form { display:grid; gap:16px; }
+    dialog h2 { font-size:21px; }
+    [hidden] { display:none !important; }
+    @media (max-width:780px) { .layout { grid-template-columns:1fr; padding:8px 16px 24px; } .header-inner { padding:20px 16px; } .connection { padding:10px 16px; } .agents { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); } .agent { border-top:0; } .sessions { max-height:260px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div><p class="eyebrow">Native runtime</p><h1>Sessions, in motion.</h1><p class="subtle">Follow progress and guide the next step.</p></div>
+      <div class="toolbar"><span id="connection-status" class="badge" role="status">Connecting</span><button id="refresh" type="button">Refresh</button><button id="new-session" class="primary" type="button" disabled>New session</button></div>
+    </div>
+  </header>
+  <details class="connection">
+    <summary>Connection <span id="origin" class="subtle mono"></span></summary>
+    <form id="connection-form" autocomplete="off">
+      <div class="token-field"><label for="token">Bearer token <span class="subtle">(optional)</span></label><input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Only needed when authentication is enabled"></div>
+      <button type="submit">Connect</button><button id="clear-token" type="button">Clear token</button>
+      <p id="token-note" class="hint">Kept in this tab’s memory only.</p>
+    </form>
+    <p class="hint">Refreshes every 3 seconds while this page is visible.</p>
+    <p id="connection-error" class="error" role="alert" hidden></p>
+  </details>
+  <main class="layout">
+    <aside class="card">
+      <div class="card-head"><h2>Agent identities</h2><span id="agent-count" class="badge">0</span></div>
+      <p class="hint pad">Each agent can have multiple independent sessions.</p>
+      <div id="agents" class="agents"><p class="empty">Loading agents…</p></div>
+    </aside>
+    <div class="stack">
+      <section class="card" aria-labelledby="sessions-heading">
+        <div class="card-head"><div class="toolbar"><h2 id="sessions-heading">Sessions</h2><span id="session-count" class="badge">0</span></div><select id="agent-filter" class="filter" aria-label="Filter sessions by agent"><option value="">All agents</option></select></div>
+        <div id="sessions" class="sessions"><p class="empty">Loading sessions…</p></div>
+      </section>
+      <section class="card" aria-label="Selected session">
+        <div id="no-selection" class="empty">Choose a session to see its progress, or start a new one.</div>
+        <div id="session-detail" hidden>
+          <div class="pad">
+            <div class="detail-title"><h2 id="detail-agent"></h2><span id="detail-status" class="badge"></span></div>
+            <p id="detail-id" class="mono subtle"></p>
+            <dl class="metadata"><div><dt>Task</dt><dd id="detail-task"></dd></div><div><dt>Turns</dt><dd id="detail-turns"></dd></div><div><dt>Last advance</dt><dd id="detail-updated"></dd></div><div><dt>Created</dt><dd id="detail-created"></dd></div></dl>
+            <h3>Latest progress</h3><p id="detail-progress" class="progress"></p>
+            <p id="detail-error" class="error" hidden></p>
+            <div class="controls">
+              <div class="toolbar"><button id="stop" class="danger" type="button">Stop session</button><button id="resume" type="button">Resume session</button></div>
+              <form id="steer-form"><label for="steer-text">Steer this session</label><textarea id="steer-text" required placeholder="Add direction or clarify the next step."></textarea><div class="form-actions"><button id="send-steer" class="primary" type="submit">Send direction</button></div></form>
+            </div>
+            <p id="action-message" class="notice" role="status" hidden></p>
+            <p id="action-error" class="error" role="alert" hidden></p>
+          </div>
+          <details id="tools-section" class="section">
+            <summary>Tool calls <span id="tool-count" class="subtle"></span></summary>
+            <p class="hint">Inspect calls and record an observed result when a call needs resolution.</p>
+            <p id="tools-error" class="error" hidden></p>
+            <div id="tools" class="entries"></div>
+            <form id="resolve-form" class="resolve-form">
+              <div><label for="call-id">Call ID</label><input id="call-id" required autocomplete="off" spellcheck="false"></div>
+              <div><label for="tool-result">Observed result (JSON)</label><textarea id="tool-result" class="mono" required spellcheck="false" placeholder='{"ok": true}'></textarea></div>
+              <div class="form-actions"><button id="resolve" type="submit">Record result</button></div>
+            </form>
+          </details>
+          <details id="transcript-section" class="section">
+            <summary>Transcript <span id="transcript-count" class="subtle"></span></summary>
+            <p id="transcript-error" class="error" hidden></p>
+            <div id="transcript" class="entries"></div>
+          </details>
+        </div>
+      </section>
+    </div>
+  </main>
+  <dialog id="create-dialog" aria-labelledby="create-title">
+    <form id="create-form">
+      <div><h2 id="create-title">Start a session</h2><p class="subtle">Choose an agent identity and give it a first instruction.</p></div>
+      <div><label for="create-agent">Agent identity</label><select id="create-agent" required></select></div>
+      <div><label for="create-input">Instruction</label><textarea id="create-input" required rows="5" placeholder="What would you like this agent to do?"></textarea></div>
+      <div><label for="create-task">Task reference <span class="subtle">(optional)</span></label><input id="create-task" placeholder="Task name, ID, or https:// link" autocomplete="off"></div>
+      <p id="create-error" class="error" role="alert" hidden></p>
+      <div class="form-actions"><button id="cancel-create" type="button">Cancel</button><button id="submit-create" type="submit" class="primary">Start session</button></div>
+    </form>
+  </dialog>
+  <noscript><p class="empty">Enable JavaScript to view sessions and use their controls.</p></noscript>
+  <script>
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const origin = ['http:', 'https:'].includes(location.protocol) ? location.origin : 'http://localhost:8787';
+    let token = '', authVersion = 0, dataRevision = 0, agents = [], sessions = [], selected = null;
+    let refreshJob = null, refreshQueued = null, mutationBusy = false, creating = false;
+    let agentsSignature = '', transcriptSignature = '', toolsSignature = '';
+    const drafts = new Map();
+    const statusStyles = {ready:'active', running:'active', retrying:'attention', waiting:'attention', stopping:'attention', needs_resolution:'attention', completed:'done', failed:'failed'};
+    const display = value => value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    function node(tag, text, className) {
+      const element = document.createElement(tag);
+      if (text != null) element.textContent = String(text);
+      if (className) element.className = className;
+      return element;
+    }
+    function put(id, value) { const text = String(value ?? ''); if ($(id).textContent !== text) $(id).textContent = text; }
+    function message(id, text) { put(id, text); $(id).hidden = !text; }
+    function date(value) {
+      if (value == null) return null;
+      const parsed = new Date(typeof value === 'number' && value < 1e12 ? value * 1000 : value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    function relative(value) {
+      const time = date(value);
+      if (!time) return 'Unknown';
+      const seconds = Math.max(0, Math.floor((Date.now() - time.getTime()) / 1000));
+      if (seconds < 5) return 'Just now';
+      if (seconds < 60) return seconds + 's ago';
+      if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+      if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
+      return Math.floor(seconds / 86400) + 'd ago';
+    }
+    function badge(status) { return node('span', String(status ?? 'unknown').replaceAll('_', ' '), 'badge ' + (statusStyles[status] || '')); }
+    function count(value) { return typeof value === 'number' ? value.toLocaleString() : 'Not reported'; }
+    function taskNode(task) {
+      const text = display(task) || 'No task linked';
+      try {
+        const url = new URL(text);
+        if (url.protocol === 'https:' || url.protocol === 'http:') {
+          const link = node('a', text);
+          link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+          return link;
+        }
+      } catch (_) { /* Non-URL task references stay plain text. */ }
+      return node('span', text);
+    }
+    async function api(path, body) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 20000);
+      const headers = {Accept:'application/json'};
+      if (token) headers.Authorization = 'Bearer ' + token;
+      if (body !== undefined) headers['Content-Type'] = 'application/json';
+      try {
+        const response = await fetch(origin + path, {method:body === undefined ? 'GET' : 'POST', headers, body:body === undefined ? undefined : JSON.stringify(body), signal:controller.signal, credentials:'omit', cache:'no-store', redirect:'error'});
+        const text = await response.text();
+        let data = text;
+        try { data = text ? JSON.parse(text) : null; } catch (_) { /* Health may be plain text. */ }
+        if (!response.ok) {
+          const detail = typeof data === 'object' && data ? display(data.error ?? data.message ?? data) : display(data);
+          throw new Error('HTTP ' + response.status + (detail ? ': ' + detail : ''));
+        }
+        return data;
+      } catch (error) {
+        if (error.name === 'AbortError') throw new Error('The request timed out.');
+        throw error;
+      } finally { clearTimeout(timeout); }
+    }
+    function array(data, name) { if (!Array.isArray(data)) throw new Error(name + ' returned an unexpected response.'); return data; }
+    function renderAgents() {
+      const signature = JSON.stringify(agents);
+      if (signature === agentsSignature) return;
+      agentsSignature = signature;
+      put('agent-count', agents.length);
+      const filter = $('agent-filter').value, choice = $('create-agent').value;
+      $('agent-filter').replaceChildren(new Option('All agents', ''));
+      $('create-agent').replaceChildren();
+      const cards = agents.map(agent => {
+        $('agent-filter').add(new Option(agent.id, agent.id));
+        $('create-agent').add(new Option(agent.id + ' · ' + agent.model, agent.id));
+        const card = node('div', null, 'agent');
+        card.append(node('p', agent.id, 'name'), node('p', agent.model, 'model'));
+        const limits = node('dl');
+        for (const [label, value] of [['Context window', count(agent.context_window_tokens)], ['Max output', count(agent.max_output_tokens)], ['Reasoning', agent.reasoning_effort || 'Not reported'], ['Max turns', count(agent.max_turns)]]) limits.append(node('dt', label), node('dd', value));
+        const instructions = node('details');
+        instructions.append(node('summary', 'Instructions'), node('p', agent.instructions || 'No instructions configured.'));
+        card.append(limits, node('p', 'Context is shared by input and output. The output limit is part of that window.', 'hint'), instructions);
+        return card;
+      });
+      $('agents').replaceChildren(...(cards.length ? cards : [node('p', 'No agent identities configured.', 'empty')]));
+      if (agents.some(agent => agent.id === filter)) $('agent-filter').value = filter;
+      if (agents.some(agent => agent.id === choice)) $('create-agent').value = choice;
+      $('new-session').disabled = !agents.length;
+    }
+    function saveDraft() {
+      if (selected) drafts.set(selected, {steer:$('steer-text').value, call:$('call-id').value, result:$('tool-result').value});
+    }
+    function selectSession(id) {
+      if (selected === id) return;
+      saveDraft(); selected = id;
+      const draft = drafts.get(id) || {steer:'', call:'', result:''};
+      $('steer-text').value = draft.steer; $('call-id').value = draft.call; $('tool-result').value = draft.result;
+      transcriptSignature = ''; toolsSignature = '';
+      $('transcript').replaceChildren(node('p', 'Loading transcript…', 'hint'));
+      $('tools').replaceChildren(node('p', 'Loading tool calls…', 'hint'));
+      put('transcript-count', ''); put('tool-count', '');
+      for (const target of ['action-message', 'action-error', 'transcript-error', 'tools-error']) message(target, '');
+      if (sessions.find(session => session.id === id)?.status === 'needs_resolution') $('tools-section').open = true;
+    }
+    function renderSessions() {
+      const visible = sessions.filter(session => !$('agent-filter').value || session.agent_id === $('agent-filter').value)
+        .sort((a, b) => (date(b.updated_at)?.getTime() || 0) - (date(a.updated_at)?.getTime() || 0));
+      if (!visible.some(session => session.id === selected)) selectSession(visible[0]?.id || null);
+      put('session-count', visible.length);
+      const focused = document.activeElement?.dataset.sessionId;
+      const cards = visible.map(session => {
+        const button = node('button', null, 'session');
+        button.type = 'button'; button.dataset.sessionId = session.id;
+        button.setAttribute('aria-pressed', String(selected === session.id));
+        const top = node('div', null, 'session-top');
+        top.append(node('span', session.agent_id, 'session-title'), badge(session.status));
+        button.append(top, node('p', session.id + ' · ' + relative(session.updated_at), 'session-meta'));
+        if (session.task) button.append(node('p', 'Task: ' + display(session.task), 'preview'));
+        button.append(node('p', session.error || session.progress || 'No progress recorded yet.', 'preview'));
+        button.addEventListener('click', () => { selectSession(session.id); renderSessions(); queueRefresh(); });
+        return button;
+      });
+      $('sessions').replaceChildren(...(cards.length ? cards : [node('p', 'No sessions yet. Start one with an agent above.', 'empty')]));
+      if (focused) cards.find(card => card.dataset.sessionId === focused)?.focus({preventScroll:true});
+      renderDetail();
+    }
+    function renderDetail() {
+      const session = sessions.find(item => item.id === selected);
+      $('no-selection').hidden = !!session; $('session-detail').hidden = !session;
+      if (!session) return;
+      put('detail-agent', session.agent_id); put('detail-id', session.id);
+      put('detail-status', String(session.status).replaceAll('_', ' '));
+      $('detail-status').className = 'badge ' + (statusStyles[session.status] || '');
+      $('detail-task').replaceChildren(taskNode(session.task));
+      put('detail-turns', session.turns);
+      put('detail-updated', relative(session.updated_at));
+      $('detail-updated').title = date(session.updated_at)?.toLocaleString() || '';
+      put('detail-created', date(session.created_at)?.toLocaleString() || 'Unknown');
+      put('detail-progress', session.progress || 'No progress recorded yet.');
+      message('detail-error', session.error);
+      for (const id of ['stop', 'resume', 'send-steer', 'resolve']) $(id).disabled = mutationBusy;
+    }
+    function renderEntries(id, entries, signature, render) {
+      const next = JSON.stringify(entries);
+      if (next === signature) return signature;
+      const expanded = new Set(Array.from($(id).children).filter(item => item.open).map(item => item.dataset.key));
+      const nodes = entries.map((entry, index) => {
+        const item = render(entry);
+        item.dataset.key = String(entry.sequence ?? entry.call_id ?? index);
+        item.open = expanded.has(item.dataset.key);
+        return item;
+      });
+      $(id).replaceChildren(...(nodes.length ? nodes : [node('p', 'No entries yet.', 'hint')]));
+      return next;
+    }
+    async function refreshSupplement(id, version, revision, type) {
+      if (!$(type + '-section').open) return;
+      try {
+        const entries = array(await api('/api/sessions/' + encodeURIComponent(id) + '/' + (type === 'tools' ? 'tools' : 'transcript')), type);
+        if (id !== selected || version !== authVersion || revision !== dataRevision) return;
+        message(type + '-error', '');
+        if (type === 'transcript') {
+          put('transcript-count', '(' + entries.length + ')');
+          transcriptSignature = renderEntries('transcript', entries, transcriptSignature, entry => {
+            const row = node('details', null, 'entry');
+            row.append(node('summary', '#' + entry.sequence + ' · ' + entry.kind + ' · ' + (date(entry.created_at)?.toLocaleTimeString() || 'Unknown time')), node('pre', display(entry.item)));
+            return row;
+          });
+        } else {
+          put('tool-count', '(' + entries.length + ')');
+          toolsSignature = renderEntries('tools', entries, toolsSignature, entry => {
+            const row = node('details', null, 'entry');
+            row.append(node('summary', entry.name + ' · ' + entry.status), node('pre', display(entry)));
+            if (!['completed', 'resolved', 'succeeded'].includes(entry.status)) {
+              const use = node('button', 'Use this call ID');
+              use.type = 'button';
+              use.addEventListener('click', () => { $('call-id').value = entry.call_id; $('tool-result').focus(); });
+              row.append(use);
+            }
+            return row;
+          });
+        }
+      } catch (error) { if (id === selected && version === authVersion && revision === dataRevision) message(type + '-error', error.message); }
+    }
+    function queueRefresh() {
+      if (refreshJob) {
+        if (!refreshQueued) refreshQueued = refreshJob.then(() => {
+          refreshQueued = null;
+          return queueRefresh();
+        });
+        return refreshQueued;
+      }
+      const job = refresh().finally(() => { if (refreshJob === job) refreshJob = null; });
+      refreshJob = job;
+      return job;
+    }
+    async function refresh() {
+      $('refresh').disabled = true;
+      const version = authVersion, revision = dataRevision;
+      try {
+        const results = await Promise.all([api('/health'), api('/api/agents'), api('/api/sessions')]);
+        if (version !== authVersion || revision !== dataRevision) return;
+        agents = array(results[1], 'Agents'); sessions = array(results[2], 'Sessions');
+        renderAgents(); renderSessions();
+        put('connection-status', 'Live'); $('connection-status').className = 'badge active';
+        $('connection-status').title = 'Last refreshed ' + new Date().toLocaleTimeString();
+        message('connection-error', '');
+        if (selected) await Promise.all([refreshSupplement(selected, version, revision, 'transcript'), refreshSupplement(selected, version, revision, 'tools')]);
+      } catch (error) {
+        if (version !== authVersion || revision !== dataRevision) return;
+        put('connection-status', 'Disconnected'); $('connection-status').className = 'badge failed';
+        message('connection-error', error.message + ' Displaying the last available data.');
+        $('connection-error').closest('details').open = true;
+      } finally { $('refresh').disabled = false; }
+    }
+    async function act(action, body, success, clear) {
+      if (!selected || mutationBusy) return;
+      const id = selected, version = authVersion;
+      mutationBusy = true; renderDetail();
+      message('action-error', ''); message('action-message', '');
+      try {
+        await api('/api/sessions/' + encodeURIComponent(id) + '/' + action, body);
+        if (version !== authVersion) return;
+        dataRevision++;
+        if (id === selected) { if (clear) clear(); message('action-message', success); }
+        await queueRefresh();
+      } catch (error) {
+        if (id === selected && version === authVersion) message('action-error', error.message + ' Check current session state before sending again.');
+      } finally { mutationBusy = false; renderDetail(); }
+    }
+    function setToken(value) {
+      token = value; authVersion++; dataRevision++;
+      $('token').value = '';
+      selectSession(null); drafts.clear();
+      agents = []; sessions = []; agentsSignature = '';
+      renderAgents(); renderSessions();
+      $('create-dialog').close(); $('create-input').value = ''; $('create-task').value = '';
+      message('create-error', ''); message('connection-error', '');
+      put('connection-status', 'Connecting'); $('connection-status').className = 'badge';
+      queueRefresh();
+    }
+    $('origin').textContent = origin;
+    $('refresh').addEventListener('click', queueRefresh);
+    $('agent-filter').addEventListener('change', () => { renderSessions(); queueRefresh(); });
+    for (const id of ['transcript-section', 'tools-section']) $(id).addEventListener('toggle', () => { if ($(id).open) queueRefresh(); });
+    $('connection-form').addEventListener('submit', event => {
+      event.preventDefault(); setToken($('token').value.trim());
+      put('token-note', token ? 'Token set for this tab. Reloading clears it.' : 'Kept in this tab’s memory only.');
+    });
+    $('clear-token').addEventListener('click', () => {
+      setToken(''); put('token-note', 'Token cleared.');
+    });
+    $('new-session').addEventListener('click', () => {
+      message('create-error', '');
+      if ($('agent-filter').value) $('create-agent').value = $('agent-filter').value;
+      $('create-dialog').showModal(); $('create-input').focus();
+    });
+    $('cancel-create').addEventListener('click', () => $('create-dialog').close());
+    $('create-dialog').addEventListener('cancel', event => { if (creating) event.preventDefault(); });
+    $('create-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (creating) return;
+      const input = $('create-input').value;
+      if (!input.trim()) { message('create-error', 'Add an instruction to start this session.'); return; }
+      creating = true; $('submit-create').disabled = true; $('cancel-create').disabled = true;
+      message('create-error', '');
+      const body = {agent_id:$('create-agent').value, input}, version = authVersion;
+      if ($('create-task').value.trim()) body.task = $('create-task').value.trim();
+      try {
+        const result = await api('/api/sessions', body);
+        if (version !== authVersion) return;
+        dataRevision++;
+        $('create-input').value = ''; $('create-task').value = ''; $('create-dialog').close();
+        $('agent-filter').value = body.agent_id;
+        if (result?.id) selectSession(result.id);
+        await queueRefresh();
+      } catch (error) {
+        if (version === authVersion) message('create-error', error.message + ' Check the session list before trying again; the request may have reached the runtime.');
+      } finally { creating = false; $('submit-create').disabled = false; $('cancel-create').disabled = false; }
+    });
+    $('stop').addEventListener('click', () => act('stop', {}, 'Stop requested.'));
+    $('resume').addEventListener('click', () => act('resume', {}, 'Resume requested.'));
+    $('steer-form').addEventListener('submit', event => {
+      event.preventDefault();
+      const text = $('steer-text').value;
+      if (!text.trim()) { message('action-error', 'Enter a direction to send.'); return; }
+      act('steer', {text}, 'Direction sent.', () => { if ($('steer-text').value === text) $('steer-text').value = ''; });
+    });
+    $('resolve-form').addEventListener('submit', event => {
+      event.preventDefault();
+      const call_id = $('call-id').value.trim(), raw = $('tool-result').value;
+      if (!call_id) { message('action-error', 'Enter the call ID to resolve.'); return; }
+      let result;
+      try { result = JSON.parse(raw); } catch (_) { message('action-error', 'The observed result must be valid JSON.'); return; }
+      act('resolve-tool', {call_id, result}, 'Tool result recorded.', () => {
+        if ($('call-id').value.trim() === call_id && $('tool-result').value === raw) { $('call-id').value = ''; $('tool-result').value = ''; }
+      });
+    });
+    setInterval(() => { if (!document.hidden) queueRefresh(); }, 3000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) queueRefresh(); });
+    queueRefresh();
+  </script>
+</body>
+</html>

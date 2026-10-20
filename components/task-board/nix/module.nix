@@ -1,0 +1,264 @@
+# NixOS module for the task-board service. capmesh-style: a dotfiles role does
+#   imports = [ task-board.nixosModules.task-board ];
+#   services.task-board.enable = true;
+# and the daemon runs as a hardened systemd service, serving MCP (/mcp), the REST API
+# (/api), and the web UI (/) on one port.
+#
+# Same no-auth-yet posture as the other LAN services: trust-on-first-use, sits behind
+# the gateway. Add real auth (and gate the firewall port) when that lands.
+self:
+{ config, lib, pkgs, ... }:
+let
+  cfg = config.services.task-board;
+  pkg = self.packages.${pkgs.system}.task-board;
+
+  # The daemon reads a TOML config file (--config); generate it from the options below.
+  # ipfs_api_url is only emitted when set (TOML has no null) — absent keeps the board CID-only.
+  settings = {
+    db_path = cfg.dbPath;
+    host = cfg.host;
+    port = cfg.port;
+    webhook_timeout_secs = cfg.webhookTimeout;
+    mcp_allowed_hosts = cfg.mcpAllowedHosts;
+  } // lib.optionalAttrs (cfg.ipfsApiUrl != null) {
+    ipfs_api_url = cfg.ipfsApiUrl;
+  } // lib.optionalAttrs cfg.dbSnapshotEnabled {
+    db_snapshot_enabled = true;
+  } // lib.optionalAttrs (cfg.dbSnapshotUser != null) {
+    db_snapshot_user = cfg.dbSnapshotUser;
+  } // lib.optionalAttrs (cfg.dbSnapshotPassword != null) {
+    db_snapshot_password = cfg.dbSnapshotPassword;
+  } // lib.optionalAttrs (cfg.operatorPerson != null) {
+    operator_person = cfg.operatorPerson;
+  } // lib.optionalAttrs (cfg.operatorDisplayName != null) {
+    operator_display_name = cfg.operatorDisplayName;
+  } // lib.optionalAttrs (cfg.hosts != { }) {
+    hosts = cfg.hosts;
+  };
+  configFile = (pkgs.formats.toml { }).generate "task-board.toml" settings;
+in
+{
+  options.services.task-board = {
+    enable = lib.mkEnableOption "the task-board agent coordination service";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkg;
+      defaultText = lib.literalMD "the flake's `task-board` package";
+      description = "The task-board package to run.";
+    };
+
+    host = lib.mkOption {
+      type = lib.types.str;
+      default = "0.0.0.0";
+      description = "Address to bind.";
+    };
+
+    port = lib.mkOption {
+      type = lib.types.port;
+      default = 8079;
+      description = "Port to listen on for MCP, REST, and the UI.";
+    };
+
+    dbPath = lib.mkOption {
+      type = lib.types.path;
+      default = "/data/task-board/board.db";
+      description = "SQLite database path. Kept off the root fs, on /data.";
+    };
+
+    webhookTimeout = lib.mkOption {
+      type = lib.types.number;
+      default = 5;
+      description = "Best-effort webhook POST timeout in seconds.";
+    };
+
+    mcpAllowedHosts = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "board.lan:8079" "board.example.com" ];
+      description = ''
+        Host authorities the MCP endpoint (/mcp) accepts in the inbound Host header.
+        rmcp only accepts loopback hosts by default (DNS-rebinding protection), so a
+        LAN-exposed or reverse-proxied deployment must list the authorities clients
+        actually send. Empty keeps the loopback-only default; a single "*" disables
+        the check entirely (any Host accepted — closed networks only).
+      '';
+    };
+
+    ipfsApiUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "http://127.0.0.1:5001";
+      description = ''
+        Optional IPFS HTTP API base URL. When set, the board can content-address raw
+        document `content` server-side (pin via /api/v0/add and store the returned CID), so a
+        client with no local IPFS can author a document. Typically the loopback Kubo API on
+        this host. Null (the default) keeps the board strictly CID-only: callers supply a CID.
+      '';
+    };
+
+    dbSnapshotEnabled = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Enable the authenticated DB-snapshot download endpoint (GET /api/admin/db-snapshot): a
+        point-in-time-consistent VACUUM INTO copy of the SQLite database behind HTTP Basic auth --
+        the extraction primitive for host migration + DR. Off by default (the endpoint 404s).
+        Requires dbSnapshotUser + dbSnapshotPassword when enabled (otherwise the endpoint 503s).
+
+        SECURITY: this module store-renders its config into the WORLD-READABLE /nix/store, so a
+        dbSnapshotPassword set here lands as PLAINTEXT readable by any local user. Only acceptable
+        for a short-lived credential disabled again right after use (e.g. a one-off migration); do
+        NOT leave this enabled as a standing surface. The whole fleet's data (incl secret-broker
+        records) is in that file -- keep the endpoint behind the gateway / LAN-bound, never a bare
+        public path, and turn it back off (404) once the pull is done.
+      '';
+    };
+
+    dbSnapshotUser = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "HTTP Basic-auth username for the DB-snapshot endpoint. Required when dbSnapshotEnabled.";
+    };
+
+    dbSnapshotPassword = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        HTTP Basic-auth password for the DB-snapshot endpoint. Required when dbSnapshotEnabled.
+        NOTE: store-rendered as plaintext (see dbSnapshotEnabled) -- use only a temporary credential.
+      '';
+    };
+
+    operatorPerson = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "alice";
+      description = ''
+        Person id of the deployment's operator. When set, startup adds that person, the
+        operator -> <id> identity alias, and the person's membership in the "operator" team, each
+        only if absent, so a later edit is kept. Null (the default) seeds no person.
+      '';
+    };
+
+    operatorDisplayName = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "Alice";
+      description = "Display name for operatorPerson. Defaults to the id.";
+    };
+
+    hosts = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
+      default = { };
+      example = {
+        "board.example.com".auth_header = "x-tunnel-user";
+        "127.0.0.1" = { };
+      };
+      description = ''
+        Per-host trusted-front-door auth, keyed by the inbound Host authority's hostname. A host
+        whose attrs set auth_header FORCES the acting user of a write to that request header's value
+        (the client cannot attribute the write to anyone else), and a write missing the header is
+        rejected 401. A host with no auth_header (e.g. "127.0.0.1" = { }) or any unlisted host stays
+        permissive -- the client sets its own actor. Lets a tunnel-fronted public hostname force the
+        username from the tunnel's authenticated-user header while localhost stays open for dev.
+      '';
+    };
+
+    openFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Open the listen port in the firewall (LAN-only posture).";
+    };
+
+    user = lib.mkOption {
+      type = lib.types.str;
+      default = "task-board";
+      description = "User the service runs as.";
+    };
+
+    group = lib.mkOption {
+      type = lib.types.str;
+      default = "task-board";
+      description = "Group the service runs as.";
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    users.users.${cfg.user} = {
+      isSystemUser = true;
+      group = cfg.group;
+      description = "task-board service user";
+    };
+    users.groups.${cfg.group} = { };
+
+    # Socket activation: systemd owns the listening socket, not the service process. Because the
+    # socket unit stays active across a service stop->start (e.g. a redeploy / `colmena switch`),
+    # the listening fd is never closed during the swap — mid-deploy connections queue in the kernel
+    # backlog and are served the moment the new process accepts, instead of hitting a
+    # connection-refused window that surfaces as a deploy-time 502 at the proxy. The board binary
+    # picks up the passed fd via LISTEN_FDS (listenfd) and falls back to binding itself when run
+    # outside systemd.
+    systemd.sockets.task-board = {
+      description = "task-board listening socket (survives service restarts so a redeploy queues connections instead of refusing them)";
+      wantedBy = [ "sockets.target" ];
+      socketConfig.ListenStream = "${cfg.host}:${toString cfg.port}";
+    };
+
+    systemd.services.task-board = {
+      description = "task-board: agent coordination board (MCP + REST + UI)";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "task-board.socket" ];
+      after = [ "network.target" "task-board.socket" ];
+
+      # Service-ONLY restart on a redeploy, leaving the socket unit (and its listening fd) up, so
+      # mid-deploy connections queue in the kernel backlog instead of hitting a connection-refused
+      # window (the recurring deploy-time 502). Without this, switch-to-configuration-ng drags the
+      # socket into the stop-set when it restarts a socket-activated service (it runs the socket
+      # stop/start branch) -- bouncing the fd on every deploy. `stopIfChanged = false` makes ng run
+      # `systemctl restart task-board.service` only, never entering that branch. restartIfChanged
+      # stays true (default) so the restart still reloads the new ExecStart -- a service-only
+      # restart that picks up the new build without closing the socket. Confirmed live on green
+      # (socket ActiveEnterTimestamp held across a deploy; service restarted onto the new build).
+      # Pairs with the board-side graceful SIGTERM drain for a zero-downtime deploy (task_753).
+      stopIfChanged = false;
+
+      environment = {
+        RUST_LOG = lib.mkDefault "info,task_board=debug";
+      };
+
+      serviceConfig = {
+        # Create/own the DB directory as root before dropping privileges (the /data role
+        # provides the mount; this just makes the subdir). The `+` runs it as root.
+        ExecStartPre = "+${pkgs.coreutils}/bin/install -d -o ${cfg.user} -g ${cfg.group} -m 0750 ${builtins.dirOf cfg.dbPath}";
+        ExecStart = "${lib.getExe cfg.package} --config ${configFile}";
+        User = cfg.user;
+        Group = cfg.group;
+        Restart = "on-failure";
+        RestartSec = 2;
+
+        # Let systemd create/own the DB's parent dir under /data when it's a subdir of
+        # a StateDirectory-style location; otherwise ensure it exists via a pre-start.
+        StateDirectory = "task-board";
+
+        # Hardening — this is stateless plumbing that only needs its DB dir writable.
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectControlGroups = true;
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        RestrictNamespaces = true;
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        # Grant write access to the DB's directory (e.g. /data/task-board).
+        ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
+      };
+    };
+
+    networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
+  };
+}

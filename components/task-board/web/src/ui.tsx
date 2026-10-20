@@ -1,0 +1,458 @@
+// Small presentational helpers shared across the app.
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { api } from './api'
+import type { AgentStatus, TaskStatus } from './api'
+import { AgentMentionContext } from './markdown'
+import { useIdentityAliases } from './resources'
+
+export const TASK_COLUMNS: TaskStatus[] = [
+  'todo',
+  'in_progress',
+  'blocked',
+  'done',
+  'cancelled',
+]
+
+export const STATUS_LABEL: Record<TaskStatus, string> = {
+  todo: 'To do',
+  in_progress: 'In progress',
+  blocked: 'Blocked',
+  done: 'Done',
+  cancelled: 'Cancelled',
+  icebox: 'Icebox',
+}
+
+// Tailwind classes for each task status chip. Theme-aware (task_1247): the dark tint (bg-*-500/15 +
+// text-*-300) composited over a light surface failed WCAG AA, so light theme uses a solid -100 bg
+// with -700/-800 text (both AA on white); the dark: variants restore the original dark palette.
+export const STATUS_CHIP: Record<TaskStatus, string> = {
+  todo: 'bg-slate-100 text-slate-700 ring-slate-500/30 dark:bg-slate-500/15 dark:text-slate-300',
+  in_progress: 'bg-sky-100 text-sky-800 ring-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300',
+  blocked: 'bg-rose-100 text-rose-700 ring-rose-500/30 dark:bg-rose-500/15 dark:text-rose-300',
+  done: 'bg-emerald-100 text-emerald-800 ring-emerald-500/30 dark:bg-emerald-500/15 dark:text-emerald-300',
+  cancelled: 'bg-zinc-100 text-zinc-600 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-400',
+  // Frost tint, distinct from cancelled's zinc -- "kept, not now" rather than "won't do".
+  icebox: 'bg-cyan-100 text-cyan-800 ring-cyan-500/30 dark:bg-cyan-500/15 dark:text-cyan-300',
+}
+
+export const AGENT_DOT: Record<AgentStatus, string> = {
+  online: 'bg-emerald-400',
+  busy: 'bg-amber-400',
+  away: 'bg-slate-400',
+  offline: 'bg-zinc-600',
+}
+
+// Slack-style unread indicator for a channel (task_1058 goal 3). `count` > 0 renders a compact
+// sky count pill (capped "9+"); `dotOnly` renders just a dot (for an aggregate "something here"
+// marker on a nav link, where a precise count is noise). Nothing renders when count is 0/undefined,
+// so a caller can drop it in unconditionally. aria-label keeps it legible to a screen reader.
+export function UnreadBadge({ count, dotOnly }: { count?: number; dotOnly?: boolean }) {
+  if (!count || count <= 0) return null
+  if (dotOnly)
+    return (
+      <span
+        className="inline-block h-2 w-2 shrink-0 rounded-full bg-sky-400"
+        aria-label={`${count} unread`}
+      />
+    )
+  return (
+    <span
+      className="inline-flex min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-5 text-white"
+      aria-label={`${count} unread`}
+    >
+      {count > 9 ? '9+' : count}
+    </span>
+  )
+}
+
+export function StatusChip({ status }: { status: TaskStatus }) {
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${STATUS_CHIP[status]}`}
+    >
+      {STATUS_LABEL[status]}
+    </span>
+  )
+}
+
+export function PriorityDot({ priority }: { priority: string | null }) {
+  if (!priority) return null
+  const color =
+    priority === 'high' || priority === 'urgent'
+      ? 'bg-rose-400'
+      : priority === 'low'
+        ? 'bg-slate-500'
+        : 'bg-amber-400'
+  return (
+    <span
+      title={`priority: ${priority}`}
+      className={`inline-block size-2 rounded-full ${color}`}
+    />
+  )
+}
+
+// Render the author of a post/comment. When `externalAuthor` is set — a bridged human (e.g. an
+// ingested Slack user) — show that identity as the author with a subtle "via <ingester>" hint,
+// so an ingested message reads as the person, not the fleet agent that relayed it (#141 §6).
+// `resolveExternal` maps an external id (e.g. "slack:U123") to a display name; falls back to the
+// bare id. Plain fleet-agent authors render unchanged.
+// A name that links to its profile page when it resolves to a known agent/person/alias (the same
+// app-wide resolver @mentions use), so clicking a comment's author opens their page (task_1426).
+// An unresolved name (unknown id, or "anon") stays plain text -- no dead links.
+function AuthorName({ id }: { id: string }) {
+  const resolve = useContext(AgentMentionContext)
+  const target = resolve(id)
+  if (!target) return <span className="font-mono">{id}</span>
+  return (
+    <Link
+      to={target.href}
+      className="font-mono hover:underline"
+      title={target.canonical !== id ? `${id} -> ${target.canonical}` : undefined}
+    >
+      {id}
+    </Link>
+  )
+}
+
+export function AuthorLabel({
+  author,
+  externalAuthor,
+  resolveExternal,
+}: {
+  author: string | null | undefined
+  externalAuthor?: string | null
+  resolveExternal?: (id: string) => string
+}) {
+  if (externalAuthor) {
+    const name = resolveExternal ? resolveExternal(externalAuthor) : externalAuthor
+    return (
+      <span>
+        <span className="font-mono">{name}</span>
+        {author && (
+          <span className="text-[var(--color-muted)]">
+            {' '}
+            · via <AuthorName id={author} />
+          </span>
+        )}
+      </span>
+    )
+  }
+  return <AuthorName id={author ?? 'anon'} />
+}
+
+// Render an identity id, resolving a known alias to its canonical identity for DISPLAY (task 532).
+// Generic: any alias -> canonical (e.g. operator -> alice; extensible for the multi-operator
+// model). Shows the canonical, with a tooltip noting the alias so the original reference stays
+// discoverable. Stored data (assignee, etc.) is never rewritten — this is display-only.
+export function Identity({ id, className }: { id: string; className?: string }) {
+  const { data: aliases } = useIdentityAliases()
+  const hit = aliases?.find((a) => a.alias === id)
+  if (!hit) return <span className={className}>{id}</span>
+  return (
+    <span className={className} title={`alias: ${hit.alias} -> ${hit.canonical}`}>
+      {hit.canonical}
+    </span>
+  )
+}
+
+export function relTime(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ''
+  const s = Math.round((Date.now() - then) / 1000)
+  if (s < 60) return `${s}s ago`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.round(m / 60)
+  if (h < 24) return `${h}h ago`
+  const d = Math.round(h / 24)
+  return `${d}d ago`
+}
+
+// True when the primary pointer is coarse (touch) — i.e. a phone/tablet. On such devices the
+// on-screen keyboard's Enter should insert a newline (submit via the send button), matching Slack
+// and most mobile text apps (task 435). Reactive, so a hybrid device that gains/loses a mouse
+// updates. SSR-safe (matchMedia may be absent).
+export function useCoarsePointer() {
+  const [coarse, setCoarse] = useState(
+    () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
+  )
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return
+    const mq = window.matchMedia('(pointer: coarse)')
+    const onChange = () => setCoarse(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return coarse
+}
+
+// A single-line-looking textarea that grows with its content (up to maxHeight, then scrolls) —
+// used for every comment/message composer so multi-line input isn't cramped in a fixed box.
+// On desktop (fine pointer) Enter submits (matching the old <input> composers); on touch devices
+// Enter inserts a newline and you submit via the send button (task 435). Shift+Enter always newlines.
+// @-mention candidates, fetched ONCE and shared across every composer — lazily, on the first '@'
+// typed anywhere, so an idle board pays nothing. A failed fetch clears the promise so a later '@'
+// retries. (task 474) The candidate set is every mentionable principal — agents, people, and
+// identity aliases — so the auto-complete can suggest a person (@alice) or an alias (@operator),
+// both of which already auto-link in rendered text, not just agents (task_1157, follow-on to the
+// task_1139 people-link + task_1151 fuzzy-match work).
+type MentionCandidate = { id: string; label: string }
+let mentionCandidatesCache: MentionCandidate[] | null = null
+let mentionCandidatesPromise: Promise<MentionCandidate[]> | null = null
+function loadMentionCandidates(): Promise<MentionCandidate[]> {
+  if (mentionCandidatesCache) return Promise.resolve(mentionCandidatesCache)
+  if (!mentionCandidatesPromise) {
+    // Each source is caught independently so one failing list (e.g. people) still yields the others
+    // rather than an empty dropdown.
+    const safe = <T,>(p: Promise<T[]>) => p.catch(() => [] as T[])
+    mentionCandidatesPromise = Promise.all([
+      safe(api.listAgents()),
+      safe(api.listPeople()),
+      safe(api.listIdentityAliases()),
+    ])
+      .then(([agents, people, aliases]) => {
+        // Dedup by handle, agents first then people then aliases, so an alias never shadows a real
+        // agent/person id and a handle registered as both shows once. An alias's label is its
+        // canonical target, so typing the canonical name also surfaces the alias.
+        const byId = new Map<string, MentionCandidate>()
+        for (const a of agents)
+          if (!byId.has(a.id)) byId.set(a.id, { id: a.id, label: a.display_name || a.id })
+        for (const p of people)
+          if (!byId.has(p.id)) byId.set(p.id, { id: p.id, label: p.display_name || p.id })
+        for (const al of aliases)
+          if (!byId.has(al.alias)) byId.set(al.alias, { id: al.alias, label: al.canonical })
+        const merged = [...byId.values()]
+        mentionCandidatesCache = merged
+        return merged
+      })
+      .catch(() => {
+        mentionCandidatesPromise = null // allow a retry on the next '@'
+        return []
+      })
+  }
+  return mentionCandidatesPromise
+}
+
+// The @mention token being typed immediately before the caret, if any: an '@' at a token boundary
+// (start-of-text or after whitespace) followed by mention-id chars ([A-Za-z0-9_-], matching the
+// server's extract_mentions) up to the caret. Returns the '@' index + the partial query.
+function activeMention(value: string, caret: number): { start: number; query: string } | null {
+  const m = /(?:^|\s)@([A-Za-z0-9_-]*)$/.exec(value.slice(0, caret))
+  if (!m) return null
+  const query = m[1]
+  return { start: caret - query.length - 1, query }
+}
+
+// Word-boundary chars in a handle/label, so a match that starts a word (concierge in "v-concierge",
+// "Review" in "Review Bot") ranks above a mid-word one.
+const MENTION_BOUNDARY = /[-_ /.]/
+
+// Fuzzy-match a typed mention query against one candidate string, returning a rank score (higher is
+// better) or null for no match. The operator asked for fuzzy (substring/typo-tolerant) auto-complete
+// rather than exact/prefix (task_1151). Two tiers, both case-insensitive:
+//   1. Contiguous substring -> high score, boosted for a prefix or word-boundary start and for an
+//      earlier position. "cnc" matches "concierge"? no (not contiguous); "con" does, strongly.
+//   2. Subsequence (query chars appear in order, gaps allowed) -> lower score, so a dropped letter
+//      or an abbreviation still matches ("cncrge"/"alc" -> "concierge"/"alice") but always ranks
+//      below a real substring hit. Consecutive-run and word-boundary matches earn more.
+// An empty query scores 0 for every candidate (the just-typed '@' lists everyone, as before).
+function fuzzyScore(query: string, text: string): number | null {
+  if (!query) return 0
+  const q = query.toLowerCase()
+  const t = text.toLowerCase()
+  const idx = t.indexOf(q)
+  if (idx !== -1) {
+    let score = 1000 - Math.min(idx, 100)
+    if (idx === 0) score += 500
+    else if (MENTION_BOUNDARY.test(t[idx - 1])) score += 250
+    return score
+  }
+  let ti = 0
+  let score = 0
+  let streak = 0
+  let prev = -2
+  for (const c of q) {
+    let found = -1
+    for (let j = ti; j < t.length; j++) {
+      if (t[j] === c) {
+        found = j
+        break
+      }
+    }
+    if (found === -1) return null
+    if (found === prev + 1) {
+      streak++
+      score += 10 + streak * 5
+    } else {
+      streak = 0
+      score += 1
+    }
+    if (found === 0 || MENTION_BOUNDARY.test(t[found - 1])) score += 15
+    prev = found
+    ti = found + 1
+  }
+  return score
+}
+
+export function AutoGrowTextarea({
+  value,
+  onChange,
+  onSubmit,
+  placeholder,
+  disabled,
+  className,
+  maxHeight = 200,
+}: {
+  value: string
+  onChange: (v: string) => void
+  onSubmit?: () => void
+  placeholder?: string
+  disabled?: boolean
+  className?: string
+  maxHeight?: number
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null)
+  const coarsePointer = useCoarsePointer()
+  // @mention typeahead state (task 474). `mention` is the active partial token; `sel` the
+  // highlighted candidate. The mentionable principals load lazily into `principals` on the first '@'.
+  const [principals, setPrincipals] = useState<MentionCandidate[]>(mentionCandidatesCache ?? [])
+  const [mention, setMention] = useState<{ start: number; query: string } | null>(null)
+  const [sel, setSel] = useState(0)
+
+  // Fuzzy-rank the candidates against the active query (task_1151): score each on the better of its
+  // id or label, drop non-matches, and sort best-first (ties -> shorter label, then id) so the
+  // strongest match is pre-selected at the top. Top 8 only, to keep the dropdown compact.
+  const candidates = mention
+    ? principals
+        .map((a) => ({
+          a,
+          score: Math.max(
+            fuzzyScore(mention.query, a.id) ?? -Infinity,
+            fuzzyScore(mention.query, a.label) ?? -Infinity,
+          ),
+        }))
+        .filter((x) => x.score > -Infinity)
+        .sort(
+          (x, y) =>
+            y.score - x.score || x.a.label.length - y.a.label.length || x.a.id.localeCompare(y.a.id),
+        )
+        .slice(0, 8)
+        .map((x) => x.a)
+    : []
+  const open = candidates.length > 0
+
+  // Resize to fit content on every value change (including a reset to '' after submit, which
+  // shrinks it back). Measuring requires clearing the height first so scrollHeight can drop.
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    el.style.height = 'auto'
+    // Only scroll once the content actually exceeds maxHeight; otherwise hide the y-overflow so a
+    // single-line composer never shows a stray scrollbar (macOS/Chrome renders one at the exact
+    // content height from sub-pixel rounding — the operator's top scrollbar complaint, task 518).
+    el.style.overflowY = el.scrollHeight > maxHeight ? 'auto' : 'hidden'
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
+  }, [value, maxHeight])
+
+  function recompute(v: string, caret: number) {
+    const m = activeMention(v, caret)
+    setMention(m)
+    setSel(0)
+    if (m && principals.length === 0) loadMentionCandidates().then(setPrincipals)
+  }
+
+  function accept(a: MentionCandidate) {
+    if (!mention) return
+    const before = value.slice(0, mention.start)
+    const after = value.slice(mention.start + 1 + mention.query.length)
+    const insert = `@${a.id} `
+    onChange(before + insert + after)
+    setMention(null)
+    const pos = before.length + insert.length
+    requestAnimationFrame(() => {
+      const el = ref.current
+      if (el) {
+        el.focus()
+        el.selectionStart = el.selectionEnd = pos
+      }
+    })
+  }
+
+  return (
+    // The wrapper takes the flex sizing every caller puts on the composer (flex-1 in a flex row);
+    // the textarea fills it (w-full). This keeps the mention dropdown positioned relative to the
+    // composer without changing any call site's layout.
+    <div className="relative flex-1 min-w-0">
+      <textarea
+        ref={ref}
+        rows={1}
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        onChange={(e) => {
+          onChange(e.target.value)
+          recompute(e.target.value, e.target.selectionStart)
+        }}
+        onBlur={() => setMention(null)}
+        onKeyDown={(e) => {
+          // When the mention dropdown is open it captures navigation/accept keys FIRST, so Enter
+          // picks a candidate rather than submitting.
+          if (open) {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault()
+              setSel((s) => (s + 1) % candidates.length)
+              return
+            }
+            if (e.key === 'ArrowUp') {
+              e.preventDefault()
+              setSel((s) => (s - 1 + candidates.length) % candidates.length)
+              return
+            }
+            if (e.key === 'Enter' || e.key === 'Tab') {
+              e.preventDefault()
+              accept(candidates[Math.min(sel, candidates.length - 1)])
+              return
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              setMention(null)
+              return
+            }
+          }
+          // Touch devices: let Enter insert a newline (submit via the send button) — task 435.
+          if (e.key === 'Enter' && !e.shiftKey && !coarsePointer && onSubmit) {
+            e.preventDefault()
+            onSubmit()
+          }
+        }}
+        className={`w-full resize-none ${className ?? ''}`}
+      />
+      {open && (
+        <ul className="absolute bottom-full left-0 z-20 mb-1 max-h-48 w-64 overflow-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-sm shadow-lg">
+          {candidates.map((a, i) => (
+            <li key={a.id}>
+              <button
+                type="button"
+                // mousedown (not click) so we accept before the textarea's blur closes the list.
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  accept(a)
+                }}
+                className={`flex w-full flex-col items-start px-2 py-1 text-left ${
+                  i === sel ? 'bg-sky-500/20' : 'hover:bg-[var(--color-panel)]'
+                }`}
+              >
+                <span className="font-mono text-xs text-sky-700 dark:text-sky-300">@{a.id}</span>
+                {a.label !== a.id && (
+                  <span className="text-[11px] text-[var(--color-muted)]">{a.label}</span>
+                )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}

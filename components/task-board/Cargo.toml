@@ -1,0 +1,64 @@
+[package]
+name = "task-board"
+version = "0.1.0"
+edition = "2021"
+description = "Scrappy SQLite + MCP/REST coordination board for agents"
+license = "MIT"
+
+[[bin]]
+name = "task-board"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "3", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+] }
+axum = { version = "0.8", features = ["macros", "ws"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+schemars = "1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+anyhow = "1"
+thiserror = "2"
+# Compile-time self-registration (task_1497): the REST discovery catalog + the body-schema set
+# collect their entries from linker-section statics (`inventory::submit!` at each definition site)
+# instead of a central hand-maintained append list, so new endpoints/schemas stop colliding on a
+# shared line. Collected under both the native binary and `cargo test` (verified by v-fleet-tooling).
+inventory = "0.3"
+base64 = "0.22"
+# Pattern matching for the design-doc structural submit gate (task_1038 placeholder/attestation
+# checks). Already in the tree transitively; promoted to a direct dep.
+regex = "1"
+# Socket activation: pick up a systemd-passed listening fd (LISTEN_FDS) so the socket survives a
+# restart/redeploy (mid-deploy connections queue in the backlog instead of connection-refused).
+listenfd = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+jsonschema = "0.58.3"
+futures-util = "0.3"
+# CommonMark parser: extract_wiki_edges walks its event stream so [[links]]/![[embeds]] are
+# recognized with code-span/code-fence awareness and block-only embed semantics (task 785),
+# matching the frontend renderer instead of a raw-byte regex scan.
+pulldown-cmark = { version = "0.12", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+# WS client for the /tunnel/ws round-trip integration test (plain ws://, no TLS backend).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+futures-util = "0.3"
+# `ServiceExt::oneshot` for router-level request tests (e.g. typed-id path extraction, task 504).
+tower = { version = "0.5", features = ["util"] }

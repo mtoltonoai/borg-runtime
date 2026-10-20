@@ -1,0 +1,94 @@
+{
+  "schema": "borg-vendored-components/v1",
+  "import_date": "2026-10-20",
+  "imported_at_utc": "2026-10-20T00:27:10.470860+00:00",
+  "ownership": "These tracked source snapshots have moved into this repository as ordinary vendored source. Future changes are made and reviewed here; the original clones and published snapshots remain unchanged. These are not submodules.",
+  "validation": "Exact tracked file paths, Git blob identities, file types and executable modes verified before portability adjustments. No builds or tests run.",
+  "components": [
+    {
+      "name": "fleet",
+      "destination": "components/fleet",
+      "origin": "https://github.com/mtoltonoai/fleet.git",
+      "commit": "13d4b32e9fbcd9287b88a33fe95939ea22e9d103",
+      "tree": "5fefde8386569db7db0de02cb21920c7bfdbf3a9",
+      "tracked_file_count": 118,
+      "archive_sha256": "76ec11d6d15b81fe69a44e3c697334d7f0d140043e3cce947bd43a97bf6f990b",
+      "tracked_path_mode_blob_manifest_sha256": "db9bc23d090c44af8edfe3d0c5b9eccaa27b6b21d485b5fa76de616025c21479",
+      "initial_import_exact": true,
+      "portability_adjustments": [
+        {
+          "path": "crates/fleet/build.rs",
+          "reason": "Resolve build-revision watcher metadata from the containing Git repository/worktree instead of ../../.git; include current branch ref, packed refs and index.",
+          "original_git_blob": "7b0a3c27c5b69c6ca0e3f4be6af85293cbff3ace",
+          "original_sha256": "eb86ba7c3a2f5c5457b10842ba8c26a9586abe5010489198ba066d8fd699335a",
+          "current_git_blob": "5289f18f8e60945745754dbd6da4b6f5eb877b33",
+          "current_sha256": "772e122bc7144645ef81e266d17b9708c8a41e70c03385da26743417d2c53696"
+        },
+        {
+          "path": "crates/fleet/src/main.rs",
+          "reason": "Keep self-redeploy Git operations at repository root, but find and build the validated Fleet Cargo workspace under components/fleet or the standalone root.",
+          "original_git_blob": "6be31e2feed7a74168e15086c74d5cb16b5c8653",
+          "original_sha256": "ef0d2ecfa9d5bd34b1eff153eedc31149070e9e7ef5a8356a1a4f52aa9b1f6f2",
+          "current_git_blob": "96b75825311713979943277204f8e027df3a2ecc",
+          "current_sha256": "605ebae76d4d22a82763a5fe5ffce21b879c6b198c9ebff6abc82a8e86d6cc1c"
+        },
+        {
+          "path": "nix/fleet-daemons.nix",
+          "reason": "Recognize a nested component/worktree as a Git checkout without requiring its own .git directory.",
+          "original_git_blob": "748bbee747f9fec6030cfded62eb972cf22a1aa8",
+          "original_sha256": "969aae4b41d865a9ed1c01a841db1dbb6f27038d5f8cfd20808c3c9232226c2f",
+          "current_git_blob": "e3eb10aad05f7435376112dd4946013e3dc0d2db",
+          "current_sha256": "5e032d7b2918de5092bbfd84b79bd55c7272940f8b6bc22b709b228faf091cb2"
+        }
+      ],
+      "remaining_files_exact": 115,
+      "types_and_modes_preserved": true
+    },
+    {
+      "name": "task-board",
+      "destination": "components/task-board",
+      "origin": "https://github.com/mtoltonoai/task-board.git",
+      "commit": "75f1ca0fbb7b732ab7400f3e02936aeb2f046c1e",
+      "tree": "a9d15740913430e0488a71f92563f2c47ade964c",
+      "tracked_file_count": 80,
+      "archive_sha256": "762b67b6495105fd6d8dd5b2c6ce7bd5647cc2fc389bc1058c8640ed5fba6643",
+      "tracked_path_mode_blob_manifest_sha256": "d63387e87b2356090878210dcf8a4f1212a8208f41decb711349aec2d45dc393",
+      "initial_import_exact": true,
+      "portability_adjustments": [],
+      "remaining_files_exact": 80,
+      "types_and_modes_preserved": true
+    }
+  ],
+  "portability_audit": {
+    "cargo_path_dependencies": [
+      {
+        "manifest": "fleet/crates/kb/Cargo.toml",
+        "dependency": "bridge-core",
+        "path": "fleet/crates/bridge-core"
+      },
+      {
+        "manifest": "fleet/crates/slack-bridge/Cargo.toml",
+        "dependency": "bridge-core",
+        "path": "fleet/crates/bridge-core"
+      },
+      {
+        "manifest": "fleet/crates/voice-assistant/Cargo.toml",
+        "dependency": "bridge-core",
+        "path": "fleet/crates/bridge-core"
+      }
+    ],
+    "independent_manifests": [
+      "components/fleet/Cargo.toml",
+      "components/task-board/Cargo.toml"
+    ],
+    "fleet_build_revision": "Git metadata watcher resolves actual containing repository/worktree HEAD, current branch ref, packed refs and index.",
+    "fleet_self_redeploy": "Git fetch/fast-forward stays at containing repository; Cargo builds from components/fleet when present, otherwise standalone root. This optional command was not executed and is not a combined Board rollout.",
+    "task_board": "No source edits required. Nix source paths, lockfile/UI paths and compile-time fixtures resolve within the component. Run scripts/gate.sh from components/task-board (root wrappers should cd there).",
+    "ci": "Fleet .github workflows retained under component as source; root CI needs explicit component working directory/pathfilters and is not activated by nested workflows.",
+    "licenses": "Fleet LICENSE preserved. Task Board declares MIT in Cargo.toml but imported snapshot contains no standalone LICENSE; none invented.",
+    "builds_or_tests_run": false,
+    "fleet_nix_freshness": "Git worktree discovery supports nested Fleet source. Set FLEET_REPO to components/fleet; existing runtime deployment configuration remains explicit.",
+    "fleet_target_directory": "Retain default components/fleet/target for checkout-run binaries. Observer/reviewer role discovery currently derives loops/ from executable ancestry; a shared outer CARGO_TARGET_DIR would break that existing assumption.",
+    "static_validation": "All198 imported paths/types/modes preserved;195 files retain exact original blobs; only3 Fleet portability files differ. Cargo manifests parsed and3 path dependency destinations checked. git diff --no-index --check emitted no whitespace diagnostics for all3 changes (exit1 reports differing files)."
+  }
+}

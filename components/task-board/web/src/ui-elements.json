@@ -1,0 +1,332 @@
+{
+  "version": 1,
+  "elements": {
+    "yes-no": {
+      "title": "Yes / no",
+      "description": "A boolean choice. The question's inline response schema is a boolean; this element renders Yes / No controls. Optional custom button labels.",
+      "component": "YesNo",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "yes_label": { "type": "string" },
+          "no_label": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "single-select": {
+      "title": "Single choice",
+      "description": "Pick exactly one option (multiple-choice). The response schema is an enum of option ids; the options live in props.",
+      "component": "SingleSelect",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
+    },
+    "multi-select": {
+      "title": "Select all that apply",
+      "description": "Pick any number of options (select-all). The response schema is an array of option ids; the options live in props. Optional min_selections / max_selections bound how many may be chosen.",
+      "component": "MultiSelect",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          },
+          "min_selections": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Minimum number of options that must be selected (omit for no floor)."
+          },
+          "max_selections": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of options that may be selected (omit for no ceiling)."
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
+    },
+    "text": {
+      "title": "Fill in the blank",
+      "description": "A free-text answer (fill-in-the-blank). The response schema is a string; optional placeholder and multiline hints are props.",
+      "component": "TextInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "placeholder": { "type": "string" },
+          "multiline": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "rank": {
+      "title": "Rank list",
+      "description": "Order the options by preference (rank-list). The response schema is an ordered permutation of the option ids; the options live in props. Optional max_ranked limits the answer to the top N (omit to rank them all).",
+      "component": "RankList",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          },
+          "max_ranked": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Rank only the top N options rather than the full list (omit to rank all)."
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
+    },
+    "age-request": {
+      "title": "Encrypted secret request",
+      "description": "Request a secret encrypted to one or more age recipients (replaces the dedicated secret-request path, task_713). The response schema is a string holding the age ciphertext, produced client-side (encrypted to every recipient), so no plaintext is ever stored on the board. props.recipient_pubkeys are the age public keys to encrypt to; optional props.target is an advisory destination the fulfiller interprets (not validated by the board).",
+      "component": "AgeRequest",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "recipient_pubkeys": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "age public keys (recipients) the secret is encrypted to, client-side; the ciphertext is encrypted to all of them."
+          },
+          "label": { "type": "string" },
+          "target": {
+            "type": "string",
+            "description": "Optional advisory destination for the secret (e.g. a path or name the fulfiller writes it to); free-form, not validated by the board."
+          }
+        },
+        "required": ["recipient_pubkeys"],
+        "additionalProperties": false
+      }
+    },
+    "string-list": {
+      "title": "List of strings",
+      "description": "Enter an arbitrary, dynamically-sized list of strings (add / remove rows), submitted as an array of strings. The response schema is an array of strings. Optional min_items / max_items bound how many rows, placeholder sets the per-row hint, and item_label names a row (e.g. \"item\" -> \"Add item\").",
+      "component": "StringList",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "min_items": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Minimum number of non-empty rows required (UI defaults to 1 if omitted)."
+          },
+          "max_items": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of rows that may be submitted (omit for no ceiling)."
+          },
+          "placeholder": { "type": "string" },
+          "item_label": {
+            "type": "string",
+            "description": "Singular noun for a row, e.g. \"item\" so the add button reads \"Add item\"."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "numeric": {
+      "title": "Number",
+      "description": "A single bounded number (a count, size, or threshold). The response schema is a number (or integer) with optional minimum / maximum / multipleOf, validated generically; this element renders a numeric input enforcing the same bounds. Optional step, placeholder, and a short unit label are props.",
+      "component": "NumericInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "minimum": {
+            "type": "number",
+            "description": "Inclusive lower bound for the entered value (mirror of the response schema's minimum)."
+          },
+          "maximum": {
+            "type": "number",
+            "description": "Inclusive upper bound for the entered value (mirror of the response schema's maximum)."
+          },
+          "integer": {
+            "type": "boolean",
+            "description": "Require a whole number (the response schema uses type integer rather than number)."
+          },
+          "step": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Granularity of the input stepper, e.g. 0.5; omit for the browser default of 1 / any."
+          },
+          "placeholder": { "type": "string" },
+          "unit": {
+            "type": "string",
+            "description": "A short unit label shown beside the input, e.g. \"ms\", \"%\", \"MB\"."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "slider": {
+      "title": "Slider",
+      "description": "A bounded continuous estimate (a percentage, budget, or any approximate number) rendered as a range slider with a live value readout -- the same number answer as the numeric element, validated against the question's inline response_schema. Both bounds are required so the slider can draw its track; step sets the granularity, integer snaps to whole numbers, and unit is a short label.",
+      "component": "SliderInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "minimum": {
+            "type": "number",
+            "description": "Inclusive lower bound (slider track start; mirror of the response schema's minimum)."
+          },
+          "maximum": {
+            "type": "number",
+            "description": "Inclusive upper bound (slider track end; mirror of the response schema's maximum)."
+          },
+          "integer": {
+            "type": "boolean",
+            "description": "Snap to whole numbers (the response schema uses type integer rather than number)."
+          },
+          "step": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Slider granularity, e.g. 5; omit for 1 (integer) or continuous (number)."
+          },
+          "unit": {
+            "type": "string",
+            "description": "A short unit label shown with the value readout, e.g. \"%\", \"ms\", \"MB\"."
+          }
+        },
+        "required": ["minimum", "maximum"],
+        "additionalProperties": false
+      }
+    },
+    "datetime": {
+      "title": "Date / time",
+      "description": "A scheduling or deadline decision picked with a native date / datetime / time control, avoiding free-text date parsing. The response schema is a string constrained by a pattern regex (the generic validator treats a string format as advisory, so the pattern -- not format -- gives the server-side guarantee): YYYY-MM-DD for mode=date, YYYY-MM-DDTHH:MM for datetime, HH:MM for time. props.mode selects the control; optional min / max bound the pickable range (same string shape as the value).",
+      "component": "DateTimeInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["date", "datetime", "time"],
+            "description": "Which native picker to render (default date). date -> YYYY-MM-DD, datetime -> YYYY-MM-DDTHH:MM, time -> HH:MM."
+          },
+          "min": {
+            "type": "string",
+            "description": "Earliest selectable value, same string shape as mode (e.g. \"2026-01-01\" for date)."
+          },
+          "max": {
+            "type": "string",
+            "description": "Latest selectable value, same string shape as mode."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "confidence-tag": {
+      "title": "Choice with confidence",
+      "description": "A single decision tagged with how sure the operator is -- it stays one decision because confidence is an attribute of the same answer (improves calibration; signals when to seek a second opinion). The answer is a composite object {choice, confidence} the generic object validation enforces (no new kind): choice is one option id, confidence is one level id. options holds the choices; confidence_levels holds the confidence scale (defaults to low / medium / high); confidence_label overrides the scale's prompt.",
+      "component": "ConfidenceTag",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          },
+          "confidence_levels": {
+            "type": "array",
+            "minItems": 2,
+            "description": "Ordered confidence scale (low to high). Omit for the default low / medium / high.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          },
+          "confidence_label": {
+            "type": "string",
+            "description": "Prompt shown above the confidence scale (default \"How confident are you?\")."
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
+    },
+    "editable-value": {
+      "title": "Editable value (approve with edit)",
+      "description": "Approve a proposed value the operator may adjust before accepting -- correct a near-right proposal in one step instead of rejecting and re-asking. The text/scalar form prefills a text field with props.proposed; the operator edits if needed and accepts, submitting the (possibly edited) string, which the inline response_schema validates (a string, optionally pattern/length-constrained). No new kind.",
+      "component": "EditableValue",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "proposed": {
+            "type": "string",
+            "description": "The proposed value prefilled into the editable field for the operator to accept or adjust."
+          },
+          "placeholder": { "type": "string" }
+        },
+        "required": ["proposed"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
