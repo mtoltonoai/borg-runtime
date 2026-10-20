@@ -23,6 +23,10 @@ class Tests(unittest.TestCase):
             self.assertNotIn('/home/dev-user/', value)
             self.assertIn('CURRENT SESSION', value)
             self.assertIn('Retry transient inference', value)
+            self.assertIn('finish the current turn', value)
+            self.assertIn('exact retained session ID', value)
+            self.assertIn('Do not pause an entire identity', value)
+            self.assertEqual(value.count(mod.WAIT_POLICY), 1)
             self.assertEqual(mod.migrated(agent, value), value)
             self.assertEqual(value.count('ROLE:'), 1)
     def test_deployment_ownership_is_task_specific_not_identity_global(self):
