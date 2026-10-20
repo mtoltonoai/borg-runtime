@@ -1,5 +1,6 @@
 """Independent children remain owned after their parent completes (tasks 23/24)."""
 import copy
+import json
 import tempfile
 from pathlib import Path
 import unittest
@@ -197,6 +198,55 @@ class ChildLineageTests(unittest.TestCase):
 
 
 class ChildJournalTests(unittest.TestCase):
+    def test_existing_child_incident_survives_ambiguous_receipts_restart_and_attempted_closure(self):
+        for ambiguity in ("runtime", "dispatch", "newer-dispatch"):
+            with self.subTest(ambiguity=ambiguity), tempfile.TemporaryDirectory() as directory:
+                board = fixture.FakeBoard()
+                board.tasks[1]["status"] = "done"
+                state = snap()
+                original = copy.deepcopy(state.dispatches[1])
+                path = Path(directory) / "recovery.sqlite"
+                journal = r.Journal(path)
+                try:
+                    r.Controller(board, journal).tick(state)
+                    row = journal.rows()[0]
+                    fault = r.Fault(**json.loads(row["payload"]))
+                    repair = board.tasks[row["task_id"]]
+                    repair["metadata"]["recovery_resolution"] = {
+                        "cause": "provisioning refusal", "fix": "source revision",
+                        "regression": "clone proof; child reconciliation still pending"}
+                    if ambiguity == "runtime":
+                        state.sessions.extend([
+                            fixture.session(id="child", task=None, generation=1,
+                                status="failed", driver_running=False, runtime_url=url)
+                            for url in ("http://worker/api", "http://other/api")])
+                    elif ambiguity == "dispatch":
+                        state.dispatches.append(dispatch(8))
+                    else:
+                        state.dispatches.extend([dispatch(8, generation=2, status="running"),
+                                                  dispatch(9, generation=2, status="running")])
+                    self.assertEqual(r.classify(state)[0], [])
+                    # Reopen from the durable observation twice. Neither restart
+                    # nor a fresh closure timestamp may turn uncertainty absent.
+                    for offset in (10, 20):
+                        repair.update(status="done", updated_at=r.iso(NOW+offset))
+                        state.now = NOW+offset+1
+                        journal.close()
+                        journal = r.Journal(path)
+                        r.Controller(board, journal).tick(state)
+                        self.assertTrue(journal.present(fault.key))
+                        self.assertEqual(repair["status"], "in_progress")
+                        self.assertNotEqual(journal.rows()[0]["state"], "closed")
+                    self.assertFalse(r.fault_observable(state, fault),
+                                     "ambiguous current state cannot clear a retained terminal failure")
+                    self.assertEqual(len(board.task_keys), 1)
+                    self.assertEqual(len(board.dispatches), 1)
+                    self.assertEqual(state.dispatches[1], original)
+                    self.assertFalse(any("symptom-cleared" in key for key in board.comments))
+                    self.assertFalse(any("/sessions" in p for _, p, _ in board.calls))
+                finally:
+                    journal.close()
+
     def test_child_failure_restart_and_resolution_preserve_one_incident_and_original_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
             board = fixture.FakeBoard()

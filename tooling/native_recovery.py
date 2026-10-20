@@ -433,6 +433,21 @@ def dispatch_evidence(dispatch: dict) -> dict:
     return evidence
 
 
+def current_dispatches(snapshot: Snapshot) -> dict[str, list[dict]]:
+    """Shared generation selection for detection AND incident-clearance proof."""
+    current: dict[str, list[dict]] = {}
+    for dispatch in snapshot.dispatches:
+        sid = dispatch.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        previous = current.get(sid, [])
+        if not previous or generation(dispatch) > generation(previous[0]):
+            current[sid] = [dispatch]
+        elif generation(dispatch) == generation(previous[0]):
+            current[sid].append(dispatch)
+    return current
+
+
 def child_session(snapshot: Snapshot, dispatch: dict) -> tuple[dict | None, bool]:
     """Ignore stale generations; refuse ambiguous same-generation observations."""
     candidates = [s for s in snapshot.sessions if s["id"] == dispatch.get("session_id")
@@ -492,16 +507,7 @@ def classify_children(snapshot: Snapshot) -> tuple[list[Fault], list[dict]]:
     """Independent child execution is not covered or closed by its parent's state."""
     lineage = SessionLineage(snapshot)
     tasks = {int(t["id"]): t for t in snapshot.tasks}
-    current: dict[str, list[dict]] = {}
-    for dispatch in snapshot.dispatches:
-        sid = dispatch.get("session_id")
-        if not isinstance(sid, str) or not sid:
-            continue
-        previous = current.get(sid, [])
-        if not previous or generation(dispatch) > generation(previous[0]):
-            current[sid] = [dispatch]
-        elif generation(dispatch) == generation(previous[0]):
-            current[sid].append(dispatch)
+    current = current_dispatches(snapshot)
     faults, waits = [], []
     for candidates in current.values():
         for dispatch in candidates:
@@ -600,14 +606,18 @@ def fault_observable(snapshot: Snapshot, fault: Fault) -> bool:
         dispatch = next((d for d in snapshot.dispatches if d.get("id") == did), None)
         if not dispatch:
             return False
+        candidates = current_dispatches(snapshot).get(dispatch.get("session_id"), [])
+        if len(candidates) != 1:
+            return False  # A retained terminal row cannot select the current owner.
+        dispatch = candidates[0]
         tid, _, reason = SessionLineage(snapshot).resolve(dispatch.get("session_id"))
         if reason or tid != fault.source_task_id:
             return False  # Changed/ambiguous ownership is not proof of recovery.
-        if dispatch.get("status") in TERMINAL or child_resolution(dispatch):
-            return True
         session, ambiguous = child_session(snapshot, dispatch)
         if ambiguous:
-            return False
+            return False  # Check uncertainty BEFORE terminal/resolution shortcuts.
+        if dispatch.get("status") in TERMINAL or child_resolution(dispatch):
+            return True
         return session is not None or snapshot.endpoints.get(api_url(dispatch["runtime_url"]), False)
     source = next((t for t in snapshot.tasks if t["id"] == fault.source_task_id), None)
     if source and source.get("status") not in ACTIONABLE:
