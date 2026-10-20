@@ -9,6 +9,7 @@ NEVER sends HTTP stop/cancellation. Execution resumes after
 activation, using a durable deployment journal. Unknown writes are never replayed.
 """
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import hashlib
 import json
@@ -24,6 +25,16 @@ sys.dont_write_bytecode = True
 from native_release import atomic_json
 
 ACTIVE = {"ready", "running", "retrying", "stopping"}
+
+
+@contextmanager
+def connection(database, read_only=False):
+    db = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30) if read_only else sqlite3.connect(database, timeout=30)
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
 
 
 def api(url, session_id, action=None):
@@ -57,7 +68,7 @@ def request_drain(database, journal):
         if value.get("database") != str(database):
             raise RuntimeError("drain journal belongs to another database")
         return value
-    with sqlite3.connect(database, timeout=30) as db:
+    with connection(database) as db:
         db.execute("PRAGMA synchronous=FULL")
         db.execute("BEGIN IMMEDIATE")
         sessions = rows(db)
@@ -68,22 +79,30 @@ def request_drain(database, journal):
                  "resumed": [], "notified": []}
         atomic_json(journal, value)
         for session in candidates:
-            db.execute("UPDATE sessions SET stop_requested=1 WHERE id=?", (session["id"],))
+            db.execute("UPDATE sessions SET stop_requested=1 WHERE id=? AND stop_requested=0", (session["id"],))
         db.commit()
     return value
 
 
 def drain(database, runtime_url, journal, wait_seconds=300, interval=0.2):
     value = request_drain(database, journal)
+    # Recover a crash between intent journaling and the original flag commit
+    # once, not on every poll. Rewriting flags every 200ms creates avoidable
+    # WAL snapshot-upgrade contention in legacy runtime deferred transactions.
+    with connection(database, read_only=True) as db:
+        missing = [sid for sid in value["sessions"] if not db.execute(
+            "SELECT stop_requested FROM sessions WHERE id=?", (sid,)).fetchone()[0]]
+    if missing:
+        with connection(database) as db:
+            db.execute("BEGIN IMMEDIATE")
+            for sid in missing:
+                db.execute("UPDATE sessions SET stop_requested=1 WHERE id=? AND stop_requested=0", (sid,))
     deadline = time.monotonic() + wait_seconds
     while True:
-        with sqlite3.connect(database, timeout=30) as db:
-            db.execute("BEGIN IMMEDIATE")
-            # A crash after journaling but before committing flags is resumable.
-            for sid in value["sessions"]:
-                db.execute("UPDATE sessions SET stop_requested=1 WHERE id=?", (sid,))
+        # Polling is genuinely read-only and closes its snapshot/connection.
+        with connection(database, read_only=True) as db:
+            db.execute("BEGIN")
             observed = rows(db)
-            db.commit()
         unsettled = [s for s in observed if any(t == "unknown" for t in s["tools"].values())]
         if unsettled:
             value.update(state="needs_reconciliation", unresolved=[s["id"] for s in unsettled])
@@ -114,7 +133,7 @@ def resume(runtime_url, journal, wait_seconds=None, interval=0.2):
         if sid in value["resumed"]:
             continue
         while True:
-            with sqlite3.connect(value["database"], timeout=30) as db:
+            with connection(value["database"]) as db:
                 raw, flag = db.execute("SELECT body,stop_requested FROM sessions WHERE id=?", (sid,)).fetchone()
                 stored = json.loads(raw)
             status = stored["status"]
@@ -130,7 +149,7 @@ def resume(runtime_url, journal, wait_seconds=None, interval=0.2):
                 atomic_json(journal, value)
                 break
             if status == "completed":
-                with sqlite3.connect(value["database"], timeout=30) as db:
+                with connection(value["database"]) as db:
                     db.execute("UPDATE sessions SET stop_requested=0 WHERE id=? AND json_extract(body,'$.status')='completed'", (sid,))
                 continue
             if status == "stopped":
@@ -142,8 +161,9 @@ def resume(runtime_url, journal, wait_seconds=None, interval=0.2):
                 except urllib.error.HTTPError as error:
                     if error.code != 409:
                         raise
+                    time.sleep(interval)
                 except (OSError, ValueError):
-                    with sqlite3.connect(value["database"], timeout=30) as db:
+                    with connection(value["database"]) as db:
                         observed_flag = db.execute("SELECT stop_requested FROM sessions WHERE id=?", (sid,)).fetchone()[0]
                     if observed_flag:
                         value["state"] = "resume_uncertain"

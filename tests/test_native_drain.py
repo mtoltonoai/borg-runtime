@@ -78,6 +78,30 @@ class DrainUnitTests(unittest.TestCase):
             api.assert_not_called()
         self.assertEqual(json.loads(self.journal.read_text())["state"], "needs_reconciliation")
 
+    def test_polling_never_rewrites_stop_flag_or_holds_writer_transaction(self):
+        body = self.session("active")
+        statements = []
+        original_connect = sqlite3.connect
+        def traced(*args, **kwargs):
+            db = original_connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+        def settle():
+            while not self.journal.exists():
+                time.sleep(0.001)
+            time.sleep(0.06)
+            with original_connect(self.database) as db:
+                db.execute("UPDATE sessions SET body=?", (json.dumps(dict(body, status="stopped")),))
+                db.execute("UPDATE tool_calls SET body=?", (json.dumps({"call": {"call_id": "call-1", "status": "succeeded"}}),))
+        with mock.patch.object(drain.sqlite3, "connect", side_effect=traced), concurrent.futures.ThreadPoolExecutor(1) as pool:
+            future = pool.submit(settle)
+            drain.drain(self.database, "http://unused", self.journal, wait_seconds=2, interval=0.005)
+            future.result(timeout=2)
+        writes = [s for s in statements if s.startswith("UPDATE sessions SET stop_requested=1")]
+        self.assertEqual(len(writes), 1, statements)
+        self.assertEqual(statements.count("BEGIN IMMEDIATE"), 1, statements)
+        self.assertGreater(statements.count("BEGIN"), 2)
+
     def test_stale_inference_snapshot_and_raced_tool_never_cancelled(self):
         self.session("active", progress="Waiting for model response", tool_status="succeeded")
         def actor_after_old_stop_check():
