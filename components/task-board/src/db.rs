@@ -1306,6 +1306,7 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .await?;
     }
 
+    crate::fleet::init(&pool).await?;
     Ok(pool)
 }
 

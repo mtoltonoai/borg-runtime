@@ -202,6 +202,24 @@ pub fn router(state: AppState) -> Router {
         .route("/tunnels", get(tunnels))
         .route("/meta", get(meta))
         .route("/metrics", get(metrics_endpoint))
+        .route("/fleet/hosts", get(crate::fleet::list_hosts))
+        .route("/fleet/hosts/{host_id}", patch(crate::fleet::update_host))
+        .route(
+            "/fleet/hosts/{host_id}/heartbeat",
+            post(crate::fleet::heartbeat),
+        )
+        .route(
+            "/fleet/dispatches",
+            get(crate::fleet::list_dispatches).post(crate::fleet::create_dispatch),
+        )
+        .route(
+            "/fleet/dispatches/adopt",
+            post(crate::fleet::adopt_dispatch),
+        )
+        .route(
+            "/fleet/dispatches/{id}",
+            get(crate::fleet::get_dispatch).patch(crate::fleet::report_dispatch),
+        )
         .route("/admin/db-snapshot", get(db_snapshot))
         .route("/agents", get(list_agents).post(register_agent))
         .route("/resolve-agent", get(resolve_agent))
@@ -939,6 +957,15 @@ struct Endpoint {
     body: Option<&'static str>,
 }
 inventory::collect!(Endpoint);
+
+inventory::submit! { Endpoint { method: "GET", path: "/api/fleet/hosts", summary: "Native Fleet hosts with Board-owned capacity, freshness, observed runtime readiness and active reservations.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/fleet/hosts/{host_id}", summary: "Update persistent host capacity, enabled/drain state, freshness policy or metadata; heartbeat does not overwrite policy.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/fleet/hosts/{host_id}/heartbeat", summary: "Report host/runtime liveness and deployed revision, seeding capacity only on initial registration.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/fleet/dispatches", summary: "List durable native dispatches, independently keyed from agent identity. Plain array; paginated with limit/offset.", query: "host_id=string&agent_id=string&task_id=int&status=string&request_id=string&session_id=string&limit=int&offset=int", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/fleet/dispatches", summary: "Atomically reserve fresh host capacity and a session UUID for an idempotent request_id; repeated changed intent conflicts.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/fleet/dispatches/adopt", summary: "Adopt an existing native session without restarting it; record its original host/runtime/workspace before enabling scheduling.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/fleet/dispatches/{id}", summary: "Read the task, identity, host, session, workspace and state of a native dispatch.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/fleet/dispatches/{id}", summary: "Report native dispatch state with host, generation and version fencing; uncertain sessions cannot be replayed through provisioning.", query: "", body: None } }
 
 // Every REST endpoint self-registers into the discovery catalog via `inventory::submit!`
 // (task_1497) rather than being appended to a central `ENDPOINTS` array, so adding an
@@ -5207,7 +5234,7 @@ mod tests {
     #[test]
     fn inventory_collects_under_cargo_test() {
         // Previously-registered counts (frozen; bump intentionally when adding an endpoint/schema).
-        const EXPECTED_ENDPOINTS: usize = 168;
+        const EXPECTED_ENDPOINTS: usize = 176;
         const EXPECTED_SCHEMAS: usize = 80;
 
         let endpoints: Vec<&Endpoint> = inventory::iter::<Endpoint>.into_iter().collect();
