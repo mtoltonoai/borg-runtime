@@ -145,14 +145,9 @@ impl Runtime {
             // a model-issued register_agent call. Binding all MCP endpoints also
             // covers aliases of the Board server without trusting a name label.
             server.bound_agent_id = Some(session.agent_id.clone());
-            server.url = server
-                .url
-                .replace(
-                    "{runtime_url}",
-                    session.runtime_url.as_deref().unwrap_or_default(),
-                )
-                .replace("{session_id}", &url_component(id))
-                .replace("{agent_id}", &url_component(&session.agent_id));
+            // Apply an authorized placement override first, then expand every
+            // URL through the same session binding. Overriding after expansion
+            // leaves literal braces and makes discovery retry a permanent 404.
             if server.name == "workspace"
                 && let Some(url) = &session.workspace_mcp_url
             {
@@ -161,10 +156,19 @@ impl Runtime {
             if server.name == "native"
                 && let Some(url) = &session.lifecycle_mcp_url
             {
-                server.url = url
-                    .replace("{session_id}", &url_component(id))
-                    .replace("{agent_id}", &url_component(&session.agent_id));
+                server.url = url.clone();
             }
+            let runtime_base = session
+                .runtime_url
+                .as_deref()
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            let runtime_base = runtime_base.strip_suffix("/api").unwrap_or(runtime_base);
+            server.url = server
+                .url
+                .replace("{runtime_url}", runtime_base)
+                .replace("{session_id}", &url_component(id))
+                .replace("{agent_id}", &url_component(&session.agent_id));
         }
         // Placement can bind an authorized server, never add a revoked tool grant.
         validate_agent(&agent)?;

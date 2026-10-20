@@ -1,14 +1,16 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+mod lifecycle_mcp;
+
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use native_runtime::{Runtime, RuntimeConfig, Session, SessionStatus};
+use native_runtime::{Runtime, RuntimeConfig, Session, SessionOptions, SessionStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -18,6 +20,8 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 struct App {
     runtime: Runtime,
     bearer: Option<Arc<str>>,
+    http: reqwest::Client,
+    instance_id: Arc<str>,
 }
 
 struct ApiError(StatusCode, &'static str);
@@ -32,6 +36,42 @@ fn runtime_error(error: anyhow::Error) -> ApiError {
     let message = error.to_string();
     if message.starts_with("session not found") {
         ApiError(StatusCode::NOT_FOUND, "Session not found")
+    } else if message.starts_with("agent not found") {
+        ApiError(StatusCode::BAD_REQUEST, "Unknown agent")
+    } else if message.contains("create intent") || message.contains("idempotency") {
+        ApiError(
+            StatusCode::CONFLICT,
+            "Session ID already belongs to a different create intent",
+        )
+    } else if message.starts_with("runtime is quiescing") {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Runtime is draining; no new sessions accepted",
+        )
+    } else if message.starts_with("agent is paused") || message.starts_with("agent is retired") {
+        ApiError(StatusCode::FORBIDDEN, "Identity is paused or retired")
+    } else if matches!(
+        message.as_str(),
+        "invalid session_id"
+            | "workspace_cwd must be absolute"
+            | "generation exceeds the Board integer range"
+            | "session metadata must be an object"
+            | "binding cannot change session_id"
+            | "session host_id differs from this runtime host"
+    ) {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid session placement or identity",
+        )
+    } else if matches!(
+        message.as_str(),
+        "resolve unknown tool outcomes before binding placement"
+            | "cannot decrease session generation"
+    ) {
+        ApiError(
+            StatusCode::CONFLICT,
+            "Resolve tool outcomes and preserve session generation before rebinding",
+        )
     } else if message.starts_with("session is already running") {
         ApiError(StatusCode::CONFLICT, "Session is still running")
     } else if message == "unresolved tool calls must be resolved before resume" {
@@ -140,32 +180,79 @@ pub fn router(runtime: Runtime, bearer: Option<String>) -> Router {
     let app = App {
         runtime,
         bearer: bearer.map(Arc::from),
+        instance_id: Arc::from(uuid::Uuid::new_v4().to_string()),
+        http: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("fixed lifecycle HTTP client configuration"),
     };
     let api = Router::new()
         .route("/agents", get(agents))
+        .route("/quiesce", post(quiesce))
+        .route("/unquiesce", post(unquiesce))
         .route("/sessions", get(sessions).post(create))
         .route("/sessions/{id}", get(read_session))
         .route("/sessions/{id}/transcript", get(transcript))
         .route("/sessions/{id}/tools", get(tools))
         .route("/sessions/{id}/steer", post(steer))
         .route("/sessions/{id}/stop", post(stop))
+        .route("/sessions/{id}/drain", post(drain_session))
+        .route("/sessions/{id}/bind", post(bind_session))
         .route("/sessions/{id}/resume", post(resume))
-        .route("/sessions/{id}/resolve-tool", post(resolve))
+        .route("/sessions/{id}/resolve-tool", post(resolve));
+    let protected = Router::new()
+        .nest("/api", api)
+        .route("/mcp/sessions/{caller_id}", post(lifecycle_mcp::handle))
         .route_layer(middleware::from_fn_with_state(app.clone(), authorize));
     Router::new()
         .route("/", get(|| async { Html(include_str!("dashboard.html")) }))
-        .route(
-            "/health",
-            get(|| async { Json(json!({"status":"ok","service":"borg-native"})) }),
-        )
-        .nest("/api", api)
+        .route("/health", get(health))
+        .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(app)
 }
 
+async fn health(State(app): State<App>) -> Json<Value> {
+    let config = app.runtime.config().ok();
+    let revision = option_env!("BORG_BUILD_REV")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("BORG_BUILD_REV").ok())
+        .unwrap_or_else(|| "unknown".into());
+    Json(
+        json!({"status":"ok", "service":"borg-native", "version":env!("CARGO_PKG_VERSION"),
+        "host_id":config.and_then(|config| config.host_id), "revision":revision,
+        "instance_id":app.instance_id.as_ref(), "ready":!app.runtime.is_draining(),
+        "draining":app.runtime.is_draining()}),
+    )
+}
+
+async fn quiesce(
+    State(app): State<App>,
+    input: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let _: Empty = body(input)?;
+    let sessions = app.runtime.quiesce().map_err(runtime_error)?;
+    Ok(Json(json!({"draining":true, "sessions":sessions})))
+}
+
+async fn unquiesce(
+    State(app): State<App>,
+    input: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let _: Empty = body(input)?;
+    app.runtime.unquiesce();
+    resume_ready(&app.runtime).map_err(runtime_error)?;
+    Ok(Json(json!({"draining":false})))
+}
+
 async fn agents(State(app): State<App>) -> Result<Json<Vec<Value>>, ApiError> {
     app.runtime
-        .agents()
+        .load_agents()
+        .await
         .map_err(runtime_error)?
         .into_iter()
         .map(|agent| {
@@ -184,6 +271,12 @@ async fn agents(State(app): State<App>) -> Result<Json<Vec<Value>>, ApiError> {
                 "max_output_tokens",
                 "context_window_tokens",
                 "max_turns",
+                "max_retries",
+                "retry_initial_ms",
+                "retry_max_ms",
+                "retry_jitter_percent",
+                "profile_source",
+                "config_source",
             ] {
                 if let Some(value) = value.get(key) {
                     public.insert(key.to_owned(), value.clone());
@@ -206,15 +299,35 @@ async fn read_session(
     session(&app.runtime, &id).map(Json)
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptQuery {
+    after_sequence: Option<i64>,
+    limit: Option<usize>,
+}
+
 async fn transcript(
     State(app): State<App>,
     Path(id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
 ) -> Result<Json<Value>, ApiError> {
     session(&app.runtime, &id)?;
-    app.runtime
-        .transcript(&id)
-        .map(|value| Json(json!(value)))
-        .map_err(runtime_error)
+    if query.limit.is_some_and(|n| !(1..=1000).contains(&n))
+        || query.after_sequence.is_some_and(|n| n < 0)
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid transcript bounds",
+        ));
+    }
+    let entries = app.runtime.transcript(&id).map_err(runtime_error)?;
+    Ok(Json(json!(
+        entries
+            .into_iter()
+            .filter(|entry| entry.sequence > query.after_sequence.unwrap_or(0))
+            .take(query.limit.unwrap_or(usize::MAX))
+            .collect::<Vec<_>>()
+    )))
 }
 
 async fn tools(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
@@ -232,6 +345,25 @@ struct CreateSession {
     #[serde(default)]
     task: Option<String>,
     input: String,
+    // Explicit fields (rather than serde flatten) reject unsupported placement
+    // keys. Fleet owns allocation; session context is immutable after creation.
+    #[serde(default, alias = "request_id")]
+    session_id: Option<String>,
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    workspace_cwd: Option<PathBuf>,
+    #[serde(default)]
+    workspace_mcp_url: Option<String>,
+    #[serde(default)]
+    lifecycle_mcp_url: Option<String>,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default = "empty_metadata")]
+    metadata: Value,
+}
+fn empty_metadata() -> Value {
+    json!({})
 }
 
 async fn create(
@@ -244,18 +376,28 @@ async fn create(
     if let Some(task) = &input.task {
         nonempty(task, 8192)?;
     }
-    if !app
-        .runtime
-        .agents()
-        .map_err(runtime_error)?
-        .iter()
-        .any(|agent| agent.id == input.agent_id)
-    {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "Unknown agent"));
+    if let Some(id) = &input.session_id {
+        nonempty(id, 256)?;
     }
+    if !input.metadata.is_object() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "metadata must be an object",
+        ));
+    }
+    let options = SessionOptions {
+        session_id: input.session_id,
+        host_id: input.host_id,
+        workspace_cwd: input.workspace_cwd,
+        workspace_mcp_url: input.workspace_mcp_url,
+        lifecycle_mcp_url: input.lifecycle_mcp_url,
+        generation: input.generation,
+        metadata: input.metadata,
+    };
     let value = app
         .runtime
-        .create_session(&input.agent_id, input.task, &input.input)
+        .create_session_with_options(&input.agent_id, input.task, &input.input, options)
+        .await
         .map_err(runtime_error)?;
     drive(&app.runtime, &value);
     Ok((
@@ -298,6 +440,34 @@ async fn stop(
     app.runtime.stop(&id).map(Json).map_err(runtime_error)
 }
 
+async fn drain_session(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    input: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Session>, ApiError> {
+    let _: Empty = body(input)?;
+    session(&app.runtime, &id)?;
+    app.runtime
+        .drain_session(&id)
+        .map(Json)
+        .map_err(runtime_error)
+}
+
+async fn bind_session(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    input: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Session>, ApiError> {
+    let options: SessionOptions = body(input)?;
+    session(&app.runtime, &id)?;
+    // Explicit deployment/Fleet adoption only. Core refuses active drivers,
+    // unknown tool outcomes, identity changes and generation rollback.
+    app.runtime
+        .bind_session(&id, options)
+        .map(Json)
+        .map_err(runtime_error)
+}
+
 async fn resume(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -329,29 +499,47 @@ async fn resolve(
 ) -> Result<Json<Session>, ApiError> {
     let input: ToolResolution = body(input)?;
     nonempty(&input.call_id, 256)?;
-    let current = session(&app.runtime, &id)?;
-    if current.status != SessionStatus::NeedsResolution {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Session has no tool result awaiting resolution",
-        ));
-    }
-    let calls = app.runtime.tool_calls(&id).map_err(runtime_error)?;
-    if !calls
+    let value = resolve_recorded(&app.runtime, &id, &input.call_id, input.result)?;
+    drive(&app.runtime, &value);
+    Ok(Json(value))
+}
+
+fn resolve_recorded(
+    runtime: &Runtime,
+    id: &str,
+    call_id: &str,
+    result: Value,
+) -> Result<Session, ApiError> {
+    let current = session(runtime, id)?;
+    let calls = runtime.tool_calls(id).map_err(runtime_error)?;
+    let original = calls
         .iter()
-        .any(|call| call.call_id == input.call_id && call.status == "unknown")
-    {
+        .find(|call| call.call_id == call_id)
+        .ok_or(ApiError(
+            StatusCode::NOT_FOUND,
+            "Original tool call not found",
+        ))?;
+    if original.status == "succeeded" {
+        // A lost resolution response is reconciled by comparing its original
+        // committed result, even if the target is now running another turn.
+        return if original.result.as_ref() == Some(&result) {
+            Ok(current)
+        } else {
+            Err(ApiError(
+                StatusCode::CONFLICT,
+                "Tool result conflicts with its recorded state",
+            ))
+        };
+    }
+    if current.status != SessionStatus::NeedsResolution || original.status != "unknown" {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "Unknown tool call is not awaiting resolution",
         ));
     }
-    let value = app
-        .runtime
-        .resolve_tool(&id, &input.call_id, input.result)
-        .map_err(runtime_error)?;
-    drive(&app.runtime, &value);
-    Ok(Json(value))
+    runtime
+        .resolve_tool(id, call_id, result)
+        .map_err(runtime_error)
 }
 
 pub fn listen_policy(config: &RuntimeConfig) -> anyhow::Result<(SocketAddr, Option<String>)> {
@@ -394,6 +582,7 @@ async fn main() -> anyhow::Result<()> {
     let (address, bearer) = listen_policy(&config)?;
     let runtime = Runtime::open(&config_path)?;
     let listener = tokio::net::TcpListener::bind(address).await?;
+    runtime.start_reporting()?;
     resume_ready(&runtime)?;
     eprintln!("borg-native listening on {}", listener.local_addr()?);
     axum::serve(listener, router(runtime, bearer))
