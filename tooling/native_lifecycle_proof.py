@@ -55,9 +55,10 @@ class Client:
         # runtime. A cross-host observer must use an explicit owner-host route,
         # never silently read a different host's identically numbered helper.
         origin = self.workspace_origins.get(session.get("host_id"))
-        if origin is not None:
-            parsed = urllib.parse.urlsplit(url)
-            url = origin.rstrip("/") + parsed.path
+        if origin is None:
+            raise ValueError("workspace owner host requires an explicit observation route, including the local host")
+        parsed = urllib.parse.urlsplit(url)
+        url = origin.rstrip("/") + parsed.path
         response = self.request(url, {"jsonrpc": "2.0", "id": "read-proof", "method": "tools/call",
                                      "params": {"name": "workspace_read", "arguments": {"path": MARKER}}},
                                 agent=session["agent_id"])

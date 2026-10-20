@@ -111,6 +111,12 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(captured[0].get_header("X-fleet-agent"), "same")
         self.assertEqual(json.loads(captured[0].data)["params"], {"name": "workspace_read", "arguments": {"path": proof.MARKER}})
 
+    def test_missing_owner_route_cannot_accidentally_read_observers_local_helper(self):
+        client = proof.Client()
+        with self.assertRaisesRegex(ValueError, "explicit observation route"):
+            client.marker({"id": "child", "agent_id": "same", "host_id": "other-host",
+                           "workspace_mcp_url": "http://127.0.0.1:8791/mcp/{session_id}"})
+
     def test_text_only_mcp_result_supported_and_failed_result_rejected(self):
         original = result({"session_id": "child"})
         original.pop("structuredContent")

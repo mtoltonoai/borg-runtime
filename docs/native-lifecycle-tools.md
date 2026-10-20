@@ -208,7 +208,8 @@ inference deadline or an instruction to restart a slow live session.
 
 Workspace helper URLs are host-local to their native runtime. For a cross-host
 observer, supply `--workspace-origin HOST=http://127.0.0.1:FORWARDED_PORT` for
-each owner host, using explicit temporary SSH forwards to that host's helper.
+each owner host (including an explicit local-host route), using temporary SSH
+forwards for remote hosts. Missing owner routes are rejected, not guessed.
 The collector preserves the session path but routes to the actual owner, not
 its own identically numbered local helper. Native runtime routing and services
 are not changed by this read-only observation.
