@@ -288,3 +288,39 @@ receipt. Newer Board list projections avoid that extra read. The real-process
 regression keeps a failed attempt1 byte-for-byte, fixes its task workspace spec,
 sets explicit attempt2 and confirms one new independent session, not a replay of
 the old failed UUID. No original failed dispatch is reset by this repair.
+
+### Automatic provisioning admission
+
+A ready model endpoint is insufficient when that host's configured default Git
+route is unusable. Fleet probes the real route with bounded `git ls-remote`,
+using the same SSH configuration as provisioning. The default interval is 30s
+and the probe timeout 10s; neither is an inference/session timeout. Observation
+state survives Fleet restart in `.native-provisioning-health.json` and a changed
+repository/ref/SSH-config binding forces a new probe.
+
+The observation is published as `host.metadata.provisioning`. Board derives
+`provisioning_ready` and includes it in the **actual placement predicate**:
+`fresh = enabled && runtime_ready && provisioning_ready && recent heartbeat`.
+Thus an empty Git-unready host cannot keep receiving reservations. Older host
+records without this observation retain their prior behavior, so roll out the
+Fleet publisher and Board predicate together. This observation never changes
+operator `enabled`, capacity or labels, and never stops existing native drivers.
+
+A Git-stage failure using that configured default closes the gate before the
+failed reservation is released. A successful later real transport probe can
+clear the observation, but cannot override an independent operator quarantine.
+Task-specific repository overrides remain task-specific failures. Existing
+failed dispatches are retained; recovery requires an explicit owned disposition
+or new reconciled attempt, not a UUID/request rewrite. Restoring the live
+controller quarantine additionally requires an actual configured repo/ref
+**clone and checkout** proof, not just a transport ping.
+
+Observation plus publication is serialized through one mutex, held through the
+Board metadata write and heartbeat. A concurrent clone failure cannot publish
+false/free capacity and then be overwritten by an older successful snapshot.
+The targeted HTTP concurrency regression forces this ordering with equal
+whole-second timestamps; it verifies final admission remains false and restart
+retains the failed observation. The process regression uses a real refused SSH
+route, proves eight tasks avoid that host across worker restarts, corrects the
+route, verifies successful reprobe does not undo operator `enabled:false`, and
+then executes a new actual workspace tool only after explicit readmission.

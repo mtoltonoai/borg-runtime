@@ -5,14 +5,16 @@
 //! Restarting Fleet does not kill an inference/tool or discard its result. The
 //! worker reconciles by preallocated session UUID before retrying any create.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -49,6 +51,10 @@ pub struct Settings {
     pub http_timeout_seconds: u64,
     #[serde(default = "provision_seconds")]
     pub provision_timeout_seconds: u64,
+    #[serde(default = "git_probe_interval")]
+    pub git_probe_interval_seconds: u64,
+    #[serde(default = "git_probe_timeout")]
+    pub git_probe_timeout_seconds: u64,
 }
 fn workspace_url() -> String {
     "http://127.0.0.1:8791/mcp/{session_id}".into()
@@ -70,6 +76,12 @@ fn http_seconds() -> u64 {
 }
 fn provision_seconds() -> u64 {
     300
+}
+fn git_probe_interval() -> u64 {
+    30
+}
+fn git_probe_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug)]
@@ -287,6 +299,57 @@ fn task_request(task: &Value, agent: &str) -> Result<Value, String> {
     )
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProvisionHealth {
+    config_digest: String,
+    ready: bool,
+    checked_at: u64,
+    last_failure_at: Option<u64>,
+    error: Option<String>,
+}
+impl ProvisionHealth {
+    fn load(settings: &Settings) -> Self {
+        let config_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({
+            "repo": settings.repo_url, "ref": settings.repo_ref, "ssh_config": settings.git_ssh_config
+        })).expect("serializable probe config")));
+        let stored = fs::read(
+            settings
+                .workspace_root
+                .join(".native-provisioning-health.json"),
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok());
+        if let Some(previous) = stored.filter(|state| state.config_digest == config_digest) {
+            return previous;
+        }
+        Self {
+            config_digest,
+            ready: false,
+            checked_at: 0,
+            last_failure_at: None,
+            error: None,
+        }
+    }
+    fn persist(&self, root: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let temporary = root.join(format!(
+            ".native-provisioning-health-{}.tmp",
+            std::process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temporary)
+            .map_err(|e| e.to_string())?;
+        file.write_all(&serde_json::to_vec(self).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(temporary, root.join(".native-provisioning-health.json"))
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Clone)]
 struct Worker {
     settings: Settings,
@@ -295,6 +358,7 @@ struct Worker {
     board: Http,
     runtime: Http,
     workspace: Http,
+    provision_health: Arc<Mutex<ProvisionHealth>>,
 }
 impl Worker {
     fn configured() -> Result<Self, String> {
@@ -305,6 +369,8 @@ impl Worker {
         if settings.poll_seconds == 0
             || settings.http_timeout_seconds == 0
             || settings.provision_timeout_seconds == 0
+            || settings.git_probe_interval_seconds == 0
+            || settings.git_probe_timeout_seconds == 0
             || !(5..=3600).contains(&settings.ttl_seconds)
             || settings.capacity > 10000
             || settings.poll_seconds * 2 >= settings.ttl_seconds
@@ -337,7 +403,9 @@ impl Worker {
             settings.http_timeout_seconds,
             settings.workspace_bearer_token_env.as_deref(),
         )?;
+        let provision_health = Arc::new(Mutex::new(ProvisionHealth::load(&settings)));
         Ok(Self {
+            provision_health,
             settings,
             board_url: crate::board::Board::base_url().trim_end_matches('/').into(),
             host: crate::this_host(),
@@ -345,6 +413,74 @@ impl Worker {
             runtime,
             workspace,
         })
+    }
+    fn probe_provisioning(&self) -> ProvisionHealth {
+        let mut state = self
+            .provision_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = time();
+        if state.checked_at > 0
+            && now >= state.checked_at
+            && now - state.checked_at < self.settings.git_probe_interval_seconds
+        {
+            return state.clone();
+        }
+        let mut probe_settings = self.settings.clone();
+        probe_settings.provision_timeout_seconds = self.settings.git_probe_timeout_seconds;
+        let result = if let Some(repo) = &self.settings.repo_url {
+            run_git(
+                &probe_settings,
+                &["ls-remote", "--", repo, "HEAD"],
+                "transport-readiness",
+            )
+        } else {
+            Ok(())
+        };
+        state.checked_at = time();
+        state.ready = result.is_ok();
+        state.error = result.err();
+        if !state.ready {
+            state.last_failure_at = Some(state.checked_at);
+        }
+        if let Err(error) = state.persist(&self.settings.workspace_root) {
+            eprintln!("native provisioning health persistence: {error}");
+        }
+        state.clone()
+    }
+    fn publish_provisioning(
+        &self,
+        state: &std::sync::MutexGuard<'_, ProvisionHealth>,
+    ) -> Result<(), String> {
+        // Observations only: never overwrite operator capacity or enabled/drain.
+        match self.board.request(
+            "PATCH",
+            &format!("{}/fleet/hosts/{}", self.board_url, encode(&self.host)),
+            Some(&json!({"metadata":{"provisioning":&**state}})),
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) if error.status == Some(404) => Ok(()), // initial heartbeat seeds it below
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    fn close_provisioning_gate(&self, error: &str) {
+        self.close_provisioning_gate_at(error, time());
+    }
+    fn close_provisioning_gate_at(&self, error: &str, observed_at: u64) {
+        let mut state = self
+            .provision_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.ready = false;
+        state.checked_at = observed_at;
+        state.last_failure_at = Some(state.checked_at);
+        state.error = Some(error.into());
+        if let Err(error) = state.persist(&self.settings.workspace_root) {
+            eprintln!("native provisioning gate persistence: {error}");
+        }
+        if let Err(error) = self.publish_provisioning(&state) {
+            eprintln!("native provisioning gate publication: {error}");
+        }
     }
     fn heartbeat(&self) -> Result<(), String> {
         let health = format!(
@@ -358,9 +494,21 @@ impl Worker {
             .runtime
             .request("GET", &health, None)
             .is_ok_and(|v| runtime_ready(&v, &self.host));
+        self.probe_provisioning();
+        self.publish_heartbeat(ready)
+    }
+    fn publish_heartbeat(&self, ready: bool) -> Result<(), String> {
+        // Keep the observation lock through BOTH writes. A concurrent clone
+        // failure cannot publish false/release its reservation and then have an
+        // older successful heartbeat overwrite it, even within the same second.
+        let provisioning = self
+            .provision_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.publish_provisioning(&provisioning)?;
         let body = json!({"capacity":self.settings.capacity,"runtime_url":self.settings.runtime_url,
             "workspace_root":self.settings.workspace_root,"runtime_ready":ready,"ttl_seconds":self.settings.ttl_seconds,
-            "revision":env!("FLEET_BUILD_REV"),"metadata":{"worker":"fleet native-worker"}});
+            "revision":env!("FLEET_BUILD_REV"),"metadata":{"worker":"fleet native-worker","provisioning":&*provisioning}});
         self.board
             .request(
                 "POST",
@@ -555,6 +703,21 @@ impl Worker {
         }
     }
     fn may_start(&self, d: &Value) -> Result<bool, String> {
+        if !self
+            .provision_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ready
+        {
+            self.report(
+                d,
+                string(d, "status")?,
+                None,
+                None,
+                json!({"held_reason":"host default Git transport is not ready"}),
+            )?;
+            return Ok(false);
+        }
         let agent = self
             .board
             .request(
@@ -689,6 +852,16 @@ impl Worker {
             // Provisioning errors cannot hide an owned task. Retain a visible
             // failed dispatch; the recovery monitor creates durable diagnosis.
             if d["status"] == "provisioning" {
+                let configured_repo = d["metadata"]["workspace"]["repo"]
+                    .as_str()
+                    .or(self.settings.repo_url.as_deref());
+                if configured_repo == self.settings.repo_url.as_deref()
+                    && error.starts_with("workspace git")
+                {
+                    // Close admission BEFORE releasing the failed reservation.
+                    // Native drivers and their completed tool receipts are untouched.
+                    self.close_provisioning_gate(error);
+                }
                 let _ = self.report(
                     &d,
                     "failed",
@@ -1116,6 +1289,8 @@ mod tests {
             workspace_bearer_token_env: None,
             http_timeout_seconds: 15,
             provision_timeout_seconds: 30,
+            git_probe_interval_seconds: 30,
+            git_probe_timeout_seconds: 10,
         }
     }
     fn dispatch(root: &Path, n: u32) -> Value {
@@ -1133,6 +1308,106 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    #[test]
+    fn stale_success_cannot_publish_after_failure_even_with_equal_timestamps() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        let tmp = Temp::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let writes = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let release_server = release.clone();
+        let writes_server = writes.clone();
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let release = release_server.clone();
+                let writes = writes_server.clone();
+                let entered = entered_tx.clone();
+                handlers.push(thread::spawn(move || {
+                    let mut reader=BufReader::new(stream.try_clone().unwrap());
+                    let mut first=String::new();reader.read_line(&mut first).unwrap();
+                    let mut length=0;
+                    loop {
+                        let mut header=String::new();reader.read_line(&mut header).unwrap();
+                        if header=="\r\n" { break; }
+                        if let Some((name,value))=header.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") { length=value.trim().parse::<usize>().unwrap(); }
+                        }
+                    }
+                    let mut body=vec![0;length];reader.read_exact(&mut body).unwrap();
+                    let body:Value=serde_json::from_slice(&body).unwrap();
+                    assert!(body.get("enabled").is_none(),"observation must not change operator intent");
+                    if index==0 {
+                        entered.send(()).unwrap();
+                        let (lock,wake)=&*release;
+                        let mut allowed=lock.lock().unwrap();
+                        while !*allowed { allowed=wake.wait(allowed).unwrap(); }
+                    }
+                    if first.starts_with("PATCH") {
+                        assert_eq!(body["metadata"]["provisioning"]["checked_at"],123);
+                        writes.lock().unwrap().push(body["metadata"]["provisioning"]["ready"].as_bool().unwrap());
+                    }
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let cfg = settings(&tmp.0);
+        let mut state = ProvisionHealth::load(&cfg);
+        state.ready = true;
+        state.checked_at = 123;
+        let client = Http::new(3, None).unwrap();
+        let worker = Worker {
+            settings: cfg,
+            board_url: format!("http://{address}/api"),
+            host: "lab".into(),
+            board: client.clone(),
+            runtime: client.clone(),
+            workspace: client,
+            provision_health: Arc::new(Mutex::new(state)),
+        };
+        let heartbeat_worker = worker.clone();
+        let heartbeat = thread::spawn(move || heartbeat_worker.publish_heartbeat(true).unwrap());
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let failing_worker = worker.clone();
+        let failure = thread::spawn(move || {
+            failing_worker.close_provisioning_gate_at("known transport failure", 123);
+            finished_tx.send(()).unwrap();
+        });
+        // A concurrent HTTP handler could accept the failure now; only the
+        // shared observation lock prevents a false release before old success.
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(150))
+                .is_err()
+        );
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        heartbeat.join().unwrap();
+        failure.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(*writes.lock().unwrap(), vec![true, false]);
+        assert!(!worker.provision_health.lock().unwrap().ready);
+        assert!(
+            !ProvisionHealth::load(&worker.settings).ready,
+            "restart must retain the failed observation"
+        );
+    }
+
     #[test]
     fn readiness_requires_native_protocol_identity_not_just_an_open_http_port() {
         let mut health = json!({"status":"ok","service":"borg-native","host_id":"lab","ready":true,"draining":false});
@@ -1422,6 +1697,10 @@ mod tests {
         a.try_lock().unwrap();
         let b = File::create(&path).unwrap();
         assert!(b.try_lock().is_err());
+        // Other parallel Git tests may have a transient fork-before-exec copy
+        // of this descriptor. Explicit unlock tests the lock contract without
+        // depending on another thread's exec scheduling.
+        a.unlock().unwrap();
         drop(a);
         assert!(b.try_lock().is_ok());
         assert_eq!(

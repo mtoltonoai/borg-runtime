@@ -51,6 +51,8 @@ repo_ref = "main"
 git_ssh_config = {json.dumps(ssh_config)}
 http_timeout_seconds = 15
 provision_timeout_seconds = 300
+git_probe_interval_seconds = 30
+git_probe_timeout_seconds = 10
 '''
 
 
