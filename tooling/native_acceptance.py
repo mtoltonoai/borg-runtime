@@ -212,8 +212,20 @@ def collect(board_url, runtimes, project=1, reader=None, board_token=None, nativ
     board = snapshot["board"]
     board["health"] = read("board.health", board_url, "/api/health", board_token,
                            lambda v: pick(obj(v), ("ok", "db", "commit")))
-    board["tasks"] = read("board.tasks", board_url, f"/api/tasks?project_id={project}", board_token,
-                          lambda v: [sanitize_task(r) for r in rows(v, "tasks")])
+    task_rows = read("board.tasks", board_url, f"/api/tasks?project_id={project}", board_token,
+                     lambda v: rows(v, "tasks"))
+    board["tasks"] = None if task_rows is None else []
+    for row in task_rows or []:
+        if row.get("status") in {"todo", "in_progress", "blocked"}:
+            tid = task_id(row.get("id"))
+            if tid is None:
+                snapshot["errors"].append({"source": "board.tasks", "error": "invalid task ID"})
+                continue
+            detail = read(f"board.task.{tid}", board_url, f"/api/tasks/{tid}?comments_limit=0", board_token, obj)
+            if detail is None:
+                continue
+            row = detail
+        board["tasks"].append(sanitize_task(row))
     # REST task listing is unpaginated; the MCP compact task feed is paginated.
     # Agent REST is paginated. Do not silently accept a full first page.
     agents = []
