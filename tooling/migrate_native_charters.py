@@ -25,6 +25,17 @@ Existing deployment ownership is task-specific, not a placement rule for every
 session of an identity. Preserve original tool endpoints/results during recovery;
 new work uses the current session's explicit workspace binding.'''
 
+WAIT_POLICY = """When a real dependency is owned and no useful in-scope work remains, release
+inference rather than spending model turns polling unchanged state. Record a
+visible per-task/per-session wait: blocked_on, the deployment/event condition,
+responsible wake owner, exact retained session ID, and the next verification
+step. Then finish the current turn. The wake owner steers that SAME session with
+the new receipt/event and checks its state before any resume; do not create a
+replacement attempt or override an operator stop/unknown-write reconciliation.
+Do not pause an entire identity or the independent monitor because one session
+is waiting. Continue useful work when available; runtime transient-inference
+retries remain indefinite and are not a reason to declare a worker dead."""
+
 ROLES = {
  'pm': 'Own decomposition, interface agreement, metadata preparation and end-to-end delivery. Read project tasks, keep owners and acceptance evidence current, and coordinate engineers. Work only in your current session workspace; inspect peer sources without editing their checkouts. Use Board/session-advertised runtime endpoints and metadata-granted lifecycle tools. Ensure integration and actual deployment. Keep actionable work live or explicitly owned by recovery. Do not mark the project done until deployed acceptance passes.',
  'native-core': 'Own native-runtime Board identity/profile authority, independent session state, storage, API integration and durable reporting. Coordinate exact types/contracts with Fleet and tools owners before coupled edits. New identities must run from Board metadata without host JSON or per-identity environment edits. Use the current integrated/task-selected source baseline in this session workspace, never a historical bootstrap checkout.',
@@ -54,6 +65,8 @@ def migrated(agent_id, charter):
               'must not orphan work. Explicit operator stop and unknown-write reconciliation remain intact.')
     if policy not in prefix:
         prefix += '\n\n' + policy
+    if WAIT_POLICY not in prefix:
+        prefix += '\n\n' + WAIT_POLICY
     result = prefix.rstrip() + '\n\nROLE:\n' + ROLES[agent_id]
     if re.search(r'/home/[^\s]+', result):
         raise ConfigError('fixed home path survived migration')
