@@ -523,10 +523,28 @@ impl Worker {
         Ok(())
     }
     fn dispatches(&self) -> Result<Vec<Value>, String> {
-        self.board.pages(
+        let mut rows = self.board.pages(
             &self.board_url,
             &format!("/fleet/dispatches?host_id={}", encode(&self.host)),
-        )
+        )?;
+        // Explicit metadata assigns observation of a bootstrap-only host to one
+        // real worker. This is not placement or permission to control its engine.
+        for host in self.board.array(&self.board_url, "/fleet/hosts")? {
+            if host["host_id"] == self.host || host["metadata"]["observer_host"] != self.host {
+                continue;
+            }
+            let target = string(&host, "host_id")?;
+            rows.extend(
+                self.board
+                    .pages(
+                        &self.board_url,
+                        &format!("/fleet/dispatches?host_id={}", encode(target)),
+                    )?
+                    .into_iter()
+                    .filter(|dispatch| dispatch["metadata"]["adopted"] == true),
+            );
+        }
+        Ok(rows)
     }
     fn schedule(&self, only_agent: Option<&str>, apply: bool) -> Result<(), String> {
         let agents = self.board.pages(
@@ -631,12 +649,16 @@ impl Worker {
         error: Option<&str>,
         metadata: Value,
     ) -> Result<Value, String> {
+        let mut metadata = metadata;
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("observer_host".into(), json!(self.host));
+        }
         self.board
             .request(
                 "PATCH",
                 &format!("{}/fleet/dispatches/{}", self.board_url, number(d, "id")?),
                 Some(&json!({
-            "host_id":self.host,"generation":d["generation"],"version":d["version"],"status":status,
+            "host_id":d["host_id"],"generation":d["generation"],"version":d["version"],"status":status,
             "progress":progress,"error":error,"metadata":metadata})),
             )
             .map_err(|e| e.to_string())
@@ -703,6 +725,9 @@ impl Worker {
         }
     }
     fn may_start(&self, d: &Value) -> Result<bool, String> {
+        if d["host_id"] != self.host {
+            return Ok(false);
+        }
         if !self
             .provision_health
             .lock()
@@ -772,6 +797,9 @@ impl Worker {
         Ok(true)
     }
     fn start(&self, mut d: Value) -> Result<(), String> {
+        if d["host_id"] != self.host {
+            return Err("observer cannot provision or create a foreign session".into());
+        }
         let result: Result<(), String> = (|| {
             d = self.report(
                 &d,
@@ -913,6 +941,7 @@ impl Worker {
             match self.observe(&d) {
                 Ok(false)
                     if launch
+                        && d["host_id"] == self.host
                         && d["metadata"]["launch_retry_at"].as_u64().unwrap_or(0) <= time() =>
                 {
                     if self.may_start(&d)? {

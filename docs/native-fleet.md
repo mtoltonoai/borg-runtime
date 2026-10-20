@@ -300,3 +300,29 @@ retains the failed observation. The process regression uses a real refused SSH
 route, proves eight tasks avoid that host across worker restarts, corrects the
 route, verifies successful reprobe does not undo operator `enabled:false`, and
 then executes a new actual workspace tool only after explicit readmission.
+
+### Observe a bootstrap-only host without placing work there
+
+An adopted builder session can keep its truthful `host_id=borg-builder`, capacity
+zero and `enabled:false`, while one existing lab worker observes its progress.
+Set `host.metadata.observer_host` to that worker's host id, for example:
+
+```json
+{"metadata":{"observer_host":"agent-lab"}}
+```
+
+Apply that as `PATCH /api/fleet/hosts/borg-builder` after deploying the observer
+support. Only the selected worker adds **adopted** dispatches from that foreign
+host to its read-only polling set. It uses their original runtime endpoint,
+retains their actual host/generation/session/workspace, and CAS-reports current
+progress/terminal state with `dispatch.metadata.observer_host` identifying who
+observed it. It does not refresh the builder as a placement worker or change its
+capacity/disabled state.
+
+Foreign observations can never reach provisioning, creation, steering, stopping,
+resuming or tool resolution. Even a missing foreign session is an observation
+error, not permission to recreate it. A real Board/Fleet process test reports an
+adopted builder running then completed, verifies zero foreign runtime writes and
+unchanged workspace contents, and checks that a subsequent404 does not trigger
+creation. This closes the initial stale-builder-dispatch projection without a
+fifth placement worker or a false lab host label.
