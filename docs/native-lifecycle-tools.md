@@ -180,3 +180,36 @@ wildcard grants with hot revocation, controls and bounded reads,
 self-stop receipt preservation, unknown-effect resolution without replay, and
 per-session filesystem/tool endpoint isolation. Deployed multi-host acceptance
 is a separate live check, not inferred from a unit test.
+
+## Live model delegation evidence
+
+After Fleet is deployed, give a fresh metadata-defined identity a parent task
+that writes `native-lifecycle-proof.json` with `{role:"parent",session_id,token}`,
+creates exactly one same-identity child through `native__session_create` with a
+stable request key, and asks that child to write the same relative filename with
+`role:"child"` in its own worktree. Both should use `workspace_write`; the parent
+checks that its marker is unchanged after the child completes. Do not create a
+new dispatch to recover an uncertain response; inspect the original request.
+
+The read-only collector joins the original native operation, Fleet request,
+child UUID, actual workspace markers, and observed concurrent drivers:
+
+```sh
+python3 tooling/native_lifecycle_proof.py \
+  --request-id STABLE_PARENT_FLEET_REQUEST --token PUBLIC_PROOF_TOKEN \
+  --trace .runtime/lifecycle-proof.jsonl --watch-seconds 240
+```
+
+Rerunning only performs reads and preserves overlap samples in the trace. It
+never enqueues, steers, resumes or resolves a session. It refuses to infer
+concurrent execution from timestamps alone, or pass based only on model claims.
+A waiting/blocked/failed proof exits 2 and retains evidence; this is not an
+inference deadline or an instruction to restart a slow live session.
+
+Workspace helper URLs are host-local to their native runtime. For a cross-host
+observer, supply `--workspace-origin HOST=http://127.0.0.1:FORWARDED_PORT` for
+each owner host (including an explicit local-host route), using temporary SSH
+forwards for remote hosts. Missing owner routes are rejected, not guessed.
+The collector preserves the session path but routes to the actual owner, not
+its own identically numbered local helper. Native runtime routing and services
+are not changed by this read-only observation.
