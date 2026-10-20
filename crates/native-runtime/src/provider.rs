@@ -53,14 +53,14 @@ impl OpenAiProvider {
         api_key: &str,
     ) -> Result<ProviderResponse, ProviderError> {
         let endpoint = reqwest::Url::parse(&request.endpoint)
-            .map_err(|_| failure("provider endpoint configuration is invalid", false))?;
+            .map_err(|_| failure("provider request configuration is invalid", false))?;
         if !matches!(endpoint.scheme(), "http" | "https")
             || endpoint.host_str().is_none()
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
             || endpoint.fragment().is_some()
         {
-            return Err(failure("provider endpoint configuration is invalid", false));
+            return Err(failure("provider request configuration is invalid", false));
         }
         let mut body = json!({
             "model": request.model,
@@ -307,7 +307,7 @@ mod tests {
                 .unwrap_err();
             assert!(!error.retryable);
             assert_eq!(error.retry_after_ms, None);
-            assert_eq!(error.message, "provider endpoint configuration is invalid");
+            assert_eq!(error.message, "provider request configuration is invalid");
             assert!(!error.message.contains("private-endpoint"));
         }
     }
