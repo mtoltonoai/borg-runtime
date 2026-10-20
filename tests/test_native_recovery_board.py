@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -128,6 +129,55 @@ class RealBoardTests(unittest.TestCase):
         self.assertEqual(len(self.board.pages("/fleet/dispatches")),1)
         self.assertEqual(len(self.board.call("GET",f"/tasks?project_id={self.project['id']}")),2)
         self.assertTrue(all(method == "GET" for method,_ in self.native_requests), "monitor never sends native mutation")
+
+    def test_running_monitor_discovers_new_project_without_host_config_change(self):
+        directory = Path(self.tmp.name)
+        config = directory / "monitor.json"
+        config.write_text(json.dumps({"board_url":self.board.base,
+            "state_path":str(directory / "monitor.sqlite"),"poll_seconds":.05,"http_timeout_seconds":2,
+            "defaults":{"missing_session_grace_seconds":0}}))
+        self.assertNotIn("project_ids",json.loads(config.read_text()))
+        monitor = subprocess.Popen([sys.executable,str(fixture.MODULE),"--config",str(config)],
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        def cleanup():
+            if monitor.poll() is None:
+                monitor.terminate()
+                try: monitor.wait(5)
+                except subprocess.TimeoutExpired:
+                    monitor.kill(); monitor.wait(3)
+        self.addCleanup(cleanup)
+        def wait_for_link(tid):
+            deadline = time.monotonic()+10
+            while time.monotonic()<deadline:
+                self.assertIsNone(monitor.poll(),"monitor exited")
+                observed = self.board.call("GET",f"/tasks/{tid}")
+                if observed["metadata"].get("recovery_task_id"):
+                    return observed["metadata"]["recovery_task_id"]
+                time.sleep(.05)
+            self.fail("new project's actionable task never got an owned recovery path")
+        # First pass is known complete before the second project even exists.
+        wait_for_link(self.task["id"])
+        added = self.board.call("POST","/projects",{"name":"Created after monitor startup"})
+        work = self.board.call("POST","/tasks",{"project_id":added["id"],"assignee":"engineer",
+            "title":"New-project actionable orphan"})
+        repair_id = wait_for_link(work["id"])
+        repair = self.board.call("GET",f"/tasks/{repair_id}")
+        self.assertEqual(repair["project_id"],added["id"])
+        self.assertEqual(repair["assignee"],"recovery-engineer")
+        self.assertEqual(repair["metadata"]["recovery"]["kind"],"missing_actionable_session")
+        excluded = []
+        for name, archived in [("Archived project",True),("Recovery disabled project",False)]:
+            project = self.board.call("POST","/projects",{"name":name,
+                "metadata":{"recovery":{"enabled":False}}})
+            if archived:
+                self.board.call("PATCH",f"/projects/{project['id']}",{"status":"archived"})
+            excluded.append(self.board.call("POST","/tasks",{"project_id":project["id"],
+                "assignee":"engineer","title":"Intentionally excluded work"}))
+        time.sleep(.4)
+        for work in excluded:
+            observed = self.board.call("GET",f"/tasks/{work['id']}")
+            self.assertNotIn("recovery_task_id",observed["metadata"])
+        self.assertNotIn("project_ids",json.loads(config.read_text()),"no config edit or restart was used")
 
     def test_frozen_dispatch_receipt_survives_response_loss_and_real_board_reassignment(self):
         original = self.board.call

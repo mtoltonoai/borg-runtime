@@ -82,6 +82,15 @@ persistent journal location, project IDs, polling/HTTP deadlines and optional
 Credentials belong in the service environment, never in Board metadata or Git.
 The `revision` field should name the exact deployed commit.
 
+Omit `project_ids` (the example does) or set it to null to discover active,
+recovery-enabled Board projects **on every observation pass**. A newly created
+project needs no host-config edit or monitor restart. Archived projects and
+projects with `metadata.recovery.enabled:false` are excluded from discovery;
+project maintenance is still observed as a visible hold. An explicit list, such
+as `project_ids:[7,9]`, intentionally restricts scope; an empty list selects none
+and publishes an idle heartbeat. Discovery outages retry indefinitely rather
+than silently falling back to project 1 or stale scope.
+
 Operational policy is merged from config defaults, then
 `project.metadata.recovery`. Per-identity and per-task `metadata.recovery`
 override task classification thresholds and monitoring eligibility. The project

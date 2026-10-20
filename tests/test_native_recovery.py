@@ -275,6 +275,44 @@ class CollectorContractTests(unittest.TestCase):
         self.assertEqual([f.kind for f in r.classify(snap)[0]], ["missing_actionable_session"])
 
 
+class ProjectDiscoveryTests(unittest.TestCase):
+    def test_omitted_scope_rediscovers_new_projects_and_filters_archived_disabled(self):
+        class Catalog:
+            projects = [{"id":1,"status":"active","metadata":{}}]
+            calls = 0
+            def call(self, method, path, data=None):
+                self.calls += 1
+                self.last = (method,path)
+                return copy.deepcopy(self.projects)
+        board = Catalog()
+        self.assertEqual(r.selected_projects(board,None),[1])
+        board.projects.extend([
+            {"id":2,"status":"active","metadata":{}},
+            {"id":3,"status":"archived","metadata":{}},
+            {"id":4,"status":"active","metadata":{"recovery":{"enabled":False}}}])
+        self.assertEqual(r.selected_projects(board,None),[1,2])
+        self.assertEqual(board.calls,2)
+        self.assertEqual(board.last,("GET","/projects?status=active"))
+        board.projects[0]["metadata"] = {"recovery":{"enabled":False}}
+        self.assertEqual(r.selected_projects(board,None),[2])
+
+    def test_explicit_scope_and_empty_scope_are_respected_without_discovery(self):
+        class NoDiscovery:
+            def call(self,*args): raise AssertionError("explicit scope performed discovery")
+        board = NoDiscovery()
+        self.assertEqual(r.selected_projects(board,[9,3,9]),[3,9])
+        self.assertEqual(r.selected_projects(board,[]),[])
+        for invalid in ("all", [True], [0], [-1]):
+            with self.assertRaises(ValueError): r.selected_projects(board,invalid)
+
+    def test_discovery_failure_does_not_fall_back_to_project_one(self):
+        class Down:
+            def call(self,*args): raise r.HttpFailure("GET",503,180)
+        with self.assertRaises(r.HttpFailure) as caught:
+            r.selected_projects(Down(),None)
+        self.assertEqual(caught.exception.delay,180)
+
+
 class JournalTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

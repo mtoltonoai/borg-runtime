@@ -839,6 +839,26 @@ class Controller:
             "metadata": {"role": "recovery-monitor", "harness": "supervisor", "recovery_monitor": health}})
 
 
+def selected_projects(board: Board, configured: list[int] | None, defaults: dict | None = None) -> list[int]:
+    """Omission discovers live Board scope on EVERY pass; a list is an opt-in pin."""
+    if configured is not None:
+        if not isinstance(configured, list) or not all(type(p) is int and p > 0 for p in configured):
+            raise ValueError("project_ids must be a list of positive integers, null, or omitted")
+        return sorted(set(configured))
+    projects = board.call("GET", "/projects?status=active")
+    if not isinstance(projects, list):
+        raise HttpFailure("GET")
+    selected = []
+    for project in projects:
+        if not isinstance(project, dict) or type(project.get("id")) is not int:
+            raise HttpFailure("GET")
+        policy = object_value(object_value(project.get("metadata")).get("recovery"))
+        enabled = policy.get("enabled", (defaults or {}).get("enabled", True))
+        if project.get("status", "active") != "archived" and enabled is not False:
+            selected.append(project["id"])
+    return sorted(set(selected))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -846,9 +866,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status", action="store_true", help="read local durable incident/health summary without acting")
     args = parser.parse_args(argv)
     config = json.loads(Path(args.config).read_text())
-    projects = config.get("project_ids", [1])
-    if not projects or not all(isinstance(p, int) and p > 0 for p in projects):
-        raise ValueError("project_ids must be nonempty positive integers")
+    configured_projects = config.get("project_ids")
+    if configured_projects is not None and (not isinstance(configured_projects, list)
+            or not all(type(p) is int and p > 0 for p in configured_projects)):
+        raise ValueError("project_ids must be a list of positive integers, null, or omitted")
     journal = Journal(config["state_path"])
     if args.status:
         row = journal.connection.execute("SELECT value FROM health WHERE key='latest'").fetchone()
@@ -874,6 +895,27 @@ def main(argv: list[str] | None = None) -> int:
     with journal.exclusive():
         while not stop.is_set():
             delay, failed = poll, False
+            try:
+                projects = selected_projects(board, configured_projects, config.get("defaults"))
+                if not projects:
+                    health = {"state": "idle", "observed_at": iso(time.time()), "project_count": 0,
+                        "scope_mode": "discovered" if configured_projects is None else "explicit",
+                        "unlimited_control_plane_retry": True}
+                    journal.save_health(health)
+                    controller.heartbeat(health)
+            except (HttpFailure, ValueError, KeyError, TypeError) as exc:
+                failures += 1
+                delay = max(delay, backoff(failures, 2, 60, exc.delay if isinstance(exc, HttpFailure) else 0))
+                diagnostic = str(exc) if isinstance(exc, HttpFailure) else "invalid project discovery response"
+                journal.save_health({"state": "project_discovery_retry", "observed_at": iso(time.time()),
+                    "attempt": failures, "retry_after_seconds": delay, "error": diagnostic,
+                    "unlimited_control_plane_retry": True})
+                LOG.warning("project discovery retry %s in %.1fs: %s", failures, delay, diagnostic)
+                if args.once:
+                    journal.close()
+                    return 1
+                stop.wait(delay)
+                continue
             for project in projects:
                 try:
                     health = controller.tick(collector.collect(project, time.time()))

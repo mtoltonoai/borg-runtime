@@ -2,7 +2,6 @@
   "board_url": "http://127.0.0.1:8079",
   "state_path": "/home/dev-user/.local/share/borg/state/recovery.sqlite",
   "monitor_id": "native-recovery-monitor",
-  "project_ids": [1],
   "poll_seconds": 15,
   "http_timeout_seconds": 10,
   "revision": "set-to-deployed-git-commit",
