@@ -610,6 +610,12 @@ impl Store {
             .context("tool call not found")?;
         r.call.status = status.into();
         r.call.error = error;
+        if status == "running" {
+            let agent = Self::get_at(&tx, id)?.agent_id;
+            for server in &mut r.servers {
+                server.bound_agent_id = Some(agent.clone());
+            }
+        }
         Self::put_tool(&tx, id, &r)?;
         tx.commit()?;
         Ok(())

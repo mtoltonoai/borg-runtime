@@ -14,7 +14,13 @@ use tokio::sync::Mutex;
 const PROTOCOL: &str = "2025-06-18";
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CATALOG_PAGES: usize = 32;
-type SessionKey = (String, String, String, Vec<(String, String)>);
+type SessionKey = (
+    String,
+    String,
+    String,
+    Vec<(String, String)>,
+    Option<String>,
+);
 type SharedSession = Arc<Mutex<ServerSession>>;
 
 pub struct McpToolExecutor {
@@ -80,6 +86,7 @@ impl McpToolExecutor {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            server.bound_agent_id.clone(),
         );
         let mut sessions = self.sessions.lock().await;
         Ok(sessions
@@ -88,6 +95,7 @@ impl McpToolExecutor {
                 Arc::new(Mutex::new(ServerSession {
                     url: server.url.clone(),
                     headers_env: server.headers_env.clone(),
+                    bound_agent_id: server.bound_agent_id.clone(),
                     session_header: None,
                     version: None,
                     initialized: false,
@@ -250,6 +258,7 @@ impl ToolExecutor for McpToolExecutor {
 struct ServerSession {
     url: String,
     headers_env: BTreeMap<String, String>,
+    bound_agent_id: Option<String>,
     session_header: Option<HeaderValue>,
     version: Option<String>,
     initialized: bool,
@@ -263,6 +272,9 @@ impl ServerSession {
         for (name, env) in &self.headers_env {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| "MCP configured header name is invalid")?;
+            if name.as_str() == "x-fleet-agent" && self.bound_agent_id.is_some() {
+                continue; // Do not even read a stale per-host/per-agent env key.
+            }
             if matches!(
                 name.as_str(),
                 "host"
@@ -280,6 +292,14 @@ impl ServerSession {
                 .map_err(|_| "MCP configured header value is invalid")?;
             value.set_sensitive(true);
             headers.insert(name, value);
+        }
+        if let Some(agent_id) = &self.bound_agent_id {
+            let value = HeaderValue::from_str(agent_id)
+                .map_err(|_| "MCP bound agent identity is invalid")?;
+            if agent_id.is_empty() || value.to_str().is_err() {
+                return Err("MCP bound agent identity is invalid".into());
+            }
+            headers.insert("x-fleet-agent", value);
         }
         headers.insert(
             ACCEPT,
@@ -757,6 +777,7 @@ mod tests {
             name: "files".into(),
             url,
             headers_env: BTreeMap::new(),
+            bound_agent_id: None,
             tools_allowlist: None,
         }
     }
@@ -927,6 +948,57 @@ mod tests {
             "real Task Board: {} tools, two distinct MCP sessions",
             first.len()
         );
+    }
+
+    #[tokio::test]
+    async fn bound_identities_override_host_environment_and_keep_separate_catalogs() {
+        let (url, task) = server(vec![
+            Reply::initialized("identity-a"),
+            Reply::ack(),
+            Reply::tools(2),
+            Reply::initialized("identity-b"),
+            Reply::ack(),
+            Reply::tools(2),
+        ])
+        .await;
+        let client = McpToolExecutor::new().unwrap();
+        let mut first = config(url.clone());
+        first.name = "board".into();
+        first.headers_env.insert(
+            "X-Fleet-Agent".into(),
+            format!("ABSENT_AGENT_ENV_{}", uuid::Uuid::new_v4()),
+        );
+        first.bound_agent_id = Some("metadata-created-a".into());
+        let mut second = first.clone();
+        second.bound_agent_id = Some("metadata-created-b".into());
+        client.list_tools("native-a", &[first]).await.unwrap();
+        client.list_tools("native-b", &[second]).await.unwrap();
+        let requests = task.await.unwrap();
+        for request in &requests[..3] {
+            assert!(
+                request
+                    .headers
+                    .contains("x-fleet-agent: metadata-created-a\r\n")
+            );
+        }
+        for request in &requests[3..] {
+            assert!(
+                request
+                    .headers
+                    .contains("x-fleet-agent: metadata-created-b\r\n")
+            );
+        }
+        assert!(
+            requests[2]
+                .headers
+                .contains("mcp-session-id: identity-a\r\n")
+        );
+        assert!(
+            requests[5]
+                .headers
+                .contains("mcp-session-id: identity-b\r\n")
+        );
+        assert_eq!(client.sessions.lock().await.len(), 2);
     }
 
     #[tokio::test]
