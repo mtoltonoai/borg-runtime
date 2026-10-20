@@ -434,6 +434,46 @@ provision_timeout_seconds=30
         self.assertFalse(host["enabled"])
         self.assertEqual(host["capacity"], 1)
 
+    def test_broken_default_git_route_is_excluded_across_restart_and_reproved_without_unpausing(self):
+        bad = f"ssh://127.0.0.1:{free_port()}/not-a-repository"
+        config = self.configs[0]
+        original_config = config.read_text()
+        config.write_text(original_config.replace("repo_url=" + json.dumps(str(self.source)), "repo_url=" + json.dumps(bad)))
+        self.workers()  # real Git transport check, before admitting new work
+        for i in range(8):
+            self.task(f"healthy route task {i}")
+        self.workers()
+        self.workers()  # separate Fleet processes: persisted gate must not reset
+        rows = self.dispatches()
+        self.assertEqual(len(rows), 8)
+        self.assertTrue(all(r["host_id"] != self.hosts[0] for r in rows))
+        self.assertFalse(self.engines[0].calls)
+        host = next(h for h in http("GET", self.board_url + "/fleet/hosts") if h["host_id"] == self.hosts[0])
+        self.assertTrue(host["enabled"])
+        self.assertTrue(host["runtime_ready"], "healthy inference is not a dead runtime")
+        self.assertFalse(host["provisioning_ready"])
+        self.assertFalse(host["fresh"])
+        state = json.loads((self.roots[0] / ".native-provisioning-health.json").read_text())
+        self.assertFalse(state["ready"])
+        # Correcting transport reprobes automatically, but never overrides an
+        # independent administrative quarantine like the retained live incident.
+        http("PATCH", self.board_url + f"/fleet/hosts/{self.hosts[0]}", {"enabled": False})
+        config.write_text(original_config)
+        self.workers()
+        host = next(h for h in http("GET", self.board_url + "/fleet/hosts") if h["host_id"] == self.hosts[0])
+        self.assertTrue(host["provisioning_ready"])
+        self.assertFalse(host["enabled"])
+        self.assertFalse(host["fresh"])
+        self.task("reproved route", {"placement": {"host": self.hosts[0]}})
+        self.workers()
+        self.assertEqual(len(self.dispatches()), 8)
+        http("PATCH", self.board_url + f"/fleet/hosts/{self.hosts[0]}", {"enabled": True})
+        self.workers()
+        self.workers()
+        repaired = next(r for r in self.dispatches() if r["host_id"] == self.hosts[0])
+        self.assertEqual(repaired["status"], "running")
+        self.assertEqual((Path(repaired["workspace_cwd"]) / "result.txt").read_text(), "preserved")
+
     def test_explicit_attempt_two_uses_authoritative_task_metadata(self):
         task = self.task(metadata={"workspace": {"repo": str(self.root / "missing-repo")}})
         self.workers()

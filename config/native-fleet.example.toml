@@ -28,6 +28,8 @@ git_ssh_config = "/home/dev-user/.ssh/borg_config"
 # These are transport/setup timeouts, NOT inference or session turn budgets.
 http_timeout_seconds = 15
 provision_timeout_seconds = 300
+git_probe_interval_seconds = 30
+git_probe_timeout_seconds = 10
 
 # Credential variable NAMES only. Supply values through the service environment;
 # never place a provider key, runtime bearer or Board token in this file or Git.

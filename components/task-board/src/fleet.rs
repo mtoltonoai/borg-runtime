@@ -203,14 +203,22 @@ fn host_value(row: &sqlx::sqlite::SqliteRow, time: i64) -> Result<Value> {
     let ttl: i64 = row.try_get("ttl_seconds")?;
     let enabled: bool = row.try_get("enabled")?;
     let ready: bool = row.try_get("runtime_ready")?;
+    let metadata: Value =
+        serde_json::from_str(&row.try_get::<String, _>("metadata")?).unwrap_or_else(|_| object());
+    let provisioning_ready = metadata
+        .get("provisioning")
+        .and_then(|p| p.get("ready"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     Ok(
         json!({"host_id":row.try_get::<String,_>("host_id")?,"capacity":row.try_get::<i64,_>("capacity")?,
         "enabled":enabled,"runtime_url":row.try_get::<String,_>("runtime_url")?,
         "workspace_root":row.try_get::<String,_>("workspace_root")?,"revision":row.try_get::<String,_>("revision")?,
         "runtime_ready":ready,"ttl_seconds":ttl,"last_seen":last_seen,
-        "fresh":enabled && ready && time >= last_seen && time - last_seen <= ttl,
+        "fresh":enabled && ready && provisioning_ready && time >= last_seen && time - last_seen <= ttl,
+        "provisioning_ready":provisioning_ready,
         "active":row.try_get::<i64,_>("active")?,
-        "metadata":serde_json::from_str::<Value>(&row.try_get::<String,_>("metadata")?).unwrap_or_else(|_| object())}),
+        "metadata":metadata}),
     )
 }
 
@@ -848,6 +856,41 @@ mod tests {
             .unwrap();
         assert_eq!(drained["capacity"], 2);
         assert_eq!(drained["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn provisioning_gate_blocks_empty_host_without_clobbering_operator_drain() {
+        let (_dir, pool) = fixture().await;
+        let mut heartbeat = hb(4);
+        heartbeat.metadata = json!({"provisioning":{"ready":false,"checked_at":now()}});
+        heartbeat_record(&pool, "bad-route", &heartbeat)
+            .await
+            .unwrap();
+        let host = hosts(&pool).await.unwrap().remove(0);
+        assert_eq!(host["runtime_ready"], true);
+        assert_eq!(host["provisioning_ready"], false);
+        assert_eq!(host["fresh"], false);
+        assert_eq!(
+            reserve(&pool, &task(1), None).await.unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // A process restart/ordinary native heartbeat cannot remove the failed
+        // provisioning observation or accidentally reopen manual drain policy.
+        heartbeat_record(&pool, "bad-route", &hb(4)).await.unwrap();
+        assert_eq!(hosts(&pool).await.unwrap()[0]["fresh"], false);
+        sqlx::query("UPDATE fleet_hosts SET enabled=0,metadata=json_set(metadata,'$.provisioning.ready',json('true'))")
+            .execute(&pool).await.unwrap();
+        let host = hosts(&pool).await.unwrap().remove(0);
+        assert_eq!(host["provisioning_ready"], true);
+        assert_eq!(host["fresh"], false);
+        sqlx::query("UPDATE fleet_hosts SET enabled=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            reserve(&pool, &task(1), None).await.unwrap()["host_id"],
+            "bad-route"
+        );
     }
 
     #[tokio::test]
