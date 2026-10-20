@@ -325,6 +325,27 @@ provision_timeout_seconds=30
         self.assertEqual(sum(self.engines[0].effects.values()), 1)
         self.assertEqual(self.dispatches()[0]["status"], "running")
 
+    def test_shared_fleet_admits_a_new_project_and_identity_without_host_edits(self):
+        # A shared daemon omits the optional project filter from its initial
+        # deployment. All later project/identity changes are Board writes only.
+        for cfg in self.configs:
+            cfg.write_text("\n".join(line for line in cfg.read_text().splitlines()
+                                     if not line.startswith("project_id=")) + "\n")
+        configs_before = [cfg.read_bytes() for cfg in self.configs]
+        first = self.task("first project task")
+        self.workers()
+        project = http("POST", self.board_url + "/projects", {"name": "new native project"})["id"]
+        http("POST", self.board_url + "/agents", {"agent_id": "new-engineer", "charter": "new metadata identity",
+             "metadata": {"harness": "native"}})
+        second = http("POST", self.board_url + "/tasks", {"project_id": project, "title": "new project task",
+                      "assignee": "new-engineer"})
+        self.workers()
+        rows = self.dispatches()
+        self.assertEqual({r["task_id"] for r in rows}, {first["id"], second["id"]})
+        self.assertEqual({r["agent_id"] for r in rows}, {"engineer", "new-engineer"})
+        self.assertTrue(all(r["status"] == "running" for r in rows), rows)
+        self.assertEqual([cfg.read_bytes() for cfg in self.configs], configs_before)
+
     def test_more_than_100_actionable_tasks_do_not_loop_the_unpaginated_tasks_api(self):
         # Regression: REST /tasks ignores limit/offset and returns the whole
         # status group. A generic pagination loop would never return here.

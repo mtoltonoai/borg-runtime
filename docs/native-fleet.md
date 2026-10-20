@@ -165,3 +165,52 @@ indicate observation freshness, **not** actual model progress. Top-level
 
 The integration fixture is not evidence that a real model ran on four machines;
 that is a separate live deployment acceptance owned jointly with the integrator.
+
+## Four-host connectivity and shared scope
+
+Use `python3 tooling/native_routes.py render --out <staging-dir>` to generate
+per-host Fleet TOML, native infrastructure merge patches and **new** route units.
+Rendering never installs or activates a service. Generated shared-worker config
+omits `project_id`: new projects and identities become eligible via Board
+metadata, without host edits. `--project` is an explicit isolated-test option.
+The process regression adds a second project/identity after first dispatch and
+verifies both run without any subsequent host configuration changes.
+
+| Target runtime | Native `runtime_url` origin | Fleet REST base |
+| --- | --- | --- |
+| agent-lab | `http://127.0.0.1:17871` | `http://127.0.0.1:17871/api` |
+| agent-lab-2 | `http://127.0.0.1:17872` | `http://127.0.0.1:17872/api` |
+| agent-lab-3 | `http://127.0.0.1:17873` | `http://127.0.0.1:17873/api` |
+| agent-lab-4 | `http://127.0.0.1:17874` | `http://127.0.0.1:17874/api` |
+
+The same loopback aliases must resolve to the **same remote hosts from every
+lifecycle caller**, not only from the builder. The existing worker
+`borg-board-tunnel.service` owns local Board8079 and reverse native17872/3/4 on
+the controller. Leave it untouched while tools are active. Add these independent
+units, only after verifying their listeners are unused:
+
+- Controller `borg-native-controller-route.socket` and matching `.service`:
+  `127.0.0.1:17871` to controller-local `8787` via systemd socket proxy.
+- Worker2/3/4 `borg-native-routes.service`: persistent SSH local forwards
+  `17871` to controller8787; `17872/3/4` to the controller's existing reverse
+  listeners; and `17870` to the existing builder/bootstrap reverse listener.
+  Uses the already installed `/home/dev-user/.ssh/borg_config` and key, with
+  keepalive/restart and `ExitOnForwardFailure`. No new credentials or public
+  listeners, and no changes to the existing Board/runtime/workspace units.
+
+Install the rendered new units into `/etc/systemd/system`, `daemon-reload`, then
+`enable --now` the controller **socket** or the worker **route service**. Keep
+activation ownership explicit with the integrator; only the independent routing
+units may be activated without a native/Board drain. Native binary, Board,
+workspace and Fleet service activation remain the integrator's coordinated job.
+Merge native config fields recursively, preserving database and credential
+settings, including existing `board.bearer_token_env`.
+
+`python3 tooling/native_routes.py audit` SSHes to every lab (executes locally for
+the current lab), verifies the caller hostname, and probes the full 4x4 health
+matrix plus each lab's builder17870 route. It fails for a missing route rather
+than inferring availability from the controller. `--require-identity` additionally
+requires integrated health responses to report the correct target `host_id`;
+legacy health without that field proves transport only. Run `audit-local` from
+the builder to prove its existing forward access to all four targets without
+copying its keys. Save JSON with `audit --output <evidence-path>`.
