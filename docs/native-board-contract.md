@@ -49,6 +49,17 @@ that cap. Read-only discovery/profile transport failures retry indefinitely.
 Permanent configuration/auth errors remain visible for owned repair. Unknown
 mutating tool outcomes require reconciliation and are never replayed.
 
+An expired RMCP session is recoverable only when the response proves rejection
+before dispatch: HTTP 404 on a request with an established session id, and the
+complete exact RMCP `Not Found: Session not found` protocol body. The client
+renews once while preserving agent/operation identity. Repeated verified expiry
+or a renewal/discovery failure becomes a durable `isError` result explicitly
+marked `borg/not_executed`; ordinary retryable discovery continues in the normal
+unlimited loop. Generic 404/proxy pages, transport loss, malformed responses,
+HTTP 5xx after dispatch, and generic JSON-RPC internal errors are still unknown,
+not replay permission. Previously unknown calls require their original audit
+and resolution; this change never replays old unresolved operations.
+
 When effective tool entries exist, they are authoritative and replace legacy
 profile tool arrays. Disabled entries grant nothing, including when all entries
 are disabled. Supported unscoped enabled payloads:
