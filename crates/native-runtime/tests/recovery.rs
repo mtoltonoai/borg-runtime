@@ -314,7 +314,10 @@ async fn two_sessions_of_one_agent_reach_inference_concurrently_and_stay_isolate
                 json!({
                     "agent_id": "engineer",
                     "session_id": own.id,
-                    "task": own.task
+                    "task": own.task,
+                    "host_id": null,
+                    "workspace_cwd": null,
+                    "generation": 0
                 })
             );
             assert_eq!(instructions, "Use the supplied tool when needed.");

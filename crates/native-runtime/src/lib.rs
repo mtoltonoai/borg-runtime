@@ -1,5 +1,6 @@
 //! Small durable Responses executor. Agent configuration is reusable metadata;
 //! each session has independent transcript, control state and tool results.
+mod board;
 pub mod mcp;
 pub mod model;
 pub mod provider;
@@ -12,7 +13,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use store::{Store, ToolRecord};
@@ -30,6 +34,10 @@ struct Inner {
     running: Mutex<HashSet<String>>,
     run_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     stops: Mutex<HashMap<String, Arc<Notify>>>,
+    draining: AtomicBool,
+    admission: Mutex<()>,
+    reporting: AtomicBool,
+    report_lock: tokio::sync::Mutex<()>,
     _database_lock: File,
 }
 struct RunGuard {
@@ -78,6 +86,9 @@ impl Runtime {
             .context("another runtime owns this database")?;
         let store = Store::open(&database)?;
         store.recover()?;
+        if config.board.is_some() {
+            store.queue_current_reports(true)?;
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 config_path,
@@ -87,12 +98,195 @@ impl Runtime {
                 running: Mutex::new(HashSet::new()),
                 run_locks: Mutex::new(HashMap::new()),
                 stops: Mutex::new(HashMap::new()),
+                draining: AtomicBool::new(false),
+                admission: Mutex::new(()),
+                reporting: AtomicBool::new(false),
+                report_lock: tokio::sync::Mutex::new(()),
                 _database_lock: lock,
             }),
         })
     }
+    pub fn config(&self) -> Result<RuntimeConfig> {
+        read_config(&self.inner.config_path)
+    }
+    /// Local-only compatibility API. Board-enabled callers must use load_agents.
     pub fn agents(&self) -> Result<Vec<AgentConfig>> {
-        Ok(read_config(&self.inner.config_path)?.agents)
+        let config = read_config(&self.inner.config_path)?;
+        if config.board.is_some() {
+            bail!("Board profiles require async load_agents");
+        }
+        Ok(config.agents)
+    }
+    pub async fn load_agents(&self) -> Result<Vec<AgentConfig>> {
+        let config = read_config(&self.inner.config_path)?;
+        match &config.board {
+            Some(board) => board::BoardClient::new(board)?.load_agents().await,
+            None => Ok(config.agents),
+        }
+    }
+    pub async fn load_agent(&self, id: &str) -> Result<AgentConfig> {
+        let config = read_config(&self.inner.config_path)?;
+        match &config.board {
+            Some(board) => board::BoardClient::new(board)?.load_agent(id).await,
+            None => self.agent(id),
+        }
+    }
+    /// Resolve fresh profile and bind endpoint templates to one durable session.
+    pub async fn session_agent(&self, id: &str) -> Result<AgentConfig> {
+        let session = self.get_session(id)?;
+        let mut agent = self.load_agent(&session.agent_id).await?;
+        if let Some(board) = &self.config()?.board {
+            board::BoardClient::new(board)?
+                .check_generation(&session.id, session.generation)
+                .await?;
+        }
+        for server in &mut agent.mcp_servers {
+            server.url = server
+                .url
+                .replace(
+                    "{runtime_url}",
+                    session.runtime_url.as_deref().unwrap_or_default(),
+                )
+                .replace("{session_id}", &url_component(id))
+                .replace("{agent_id}", &url_component(&session.agent_id));
+            if server.name == "workspace"
+                && let Some(url) = &session.workspace_mcp_url
+            {
+                server.url = url.clone();
+            }
+            if server.name == "native"
+                && let Some(url) = &session.lifecycle_mcp_url
+            {
+                server.url = url
+                    .replace("{session_id}", &url_component(id))
+                    .replace("{agent_id}", &url_component(&session.agent_id));
+            }
+        }
+        // Placement can bind an authorized server, never add a revoked tool grant.
+        validate_agent(&agent)?;
+        Ok(agent)
+    }
+    pub async fn create_session_with_options(
+        &self,
+        agent_id: &str,
+        task: Option<String>,
+        input: &str,
+        mut options: SessionOptions,
+    ) -> Result<Session> {
+        validate_create(agent_id, input, &options)?;
+        let config = read_config(&self.inner.config_path)?;
+        if options.host_id.is_none() {
+            options.host_id = config.host_id.clone();
+        }
+        if config.host_id.is_some() && options.host_id != config.host_id {
+            bail!("session host_id differs from this runtime host");
+        }
+        if let Some(session) = self
+            .inner
+            .store
+            .existing_request(agent_id, &task, input, &options)?
+        {
+            return Ok(self.observe(session));
+        }
+        self.ensure_accepting()?;
+        self.load_agent(agent_id).await?;
+        let _admission = self.inner.admission.lock().unwrap();
+        self.ensure_accepting()?;
+        let session = self.inner.store.create_with_options(
+            agent_id,
+            task,
+            input,
+            options,
+            config.runtime_url,
+        )?;
+        Ok(self.observe(session))
+    }
+    fn ensure_accepting(&self) -> Result<()> {
+        if self.is_draining() {
+            bail!("runtime is quiescing; no new sessions accepted");
+        }
+        Ok(())
+    }
+    pub fn is_draining(&self) -> bool {
+        self.inner.draining.load(Ordering::SeqCst)
+    }
+    /// Cooperative drain: never cancels an in-flight tool or inference. Callers
+    /// poll driver_running before stopping the process. Ready work restarts from
+    /// committed state after deployment.
+    pub fn quiesce(&self) -> Result<Vec<Session>> {
+        let _admission = self.inner.admission.lock().unwrap();
+        self.inner.draining.store(true, Ordering::SeqCst);
+        self.list_sessions()
+    }
+    pub fn unquiesce(&self) {
+        self.inner.draining.store(false, Ordering::SeqCst);
+    }
+    /// Start the durable reporting worker once. The worker owns only a Weak
+    /// runtime between deliveries; dropping a runtime releases its database lock.
+    pub fn start_reporting(&self) -> Result<()> {
+        let config = read_config(&self.inner.config_path)?;
+        let Some(board) = config.board else {
+            return Ok(());
+        };
+        let handle =
+            tokio::runtime::Handle::try_current().context("reporting requires an async runtime")?;
+        if self.inner.reporting.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let weak = Arc::downgrade(&self.inner);
+        handle.spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let runtime = Runtime { inner };
+                let _ = runtime.flush_reports().await;
+                drop(runtime);
+                tokio::time::sleep(Duration::from_millis(board.report_interval_ms)).await;
+            }
+        });
+        Ok(())
+    }
+    pub async fn flush_reports(&self) -> Result<usize> {
+        let _lock = self.inner.report_lock.lock().await;
+        let config = read_config(&self.inner.config_path)?;
+        let Some(board) = config.board else {
+            return Ok(0);
+        };
+        let client = board::BoardClient::new(&board)?;
+        self.inner.store.queue_current_reports(false)?;
+        let mut delivered = 0;
+        let mut failed = HashSet::new();
+        // Bounded batches keep shutdown and one unavailable identity responsive.
+        for (sequence, mut session) in self.inner.store.pending_reports(256)? {
+            if failed.contains(&session.id) {
+                continue;
+            }
+            session.driver_running = self.inner.running.lock().unwrap().contains(&session.id);
+            match client.report(&session).await {
+                Ok(()) => {
+                    self.inner.store.acknowledge_report(sequence, &session.id)?;
+                    delivered += 1;
+                }
+                Err(error) => {
+                    self.inner
+                        .store
+                        .report_error(&session.id, &error.to_string())?;
+                    failed.insert(session.id);
+                }
+            }
+        }
+        Ok(delivered)
+    }
+    fn observe(&self, mut session: Session) -> Session {
+        session.driver_running = self.inner.running.lock().unwrap().contains(&session.id);
+        session.report_error = self
+            .inner
+            .store
+            .get_report_error(&session.id)
+            .ok()
+            .flatten();
+        session
     }
     fn agent(&self, id: &str) -> Result<AgentConfig> {
         self.agents()?
@@ -106,6 +300,8 @@ impl Runtime {
         task: Option<String>,
         input: &str,
     ) -> Result<Session> {
+        let _admission = self.inner.admission.lock().unwrap();
+        self.ensure_accepting()?;
         self.agent(agent_id)?;
         if input.trim().is_empty() {
             bail!("input must not be empty")
@@ -113,10 +309,16 @@ impl Runtime {
         self.inner.store.create(agent_id, task, input)
     }
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
-        self.inner.store.list()
+        Ok(self
+            .inner
+            .store
+            .list()?
+            .into_iter()
+            .map(|s| self.observe(s))
+            .collect())
     }
     pub fn get_session(&self, id: &str) -> Result<Session> {
-        self.inner.store.get(id)
+        Ok(self.observe(self.inner.store.get(id)?))
     }
     pub fn transcript(&self, id: &str) -> Result<Vec<TranscriptEntry>> {
         self.inner.store.transcript(id)
@@ -153,6 +355,33 @@ impl Runtime {
             self.notify(id).notify_one();
         }
         Ok(s)
+    }
+    /// Explicit placement adoption at an inactive boundary. Prior transcripts
+    /// and committed tool receipts/endpoints remain immutable. Unknown effects
+    /// must be reconciled before moving a session to another workspace.
+    pub fn bind_session(&self, id: &str, mut options: SessionOptions) -> Result<Session> {
+        validate_create("binding", "binding", &options)?;
+        if options.session_id.as_ref().is_some_and(|other| other != id) {
+            bail!("binding cannot change session_id");
+        }
+        let config = self.config()?;
+        if options.host_id.is_none() {
+            options.host_id = config.host_id.clone();
+        }
+        if config.host_id.is_some() && options.host_id != config.host_id {
+            bail!("session host_id differs from this runtime host");
+        }
+        let running = self.inner.running.lock().unwrap();
+        if running.contains(id) {
+            bail!("session is already running; drain before binding placement");
+        }
+        self.inner.store.bind(id, options, config.runtime_url)
+    }
+    /// Graceful per-session stop: mark the durable boundary but do not cancel
+    /// the active tool future (including a tool requesting its own stop).
+    pub fn drain_session(&self, id: &str) -> Result<Session> {
+        let running = self.inner.running.lock().unwrap();
+        self.inner.store.stop(id, running.contains(id))
     }
     pub fn resume(&self, id: &str) -> Result<Session> {
         let running = self.inner.running.lock().unwrap();
@@ -193,6 +422,9 @@ impl Runtime {
             id: id.into(),
         };
         let s = self.get_session(id)?;
+        if self.is_draining() {
+            return Ok(s);
+        }
         if matches!(
             s.status,
             SessionStatus::Completed
@@ -243,7 +475,46 @@ impl Runtime {
                     .state(id, SessionStatus::Stopped, "Stopped", None);
             }
             let session = self.get_session(id)?;
-            let config = self.agent(&session.agent_id)?;
+            if self.is_draining() {
+                return self.inner.store.state(
+                    id,
+                    SessionStatus::Ready,
+                    "Quiesced at a durable boundary; ready after restart",
+                    None,
+                );
+            }
+            let mut profile_attempt = 0u64;
+            let fallback_retry: AgentConfig =
+                serde_json::from_value(json!({"id": session.agent_id, "instructions":""}))?;
+            let config = loop {
+                let loaded = tokio::select! {
+                    biased;
+                    _=stop.notified()=>return self.inner.store.state(id,SessionStatus::Stopped,"Stopped during profile load",None),
+                    result=self.session_agent(id)=>result,
+                };
+                match loaded {
+                    Ok(config) => break config,
+                    Err(error) => {
+                        let Some(hint) = board::read_retry_after(&error) else {
+                            return Err(error);
+                        };
+                        profile_attempt = profile_attempt.saturating_add(1);
+                        if self
+                            .wait_retry(
+                                id,
+                                "profile_discovery",
+                                profile_attempt,
+                                &fallback_retry,
+                                &error.to_string(),
+                                hint,
+                            )
+                            .await?
+                        {
+                            return self.retry_interrupted(id, "Stopped during profile retry");
+                        }
+                    }
+                }
+            };
             // Pending intents were durably committed by a completed model response.
             // Resume these before another model call; Unknown intents are never sent again.
             let intents = self.inner.store.tools(id)?;
@@ -269,6 +540,14 @@ impl Runtime {
                 );
             }
             for record in intents.into_iter().filter(|r| r.call.status == "pending") {
+                if self.is_draining() {
+                    return self.inner.store.state(
+                        id,
+                        SessionStatus::Ready,
+                        "Quiesced before the next tool; committed results preserved",
+                        None,
+                    );
+                }
                 if self.inner.store.stopped(id)? {
                     return self.inner.store.state(
                         id,
@@ -287,6 +566,28 @@ impl Runtime {
                 self.inner
                     .store
                     .tool_state(id, &call.call_id, "running", None)?;
+                if let Some((namespace, tool)) = call.name.split_once("__") {
+                    let current = config
+                        .mcp_servers
+                        .iter()
+                        .find(|server| server.name == namespace);
+                    let original = record
+                        .servers
+                        .iter()
+                        .find(|server| server.name == namespace);
+                    let granted = current.zip(original).is_some_and(|(current, original)| {
+                        current.url == original.url
+                            && current
+                                .tools_allowlist
+                                .as_ref()
+                                .is_none_or(|allowed| allowed.iter().any(|name| name == tool))
+                    });
+                    if !granted {
+                        self.inner.store.tool_result(id, &call.call_id,
+                            json!({"isError":true,"content":[{"type":"text","text":"Tool grant or endpoint changed before dispatch; no tool was executed"}]}), false)?;
+                        continue;
+                    }
+                }
                 let result = tokio::select! {
                     biased;
                     _=stop.notified()=>Err("Stop requested while a tool result was pending; resolve its original outcome".to_string()),
@@ -319,6 +620,14 @@ impl Runtime {
                     .inner
                     .store
                     .state(id, SessionStatus::Stopped, "Stopped", None);
+            }
+            if self.is_draining() {
+                return self.inner.store.state(
+                    id,
+                    SessionStatus::Ready,
+                    "Quiesced after tool results were committed",
+                    None,
+                );
             }
             if config.max_turns.is_some_and(|limit| turns >= limit) {
                 return self.inner.store.state(
@@ -358,12 +667,8 @@ impl Runtime {
                             )
                             .await?
                         {
-                            return self.inner.store.state(
-                                id,
-                                SessionStatus::Stopped,
-                                "Stopped during tool discovery retry",
-                                None,
-                            );
+                            return self
+                                .retry_interrupted(id, "Stopped during tool discovery retry");
                         }
                     }
                 }
@@ -388,7 +693,7 @@ impl Runtime {
                 model: config.model.clone(),
                 instructions: format!(
                     "Runtime identity and task context: {}\n\n{}",
-                    json!({"agent_id":session.agent_id,"session_id":session.id,"task":session.task}),
+                    json!({"agent_id":session.agent_id,"session_id":session.id,"task":session.task,"host_id":session.host_id,"workspace_cwd":session.workspace_cwd,"generation":session.generation}),
                     config.instructions,
                 ),
                 input,
@@ -450,12 +755,7 @@ impl Runtime {
                             )
                             .await?
                         {
-                            return self.inner.store.state(
-                                id,
-                                SessionStatus::Stopped,
-                                "Stopped during inference retry",
-                                None,
-                            );
+                            return self.retry_interrupted(id, "Stopped during inference retry");
                         }
                     }
                     Err(error) => {
@@ -518,10 +818,36 @@ impl Runtime {
             return Ok(true);
         }
         let stop = self.notify(id);
-        tokio::select! {
-            biased;
-            _=stop.notified()=>Ok(true),
-            _=tokio::time::sleep(Duration::from_millis(delay))=>Ok(false),
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(delay);
+        loop {
+            if self.inner.store.stopped(id)? || self.is_draining() {
+                return Ok(true);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            // A graceful drain never sends cancellation into an active tool;
+            // read-only backoff can safely observe its durable flag promptly.
+            tokio::select! {
+                biased;
+                _=stop.notified()=>return Ok(true),
+                _=tokio::time::sleep_until(deadline.min(now + Duration::from_secs(1)))=>{},
+            }
+        }
+    }
+    fn retry_interrupted(&self, id: &str, progress: &str) -> Result<Session> {
+        if self.is_draining() && !self.inner.store.stopped(id)? {
+            self.inner.store.state(
+                id,
+                SessionStatus::Ready,
+                "Quiesced during read-only retry",
+                None,
+            )
+        } else {
+            self.inner
+                .store
+                .state(id, SessionStatus::Stopped, progress, None)
         }
     }
     fn parse_calls(
@@ -586,26 +912,78 @@ pub fn read_config(path: impl AsRef<Path>) -> Result<RuntimeConfig> {
         &std::fs::read(path.as_ref()).context("read runtime configuration")?,
     )
     .context("parse runtime configuration")?;
+    if let Some(board) = &config.board {
+        board::BoardClient::new(board)?;
+    }
     let mut ids = HashSet::new();
     for agent in &config.agents {
-        if agent.id.trim().is_empty() || agent.model.trim().is_empty() || !ids.insert(&agent.id) {
-            bail!("agents need unique nonempty ids and models")
+        if !ids.insert(&agent.id) {
+            bail!("agents need unique nonempty ids and models");
         }
-        if agent.max_turns == Some(0) || agent.max_output_tokens == Some(0) {
-            bail!("configured turn/output limits must be positive or absent")
-        }
-        if agent.retry_initial_ms == 0
-            || agent.retry_max_ms == 0
-            || agent.retry_jitter_percent > 100
-        {
-            bail!("retry delays must be positive and jitter percent at most 100")
-        }
-        let mut names = HashSet::new();
-        for server in &agent.mcp_servers {
-            if server.name.is_empty() || !names.insert(&server.name) {
-                bail!("MCP servers need unique nonempty names per agent")
-            }
-        }
+        validate_agent(agent)?;
     }
     Ok(config)
+}
+pub(crate) fn validate_agent(agent: &AgentConfig) -> Result<()> {
+    if agent.id.trim().is_empty() || agent.model.trim().is_empty() {
+        bail!("agents need unique nonempty ids and models");
+    }
+    if agent.max_turns == Some(0) || agent.max_output_tokens == Some(0) {
+        bail!("configured turn/output limits must be positive or absent");
+    }
+    if agent.context_window_tokens == 0
+        || agent
+            .max_output_tokens
+            .is_some_and(|n| u64::from(n) > agent.context_window_tokens)
+    {
+        bail!("output must fit the shared context window");
+    }
+    if agent.retry_initial_ms == 0 || agent.retry_max_ms == 0 || agent.retry_jitter_percent > 100 {
+        bail!("retry delays must be positive and jitter percent at most 100")
+    }
+    let mut names = HashSet::new();
+    for server in &agent.mcp_servers {
+        if server.name.is_empty() || !names.insert(&server.name) {
+            bail!("MCP servers need unique nonempty names per agent");
+        }
+    }
+    Ok(())
+}
+fn validate_create(agent: &str, input: &str, options: &SessionOptions) -> Result<()> {
+    if agent.trim().is_empty() || input.trim().is_empty() {
+        bail!("input and agent_id must not be empty");
+    }
+    if options
+        .session_id
+        .as_ref()
+        .is_some_and(|s| s.is_empty() || s.len() > 256 || s.chars().any(char::is_control))
+    {
+        bail!("invalid session_id");
+    }
+    if options
+        .workspace_cwd
+        .as_ref()
+        .is_some_and(|p| !p.is_absolute())
+    {
+        bail!("workspace_cwd must be absolute");
+    }
+    if options.generation > i64::MAX as u64 {
+        bail!("generation exceeds the Board integer range");
+    }
+    if !options.metadata.is_object() {
+        bail!("session metadata must be an object");
+    }
+    Ok(())
+}
+fn url_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
