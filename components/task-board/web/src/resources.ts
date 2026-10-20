@@ -30,9 +30,11 @@ import {
   type TaskSummary,
 } from './api'
 import { invalidate, invalidateMatching, useResource } from './store'
+import type { NativeFleetSnapshot } from './native-fleet'
 
 // Resource keys. Keep these in one place so producers (touched) and consumers (hooks) agree.
 const keys = {
+  nativeFleet: 'nativeFleet',
   projects: 'projects',
   agents: 'agents',
   // Keyed by window size so a wide per-agent feed (AgentView) and the compact chrome feed
@@ -74,6 +76,14 @@ const keys = {
   reviewTrend: 'reviewTrend',
   // Deployment-configured custom link-tag rules (task_1243); static, so one cache entry.
   linkRules: 'system:linkRules',
+}
+
+export function useNativeFleet() {
+  return useResource<NativeFleetSnapshot>(keys.nativeFleet, () => api.nativeFleet())
+}
+
+export function refreshNativeFleet() {
+  invalidate(keys.nativeFleet)
 }
 
 export function useProjects() {
@@ -731,6 +741,7 @@ export interface StreamEvent {
  * components refetch from scratch.
  */
 export function applyStreamEvent(ev: StreamEvent) {
+  if (ev.type.startsWith('fleet.') || ev.type === 'session.state_reported') refreshNativeFleet()
   if (ev.type === 'resync') {
     invalidateMatching('') // every key startsWith '' — invalidate all loaded resources
     return

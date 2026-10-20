@@ -12,6 +12,7 @@ import Documents from './Documents.tsx'
 import DocumentView from './DocumentView.tsx'
 import ErrorBoundary from './ErrorBoundary.tsx'
 import Home from './Home.tsx'
+import NativeFleet from './NativeFleet.tsx'
 import Layout from './Layout.tsx'
 import People from './People.tsx'
 import ProjectAccess from './ProjectAccess.tsx'
@@ -69,6 +70,7 @@ createRoot(document.getElementById('root')!).render(
         <Routes>
           <Route element={<Layout />}>
             <Route index element={<Home />} />
+            <Route path="native" element={<NativeFleet />} />
             <Route path="awaiting" element={<Awaiting />} />
             <Route path="search" element={<Search />} />
             <Route path="settings" element={<Settings />} />

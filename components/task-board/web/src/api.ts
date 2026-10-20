@@ -1,3 +1,5 @@
+import { loadNativeFleet } from './native-fleet'
+
 // Typed client for the task-board REST API. Request URLs are resolved against the page's
 // base URI, which reflects the <base href> the backend injects from X-Forwarded-Prefix —
 // so the same build works at the origin root or behind a sub-path proxy (e.g. /board)
@@ -655,6 +657,7 @@ export function setApiFailureReporter(fn: (f: ApiFailure) => void) {
 }
 
 export const api = {
+  nativeFleet: () => loadNativeFleet((path) => req<unknown>('GET', path)),
   meta: () => req<Meta>('GET', '/meta'),
 
   // Deployment-configured link-tag rules (task_1243): a read-only list the UI uses to linkify

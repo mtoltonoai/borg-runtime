@@ -60,7 +60,12 @@ export default function Home() {
 
   return (
     <main ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-5">
-      <h1 className="mb-4 text-sm font-semibold">Fleet dashboard</h1>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <h1 className="text-sm font-semibold">Fleet dashboard</h1>
+        <Link to="/native" className="text-xs text-sky-700 dark:text-sky-400 underline decoration-dotted underline-offset-2">
+          Native sessions, hosts and deployed revisions
+        </Link>
+      </div>
 
       {/* Headline stats. */}
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">

@@ -13,5 +13,6 @@ python3 -m unittest discover -s tests -v
   cargo test --locked
   cd web
   npm ci
+  npm run test:native
   npm run build
 )
