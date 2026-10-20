@@ -62,3 +62,6 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 futures-util = "0.3"
 # `ServiceExt::oneshot` for router-level request tests (e.g. typed-id path extraction, task 504).
 tower = { version = "0.5", features = ["util"] }
+
+# This source component is independent, including in a nested Git build worktree.
+[workspace]
