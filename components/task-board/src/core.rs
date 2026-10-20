@@ -10506,6 +10506,12 @@ pub async fn check_cid_content(
     acknowledge: bool,
     acknowledged_phrases: &[String],
 ) -> anyhow::Result<Vec<String>> {
+    // A disabled style gate must not add an IPFS availability dependency to
+    // publishing a CID. The document operation itself still validates/stores
+    // its identifier; only optional content scanning is skipped here.
+    if content_policy(pool).await?["enforce_style"] != true {
+        return Ok(Vec::new());
+    }
     // A pure blanket acknowledge (no scoped list) suppresses everything, so there is nothing to
     // scan or surface and we skip the fetch. A scoped list must still be enforced, so it falls
     // through to fetch + check_content, which rejects any banned hit not in the list (task_1534).
@@ -31888,6 +31894,29 @@ mod tests {
     async fn check_cid_content_skips_without_backend_or_ack_or_nontext() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // Advisory/default policy never fetches an unreachable style-only backend.
+        assert!(check_cid_content(
+            &pool,
+            Some("http://127.0.0.1:1"),
+            "Qm-test",
+            "text/markdown",
+            false,
+            &[]
+        )
+        .await
+        .is_ok());
+        set_content_policy(&pool, true, None).await?;
+        // Opted-in enforcement still fails closed if configured content cannot be read.
+        assert!(check_cid_content(
+            &pool,
+            Some("http://127.0.0.1:1"),
+            "Qm-test",
+            "text/markdown",
+            false,
+            &[]
+        )
+        .await
+        .is_err());
         add_banned_phrase(&pool, "robust", None, Some("t")).await?;
 
         // No IPFS backend -> cannot fetch, so it cannot gate: Ok without touching the network.
