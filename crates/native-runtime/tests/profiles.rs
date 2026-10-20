@@ -46,7 +46,7 @@ impl Board {
         *state.identity.lock().unwrap() = json!({"id":"engineer","charter":"Board charter v1","lifecycle_intent":"run","metadata":{"role":"engineering","model":"board-model"}});
         *state.runtime.lock().unwrap() = json!({"role":"engineering","role_version":1,"agent_version":0,"entries":[{"id":"profile","enabled":true,"payload":{"retry_initial_ms":1,"retry_max_ms":2}}]});
         *state.tools.lock().unwrap() = json!({"role_version":1,"agent_version":0,"entries":[
-            {"id":"workspace","enabled":true,"payload":{"kind":"mcp","name":"workspace","url":"http://unused/{session_id}","tools_allowlist":["write"]}},
+            {"id":"workspace","enabled":true,"payload":{"kind":"mcp","name":"workspace","bound_agent_id":"spoofed-profile-id","url":"http://unused/{session_id}","tools_allowlist":["write"]}},
             {"id":"native","enabled":true,"payload":{"kind":"mcp","name":"native","url":"{runtime_url}/mcp/sessions/{session_id}"}}
         ]});
         async fn identity(
@@ -275,6 +275,12 @@ async fn board_only_new_identity_hot_reload_parallel_sessions_and_endpoint_bindi
     assert_eq!(profile.context_window_tokens, 1050000);
     assert_eq!(profile.max_turns, None);
     assert_eq!(profile.max_retries, None);
+    assert!(
+        profile
+            .mcp_servers
+            .iter()
+            .all(|server| server.bound_agent_id.as_deref() == Some("engineer"))
+    );
     assert_eq!(
         profile.profile_source.as_ref().unwrap()["authority"],
         "board"
@@ -752,5 +758,142 @@ async fn explicit_binding_preserves_transcript_and_rejects_generation_rollback()
     assert_eq!(
         runtime.get_session("adopt").unwrap().status,
         SessionStatus::Completed
+    );
+}
+
+struct BoardIdentityModel {
+    barrier: Barrier,
+}
+impl Provider for BoardIdentityModel {
+    fn respond(
+        &self,
+        request: ProviderRequest,
+    ) -> BoxFuture<'_, Result<ProviderResponse, ProviderError>> {
+        Box::pin(async move {
+            if request
+                .input
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+            {
+                return Ok(answer());
+            }
+            self.barrier.wait().await;
+            Ok(ProviderResponse {
+                id: None,
+                status: "completed".into(),
+                usage: None,
+                output: vec![json!({
+                    "type":"function_call","call_id":"identity-check","name":"board__set_status",
+                    "arguments":"{\"status\":\"idle\",\"status_message\":\"native identity binding test\"}"
+                })],
+            })
+        })
+    }
+}
+#[tokio::test]
+#[ignore = "requires BORG_TEST_TASK_BOARD_URL; tests actual Board MCP attribution for two new identities then pauses fixtures"]
+async fn real_board_mcp_binds_concurrent_new_identities_without_host_env_or_registration() {
+    let url = std::env::var("BORG_TEST_TASK_BOARD_URL")
+        .unwrap()
+        .trim_end_matches('/')
+        .to_owned();
+    let client = reqwest::Client::new();
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let role = format!("native-binding-role-{suffix}");
+    let ids = [
+        format!("native-binding-a-{suffix}"),
+        format!("native-binding-b-{suffix}"),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_file(&dir, &url);
+    let original = std::fs::read(&config).unwrap();
+    let runtime = Runtime::with_backends(
+        &config,
+        Arc::new(BoardIdentityModel {
+            barrier: Barrier::new(2),
+        }),
+        Arc::new(native_runtime::mcp::McpToolExecutor::new().unwrap()),
+    )
+    .unwrap();
+    // The runtime already exists. New identities/tool grants are Board-only.
+    for id in &ids {
+        client.post(format!("{url}/api/agents")).json(&json!({"agent_id":id,"charter":"identity binding test","metadata":{"role":role,"harness":"native-test-fixture","test_only":true}})).send().await.unwrap().error_for_status().unwrap();
+    }
+    client
+        .post(format!("{url}/api/roles/{role}/config/tool"))
+        .json(&json!({"entry_id":"board","enabled":true,"payload":{
+            "kind":"mcp","name":"board","url":format!("{url}/mcp"),"tools_allowlist":["set_status"],
+            "headers_env":{"X-Fleet-Agent":format!("ABSENT_NATIVE_IDENTITY_{}",suffix)},
+            "bound_agent_id":"spoofed-profile-value"
+        }}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let session_ids = [format!("binding-a-{suffix}"), format!("binding-b-{suffix}")];
+    for (id, session_id) in ids.iter().zip(&session_ids) {
+        runtime
+            .create_session_with_options(
+                id,
+                None,
+                "report my identity via Board without register_agent",
+                options(session_id, "/tmp/identity-test"),
+            )
+            .await
+            .unwrap();
+    }
+    let (first, second) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(runtime.run(&session_ids[0]), runtime.run(&session_ids[1]))
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.unwrap().status, SessionStatus::Completed);
+    assert_eq!(second.unwrap().status, SessionStatus::Completed);
+    for (id, session_id) in ids.iter().zip(&session_ids) {
+        let agent: Value = client
+            .get(format!("{url}/api/agents/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(agent["status"], "idle");
+        assert_eq!(agent["status_message"], "native identity binding test");
+        let calls = runtime.tool_calls(session_id).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "succeeded");
+        assert!(
+            serde_json::to_string(&calls[0].result)
+                .unwrap()
+                .contains(id)
+        );
+        assert_eq!(
+            runtime.session_agent(session_id).await.unwrap().mcp_servers[0]
+                .bound_agent_id
+                .as_deref(),
+            Some(id.as_str())
+        );
+        let connection = rusqlite::Connection::open(dir.path().join("sessions.sqlite")).unwrap();
+        let persisted: String = connection
+            .query_row(
+                "SELECT body FROM tool_calls WHERE session_id=?",
+                [session_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let persisted: Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(persisted["servers"][0]["bound_agent_id"], *id);
+    }
+    assert!(runtime.flush_reports().await.unwrap() > 0);
+    for id in &ids {
+        client.post(format!("{url}/api/agents/{id}/lifecycle-intent")).json(&json!({"intent":"paused","intent_by":"native-core","reason":"native identity binding test complete"})).send().await.unwrap().error_for_status().unwrap();
+    }
+    assert_eq!(std::fs::read(&config).unwrap(), original);
+    eprintln!(
+        "real Board MCP identity test passed: agents={ids:?}, sessions={session_ids:?}, no register_agent call or per-agent env, durable bindings preserved"
     );
 }

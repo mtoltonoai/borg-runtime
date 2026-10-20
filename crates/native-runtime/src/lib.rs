@@ -141,6 +141,10 @@ impl Runtime {
                 .await?;
         }
         for server in &mut agent.mcp_servers {
+            // Stable identity is runtime authority, never a shared host env or
+            // a model-issued register_agent call. Binding all MCP endpoints also
+            // covers aliases of the Board server without trusting a name label.
+            server.bound_agent_id = Some(session.agent_id.clone());
             server.url = server
                 .url
                 .replace(
@@ -539,7 +543,13 @@ impl Runtime {
                     Some("unresolved tool outcome".into()),
                 );
             }
-            for record in intents.into_iter().filter(|r| r.call.status == "pending") {
+            for mut record in intents.into_iter().filter(|r| r.call.status == "pending") {
+                // Adopt legacy pending intents' identity without changing their
+                // endpoint/arguments/operation id. tool_state persists this same
+                // trusted binding before any request can be sent.
+                for server in &mut record.servers {
+                    server.bound_agent_id = Some(session.agent_id.clone());
+                }
                 if self.is_draining() {
                     return self.inner.store.state(
                         id,

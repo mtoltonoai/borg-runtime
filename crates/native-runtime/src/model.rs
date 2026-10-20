@@ -144,6 +144,10 @@ pub struct McpServerConfig {
     pub url: String,
     #[serde(default)]
     pub headers_env: BTreeMap<String, String>,
+    /// Runtime-owned identity binding, persisted with the original tool intent.
+    /// session_agent always replaces profile-supplied values with Session.agent_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_agent_id: Option<String>,
     #[serde(default)]
     pub tools_allowlist: Option<Vec<String>>,
 }

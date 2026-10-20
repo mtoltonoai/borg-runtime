@@ -69,7 +69,13 @@ are disabled. Supported unscoped enabled payloads:
 {"kind":"provider","tool":{"type":"web_search"}}
 ```
 
-MCP payloads also accept `headers_env`. Unsupported/scoped grants fail closed;
+MCP payloads also accept `headers_env`. The runtime binds `bound_agent_id` to the
+actual durable session identity on every resolved MCP server (including Board
+aliases) and transports it as `X-Fleet-Agent`. A profile-supplied identity is
+never trusted; a host `headers_env` entry for that header is ignored without
+reading its environment variable. This binding is persisted with tool intents,
+and legacy pending intents acquire the current trusted identity before dispatch.
+No model `register_agent` call or per-agent host environment variable is needed. Unsupported/scoped grants fail closed;
 there is no silent broad-tool fallback. Before discovery, `{session_id}` and
 `{agent_id}` URL components and `{runtime_url}` are expanded. Placement can bind
 the endpoint of an already-authorized `workspace` or `native` server; it cannot
