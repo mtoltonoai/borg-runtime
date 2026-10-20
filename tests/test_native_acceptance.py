@@ -34,8 +34,10 @@ def fixture():
             "generation": 1, "status": "running", "updated_at": NOW})
         snapshot["board"]["tasks"].append({"id": number, "assignee": "engineer", "status": "in_progress"})
         snapshot["runtimes"][host] = {"health": {"status": "ok", "host_id": host, "revision": REV, "instance_id": f"old-{host}"},
-            "agents": [profile], "sessions": [session], "tools": {sid: [{"call_id": "call-1", "operation_id": f"{sid}:call-1",
-                "name": "workspace__workspace_run", "status": "succeeded", "result_sha256": audit.digest({"exit_code": 0})}]}}
+            "agents": [profile], "sessions": [session], "tools": {sid: [audit.tool_receipt({
+                "call_id": "call-1", "operation_id": f"{sid}:call-1", "name": "workspace__workspace_run",
+                "arguments": {"command": "printf original"}, "status": "succeeded",
+                "result": {"exit_code": 0}, "error": None})]}}
     return snapshot
 
 
@@ -252,6 +254,96 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertFalse(audit.compare_restart(self.snapshot, after)["ok"])
 
 
+class ReceiptCustodyTests(unittest.TestCase):
+    def setUp(self):
+        self.raw = {"call_id": "call-1", "operation_id": "session-1:call-1",
+                    "name": "workspace__workspace_run", "arguments": {"command": "printf PRIVATE"},
+                    "status": "succeeded", "result": {"output": "PRIVATE"}, "error": None}
+        self.before = fixture()
+        self.before["runtimes"]["agent-lab"]["tools"]["session-1"] = [audit.tool_receipt(self.raw)]
+        self.after = copy.deepcopy(self.before)
+        self.after["runtimes"]["agent-lab"]["health"]["instance_id"] += "-new"
+
+    def compare(self):
+        return audit.compare_restart(self.before, self.after, ["agent-lab"])
+
+    def replace_current(self, raw):
+        self.after["runtimes"]["agent-lab"]["tools"]["session-1"] = [audit.tool_receipt(raw)]
+
+    def test_hash_covers_complete_public_call_without_exporting_bodies(self):
+        receipt = audit.tool_receipt(self.raw)
+        self.assertEqual(receipt.get("receipt_sha256"), audit.digest(self.raw))
+        self.assertNotIn("PRIVATE", json.dumps(receipt))
+        self.assertNotIn("arguments", receipt)
+        self.assertNotIn("result", receipt)
+        self.assertNotIn("error", receipt)
+        self.assertTrue(self.compare()["ok"])
+
+    def test_same_result_cannot_hide_changed_name_arguments_or_error(self):
+        for key, value in (("name", "workspace__workspace_write"),
+                           ("arguments", {"command": "printf REPLACEMENT"}),
+                           ("error", "PRIVATE rewritten error")):
+            with self.subTest(field=key):
+                changed = dict(self.raw, **{key: value})
+                self.replace_current(changed)
+                self.assertEqual(audit.tool_receipt(changed)["result_sha256"],
+                                 audit.tool_receipt(self.raw)["result_sha256"])
+                result = self.compare()
+                self.assertFalse(result["ok"], result)
+                self.assertNotIn("PRIVATE", json.dumps(result))
+                self.assertNotIn("REPLACEMENT", json.dumps(result))
+
+    def test_missing_hash_in_result_only_snapshot_fails_closed(self):
+        for which in ("before", "after", "both"):
+            with self.subTest(snapshot=which):
+                before, after = copy.deepcopy(self.before), copy.deepcopy(self.after)
+                for snap, label in ((before, "before"), (after, "after")):
+                    if which in (label, "both"):
+                        snap["runtimes"]["agent-lab"]["tools"]["session-1"][0].pop("receipt_sha256", None)
+                result = audit.compare_restart(before, after, ["agent-lab"])
+                self.assertFalse(result["ok"], "result-only snapshots cannot establish full call preservation")
+
+    def test_incomplete_public_call_does_not_get_a_full_receipt_digest(self):
+        for key in self.raw:
+            with self.subTest(missing=key):
+                partial = dict(self.raw)
+                del partial[key]
+                self.assertNotIn("receipt_sha256", audit.tool_receipt(partial))
+        for key in ("call_id", "operation_id", "name"):
+            for invalid in (None, "", 1):
+                with self.subTest(field=key, invalid=invalid):
+                    self.assertNotIn("receipt_sha256", audit.tool_receipt(dict(self.raw, **{key: invalid})))
+
+    def test_normal_mcp_error_result_is_a_completed_preserved_receipt(self):
+        raw = dict(self.raw, result={"content": [{"type": "text", "text": "denied PRIVATE"}], "isError": True})
+        self.before["runtimes"]["agent-lab"]["tools"]["session-1"] = [audit.tool_receipt(raw)]
+        self.replace_current(raw)
+        result = self.compare()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["preserved_completed_tools"], 1)
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_pending_and_unknown_calls_do_not_claim_preservation(self):
+        for status in ("pending", "running", "unknown", "failed"):
+            with self.subTest(status=status):
+                receipt = audit.tool_receipt(dict(self.raw, status=status))
+                self.assertNotIn("receipt_sha256", receipt)
+                self.replace_current(dict(self.raw, status=status))
+                self.assertFalse(self.compare()["ok"])
+
+    def test_json_key_order_and_additional_new_calls_do_not_change_old_receipt(self):
+        reordered = dict(reversed(list(self.raw.items())))
+        self.replace_current(reordered)
+        self.after["runtimes"]["agent-lab"]["tools"]["session-1"].append(audit.tool_receipt(
+            dict(self.raw, call_id="call-new", operation_id="session-1:call-new")))
+        result = self.compare()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["preserved_completed_tools"], 1)
+
+    def test_empty_host_scope_is_not_a_receipt_proof(self):
+        self.assertFalse(audit.compare_restart(self.before, self.after, [])["ok"])
+
+
 class HTTPTests(unittest.TestCase):
     def setUp(self):
         self.routes = {}
@@ -308,11 +400,13 @@ class HTTPTests(unittest.TestCase):
         self.route("/health", {"status": "ok", "authorization": "PRIVATE"})
         self.route("/api/agents", [{"id": "engineer", "instructions": "PRIVATE", "api_key_env": "PRIVATE"}])
         self.route("/api/sessions", [{"id": "sid", "agent_id": "engineer", "error": "PRIVATE"}])
-        self.route("/api/sessions/sid/tools", [{"call_id": "c", "operation_id": "o", "name": "workspace__workspace_run", "status": "succeeded", "arguments": {"secret": "PRIVATE"}, "result": {"output": "PRIVATE"}}])
+        self.route("/api/sessions/sid/tools", [{"call_id": "c", "operation_id": "o", "name": "workspace__workspace_run", "status": "succeeded", "arguments": {"secret": "PRIVATE"}, "result": {"output": "PRIVATE"}, "error": None}])
         result = audit.collect(self.base, {"lab": self.base})
         self.assertEqual(result["errors"], [])
         self.assertNotIn("PRIVATE", json.dumps(result))
         self.assertEqual(result["runtimes"]["lab"]["tools"]["sid"][0]["result_sha256"], audit.digest({"output": "PRIVATE"}))
+        self.assertEqual(result["runtimes"]["lab"]["tools"]["sid"][0]["receipt_sha256"],
+                         audit.digest(self.routes["/api/sessions/sid/tools"][1][0]))
         self.assertTrue(all(method == "GET" for method, path in self.requests))
 
     def test_url_fields_cannot_retain_query_or_userinfo_credentials(self):

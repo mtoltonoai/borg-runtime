@@ -3,7 +3,9 @@
 
 This is an operational check, not a substitute for the live acceptance demos.
 Only GETs are issued. Transcripts, instructions, credentials, arguments and tool
-result bodies are never written to evidence; completed results are SHA256'd.
+result bodies are never written to evidence; completed public ToolCall records
+are SHA256'd. The API does not expose frozen MCP server bindings, so this audit
+cannot establish preservation of those bindings or external exactly-once effects.
 """
 from __future__ import annotations
 
@@ -140,6 +142,13 @@ def tool_receipt(value):
     out = pick(value, ("call_id", "operation_id", "name", "status"))
     if value.get("status") in SUCCESS and "result" in value:
         out["result_sha256"] = digest(value["result"])
+        # A matching output alone does not preserve the original call. Hash the
+        # complete public native ToolCall, including its name, arguments and
+        # error, without copying any of those bodies into the audit artifact.
+        required = {"call_id", "operation_id", "name", "arguments", "status", "result", "error"}
+        if required <= value.keys() and all(isinstance(value[k], str) and value[k]
+                                            for k in ("call_id", "operation_id", "name")):
+            out["receipt_sha256"] = digest(value)
     return out
 
 
@@ -444,7 +453,11 @@ def audit(snapshot, expected_hosts=HOSTS, revision=None, now=None, max_host_age=
 
 
 def compare_restart(before, after, hosts=HOSTS):
-    """Require a changed process ID and identical prior successful tool receipts."""
+    """Require a changed process ID and identical complete public tool receipts.
+
+    Old result-only snapshots remain usable for operational audit, not for this
+    stronger custody claim. Capture a complete baseline before the next restart.
+    """
     failures = []
     retained = 0
     for host in hosts:
@@ -473,7 +486,13 @@ def compare_restart(before, after, hosts=HOSTS):
                 if call.get("status") not in SUCCESS:
                     continue
                 matches = by_operation.get(call.get("operation_id"), [])
+                receipt_hash = call.get("receipt_sha256")
+                if not isinstance(receipt_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt_hash):
+                    failures.append({"host": host, "session": sid, "operation": call.get("operation_id"),
+                                     "reason": "complete original tool receipt unavailable; capture a full baseline"})
+                    continue
                 if (not call.get("operation_id") or not call.get("result_sha256") or len(matches) != 1
+                        or matches[0].get("receipt_sha256") != receipt_hash
                         or matches[0].get("result_sha256") != call["result_sha256"]
                         or matches[0].get("call_id") != call.get("call_id")
                         or matches[0].get("status") not in SUCCESS):
@@ -486,7 +505,7 @@ def compare_restart(before, after, hosts=HOSTS):
     if before.get("errors") or after.get("errors"):
         failures.append({"reason": "incomplete snapshot cannot prove restart preservation"})
     return {"ok": not failures, "preserved_completed_tools": retained, "failures": failures,
-            "scope": "receipt preservation, not proof that external side effects occurred only once"}
+            "scope": "complete public tool receipt preservation; not proof of frozen MCP bindings or external exactly-once effects"}
 
 
 def main(argv=None):
