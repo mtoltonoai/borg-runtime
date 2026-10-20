@@ -34,6 +34,9 @@ pub struct Settings {
     pub project_id: Option<i64>,
     #[serde(default)]
     pub repo_url: Option<String>,
+    /// Existing host SSH config; copied as a repo-local command, never as key bytes.
+    #[serde(default)]
+    pub git_ssh_config: Option<PathBuf>,
     #[serde(default = "repo_ref")]
     pub repo_ref: String,
     #[serde(default)]
@@ -226,6 +229,27 @@ fn pending(v: &Value) -> bool {
         Some("reserved" | "provisioning" | "launching")
     ) && v["metadata"]["adopted"] != true
 }
+fn runtime_ready(value: &Value, host: &str) -> bool {
+    value["status"] == "ok"
+        && value["service"] == "borg-native"
+        && value["ready"] == true
+        && value["draining"] != true
+        && value["host_id"] == host
+}
+fn session_matches(d: &Value, session: &Value) -> bool {
+    if session["id"] != d["session_id"] || session["agent_id"] != d["agent_id"] {
+        return false;
+    }
+    // Old adopted sessions predate placement fields. They are observed only,
+    // never recreated. New native dispatches require the complete binding.
+    if d["metadata"]["adopted"] == true {
+        return true;
+    }
+    session["host_id"] == d["host_id"]
+        && session["generation"] == d["generation"]
+        && session["workspace_cwd"] == d["workspace_cwd"]
+        && session["task"] == json!(d["task_id"].as_i64().map(|id| format!("task_{id}")))
+}
 fn native_agent(v: &Value) -> bool {
     v["metadata"]["harness"] == "native"
         && v["retired"] != true
@@ -292,6 +316,15 @@ impl Worker {
         {
             return Err("native workspace_root must be absolute; workspace_mcp_url must contain {session_id}".into());
         }
+        if settings
+            .git_ssh_config
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute() || !p.is_file())
+        {
+            return Err(
+                "native git_ssh_config must name an existing absolute host SSH config".into(),
+            );
+        }
         let board = Http::new(
             settings.http_timeout_seconds,
             settings.board_bearer_token_env.as_deref(),
@@ -324,7 +357,7 @@ impl Worker {
         let ready = self
             .runtime
             .request("GET", &health, None)
-            .is_ok_and(|v| v["status"] == "ok" && v["ready"] != false && v["draining"] != true);
+            .is_ok_and(|v| runtime_ready(&v, &self.host));
         let body = json!({"capacity":self.settings.capacity,"runtime_url":self.settings.runtime_url,
             "workspace_root":self.settings.workspace_root,"runtime_ready":ready,"ttl_seconds":self.settings.ttl_seconds,
             "revision":env!("FLEET_BUILD_REV"),"metadata":{"worker":"fleet native-worker"}});
@@ -447,18 +480,12 @@ impl Worker {
         );
         match self.runtime.request("GET", &url, None) {
             Ok(session) => {
-                if session["id"] != d["session_id"]
-                    || session["agent_id"] != d["agent_id"]
-                    || (d["metadata"]["adopted"] != true
-                        && session
-                            .get("workspace_cwd")
-                            .is_some_and(|cwd| !cwd.is_null() && cwd != &d["workspace_cwd"]))
-                {
+                if !session_matches(d, &session) {
                     self.report(
                         d,
                         "needs_resolution",
                         None,
-                        Some("native session identity/workspace does not match reservation"),
+                        Some("native session identity/task/host/generation/workspace does not match reservation"),
                         json!({"observed_at":time()}),
                     )?;
                     return Ok(true);
@@ -488,12 +515,14 @@ impl Worker {
             Err(e) => {
                 // Observation failure is NOT terminal session failure. Inference may
                 // still be live; leave the placement held for owned reconciliation.
+                let observation_error = format!("runtime observation unavailable: {e}");
+                let error = d["error"]
+                    .as_str()
+                    .filter(|message| !message.starts_with("runtime observation unavailable:"))
+                    .unwrap_or(&observation_error);
                 self.report(
-                    d,
-                    string(d, "status")?,
-                    d["progress"].as_str(),
-                    Some(&format!("runtime observation unavailable: {e}")),
-                    json!({"observation_error_at":time(),"fleet_revision":env!("FLEET_BUILD_REV")}),
+                    d, string(d, "status")?, d["progress"].as_str(), Some(error),
+                    json!({"observation_error_at":time(),"observation_error":observation_error,"fleet_revision":env!("FLEET_BUILD_REV")}),
                 )?;
                 Ok(true)
             }
@@ -803,7 +832,7 @@ fn provision(settings: &Settings, d: &Value) -> Result<PathBuf, String> {
     {
         return Err("invalid workspace ref".into());
     }
-    let identity = json!({"session_id":id,"dispatch_id":d["id"],"agent_id":d["agent_id"],"repo":repo,"ref":reference});
+    let identity = json!({"session_id":id,"dispatch_id":d["id"],"agent_id":d["agent_id"],"repo":repo,"ref":reference,"git_ssh_config":settings.git_ssh_config});
     let manifest = ".fleet-workspace.json";
     if target.exists() || fs::symlink_metadata(&target).is_ok() {
         if fs::symlink_metadata(&target)
@@ -861,6 +890,22 @@ fn provision(settings: &Settings, d: &Value) -> Result<PathBuf, String> {
             ],
             id,
         )?;
+        if let Some(command) = git_ssh_command(settings)? {
+            // The bootstrap checkout's core.sshCommand does not propagate into
+            // service clones. Preserve the configured route for session pushes.
+            run_git(
+                settings,
+                &[
+                    "-C",
+                    staging.to_str().unwrap(),
+                    "config",
+                    "core.sshCommand",
+                    &command,
+                ],
+                id,
+            )?;
+        }
+        let commit = resolve_checkout_ref(&staging, reference)?;
         let branch = format!("native/session-{id}");
         run_git(
             settings,
@@ -870,7 +915,7 @@ fn provision(settings: &Settings, d: &Value) -> Result<PathBuf, String> {
                 "checkout",
                 "-b",
                 &branch,
-                reference,
+                &commit,
             ],
             id,
         )?;
@@ -900,6 +945,58 @@ fn provision(settings: &Settings, d: &Value) -> Result<PathBuf, String> {
     fs::rename(&staging, &target).map_err(|e| e.to_string())?;
     Ok(target)
 }
+fn resolve_checkout_ref(directory: &Path, reference: &str) -> Result<String, String> {
+    // A bare deployment repo may advertise an unborn default HEAD even though
+    // origin/main exists. Resolve the requested ref explicitly instead of
+    // relying on clone to create a local branch with that name.
+    let remote = format!(
+        "refs/remotes/origin/{}",
+        reference.strip_prefix("refs/heads/").unwrap_or(reference)
+    );
+    for candidate in [reference, remote.as_str()] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{candidate}^{{commit}}"),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            let commit = String::from_utf8(output.stdout)
+                .map_err(|e| e.to_string())?
+                .trim()
+                .to_owned();
+            if matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Ok(commit);
+            }
+        }
+    }
+    Err(format!(
+        "workspace ref {reference:?} is not a fetched commit or origin branch"
+    ))
+}
+fn git_ssh_command(settings: &Settings) -> Result<Option<String>, String> {
+    settings
+        .git_ssh_config
+        .as_ref()
+        .map(|p| {
+            let path = p.to_str().ok_or("SSH config path is not UTF-8")?;
+            if !p.is_absolute() || path.chars().any(char::is_control) {
+                return Err("SSH config path must be absolute without control characters".into());
+            }
+            Ok(format!(
+                "ssh -F '{}' -o BatchMode=yes",
+                path.replace('\'', "'\\''")
+            ))
+        })
+        .transpose()
+}
 fn run_git(settings: &Settings, args: &[&str], id: &str) -> Result<(), String> {
     let log = settings.workspace_root.join(format!(".{id}.provision.log"));
     let stdout = OpenOptions::new()
@@ -914,6 +1011,9 @@ fn run_git(settings: &Settings, args: &[&str], id: &str) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr);
+    if let Some(command) = git_ssh_command(settings)? {
+        cmd.env("GIT_SSH_COMMAND", command);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -983,6 +1083,7 @@ mod tests {
             ttl_seconds: 60,
             project_id: Some(1),
             repo_url: None,
+            git_ssh_config: None,
             repo_ref: "HEAD".into(),
             bearer_token_env: None,
             board_bearer_token_env: None,
@@ -1005,6 +1106,45 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    #[test]
+    fn readiness_requires_native_protocol_identity_not_just_an_open_http_port() {
+        let mut health = json!({"status":"ok","service":"borg-native","host_id":"lab","ready":true,"draining":false});
+        assert!(runtime_ready(&health, "lab"));
+        assert!(!runtime_ready(&health, "other"));
+        health["ready"] = json!(false);
+        assert!(!runtime_ready(&health, "lab"));
+        health["ready"] = json!(true);
+        health["draining"] = json!(true);
+        assert!(!runtime_ready(&health, "lab"));
+        assert!(!runtime_ready(
+            &json!({"status":"ok","service":"borg-native"}),
+            "lab"
+        ));
+    }
+    #[test]
+    fn observed_session_must_match_task_host_generation_and_workspace() {
+        let mut d = dispatch(Path::new("/workspaces"), 1);
+        let good = json!({"id":d["session_id"],"agent_id":d["agent_id"],"task":"task_1","host_id":d["host_id"],
+            "generation":d["generation"],"workspace_cwd":d["workspace_cwd"]});
+        assert!(session_matches(&d, &good));
+        for key in [
+            "host_id",
+            "generation",
+            "workspace_cwd",
+            "task",
+            "id",
+            "agent_id",
+        ] {
+            let mut wrong = good.clone();
+            wrong[key] = json!("mismatch");
+            assert!(!session_matches(&d, &wrong), "{key}");
+        }
+        d["metadata"]["adopted"] = json!(true);
+        assert!(session_matches(
+            &d,
+            &json!({"id":d["session_id"],"agent_id":d["agent_id"]})
+        ));
     }
     #[test]
     fn native_harness_is_distinct_from_legacy_roster_marker_and_respects_intent() {
@@ -1126,6 +1266,9 @@ mod tests {
         ]);
         let mut cfg = settings(&root);
         cfg.repo_url = Some(source.to_str().unwrap().into());
+        let ssh_config = tmp.0.join("ssh config");
+        fs::write(&ssh_config, "Host *\n  BatchMode yes\n").unwrap();
+        cfg.git_ssh_config = Some(ssh_config.clone());
         let a = provision(&cfg, &dispatch(&root, 1)).unwrap();
         let b = provision(&cfg, &dispatch(&root, 2)).unwrap();
         fs::write(a.join("source.txt"), "independent edit").unwrap();
@@ -1140,6 +1283,20 @@ mod tests {
         );
         assert!(a.join(".git").is_dir());
         assert!(b.join(".git").is_dir());
+        let configured = Command::new("git")
+            .args([
+                "-C",
+                a.to_str().unwrap(),
+                "config",
+                "--local",
+                "core.sshCommand",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(configured.stdout).unwrap().trim(),
+            git_ssh_command(&cfg).unwrap().unwrap()
+        );
         let status = Command::new("git")
             .args(["-C", b.to_str().unwrap(), "status", "--porcelain"])
             .output()
@@ -1148,6 +1305,49 @@ mod tests {
             status.stdout.is_empty(),
             "ownership manifest must not dirty source commits"
         );
+    }
+    #[test]
+    fn checkout_explicit_main_even_when_bare_remote_head_is_unborn() {
+        let tmp = Temp::new();
+        let source = tmp.0.join("source");
+        let bare = tmp.0.join("bare");
+        let root = tmp.0.join("workspaces");
+        git(&["init", "-b", "main", source.to_str().unwrap()]);
+        fs::write(source.join("proof"), "requested main branch").unwrap();
+        git(&["-C", source.to_str().unwrap(), "add", "proof"]);
+        git(&[
+            "-C",
+            source.to_str().unwrap(),
+            "-c",
+            "user.email=fleet-test@example.invalid",
+            "-c",
+            "user.name=Fleet Test",
+            "commit",
+            "-m",
+            "base",
+        ]);
+        git(&[
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        git(&[
+            "-C",
+            bare.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/not-created",
+        ]);
+        let mut cfg = settings(&root);
+        cfg.repo_url = Some(bare.to_str().unwrap().into());
+        cfg.repo_ref = "main".into();
+        let target = provision(&cfg, &dispatch(&root, 1)).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("proof")).unwrap(),
+            "requested main branch"
+        );
+        assert!(resolve_checkout_ref(&target, "refs/heads/main").is_ok());
     }
     #[test]
     fn workspace_refuses_traversal_symlink_and_unowned_partial_tree() {

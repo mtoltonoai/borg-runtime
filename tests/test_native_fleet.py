@@ -34,6 +34,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FLEET = ROOT / "components/fleet/target/debug/fleet"
 BOARD = ROOT / "components/task-board/target/debug/task-board"
 WORKSPACE = ROOT / "tooling/workspace_mcp.py"
+SSH_REPO = None
+SSH_CONFIG = None
 
 
 def free_port():
@@ -79,7 +81,9 @@ def stop(proc):
 
 
 class Engine:
-    def __init__(self):
+    def __init__(self, host):
+        self.host = host
+        self.ready = True
         self.lock = threading.RLock()
         self.sessions = {}
         self.intents = {}
@@ -116,7 +120,7 @@ class Engine:
 
             def do_GET(self):
                 if self.path == "/health":
-                    return self.reply(200, {"status": "ok"})
+                    return self.reply(200, {"status": "ok", "service": "borg-native", "host_id": engine.host, "ready": engine.ready, "draining": not engine.ready})
                 if self.path.startswith("/api/sessions/"):
                     key = self.path.rsplit("/", 1)[1]
                     with engine.lock:
@@ -211,7 +215,7 @@ class FleetIntegration(unittest.TestCase):
             workspace_port = free_port()
             self.spawn([sys.executable, str(WORKSPACE), "--session-root", str(root), "--port", str(workspace_port)], f"workspace-{i}")
             wait_for(lambda: socket.create_connection(("127.0.0.1", workspace_port), timeout=.1).close() is None)
-            engine = Engine()
+            engine = Engine(host)
             self.engines.append(engine)
             config = self.root / f"fleet-{i}.toml"
             config.write_text(f'''board_api={json.dumps(self.board_url)}
@@ -325,6 +329,48 @@ provision_timeout_seconds=30
         self.assertEqual(sum(self.engines[0].effects.values()), 1)
         self.assertEqual(self.dispatches()[0]["status"], "running")
 
+    def test_opt_in_real_ssh_clone_and_persisted_session_git_route(self):
+        if not SSH_REPO:
+            self.skipTest("pass --ssh-repo and --ssh-config for the real deployment Git boundary")
+        for config in self.configs:
+            text = config.read_text().replace("repo_url=" + json.dumps(str(self.source)),
+                                               "repo_url=" + json.dumps(SSH_REPO))
+            config.write_text(text + "git_ssh_config=" + json.dumps(str(SSH_CONFIG)) + "\n")
+        self.task("real ssh clone route proof", {"placement": {"host": self.hosts[0]}})
+        self.workers()
+        row = self.dispatches()[0]
+        if row["status"] != "running":
+            for log in self.roots[0].glob(".*.provision.log"):
+                print(log.read_text()[-3000:])
+        self.assertEqual(row["status"], "running", row)
+        cwd = Path(row["workspace_cwd"])
+        self.assertTrue((cwd / ".git").is_dir())
+        result = subprocess.run(["git", "-C", str(cwd), "ls-remote", "origin", "refs/heads/main"],
+                                capture_output=True, text=True, check=True, timeout=20)
+        self.assertTrue(result.stdout.strip())
+        route = subprocess.run(["git", "-C", str(cwd), "config", "--local", "core.sshCommand"],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertIn(str(SSH_CONFIG), route)
+        self.assertEqual((cwd / "result.txt").read_text(), "preserved")
+        self.assertEqual(sum(sum(e.effects.values()) for e in self.engines), 1)
+
+    def test_runtime_drain_blocks_new_reservations_until_ready(self):
+        for engine in self.engines:
+            engine.ready = False
+        self.workers()  # publish runtime_ready=false before introducing work
+        self.task("waiting for runtime readiness")
+        self.workers()
+        self.assertFalse(self.dispatches())
+        self.assertTrue(all(not h["runtime_ready"] for h in http("GET", self.board_url + "/fleet/hosts")))
+        for engine in self.engines:
+            engine.ready = True
+        self.workers()
+        # A worker may reserve on a host that already completed its once pass;
+        # another bounded reconciliation observes/launches the durable binding.
+        self.workers()
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertEqual(self.dispatches()[0]["status"], "running")
+
     def test_shared_fleet_admits_a_new_project_and_identity_without_host_edits(self):
         # A shared daemon omits the optional project filter from its initial
         # deployment. All later project/identity changes are Board writes only.
@@ -408,7 +454,12 @@ if __name__ == "__main__":
     parser.add_argument("--fleet", type=Path, default=FLEET)
     parser.add_argument("--board", type=Path, default=BOARD)
     parser.add_argument("--workspace", type=Path, default=WORKSPACE)
+    parser.add_argument("--ssh-repo", help="optional read-only clone proof against a real deployment repository")
+    parser.add_argument("--ssh-config", type=Path, help="existing SSH config; no keys are copied")
     args, remaining = parser.parse_known_args()
+    SSH_REPO, SSH_CONFIG = args.ssh_repo, args.ssh_config
+    if SSH_REPO and not SSH_CONFIG:
+        parser.error("--ssh-repo requires explicit --ssh-config")
     FLEET, BOARD, WORKSPACE = map(lambda p: p.resolve(), (args.fleet, args.board, args.workspace))
     for path in (FLEET, BOARD, WORKSPACE):
         if not path.is_file():
