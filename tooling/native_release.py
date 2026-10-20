@@ -2,7 +2,7 @@
 """Immutable release verification, guarded systemd activation and live evidence.
 
 Run on the destination host. Never copies/replaces a live database, cancels a
-session, resolves an unknown tool, or reads credential files. Active bootstrap
+session, resolves an unknown tool, or reads credential files. Active native
 sessions are automatically drained at a receipt-preserving execution boundary.
 """
 import argparse
@@ -27,7 +27,6 @@ sys.dont_write_bytecode = True
 BASE = Path("/home/dev-user/.local/share/borg")
 COMPONENTS = ("board", "workspace", "session-workspace", "native", "fleet", "recovery")
 TERMINAL = {"completed", "stopped", "waiting", "failed", "needs_resolution", "quiesced"}
-LEGACY = ("borg-controller.service", "borg-worker.service", "borg-deployer.service")
 
 
 def run(args, **kwargs):
@@ -264,7 +263,7 @@ def inventory(base):
                          ("borg-board-tunnel.service", "borg-native-routes.service",
                           "borg-native-controller-route.socket", "borg-native-controller-route.service",
                           "borg-native-builder-route.socket", "borg-native-builder-route.service",
-                          "borg-pm-workspace.service") + LEGACY},
+                          "borg-pm-workspace.service")},
             "databases": [p.name for p in sorted((base / "state").glob("*.sqlite"))]}
 
 
@@ -301,10 +300,6 @@ def install_locked(args):
         raise ValueError("requested component was not built in this release")
     if any(c in components for c in ("board", "recovery")) and args.host_id != "agent-lab":
         raise ValueError("shared Board and recovery ledger belong only on agent-lab")
-    for name in LEGACY:
-        state = service_state(name)
-        if state.get("ActiveState") == "active" or state.get("UnitFileState") in ("enabled", "enabled-runtime"):
-            raise RuntimeError("legacy service must stay disabled: " + name)
     for component, filename in (("board", "board.toml"), ("native", "runtime.json"),
                                 ("fleet", "native-fleet.toml"), ("recovery", "native-recovery.json")):
         if component in components and not (base / "config" / filename).is_file():

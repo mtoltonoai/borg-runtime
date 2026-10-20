@@ -12,16 +12,31 @@ Default state root: `/home/dev-user/.local/share/borg`.
 | --- | --- | --- |
 | `borg-board` | `agent-lab` only | Existing `state/board.sqlite`, loopback 8079 |
 | `borg-board-tunnel` | other labs and builder | Persistent existing SSH connection to that Board |
-| `borg-native` | all four labs | Existing `state/native.sqlite`, loopback 8787 |
-| `borg-workspace` | all four labs | Legacy/bootstrap checkout MCP, loopback 8766 |
+| `borg-native` | all four labs; retained builder runtime | Existing `state/native.sqlite`, loopback 8787 |
+| `borg-workspace` | all four labs | Retained original-session checkout MCP, loopback 8766 |
 | `borg-session-workspace` | all four labs | Session-isolated MCP under `workspaces/{session_id}`, loopback 8791 |
 | `borg-fleet` | all four labs | Board-authoritative capacity, dispatch, workspace and runtime reconciliation |
 | `borg-recovery` | `agent-lab` only | Independent durable incident/outbox controller |
 
-The former controller/worker/deployer services stay disabled. The installer
-rejects activation if it finds these services active or enabled. Credentials stay
-in existing mode-0600 environment files and are neither packaged nor printed.
-Responses API credentials and Codex login remain separate.
+Release verification covers current native service state, selected images,
+dependency readiness and durable session receipts. Credentials stay in existing
+mode-0600 environment files and are neither packaged nor printed. Responses API
+credentials and Codex login remain separate.
+
+### Recorded rollout, not final acceptance
+
+Project 1 / task 6 records the integrated `175d295a2fc167d77948fd7c020e794480753468`
+rollout on October 20, 2026: the shared Board and runtimes used Board-only identity
+configuration, existing sessions retained explicit bindings, and Fleet was
+enabled on all four labs at 03:51 UTC. The independent recovery service was
+also enabled on `agent-lab`. The retained builder session is observed but its
+host is disabled with capacity zero for new placement; it is not a fifth worker.
+
+This is the recorded deployment baseline, not a claim that final acceptance is
+complete. Live Git-route repairs, Board revision/projection verification and
+parent-child recovery-lineage checks remain owned under task 6 and its related
+tasks. Use their latest receipts and the [acceptance audit](native-acceptance.md)
+for final state; do not infer a pass from service enablement or these docs.
 
 ## Build and stage
 
@@ -51,14 +66,20 @@ Set `BORG_BUILD_ROOT` to use a dedicated build cache when disk space is tight.
 Host JSON contains only runtime infrastructure (`database_path`, `listen`,
 `board`, `host_id`, `runtime_url`), not a hand-maintained list of identities.
 Board identity charter, effective runtime profile and tool grants supply identity
-configuration. The selected model remains `gpt-6-astra`, max reasoning, 128000
-output, shared 1050000-token context, and no default turn cap.
+configuration at inference boundaries. New identities inherit role metadata;
+no per-identity host JSON or environment edits are needed. See
+[metadata setup](native-metadata-deployment.md) and the
+[profile contract](native-board-contract.md).
 
-Transient inference and read-only discovery retry indefinitely with visible
-status, capped jittered backoff and Retry-After. Until the explicit unlimited
-runtime is deployed, legacy bootstrap profiles use `max_retries=4294967295` and
-`retry_initial_ms=5000`. This is a compatibility bridge, not a finite-budget
-product policy. Operator stop and uncertain-write reconciliation remain effective.
+The selected model remains `gpt-6-astra`, max reasoning, 128000 output, full
+shared 1050000-token context, no smaller input cap and no default turn cap.
+The deployed retry profile is `max_retries: null`, `retry_initial_ms: 5000`,
+`retry_max_ms: 60000`, `retry_jitter_percent: 20`. Transient inference and retryable
+read-only profile/discovery failures retry indefinitely with durable visible
+status. Local exponential delay and jitter are capped at 60 seconds; server
+`Retry-After` floors may exceed that cap. Legacy numeric retry limits never
+terminate recoverable work. Operator stop remains effective; uncertain tool
+writes require original-result reconciliation, not automatic replay.
 
 Fleet starts with:
 
@@ -67,61 +88,90 @@ fleet --config /home/dev-user/.local/share/borg/config/native-fleet.toml native-
 ```
 
 Its top-level `board_api` is `http://127.0.0.1:8079/api` and `host` identifies the
-lab. `[native]` supplies `runtime_url` (ending `/api`), `workspace_root`,
-`workspace_mcp_url = "http://127.0.0.1:8791/mcp/{session_id}"`, `capacity`,
-`poll_seconds`, `project_id`, `repo_url`, and `repo_ref`. Capacity is then Board
-metadata, not a host-local scheduling authority. Do not enable dispatch before
-existing bootstrap sessions are adopted or their tasks have a visible terminal
-or maintenance disposition. A stable identity can have multiple independent
-session UUIDs/workspaces.
+lab. `[native]` supplies the advertised `runtime_url` (ending `/api`),
+`workspace_root`, `workspace_mcp_url = "http://127.0.0.1:8791/mcp/{session_id}"`,
+initial `capacity`, `poll_seconds`, `repo_url`, `repo_ref` and `git_ssh_config`.
+Shared workers omit `project_id` so new Board projects need no host edits; an
+explicit value intentionally scopes a test worker. Host capacity and enablement
+are then authoritative Board metadata, not overwritten by each heartbeat.
 
-## Guarded rolling activation
+Board placement reserves a session UUID on a fresh eligible host using the
+lowest occupied/capacity ratio. Each session gets an independent checkout and
+`native/session-<UUID>` branch. Identity/task placement and workspace metadata
+can constrain selection; observational identity `host` or `workspace_cwd` is not
+a session binding. Runtime origins and Fleet REST URLs must identify the same
+host from every lifecycle caller; see [four-host routes](native-fleet.md).
+Existing adopted sessions keep their original IDs, endpoints and workspaces.
 
-1. Coordinate a bounded, visible maintenance/drain with the task/session owners.
-   The installer stops local Fleet admission before changing its runtime or tools.
-2. **Do not call the old bootstrap stop API during a tool.** It cancels receipt
-   collection and leaves an unknown side effect. The installer automatically sets
-   the existing durable stop flag without notifying cancellation and waits for
-   the original execution boundary, including any raced tool receipt. It never
-   infers dispatch exclusion from progress text. A live slow model call is not
-   proof of a dead process. No operator
-   approval or agent-completion gate is required.
-3. Resolve any truly uncertain tool outcome from original receipts, not by
-   repeating the write. A durable drain journal owns every deployment pause and
-   resumes original work after verification (including after recoverable errors).
-   Timeout cleanup stays resume-pending until the runtime actually clears its
-   stop flag. Detached systemd jobs use --no-block; a self-targeted calling tool
-   returns its receipt instead of polling its own drain.
-   Unknown outcomes remain visible and are never replayed.
-4. Configure the existing state paths, metadata and credentials. Then activate
-   one host and verify before proceeding. Update Board only while its callers
-   are coordinated/quiescent; retain the same database and persistent tunnels.
+## Guarded activation
+
+The task's integrator owns publication and activation. Worker sessions deliver
+tested commits from their own branches; they do not restart services or edit
+another session's checkout to integrate a change.
+
+1. Coordinate visible maintenance/drain with task/session owners. The installer
+   pauses local Fleet admission before changing its runtime or tools. A shared
+   Board update requires draining callers on every host, not only `agent-lab`.
+2. **Never cancel an in-flight tool to force a rollout.** The installer sets the
+   durable stop flag without notifying cancellation and waits for the original
+   execution boundary, including a raced tool receipt. It does not infer dispatch
+   exclusion from progress text. A slow live model call is not proof of death.
+3. Reconcile truly uncertain outcomes using original receipts and external
+   effects, not by repeating the write. A durable drain journal owns each
+   deployment pause. Timeout cleanup remains resume-pending until the runtime
+   actually clears its stop flag. Detached systemd jobs use `--no-block`: the
+   initiating tool returns its receipt before anyone polls its own drain.
+4. Retain state paths, credentials and the shared database. Activate and verify
+   selected images, actual readiness and preserved receipts before resuming
+   work. A failed or unverified image must not receive new admission.
 
 ```sh
-# On the destination host, after infrastructure configuration:
-# Detached systemd rollout survives its calling tool, including self-upgrade.
+# On one destination host, for an already staged per-host release:
+release="/home/dev-user/.local/share/borg/releases/$revision"
 python3 -B "$release/native_release.py" launch --release "$release" \
   --host-id agent-lab-2 --components workspace,session-workspace,native,fleet
-# Or stage + rolling activation over SSH:
+# Or stage + rolling per-host activation over SSH:
 python3 tooling/deploy_native.py "$release" --hosts borg-agent-lab-2 --activate
-# Board/recovery are explicitly selected on agent-lab only:
-python3 -B "$release/native_release.py" launch --release "$release" \
-  --host-id agent-lab --components board,workspace,session-workspace,native,fleet,recovery
 ```
 
+For shared Board updates, the deployment owner runs the detached whole-cluster
+coordinator from its builder checkout. It stages the release, pauses Fleet and
+recovery, and drains the four labs plus its local builder runtime before
+updating Board. It verifies selected runtimes, resumes owned sessions and
+restarts previously active supervisors. Updating supervisor binaries is a
+separate selected-component install; the coordinator accepts only
+`board,native,workspace,session-workspace`.
+
+```sh
+# From the deployment owner's builder checkout, after building a committed release:
+release="$PWD/.runtime/releases/$revision"
+python3 tooling/native_rollout.py launch --release "$release" --components board,native
+```
+
+Routine updates do not need `--board-profiles`: the one-time profile/binding
+migration is already complete. Do not change identity workspace metadata to
+reroute an existing session or its committed tools. Board and recovery component
+installs are restricted to `agent-lab`.
+
 The installer uses SQLite's online backup API (including committed WAL data),
-checks backup integrity, preserves old unit files, installs enabled services with
-unlimited systemd restart, and requires actual JSON Board and MCP discovery
-readiness. A SPA fallback returning HTTP 200 is not Board readiness. Startup
-probes are bounded so systemd can retry failed startup; inference has no such
-finite retry budget. Dependencies are ordered with Board/tunnel and workspace
-before native, and native before Fleet/recovery.
+checks backup integrity, preserves old unit files, and installs enabled services
+with unlimited systemd restart. Native/Fleet startup requires real JSON Board
+and native/workspace readiness, not a SPA fallback returning HTTP 200. Startup
+probes are bounded so systemd can retry; inference has no finite retry budget.
+Dependencies order Board/tunnel and workspace before native, and native before
+Fleet. Recovery has network-only ordering and no watched-service readiness
+precondition, so a Board/native outage cannot prevent its own retry loop from
+starting.
 
 Every activation writes `state/deployments/<timestamp>.json` with before/after
 session receipt hashes, backup hashes and service state. Binary claims are
-corroborated by SHA-256 of `/proc/<pid>/exe`, not a version string alone. A failed
-rollout exits nonzero and retains evidence. It does not roll back a database or
-blindly replay a session. Diagnose and repair with an owned task.
+corroborated by SHA-256 of `/proc/<pid>/exe`, not a version string alone. The
+cluster coordinator also writes `state/cluster-rollouts/<transaction>.json`.
+A failed install retains recovery evidence and does not replace a database or
+blindly replay a session. If shared Board activation is uncertain, the detached
+coordinator reconciles the original/selected image, configuration, readiness and
+unchanged database identity; if unavailable, its recovery continuation remains
+alive instead of leaving the paused integrator as the only repair path.
 
 ## Required acceptance evidence
 
@@ -135,6 +185,7 @@ acceptance audit consumes these receipts. Missing evidence stays visibly unprove
 ```sh
 BORG_NATIVE_TEST_BIN="$PWD/.runtime/build/native/debug/borg-native" \
   python3 -m unittest discover -s tests -p 'test_native_d*.py' -v
+python3 -m unittest discover -s tests -p test_native_rollout.py -v
 python3 tooling/native_release.py inventory
 python3 tooling/native_ready.py --board-api http://127.0.0.1:8079/api \
   --native-url http://127.0.0.1:8787 --workspace-url http://127.0.0.1:8766/mcp
