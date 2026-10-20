@@ -40,9 +40,9 @@ fn delay_with_random(
     let lower = base.saturating_sub(spread).max(1);
     let upper = base.saturating_add(spread).min(cap).max(lower);
     let jittered = lower.saturating_add(random % upper.saturating_sub(lower).saturating_add(1));
-    // A server hint is a floor within the configured sleep cap. Operator stop
-    // interrupts even a long hinted backoff; no numeric attempt counter can end it.
-    jittered.max(retry_after.unwrap_or(0)).min(cap).max(1)
+    // The local exponential/jitter delay is capped, but a server cooldown is
+    // a floor, even when longer. Operator stop still interrupts the whole wait.
+    jittered.min(cap).max(retry_after.unwrap_or(0)).max(1)
 }
 
 #[cfg(test)]
@@ -65,8 +65,8 @@ mod tests {
                 let delay = delay_with_random(&config, attempt, None, random);
                 assert!((1..=60000).contains(&delay));
                 assert_eq!(
-                    delay_with_random(&config, attempt, Some(u64::MAX), random),
-                    60000
+                    delay_with_random(&config, attempt, Some(300000), random),
+                    300000
                 );
             }
         }
