@@ -31,7 +31,10 @@ impl Store {
           CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, body TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS transcript(sequence INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), kind TEXT NOT NULL, item TEXT NOT NULL, created_at INTEGER NOT NULL);
           CREATE INDEX IF NOT EXISTS transcript_session ON transcript(session_id, sequence);
-          CREATE TABLE IF NOT EXISTS tool_calls(session_id TEXT NOT NULL REFERENCES sessions(id), call_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(session_id,call_id));")?;
+          CREATE TABLE IF NOT EXISTS tool_calls(session_id TEXT NOT NULL REFERENCES sessions(id), call_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(session_id,call_id));
+          CREATE TABLE IF NOT EXISTS session_requests(session_id TEXT PRIMARY KEY REFERENCES sessions(id), body TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS board_reports(sequence INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), body TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS board_report_errors(session_id TEXT PRIMARY KEY REFERENCES sessions(id), error TEXT NOT NULL);")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -46,6 +49,11 @@ impl Store {
         };
         for body in sessions {
             let mut session: Session = serde_json::from_str(&body)?;
+            let legacy = session.last_progress_at == 0;
+            if legacy {
+                session.last_progress_at = session.updated_at.max(session.created_at);
+            }
+            session.driver_running = false;
             let records = Self::tools_at(&tx, &session.id)?;
             let mut unknown = false;
             let previous_status = session.status;
@@ -76,7 +84,7 @@ impl Store {
                 };
                 session.progress = "Recovered from the committed transcript".into();
             }
-            if unknown || session.status != previous_status {
+            if unknown || legacy || session.status != previous_status {
                 Self::put_session(&tx, &mut session)?;
             }
         }
@@ -84,11 +92,78 @@ impl Store {
         Ok(())
     }
     pub fn create(&self, agent: &str, task: Option<String>, input: &str) -> Result<Session> {
+        self.create_with_options(agent, task, input, SessionOptions::default(), None)
+    }
+    pub fn existing_request(
+        &self,
+        agent: &str,
+        task: &Option<String>,
+        input: &str,
+        options: &SessionOptions,
+    ) -> Result<Option<Session>> {
+        let Some(id) = &options.session_id else {
+            return Ok(None);
+        };
+        let request = serde_json::to_string(
+            &json!({"agent_id":agent,"task":task,"input":input,"options":options}),
+        )?;
+        let c = self.conn.lock().unwrap();
+        let prior: Option<String> = c
+            .query_row(
+                "SELECT body FROM session_requests WHERE session_id=?",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            if prior != request {
+                bail!("session create conflict: idempotency key has different intent");
+            }
+            return Ok(Some(Self::get_at(&c, id)?));
+        }
+        Ok(None)
+    }
+    pub fn create_with_options(
+        &self,
+        agent: &str,
+        task: Option<String>,
+        input: &str,
+        options: SessionOptions,
+        runtime_url: Option<String>,
+    ) -> Result<Session> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
+        let id = options
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let request = serde_json::to_string(
+            &json!({"agent_id": agent,"task":task,"input":input,"options":options}),
+        )?;
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT body FROM session_requests WHERE session_id=?",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            if prior != request {
+                bail!("session create conflict: idempotency key has different intent");
+            }
+            return Self::get_at(&tx, &id);
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)",
+            [&id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            bail!("session create conflict: existing session has no matching create receipt");
+        }
         let stamp = now();
         let session = Session {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             agent_id: agent.into(),
             task,
             status: SessionStatus::Ready,
@@ -97,11 +172,29 @@ impl Store {
             turns: 0,
             created_at: stamp,
             updated_at: stamp,
+            generation: options.generation,
+            host_id: options.host_id,
+            runtime_url,
+            workspace_cwd: options.workspace_cwd,
+            workspace_mcp_url: options.workspace_mcp_url,
+            lifecycle_mcp_url: options.lifecycle_mcp_url,
+            metadata: options.metadata,
+            phase: "idle".into(),
+            step: 0,
+            last_progress_at: stamp,
+            driver_running: false,
+            failure_kind: None,
+            report_error: None,
         };
         tx.execute(
             "INSERT INTO sessions(id,body) VALUES(?,?)",
             params![session.id, serde_json::to_string(&session)?],
         )?;
+        tx.execute(
+            "INSERT INTO session_requests(session_id,body) VALUES(?,?)",
+            params![session.id, request],
+        )?;
+        Self::queue_report(&tx, &session)?;
         Self::append(
             &tx,
             &session.id,
@@ -131,12 +224,103 @@ impl Store {
             .map(|v| Ok(serde_json::from_str(&v)?))
             .collect()
     }
+    fn advance(s: &mut Session) {
+        s.step = s.step.saturating_add(1);
+        s.last_progress_at = now();
+    }
     fn put_session(c: &Connection, s: &mut Session) -> Result<()> {
         s.updated_at = now();
+        s.phase = match s.status {
+            SessionStatus::Ready | SessionStatus::Completed => "idle",
+            SessionStatus::Stopping => s.phase.as_str(),
+            SessionStatus::Waiting | SessionStatus::Stopped => "suspended",
+            SessionStatus::Failed | SessionStatus::NeedsResolution => "blocked",
+            SessionStatus::Retrying => "awaiting-model",
+            SessionStatus::Running
+                if s.progress.starts_with("Calling ")
+                    || s.progress == "Loading configured tools" =>
+            {
+                "awaiting-tool-result"
+            }
+            SessionStatus::Running => "awaiting-model",
+        }
+        .into();
+        if s.progress.starts_with("Quiesced") {
+            s.phase = "suspended".into();
+        }
+        s.failure_kind = match s.status {
+            SessionStatus::NeedsResolution => Some("uncertain_tool_outcome".into()),
+            SessionStatus::Failed if s.progress.starts_with("Inference failed") => {
+                Some("inference_failed".into())
+            }
+            SessionStatus::Failed => Some("runtime_error".into()),
+            _ => None,
+        };
         c.execute(
             "UPDATE sessions SET body=? WHERE id=?",
             params![serde_json::to_string(s)?, s.id],
         )?;
+        Self::queue_report(c, s)?;
+        Ok(())
+    }
+    fn queue_report(c: &Connection, s: &Session) -> Result<()> {
+        c.execute(
+            "INSERT INTO board_reports(session_id,body) VALUES(?,?)",
+            params![s.id, serde_json::to_string(s)?],
+        )?;
+        Ok(())
+    }
+    pub fn pending_reports(&self, limit: usize) -> Result<Vec<(i64, Session)>> {
+        let c = self.conn.lock().unwrap();
+        let mut q =
+            c.prepare("SELECT sequence,body FROM board_reports ORDER BY sequence LIMIT ?")?;
+        let raw = q
+            .query_map([limit as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        raw.into_iter()
+            .map(|(seq, body)| Ok((seq, serde_json::from_str(&body)?)))
+            .collect()
+    }
+    pub fn acknowledge_report(&self, sequence: i64, id: &str) -> Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM board_reports WHERE sequence=?", [sequence])?;
+        tx.execute("DELETE FROM board_report_errors WHERE session_id=?", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn report_error(&self, id: &str, error: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute("INSERT INTO board_report_errors(session_id,error) VALUES(?,?) ON CONFLICT(session_id) DO UPDATE SET error=excluded.error", params![id,error])?;
+        Ok(())
+    }
+    pub fn get_report_error(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT error FROM board_report_errors WHERE session_id=?",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn queue_current_reports(&self, include_terminal: bool) -> Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        let raw = {
+            let mut q = tx.prepare(
+                "SELECT body FROM sessions WHERE id NOT IN (SELECT session_id FROM board_reports) AND (? OR json_extract(body,'$.status') IN ('ready','running','retrying','stopping'))",
+            )?;
+            q.query_map([include_terminal], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for body in raw {
+            Self::queue_report(&tx, &serde_json::from_str(&body)?)?;
+        }
+        tx.commit()?;
         Ok(())
     }
     pub fn state(
@@ -152,6 +336,52 @@ impl Store {
         s.status = status;
         s.progress = progress.into();
         s.error = error;
+        Self::put_session(&tx, &mut s)?;
+        tx.commit()?;
+        Ok(s)
+    }
+    pub fn bind(
+        &self,
+        id: &str,
+        options: SessionOptions,
+        runtime_url: Option<String>,
+    ) -> Result<Session> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        let mut s = Self::get_at(&tx, id)?;
+        if Self::tools_at(&tx, id)?
+            .iter()
+            .any(|r| matches!(r.call.status.as_str(), "running" | "unknown"))
+        {
+            bail!("resolve unknown tool outcomes before binding placement");
+        }
+        if options.generation < s.generation {
+            bail!("cannot decrease session generation");
+        }
+        if options.generation > s.generation {
+            tx.execute("DELETE FROM board_reports WHERE session_id=?", [id])?;
+        }
+        s.generation = options.generation;
+        if options.host_id.is_some() {
+            s.host_id = options.host_id;
+        }
+        if options.workspace_cwd.is_some() {
+            s.workspace_cwd = options.workspace_cwd;
+        }
+        if options.workspace_mcp_url.is_some() {
+            s.workspace_mcp_url = options.workspace_mcp_url;
+        }
+        if options.lifecycle_mcp_url.is_some() {
+            s.lifecycle_mcp_url = options.lifecycle_mcp_url;
+        }
+        if runtime_url.is_some() {
+            s.runtime_url = runtime_url;
+        }
+        if let (Some(current), Some(extra)) =
+            (s.metadata.as_object_mut(), options.metadata.as_object())
+        {
+            current.extend(extra.clone());
+        }
         Self::put_session(&tx, &mut s)?;
         tx.commit()?;
         Ok(s)
@@ -213,6 +443,7 @@ impl Store {
         ) {
             s.status = SessionStatus::Ready;
         }
+        Self::advance(&mut s);
         s.progress = "New input saved".into();
         Self::put_session(&tx, &mut s)?;
         tx.commit()?;
@@ -286,6 +517,7 @@ impl Store {
             )?;
         }
         s.turns += 1;
+        Self::advance(&mut s);
         let mut finished = false;
         if !has_calls {
             let newer: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM transcript WHERE session_id=? AND kind='input' AND sequence>?)", params![id, input_sequence], |r| r.get(0))?;
@@ -382,6 +614,7 @@ impl Store {
         if !explicit && r.call.status != "running" {
             bail!("tool call is not running")
         }
+        Self::advance(&mut s);
         r.call.status = "succeeded".into();
         r.call.result = Some(result.clone());
         r.call.error = None;
