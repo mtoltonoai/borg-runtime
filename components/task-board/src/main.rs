@@ -6,6 +6,7 @@ mod config;
 mod core;
 mod db;
 mod events;
+mod fleet;
 mod ipfs;
 mod mcp;
 mod metrics;
