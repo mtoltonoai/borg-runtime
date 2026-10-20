@@ -23,20 +23,38 @@ dependency readiness and durable session receipts. Credentials stay in existing
 mode-0600 environment files and are neither packaged nor printed. Responses API
 credentials and Codex login remain separate.
 
-### Recorded rollout, not final acceptance
+### Verified selected deployment (October 20, 2026)
 
-Project 1 / task 6 records the integrated `175d295a2fc167d77948fd7c020e794480753468`
-rollout on October 20, 2026: the shared Board and runtimes used Board-only identity
-configuration, existing sessions retained explicit bindings, and Fleet was
-enabled on all four labs at 03:51 UTC. The independent recovery service was
-also enabled on `agent-lab`. The retained builder session is observed but its
-host is disabled with capacity zero for new placement; it is not a fifth worker.
+One persistent Board and four enabled Fleet workers are live. Host configs use
+Board-only identity configuration; model, tools, roles and retry policy are
+metadata. Native session IDs, bindings, databases and completed receipts were
+retained. The builder remains an observed control-plane host, capacity zero and
+disabled for placement; one explicitly assigned Fleet observer reports its real
+session progress without launching foreign work.
 
-This is the recorded deployment baseline, not a claim that final acceptance is
-complete. Live Git-route repairs, Board revision/projection verification and
-parent-child recovery-lineage checks remain owned under task 6 and its related
-tasks. Use their latest receipts and the [acceptance audit](native-acceptance.md)
-for final state; do not infer a pass from service enablement or these docs.
+The final selected updates intentionally did not restart unchanged Native or
+worker workspace processes. Their source trees are identical in the deployed
+Native baseline and the final integrated source.
+
+| Component | Verified deployed release |
+| --- | --- |
+| Shared Board and all four Fleet workers | `049de0c832471fee9efd1aebe3909d0762fdc579` |
+| Native engines and four-lab workspace services | `175d295a2fc167d77948fd7c020e794480753468` |
+| Independent recovery controller | `5ad61bf7a31f9473d89f170722e836714f7532ea` |
+| Selected-update helper source correction | `2eaee3d8948fd3b4a3bd4daf282fb48dc0a8da4c` and its final documentation/audit descendants |
+
+Task 28 completed the single linked repaired-lab1 execution in the existing
+project/identity: real hostname/cwd/Git checkout, marker write/readback and a
+normal cross-workspace denial. It supplements task 21's real delegation and
+other-host receipts; it does not retroactively turn retained failures 7/10/11
+into successes. The lineage-aware monitor automatically created owned task 27,
+and its incident/task/dispatch plus frozen outbox/receipt hashes survived the
+planned monitor restart on the same SQLite inode.
+
+Project 1 / task 6 owns exact release, process, database, receipt and final Git
+publication records. The [acceptance audit](native-acceptance.md) verifies the
+explicit component revision map; a uniform revision check is not appropriate
+for this selected deployment. No service is relabeled to imply an unused build.
 
 ## Build and stage
 
@@ -109,13 +127,17 @@ The task's integrator owns publication and activation. Worker sessions deliver
 tested commits from their own branches; they do not restart services or edit
 another session's checkout to integrate a change.
 
-1. Coordinate visible maintenance/drain with task/session owners. The installer
-   pauses local Fleet admission before changing its runtime or tools. A shared
-   Board update requires draining callers on every host, not only `agent-lab`.
-2. **Never cancel an in-flight tool to force a rollout.** The installer sets the
-   durable stop flag without notifying cancellation and waits for the original
-   execution boundary, including a raced tool receipt. It does not infer dispatch
-   exclusion from progress text. A slow live model call is not proof of death.
+1. Select only changed components. For a Board/Fleet-only update use the
+   per-host installer: `board,fleet` on the controller and `fleet` on other labs,
+   omitting the builder. It retains online backups, actual image/readiness checks
+   and local Fleet admission pause, but does not drain/resume Native sessions or
+   restart Native/workspace services. A recovery-only update is independent of
+   Fleet and watched-service readiness.
+2. **Never cancel an in-flight tool to force a rollout.** When Native or a
+   workspace service is actually selected, the installer sets the durable stop
+   flag without cancellation and waits for original receipt boundaries. It does
+   not infer dispatch exclusion from progress text. A slow live model call is
+   not proof of death.
 3. Reconcile truly uncertain outcomes using original receipts and external
    effects, not by repeating the write. A durable drain journal owns each
    deployment pause. Timeout cleanup remains resume-pending until the runtime
@@ -134,17 +156,18 @@ python3 -B "$release/native_release.py" launch --release "$release" \
 python3 tooling/deploy_native.py "$release" --hosts borg-agent-lab-2 --activate
 ```
 
-For shared Board updates, the deployment owner runs the detached whole-cluster
-coordinator from its builder checkout. It stages the release, pauses Fleet and
-recovery, and drains the four labs plus its local builder runtime before
-updating Board. It verifies selected runtimes, resumes owned sessions and
-restarts previously active supervisors. Updating supervisor binaries is a
-separate selected-component install; the coordinator accepts only
-`board,native,workspace,session-workspace`.
+For ordinary selected Board/Fleet updates, use the per-host path above with
+`--components board,fleet` on `agent-lab` and `--components fleet` on workers.
+Build from the corrected helper source; never edit a frozen release manifest.
+The detached whole-cluster coordinator is for an intentional Native/profile
+transition, not a Board-only patch: it drains all five callers and its target
+list does not install Fleet. Use it only when that wider transition is wanted.
 
 ```sh
-# From the deployment owner's builder checkout, after building a committed release:
-release="$PWD/.runtime/releases/$revision"
+# Selected controller update; Native/workspace images and drivers are not selected:
+python3 -B "$release/native_release.py" launch --release "$release" \
+  --host-id agent-lab --components board,fleet
+# Intentional whole-cluster Native transition, when required:
 python3 tooling/native_rollout.py launch --release "$release" --components board,native
 ```
 
@@ -163,8 +186,10 @@ Fleet. Recovery has network-only ordering and no watched-service readiness
 precondition, so a Board/native outage cannot prevent its own retry loop from
 starting.
 
-Every activation writes `state/deployments/<timestamp>.json` with before/after
-session receipt hashes, backup hashes and service state. Binary claims are
+Every activation writes `state/deployments/<timestamp>.json` with backup hashes,
+selected image and service state. Native/workspace transitions additionally
+record before/after session receipt hashes; a selected Board/Fleet update does
+not pretend to perform a Native drain or process-restart test. Binary claims are
 corroborated by SHA-256 of `/proc/<pid>/exe`, not a version string alone. The
 cluster coordinator also writes `state/cluster-rollouts/<transaction>.json`.
 A failed install retains recovery evidence and does not replace a database or

@@ -304,7 +304,7 @@ def collect(board_url, runtimes, project=1, reader=None, board_token=None, nativ
     return snapshot
 
 
-def audit(snapshot, expected_hosts=HOSTS, revision=None, now=None, max_host_age=90):
+def audit(snapshot, expected_hosts=HOSTS, revision=None, now=None, max_host_age=90, revisions=None):
     now = time.time() if now is None else now
     checks = []
 
@@ -312,16 +312,19 @@ def audit(snapshot, expected_hosts=HOSTS, revision=None, now=None, max_host_age=
         checks.append({"check": name, "status": "pass" if ok else "fail", "details": details})
 
     check("collection", not snapshot.get("errors"), snapshot.get("errors", []))
-    check("expected_revision", bool(revision and re.fullmatch(r"[0-9a-f]{40}", revision)),
-          "Supply the full integrated commit; readiness alone does not identify deployed code.")
+    expected_revisions = revisions if revisions is not None else {name: revision for name in ("board", "fleet", "native")}
+    exact = (isinstance(expected_revisions, dict) and set(expected_revisions) == {"board", "fleet", "native"}
+             and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) for value in expected_revisions.values()))
+    check("expected_revision", exact,
+          "Require exact Board, Fleet and Native source commits (one common revision or a complete component map); readiness is not provenance.")
     check("snapshot_fresh", fresh(snapshot.get("finished_at", snapshot.get("collected_at")), now, max_host_age),
           "Evidence must be current; a saved old healthy snapshot is not current readiness.")
     board = obj(snapshot.get("board"))
     health = obj(board.get("health"))
     check("board_ready", health.get("ok") is True and health.get("db") is True,
           "Board /api/health must verify its database, not return the SPA.")
-    if revision:
-        check("board_revision", health.get("commit") == revision, {"expected": revision, "actual": health.get("commit")})
+    if exact:
+        check("board_revision", health.get("commit") == expected_revisions["board"], {"expected": expected_revisions["board"], "actual": health.get("commit")})
     host_rows = board.get("hosts") or []
     hosts = {h.get("host_id"): h for h in host_rows}
     check("unique_hosts", len(host_rows) == len(hosts) and None not in hosts,
@@ -351,9 +354,10 @@ def audit(snapshot, expected_hosts=HOSTS, revision=None, now=None, max_host_age=
                            and row.get("runtime_ready") is True and row.get("fresh", True) is True)
         check(f"host:{host}", live_host[host] and valid_capacity and row.get("enabled", True) is not False,
               {"native_ready": ready, "last_seen": row.get("last_seen"), "capacity": capacity})
-        if revision:
-            check(f"revision:{host}", h.get("revision") == revision and row.get("revision") == revision,
-                  {"expected": revision, "native": h.get("revision"), "fleet": row.get("revision")})
+        if exact:
+            check(f"revision:{host}", h.get("revision") == expected_revisions["native"] and row.get("revision") == expected_revisions["fleet"],
+                  {"expected_native": expected_revisions["native"], "expected_fleet": expected_revisions["fleet"],
+                   "native": h.get("revision"), "fleet": row.get("revision")})
         profiles = {p.get("id"): p for p in runtime.get("agents") or []}
         invalid = []
         finite = []
@@ -527,6 +531,7 @@ def main(argv=None):
     parser.add_argument("--expected-host", action="append", dest="hosts")
     parser.add_argument("--project", type=int, default=1)
     parser.add_argument("--expected-revision")
+    parser.add_argument("--expected-revisions", type=Path, help="JSON with exact board/fleet/native SHAs for selected-component deployments")
     parser.add_argument("--board-token-env")
     parser.add_argument("--native-token-env")
     parser.add_argument("--snapshot-in", type=Path)
@@ -558,7 +563,10 @@ def main(argv=None):
                                os.environ.get(args.native_token_env) if args.native_token_env else None)
         if not isinstance(snapshot, dict) or snapshot.get("schema_version") != SCHEMA:
             raise ReadError("unsupported snapshot schema")
-        report = audit(snapshot, args.hosts or HOSTS, args.expected_revision, max_host_age=args.max_host_age)
+        if args.expected_revision and args.expected_revisions:
+            raise ReadError("choose one common revision or the explicit component map")
+        revisions = json.loads(args.expected_revisions.read_text()) if args.expected_revisions else None
+        report = audit(snapshot, args.hosts or HOSTS, args.expected_revision, max_host_age=args.max_host_age, revisions=revisions)
         if args.before:
             report["restart"] = compare_restart(json.loads(args.before.read_text()), snapshot, args.hosts or HOSTS)
             report["ok"] = report["ok"] and report["restart"]["ok"]

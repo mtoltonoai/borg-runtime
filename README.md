@@ -128,20 +128,30 @@ The checks cover native recovery/concurrency and protocol behavior, workspace
 MCP paths/processes, Fleet, Task Board, and the built Task Board frontend.
 Component commands must run from their component directory.
 
-## Deployment evidence and remaining acceptance
+## Verified deployment and evidence
 
-The integrated Board/native/Fleet path is implemented and deployed across the
-four workers. Board's `/native` view consumes per-session reports and Fleet host
-and dispatch data; it does not replace the runtime's durable transcripts. See
-[architecture](docs/architecture.md) for component and authority boundaries.
+The Board/native/Fleet path is live on all four labs with one shared persistent
+Board. `/native` displays real host, independent session, progress and failure
+state. The final selected release map is **Board/Fleet `049de0c`, Native/worker
+workspaces `175d295`, recovery `5ad61bf`**; source/helper correction `2eaee3d`
+and its documentation/audit descendants do not require another Native rollout.
+The [deployment guide](docs/native-deployment.md) records full commit IDs.
 
-Implementation and enabled services are not final acceptance. Project 1 / task 6
-owns the remaining live Git-route, Board revision/projection and parent-child
-recovery-lineage verification. The [acceptance audit](docs/native-acceptance.md)
-requires actual revisions, load distribution, independent same-identity sessions,
-filesystem isolation, preserved receipts across restart, owned repairs and a
-native-authored tested change deployed and published. Missing evidence remains
-unproven; this documentation does not close those checks.
+Live evidence includes a fresh metadata-defined identity/project without host
+JSON edits, model-authored same-identity delegation, distinct workspace marker
+readbacks and denied cross-reads, preserved completed receipts across restarts,
+and automatic owned repair of the retained failed child through parent lineage.
+Task 28 completed the **one linked repaired-lab1 leg** using the existing identity
+and other-host evidence; failures 7/10/11 remain truthful historical failures,
+not replayed successes. Fleet-native sessions authored tested code that was
+integrated and deployed, including the Board revision and task-list metadata fixes.
+
+Project 1 / task 6 holds exact live service/image/database receipts, linked
+verification and final Git publication records. The
+[acceptance audit](docs/native-acceptance.md) compares exact per-component
+revisions while retaining all identity, full-profile, placement, ownership and
+receipt checks. It never substitutes health or a uniform label for evidence.
+See [architecture](docs/architecture.md) for authority and recovery boundaries.
 
 ## Independent durable recovery
 

@@ -57,6 +57,25 @@ class AcceptanceTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["demonstrations_required"]), 8)
         self.assertIn("live demonstrations still required", result["scope"])
 
+    def test_exact_selected_component_revisions_pass_without_relabeling_native(self):
+        expected = {"board": "b" * 40, "fleet": "c" * 40, "native": REV}
+        self.snapshot["board"]["health"]["commit"] = expected["board"]
+        for host in self.snapshot["board"]["hosts"]:
+            host["revision"] = expected["fleet"]
+        result = audit.audit(self.snapshot, revisions=expected, now=NOW)
+        self.assertTrue(result["ok"], result)
+        self.snapshot["runtimes"]["agent-lab"]["health"]["revision"] = "d" * 40
+        checks = {c["check"]: c for c in audit.audit(self.snapshot, revisions=expected, now=NOW)["checks"]}
+        self.assertEqual(checks["revision:agent-lab"]["status"], "fail")
+
+    def test_incomplete_or_unrecognized_component_map_cannot_skip_provenance(self):
+        for expected in ({"board": REV}, {"board": REV, "fleet": REV, "native": "unknown"},
+                         {"board": REV, "fleet": REV, "native": REV, "other": REV}):
+            with self.subTest(expected=expected):
+                report = audit.audit(self.snapshot, revisions=expected, now=NOW)
+                self.assertFalse(report["ok"])
+                self.assertEqual(next(c for c in report["checks"] if c["check"] == "expected_revision")["status"], "fail")
+
     def test_absent_fleet_cannot_pass_as_bootstrap_health(self):
         self.snapshot["board"]["hosts"] = []
         self.snapshot["board"]["dispatches"] = []

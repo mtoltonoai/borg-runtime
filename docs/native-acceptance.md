@@ -191,3 +191,27 @@ provenance: the operational audit's `board_revision` check continues to fail
 until the integrator rebuilds/installs the correctly stamped Board. A repeated
 cohort start reports `fresh_registration: false`, rather than pretending an
 already existing identity was newly created again.
+
+
+## Exact component revisions after selected updates
+
+`--expected-revision SHA` remains the strict uniform-release mode. For an
+intentional selected update, use `--expected-revisions FILE` containing exactly
+`board`, `fleet` and `native` full 40-character commits. For this verified rollout:
+
+```json
+{
+  "board": "049de0c832471fee9efd1aebe3909d0762fdc579",
+  "fleet": "049de0c832471fee9efd1aebe3909d0762fdc579",
+  "native": "175d295a2fc167d77948fd7c020e794480753468"
+}
+```
+
+Every advertised component must match its own expected commit. Missing, invalid
+or unknown component keys fail closed; this is not a revision-check waiver.
+All remaining operational and full public ToolCall custody checks are unchanged.
+Worker workspace175d295 and monitor5ad61bf identity additionally come from their
+exact release manifests, running command paths and deployment receipts, not from
+a Native-only API assertion. The builder's original workspace endpoint is
+retained for its deployment session. No new cohort or unnecessary Native restart
+is needed to make a uniform version string appear.
