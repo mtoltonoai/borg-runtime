@@ -1,4 +1,9 @@
 name: Check
+env:
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
 on: [push, pull_request]
 jobs:
   rust:
@@ -42,3 +47,18 @@ jobs:
       - run: npm ci
       - run: npm run test:native
       - run: npm run build
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --bin borg-native
+      - run: cargo build --locked --manifest-path components/fleet/Cargo.toml --bin fleet
+      - run: cargo build --locked --manifest-path components/task-board/Cargo.toml --bin task-board
+      - run: python3 -m unittest discover -s tests -v
+        env:
+          BORG_NATIVE_TEST_BIN: ${{ github.workspace }}/target/debug/borg-native
+          BORG_TEST_FLEET_BINARY: ${{ github.workspace }}/components/fleet/target/debug/fleet
+          BORG_TEST_BOARD_BINARY: ${{ github.workspace }}/components/task-board/target/debug/task-board

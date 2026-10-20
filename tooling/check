@@ -2,17 +2,32 @@
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
+cargo build --locked --bin borg-native
 cargo test --locked
-python3 -m unittest discover -s tests -v
 (
   cd components/fleet
+  cargo build --locked --bin fleet
   cargo test --locked --bin fleet
 )
 (
   cd components/task-board
+  cargo build --locked --bin task-board
   cargo test --locked
   cd web
   npm ci
   npm run test:native
   npm run build
 )
+
+# Python boundary tests run only AFTER their actual executables exist. Cargo's
+# metadata accounts for a caller-selected CARGO_TARGET_DIR instead of guessing.
+target_dir() {
+  (cd "$1" && cargo metadata --locked --no-deps --format-version 1) |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
+}
+export BORG_NATIVE_TEST_BIN="$(target_dir "$repo")/debug/borg-native"
+export BORG_TEST_FLEET_BINARY="$(target_dir "$repo/components/fleet")/debug/fleet"
+export BORG_TEST_BOARD_BINARY="$(target_dir "$repo/components/task-board")/debug/task-board"
+python3 -m unittest discover -s tests -v

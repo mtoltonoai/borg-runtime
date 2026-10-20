@@ -31,8 +31,8 @@ import urllib.request
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
-FLEET = ROOT / "components/fleet/target/debug/fleet"
-BOARD = ROOT / "components/task-board/target/debug/task-board"
+FLEET = Path(os.environ.get("BORG_TEST_FLEET_BINARY", ROOT / "components/fleet/target/debug/fleet"))
+BOARD = Path(os.environ.get("BORG_TEST_BOARD_BINARY", ROOT / "components/task-board/target/debug/task-board"))
 WORKSPACE = ROOT / "tooling/workspace_mcp.py"
 SSH_REPO = None
 SSH_CONFIG = None
@@ -183,6 +183,11 @@ class Engine:
 
 
 class FleetIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not FLEET.is_file() or not BOARD.is_file():
+            raise unittest.SkipTest("build Fleet/Board or set BORG_TEST_FLEET_BINARY and BORG_TEST_BOARD_BINARY; tooling/check runs the full boundary")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="native-fleet-integration-")
         self.root = Path(self.temp.name)
