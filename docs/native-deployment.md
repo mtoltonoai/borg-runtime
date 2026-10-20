@@ -79,13 +79,17 @@ session UUIDs/workspaces.
    The installer stops local Fleet admission before changing its runtime or tools.
 2. **Do not call the old bootstrap stop API during a tool.** It cancels receipt
    collection and leaves an unknown side effect. The installer automatically sets
-   the existing durable stop flag without notifying cancellation, waits for the
-   current tool receipt, and cancels inference only after future tool dispatch is
-   fenced. A live slow model call is not proof of a dead process. No operator
+   the existing durable stop flag without notifying cancellation and waits for
+   the original execution boundary, including any raced tool receipt. It never
+   infers dispatch exclusion from progress text. A live slow model call is not
+   proof of a dead process. No operator
    approval or agent-completion gate is required.
 3. Resolve any truly uncertain tool outcome from original receipts, not by
    repeating the write. A durable drain journal owns every deployment pause and
    resumes original work after verification (including after recoverable errors).
+   Timeout cleanup stays resume-pending until the runtime actually clears its
+   stop flag. Detached systemd jobs use --no-block; a self-targeted calling tool
+   returns its receipt instead of polling its own drain.
    Unknown outcomes remain visible and are never replayed.
 4. Configure the existing state paths, metadata and credentials. Then activate
    one host and verify before proceeding. Update Board only while its callers

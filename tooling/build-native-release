@@ -22,7 +22,7 @@ fi
 # These knobs do not affect model/runtime context or execution limits.
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
 export BORG_BUILD_REV="$revision" FLEET_BUILD_REV="$revision"
-export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.99.0}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}"
 CARGO_TARGET_DIR="$build_root/native" cargo build --locked --profile "$profile" --bin borg-native
 (cd components/fleet && CARGO_TARGET_DIR="$build_root/fleet" cargo build --locked --profile "$profile" --bin fleet)

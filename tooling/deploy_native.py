@@ -11,6 +11,7 @@ a safe execution boundary; it never cancels or replays an unknown tool write.
 import argparse
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -68,7 +69,8 @@ else:os.rename(incoming,destination)
         # Only this randomly named staging directory is ours to remove.
         ssh(host, "rm -rf -- " + q(str(incoming)), config)
         raise
-    return {"host": host, "release": str(destination), "revision": metadata["revision"], "staged": True}
+    return {"host": host, "host_id": ssh(host, "hostname", config).decode().strip(),
+            "release": str(destination), "revision": metadata["revision"], "staged": True}
 
 
 def main():
@@ -91,13 +93,19 @@ def main():
     if args.activate:
         for result in staged:
             path = Path(result["release"])
-            host_id = result["host"].removeprefix("borg-")
+            host_id = result["host_id"]
             command = shlex.join(["python3", "-B", str(path / "native_release.py"), "launch",
                                   "--release", str(path), "--base", str(args.base),
                                   "--host-id", host_id, "--components", args.components])
             output = ssh(result["host"], command, args.ssh_config)
             handle = json.loads(output)
             print(json.dumps(handle), flush=True)
+            if host_id == os.uname().nodename:
+                # The initiating workspace_run is itself an in-flight tool.
+                # Return its receipt before a detached self-upgrade drains it.
+                print(json.dumps({"host": result["host"], "job": handle["job"],
+                                  "poll_deferred_for_self_upgrade": True}), flush=True)
+                continue
             deadline = time.monotonic() + 900
             while True:
                 state = ssh(result["host"], "systemctl show " + shlex.quote(handle["job"]) +

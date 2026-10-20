@@ -78,21 +78,88 @@ class DrainUnitTests(unittest.TestCase):
             api.assert_not_called()
         self.assertEqual(json.loads(self.journal.read_text())["state"], "needs_reconciliation")
 
-    def test_inference_cancel_only_after_stop_flag_committed(self):
+    def test_stale_inference_snapshot_and_raced_tool_never_cancelled(self):
         self.session("active", progress="Waiting for model response", tool_status="succeeded")
-        def stop(url, sid, action):
-            self.assertEqual(action, "stop")
+        def actor_after_old_stop_check():
+            while not self.journal.exists():
+                time.sleep(0.001)
+            # Actor had already passed stopped=false before drain's commit.
+            # It dispatches AFTER a stale inference/no-running-tool snapshot.
             with sqlite3.connect(self.database) as db:
-                body, flag = db.execute("SELECT body,stop_requested FROM sessions").fetchone()
-                self.assertEqual(flag, 1)
-                body = json.loads(body)
+                body = json.loads(db.execute("SELECT body FROM sessions").fetchone()[0])
+                body.update(progress="Calling original raced tool")
+                db.execute("UPDATE sessions SET body=?", (json.dumps(body),))
+                db.execute("UPDATE tool_calls SET body=?", (json.dumps({"call": {"call_id": "call-1", "status": "running"}}),))
+            time.sleep(0.04)
+            with sqlite3.connect(self.database) as db:
                 body["status"] = "stopped"
                 db.execute("UPDATE sessions SET body=?", (json.dumps(body),))
-            return body
-        with mock.patch.object(drain, "api", side_effect=stop) as api:
-            value = drain.drain(self.database, "http://unused", self.journal, wait_seconds=1, interval=0.001)
-        self.assertEqual(api.call_count, 1)
+                db.execute("UPDATE tool_calls SET body=?", (json.dumps({"call": {"call_id": "call-1", "status": "succeeded"}}),))
+        with mock.patch.object(drain, "api") as api, concurrent.futures.ThreadPoolExecutor(1) as pool:
+            actor = pool.submit(actor_after_old_stop_check)
+            value = drain.drain(self.database, "http://unused", self.journal, wait_seconds=2, interval=0.005)
+            actor.result(timeout=2)
+            api.assert_not_called()
         self.assertEqual(value["state"], "drained")
+        self.assertEqual(value["after"][0]["tools"], {"call-1": "succeeded"})
+
+    def test_timeout_cleanup_does_not_claim_running_tool_resumed(self):
+        self.session("active")
+        with self.assertRaises(TimeoutError):
+            drain.drain(self.database, "http://unused", self.journal, wait_seconds=0)
+        with mock.patch.object(drain, "api") as api:
+            with self.assertRaises(TimeoutError):
+                drain.resume("http://unused", self.journal, wait_seconds=0)
+            api.assert_not_called()
+        value = json.loads(self.journal.read_text())
+        self.assertEqual(value["state"], "resume_pending")
+        self.assertEqual(value["resumed"], [])
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute("SELECT stop_requested FROM sessions").fetchone()[0], 1)
+
+    def test_timeout_then_late_tool_boundary_gets_verified_real_resume(self):
+        body = self.session("active")
+        with self.assertRaises(TimeoutError):
+            drain.drain(self.database, "http://unused", self.journal, wait_seconds=0)
+        def runtime_resume(url, sid, action):
+            self.assertEqual(action, "resume")
+            with sqlite3.connect(self.database) as db:
+                old, flag = db.execute("SELECT body,stop_requested FROM sessions").fetchone()
+                self.assertEqual(json.loads(old)["status"], "stopped")
+                self.assertEqual(flag, 1)
+                value = dict(body, status="ready")
+                db.execute("UPDATE sessions SET body=?,stop_requested=0", (json.dumps(value),))
+            return value
+        with mock.patch.object(drain, "api", side_effect=runtime_resume) as api, concurrent.futures.ThreadPoolExecutor(1) as pool:
+            future = pool.submit(drain.resume, "http://unused", self.journal, 2, 0.005)
+            time.sleep(0.03)
+            self.assertFalse(future.done())
+            self.assertEqual(json.loads(self.journal.read_text())["resumed"], [])
+            api.assert_not_called()
+            # This late stopped write is the race which used to orphan work.
+            with sqlite3.connect(self.database) as db:
+                db.execute("UPDATE sessions SET body=?", (json.dumps(dict(body, status="stopped")),))
+                db.execute("UPDATE tool_calls SET body=?", (json.dumps({"call": {"call_id": "call-1", "status": "succeeded"}}),))
+            value = future.result(timeout=2)
+        self.assertEqual(value["state"], "resumed")
+        self.assertEqual(value["resumed"], ["active"])
+        self.assertEqual(api.call_count, 1)
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute("SELECT stop_requested FROM sessions").fetchone()[0], 0)
+
+    def test_lost_resume_reply_is_reconciled_without_repeating_write(self):
+        body = self.session("active")
+        drain.request_drain(self.database, self.journal)
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE sessions SET body=?", (json.dumps(dict(body, status="stopped")),))
+        def committed_but_lost(url, sid, action):
+            with sqlite3.connect(self.database) as db:
+                db.execute("UPDATE sessions SET body=?,stop_requested=0", (json.dumps(dict(body, status="running")),))
+            raise OSError("lost HTTP reply after commit")
+        with mock.patch.object(drain, "api", side_effect=committed_but_lost) as api:
+            value = drain.resume("http://unused", self.journal, wait_seconds=1)
+        self.assertEqual(value["state"], "resumed")
+        self.assertEqual(api.call_count, 1)
 
 
 @unittest.skipUnless(os.environ.get("BORG_NATIVE_TEST_BIN"), "set BORG_NATIVE_TEST_BIN for real native execution")

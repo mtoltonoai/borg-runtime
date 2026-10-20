@@ -1,5 +1,6 @@
 """Deployment safety and real read-only HTTP boundary tests."""
 import importlib.util
+import argparse
 import json
 from pathlib import Path
 import sqlite3
@@ -111,6 +112,19 @@ class ReleaseTests(unittest.TestCase):
         unit = release.unit("session-workspace", Path("/release/abc"), Path("/state"), "agent-lab")
         self.assertIn("--session-root /state/workspaces --port 8791", unit)
         self.assertNotIn("--root ", unit)
+
+    def test_detached_launch_is_nonblocking_and_survives_calling_tool(self):
+        path = self.artifact()
+        args = argparse.Namespace(release=path, base=self.root, user="mtolton", host_id="agent-lab-2",
+                                  workspace="/workspace", runtime_url="http://127.0.0.1:8787",
+                                  components="native", wait_seconds=600)
+        with mock.patch.object(release, "run", return_value="") as run:
+            result = release.launch(args)
+        command = run.call_args.args[0]
+        self.assertIn("--no-block", command)
+        self.assertIn("--property=TimeoutStartSec=infinity", command)
+        self.assertEqual(command[:3], ["sudo", "-n", "systemd-run"])
+        self.assertTrue(result["launched"])
 
     def test_unit_rejects_systemd_injection(self):
         with self.assertRaises(ValueError):

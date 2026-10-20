@@ -386,8 +386,8 @@ def launch(args):
     metadata = verify(args.release)
     job = "borg-native-rollout-" + metadata["revision"][:12] + "-" + uuid.uuid4().hex[:8]
     command = ["sudo", "-n", "systemd-run", "--unit=" + job, "--uid=" + args.user,
-               "--working-directory=" + str(args.base), "--property=Type=oneshot",
-               "--property=RemainAfterExit=yes", "--property=TimeoutStartSec=900",
+               "--working-directory=" + str(args.base), "--no-block", "--property=Type=oneshot",
+               "--property=RemainAfterExit=yes", "--property=TimeoutStartSec=infinity",
                "/usr/bin/python3", "-B", str(args.release / "native_release.py"), "install",
                "--base", str(args.base), "--release", str(args.release),
                "--host-id", args.host_id, "--user", args.user, "--workspace", args.workspace,

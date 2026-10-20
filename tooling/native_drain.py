@@ -3,9 +3,9 @@
 
 Compatibility bridge for the original runtime, whose HTTP stop cancels tools.
 Set its existing durable stop flag WITHOUT sending a cancellation notification.
-A running tool then finishes normally; no later tool can start. Only after that
-flag is committed and the actor is in inference/read-only discovery do we use
-HTTP stop to avoid waiting indefinitely for a model. Execution resumes after
+A running or raced original tool then finishes normally. The legacy bridge is
+passive-only: a progress snapshot is not atomic exclusion of dispatch, so it
+NEVER sends HTTP stop/cancellation. Execution resumes after
 activation, using a durable deployment journal. Unknown writes are never replayed.
 """
 import argparse
@@ -24,7 +24,6 @@ sys.dont_write_bytecode = True
 from native_release import atomic_json
 
 ACTIVE = {"ready", "running", "retrying", "stopping"}
-SAFE_CANCEL_PROGRESS = {"Waiting for model response", "Loading configured tools"}
 
 
 def api(url, session_id, action=None):
@@ -96,22 +95,9 @@ def drain(database, runtime_url, journal, wait_seconds=300, interval=0.2):
             value.update(state="drained", after=observed)
             atomic_json(journal, value)
             return value
-        for session in active:
-            if session["id"] not in value["sessions"]:
-                # A newly admitted session or independently stopped actor is not
-                # ours to cancel. Fence admission and retry; don't invent ownership.
-                continue
-            if any(t == "running" for t in session["tools"].values()):
-                continue
-            if session["id"] in value["notified"]:
-                continue
-            safe = session["progress"] in SAFE_CANCEL_PROGRESS or session["status"] == "retrying"
-            if safe:
-                # With the durable flag set, this actor cannot move from inference
-                # to a tool. Notify only here, never during a running tool.
-                api(runtime_url, session["id"], "stop")
-                value["notified"].append(session["id"])
-                atomic_json(journal, value)
+        # Deliberately no HTTP stop here. Even a seemingly inference-only
+        # snapshot can race a tool which already passed stopped=false. Let the
+        # original actor commit any such tool result and observe the flag itself.
         if time.monotonic() >= deadline:
             value.update(state="waiting_for_boundary", waiting=[s["id"] for s in active])
             atomic_json(journal, value)
@@ -119,32 +105,59 @@ def drain(database, runtime_url, journal, wait_seconds=300, interval=0.2):
         time.sleep(interval)
 
 
-def resume(runtime_url, journal):
+def resume(runtime_url, journal, wait_seconds=None, interval=0.2):
     value = json.loads(journal.read_text())
+    deadline = None if wait_seconds is None else time.monotonic() + wait_seconds
+    value["state"] = "resume_pending"
+    atomic_json(journal, value)
     for sid in value["sessions"]:
         if sid in value["resumed"]:
             continue
-        session = api(runtime_url, sid)
-        if session["status"] == "stopped":
-            try:
-                api(runtime_url, sid, "resume")
-            except (OSError, ValueError):
-                # Reconcile a lost HTTP reply before considering any reattempt.
-                session = api(runtime_url, sid)
-                if session["status"] == "stopped":
-                    raise RuntimeError("resume receipt uncertain; inspect original state") from None
-            value["resumed"].append(sid)
-        elif session["status"] in ("ready", "running", "retrying"):
-            value["resumed"].append(sid)
-        elif session["status"] == "completed":
-            # Completed during the drain: no reason to rerun the user's finished
-            # task. Remove only our compatibility flag, leaving the body intact.
+        while True:
             with sqlite3.connect(value["database"], timeout=30) as db:
-                db.execute("UPDATE sessions SET stop_requested=0 WHERE id=? AND json_extract(body,'$.status')='completed'", (sid,))
-            value["resumed"].append(sid)
-        else:
-            raise RuntimeError("session needs owned repair instead of automatic resume: " + sid)
-        atomic_json(journal, value)
+                raw, flag = db.execute("SELECT body,stop_requested FROM sessions WHERE id=?", (sid,)).fetchone()
+                stored = json.loads(raw)
+            status = stored["status"]
+            if status in ("needs_resolution", "failed"):
+                value["state"] = "needs_reconciliation"
+                atomic_json(journal, value)
+                raise RuntimeError("session needs owned repair instead of automatic resume: " + sid)
+            if not flag:
+                # Only the runtime resume transaction (or an explicit concurrent
+                # operator action) clears the flag. Observing running is NOT
+                # sufficient: a late tool completion can still park that actor.
+                value["resumed"].append(sid)
+                atomic_json(journal, value)
+                break
+            if status == "completed":
+                with sqlite3.connect(value["database"], timeout=30) as db:
+                    db.execute("UPDATE sessions SET stop_requested=0 WHERE id=? AND json_extract(body,'$.status')='completed'", (sid,))
+                continue
+            if status == "stopped":
+                # Stopped can become visible just before its old run guard drops.
+                # A 409 is a proven pre-execution refusal; wait and retry it. A
+                # lost success is reconciled from the flag rather than reposted.
+                try:
+                    api(runtime_url, sid, "resume")
+                except urllib.error.HTTPError as error:
+                    if error.code != 409:
+                        raise
+                except (OSError, ValueError):
+                    with sqlite3.connect(value["database"], timeout=30) as db:
+                        observed_flag = db.execute("SELECT stop_requested FROM sessions WHERE id=?", (sid,)).fetchone()[0]
+                    if observed_flag:
+                        value["state"] = "resume_uncertain"
+                        atomic_json(journal, value)
+                        raise RuntimeError("resume receipt uncertain; inspect original state") from None
+                # Verify the actual committed flag before claiming success.
+                continue
+            # A timeout while a tool is running must not claim resume and leave
+            # stop_requested=1. Keep this detached durable job alive until the
+            # safe boundary; then perform/verify the real runtime resume.
+            if deadline is not None and time.monotonic() >= deadline:
+                atomic_json(journal, value)
+                raise TimeoutError("resume still pending original execution boundary")
+            time.sleep(interval)
     value["state"] = "resumed"
     atomic_json(journal, value)
     return value
