@@ -158,10 +158,10 @@ async fn board_comments_continue_native_sessions_without_weakening_unknown_effec
                 board.try_wait().unwrap().is_none(),
                 "Board exited before readiness"
             );
-            if let Ok(response) = client.get(format!("{base}/api/health")).send().await {
-                if response.status().is_success() {
-                    break;
-                }
+            if let Ok(response) = client.get(format!("{base}/api/health")).send().await
+                && response.status().is_success()
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
