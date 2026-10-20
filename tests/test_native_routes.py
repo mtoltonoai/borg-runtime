@@ -28,6 +28,7 @@ class NativeRouteTests(unittest.TestCase):
                 self.assertEqual(cfg["native"]["runtime_url"], patch["runtime_url"] + "/api")
                 self.assertEqual(cfg["board_api"], patch["board"]["url"] + "/api")
                 self.assertIn("{session_id}", cfg["native"]["workspace_mcp_url"])
+                self.assertEqual(cfg["native"]["git_ssh_config"], routes.DEFAULT_SSH)
                 self.assertNotIn("project_id", cfg["native"], "shared fleet must admit metadata-defined new projects")
                 for key in ("agents", "model", "api_key", "max_turns", "max_output_tokens"):
                     self.assertNotIn(key, cfg["native"])

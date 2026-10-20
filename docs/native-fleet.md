@@ -214,3 +214,35 @@ requires integrated health responses to report the correct target `host_id`;
 legacy health without that field proves transport only. Run `audit-local` from
 the builder to prove its existing forward access to all four targets without
 copying its keys. Save JSON with `audit --output <evidence-path>`.
+
+### Admission and Git-route checks
+
+New placement requires an integrated native `/health` response with
+`service:borg-native`, `ready:true`, `draining:false` and a matching `host_id`.
+A healthy legacy HTTP listener or a route to the wrong lab is not admission
+readiness. A newly created session must match the reserved identity, task,
+host, generation and workspace. Observation-only bootstrap adoption tolerates
+missing legacy placement fields; it still never recreates that session.
+
+The generated config sets `git_ssh_config` to the existing host Borg SSH config.
+Fleet uses it for cloning and persists a **repo-local** `core.sshCommand` for
+subsequent session pushes. It does not copy keys or mutate global Git/SSH config.
+The bootstrap checkout's own `.git/config` cannot supply this setting to a
+service running outside that checkout. A deployment bare repository may also
+have an unborn default HEAD: explicit `repo_ref=main` resolves `origin/main`
+rather than assuming clone created a local main branch. SHA and tag refs remain
+supported. Both boundaries have regressions.
+
+An opt-in real-SSH version of the process test is available (read-only remote
+clone/list; no production sessions or remote branches are modified):
+
+```sh
+python3 tests/test_native_fleet.py \
+  --ssh-repo ssh://borg-agent-lab/home/dev-user/.local/share/borg/git/borg-runtime.git \
+  --ssh-config /home/dev-user/.ssh/borg_config
+```
+
+This exercises Fleet provisioning against the actual configured SSH remote,
+then uses the resulting clone's persisted Git route independently and executes
+an actual workspace MCP shell tool. The native HTTP engine remains the explicit
+fault-injection fixture; live model/host acceptance is still separate.

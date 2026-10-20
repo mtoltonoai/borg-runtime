@@ -28,7 +28,7 @@ def origin(host):
     return f"http://127.0.0.1:{PORTS[host]}"
 
 
-def fleet_config(host, base=DEFAULT_BASE, capacity=4, project=None):
+def fleet_config(host, base=DEFAULT_BASE, capacity=4, project=None, ssh_config=DEFAULT_SSH):
     # JSON strings are also valid TOML basic strings for these absolute paths.
     project_line = f"project_id = {project}\n" if project is not None else ""
     return f'''# Generated connectivity only; identity/model/tools remain Board metadata.
@@ -44,6 +44,7 @@ poll_seconds = 5
 ttl_seconds = 60
 {project_line}repo_url = "ssh://borg-agent-lab/home/dev-user/.local/share/borg/git/borg-runtime.git"
 repo_ref = "main"
+git_ssh_config = {json.dumps(ssh_config)}
 http_timeout_seconds = 15
 provision_timeout_seconds = 300
 '''
@@ -136,7 +137,7 @@ def render(out, *, base=DEFAULT_BASE, user="mtolton", ssh_config=DEFAULT_SSH,
     for host in HOSTS:
         folder = out / host
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / "native-fleet.toml").write_text(fleet_config(host, base, capacity, project))
+        (folder / "native-fleet.toml").write_text(fleet_config(host, base, capacity, project, ssh_config))
         (folder / "runtime-patch.json").write_text(json.dumps(runtime_patch(host), indent=2) + "\n")
         units = controller_units(user, proxy) if host == "agent-lab" else {"borg-native-routes.service": worker_unit(user, ssh_config)}
         for name, content in units.items():

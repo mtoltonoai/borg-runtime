@@ -20,6 +20,8 @@ poll_seconds = 5
 # identity worktree. Omit repo_url to provision an empty workspace instead.
 repo_url = "ssh://borg-agent-lab/home/dev-user/.local/share/borg/git/borg-runtime.git"
 repo_ref = "main"
+# Preserve the existing SSH alias/key routing for service clones and later pushes.
+git_ssh_config = "/home/dev-user/.ssh/borg_config"
 
 # These are transport/setup timeouts, NOT inference or session turn budgets.
 http_timeout_seconds = 15
