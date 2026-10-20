@@ -24,7 +24,15 @@ SQLite. Task Board remains the authority for shared work.
 
 The native HTTP service provides session creation, status, transcript, steering,
 stop, resume and uncertain-tool resolution, with a small dashboard at `/`.
-Transient inference failures retry from committed conversation state. Startup
+Transient inference failures and retryable read-only MCP discovery failures retry
+indefinitely from committed state. `max_retries: null` is the explicit unlimited
+policy (and default); legacy numeric `max_retries` values are accepted but never
+terminate recoverable work. `retry_initial_ms`, `retry_max_ms` (default 60000),
+and `retry_jitter_percent` (default 20) control bounded exponential sleeps;
+`Retry-After` seconds or HTTP dates are respected within the configured sleep
+cap. Retry stage, count, error and next delay are durable and visible. Operator
+stop interrupts both inference and backoff. Permanent configuration/authentication
+errors remain visible for repair, and uncertain tool writes are never retried. Startup
 recovers interrupted inference; a tool interrupted without a durable result
 requires resolution before another attempt.
 

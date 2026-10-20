@@ -1,6 +1,6 @@
 use native_runtime::{
-    BoxFuture, McpServerConfig, Provider, ProviderError, ProviderRequest, ProviderResponse, Runtime,
-    SessionStatus, ToolExecutor,
+    BoxFuture, McpServerConfig, Provider, ProviderError, ProviderRequest, ProviderResponse,
+    Runtime, SessionStatus, ToolExecutor,
 };
 use serde_json::{Value, json};
 use std::{
@@ -34,7 +34,8 @@ impl Fixture {
                     "instructions": "Use the supplied tool when needed.",
                     "max_turns": 1,
                     "max_retries": max_retries,
-                    "retry_initial_ms": 1
+                    "retry_initial_ms": 1,
+                    "retry_max_ms": 2
                 }]
             }))
             .unwrap(),
@@ -318,7 +319,11 @@ async fn two_sessions_of_one_agent_reach_inference_concurrently_and_stay_isolate
             );
             assert_eq!(instructions, "Use the supplied tool when needed.");
             assert!(!request.instructions.contains(&other.id));
-            assert!(!request.instructions.contains(other.task.as_deref().unwrap()));
+            assert!(
+                !request
+                    .instructions
+                    .contains(other.task.as_deref().unwrap())
+            );
         }
     }
     assert!(tools.invocations.lock().unwrap().is_empty());
@@ -524,41 +529,50 @@ async fn ambiguous_tool_and_interrupted_intent_require_resolution_without_replay
 }
 
 #[tokio::test]
-async fn transient_provider_failure_exhausts_a_finite_retry_budget() {
+async fn transient_provider_failure_retries_past_legacy_budget_until_success() {
     let fixture = Fixture::new(2);
-    let provider = Arc::new(ScriptProvider::new(
-        (0..3)
-            .map(|_| {
-                Err(ProviderError {
-                    message: "temporary provider failure".into(),
-                    retryable: true,
-                })
+    let mut replies = (0..32)
+        .map(|_| {
+            Err(ProviderError {
+                message: "temporary provider failure".into(),
+                retryable: true,
+                retry_after_ms: Some(1),
             })
-            .collect(),
-    ));
+        })
+        .collect::<Vec<_>>();
+    replies.push(Ok(completed("recovered")));
+    let provider = Arc::new(ScriptProvider::new(replies));
     let tools = Arc::new(RecordingTools::default());
     let runtime = fixture.runtime(provider.clone(), tools.clone());
-    let session = runtime.create_session("engineer", None, "Try once.").unwrap();
+    let session = runtime
+        .create_session("engineer", None, "Keep retrying.")
+        .unwrap();
     let result = tokio::time::timeout(Duration::from_secs(5), runtime.run(&session.id))
         .await
-        .expect("retry budget must terminate")
+        .unwrap()
         .unwrap();
-    assert_eq!(result.status, SessionStatus::Failed);
+    assert_eq!(result.status, SessionStatus::Completed);
     let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3, "initial request plus exactly two retries");
-    assert!(requests.windows(2).all(|pair| pair[0].input == pair[1].input));
+    assert_eq!(
+        requests.len(),
+        33,
+        "neither old budget 2 nor bootstrap budget 20 may end retries"
+    );
+    assert!(
+        requests
+            .windows(2)
+            .all(|pair| pair[0].input == pair[1].input)
+    );
     assert!(tools.invocations.lock().unwrap().is_empty());
     assert!(runtime.tool_calls(&session.id).unwrap().is_empty());
     let transcript = runtime.transcript(&session.id).unwrap();
-    assert_eq!(transcript.iter().filter(|entry| entry.kind == "retry").count(), 2);
-    assert!(!transcript.iter().any(|entry| entry.kind == "output"));
-    drop(requests);
-    // Calling the driver again is not implicit permission to renew a failed run.
-    assert_eq!(
-        runtime.run(&session.id).await.unwrap().status,
-        SessionStatus::Failed
+    let retries: Vec<_> = transcript.iter().filter(|e| e.kind == "retry").collect();
+    assert_eq!(retries.len(), 32);
+    assert!(
+        retries
+            .iter()
+            .all(|e| e.item["retry_policy"] == "unlimited")
     );
-    assert_eq!(provider.requests.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -571,7 +585,9 @@ async fn stop_cancels_inflight_inference_and_persists_a_stopped_session() {
     });
     let tools = Arc::new(RecordingTools::default());
     let runtime = fixture.runtime(provider.clone(), tools.clone());
-    let session = runtime.create_session("engineer", None, "Wait for stop.").unwrap();
+    let session = runtime
+        .create_session("engineer", None, "Wait for stop.")
+        .unwrap();
     let driver = {
         let runtime = runtime.clone();
         let id = session.id.clone();
@@ -606,8 +622,8 @@ async fn stop_cancels_inflight_inference_and_persists_a_stopped_session() {
 }
 
 #[tokio::test]
-async fn incomplete_responses_retry_committed_input_without_tools_and_exhaust_finitely() {
-    for eventually_completes in [true, false] {
+async fn incomplete_responses_retry_committed_input_without_tools_past_legacy_budget() {
+    for incomplete_count in [1usize, 24] {
         let fixture = Fixture::new(2);
         let partial = ProviderResponse {
             id: Some("response-incomplete".into()),
@@ -625,43 +641,41 @@ async fn incomplete_responses_retry_committed_input_without_tools_and_exhaust_fi
             usage: Some(json!({"input_tokens": 3, "output_tokens": 1})),
             status: "incomplete".into(),
         };
-        let replies = if eventually_completes {
-            vec![Ok(partial.clone()), Ok(completed("complete-after-retry"))]
-        } else {
-            vec![Ok(partial.clone()), Ok(partial.clone()), Ok(partial.clone())]
-        };
+        let mut replies = vec![Ok(partial.clone()); incomplete_count];
+        replies.push(Ok(completed("complete-after-retry")));
         let provider = Arc::new(ScriptProvider::new(replies));
         let tools = Arc::new(RecordingTools::default());
         let runtime = fixture.runtime(provider.clone(), tools.clone());
         let session = runtime
-            .create_session("engineer", None, "Only complete responses may execute tools.")
+            .create_session(
+                "engineer",
+                None,
+                "Only complete responses may execute tools.",
+            )
             .unwrap();
         let outcome = tokio::time::timeout(Duration::from_secs(5), runtime.run(&session.id))
             .await
-            .expect("incomplete-response retries must have a finite budget")
+            .expect("incomplete responses must recover without a retry budget")
             .unwrap();
-        assert_eq!(
-            outcome.status,
-            if eventually_completes {
-                SessionStatus::Completed
-            } else {
-                SessionStatus::Failed
-            }
-        );
-        assert_eq!(outcome.turns, if eventually_completes { 1 } else { 0 });
+        assert_eq!(outcome.status, SessionStatus::Completed);
+        assert_eq!(outcome.turns, 1);
         assert!(tools.invocations.lock().unwrap().is_empty());
         assert!(runtime.tool_calls(&session.id).unwrap().is_empty());
 
-        let expected_requests = if eventually_completes { 2 } else { 3 };
+        let expected_requests = incomplete_count + 1;
         {
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), expected_requests);
-            assert!(requests.windows(2).all(|pair| pair[0].input == pair[1].input));
             assert!(
                 requests
+                    .windows(2)
+                    .all(|pair| pair[0].input == pair[1].input)
+            );
+            assert!(
+                requests.iter().all(|request| request
+                    .input
                     .iter()
-                    .all(|request| request.input.iter().all(|item| item != &reasoning()
-                        && item["call_id"] != "partial-call")),
+                    .all(|item| item != &reasoning() && item["call_id"] != "partial-call")),
                 "partial output is diagnostic evidence, not committed model input"
             );
         }
@@ -671,7 +685,7 @@ async fn incomplete_responses_retry_committed_input_without_tools_and_exhaust_fi
             .filter(|entry| entry.kind == "incomplete_response")
             .map(|entry| entry.item.clone())
             .collect();
-        assert_eq!(diagnostics.len(), if eventually_completes { 1 } else { 3 });
+        assert_eq!(diagnostics.len(), incomplete_count);
         for diagnostic in &diagnostics {
             assert_eq!(diagnostic["id"], "response-incomplete");
             assert_eq!(diagnostic["status"], "incomplete");
@@ -679,13 +693,14 @@ async fn incomplete_responses_retry_committed_input_without_tools_and_exhaust_fi
             assert_eq!(diagnostic["usage"], json!(partial.usage));
         }
         assert_eq!(
-            transcript.iter().filter(|entry| entry.kind == "retry").count(),
+            transcript
+                .iter()
+                .filter(|entry| entry.kind == "retry")
+                .count(),
             expected_requests - 1
         );
-        assert!(
-            !transcript.iter().any(|entry| entry.kind == "output"
-                && (entry.item == reasoning() || entry.item["call_id"] == "partial-call"))
-        );
+        assert!(!transcript.iter().any(|entry| entry.kind == "output"
+            && (entry.item == reasoning() || entry.item["call_id"] == "partial-call")));
         drop(runtime);
 
         let reopened = fixture.runtime(provider.clone(), tools.clone());
@@ -697,7 +712,7 @@ async fn incomplete_responses_retry_committed_input_without_tools_and_exhaust_fi
             .map(|entry| entry.item)
             .collect();
         assert_eq!(retained, diagnostics);
-        // Neither a completed run nor exhausted retries are implicitly renewed.
+        // A completed run is not implicitly renewed.
         assert_eq!(
             reopened.run(&session.id).await.unwrap().status,
             outcome.status
@@ -764,4 +779,178 @@ async fn simultaneous_drivers_of_one_session_queue_and_share_one_provider_reques
             .count(),
         1
     );
+}
+
+struct AlwaysRetry;
+impl Provider for AlwaysRetry {
+    fn respond(
+        &self,
+        _: ProviderRequest,
+    ) -> BoxFuture<'_, Result<ProviderResponse, ProviderError>> {
+        Box::pin(async {
+            Err(ProviderError {
+                message: "temporary outage".into(),
+                retryable: true,
+                retry_after_ms: Some(60_000),
+            })
+        })
+    }
+}
+async fn wait_retrying(runtime: &Runtime, id: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if runtime.get_session(id).unwrap().status == SessionStatus::Retrying {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn stop_interrupts_unlimited_backoff_and_restart_recovers_committed_input() {
+    let fixture = Fixture::new(0);
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["agents"][0]["max_retries"] = Value::Null;
+    config["agents"][0]["retry_max_ms"] = json!(60000);
+    std::fs::write(&fixture.config, serde_json::to_vec(&config).unwrap()).unwrap();
+    let tools = Arc::new(RecordingTools::default());
+    let runtime = fixture.runtime(Arc::new(AlwaysRetry), tools.clone());
+    let stopped = runtime
+        .create_session("engineer", None, "operator stop")
+        .unwrap();
+    let interrupted = runtime
+        .create_session("engineer", None, "durable retry input")
+        .unwrap();
+    let mut drivers = Vec::new();
+    for id in [&stopped.id, &interrupted.id] {
+        let runtime = runtime.clone();
+        let id = id.clone();
+        drivers.push(tokio::spawn(async move { runtime.run(&id).await }));
+    }
+    wait_retrying(&runtime, &stopped.id).await;
+    wait_retrying(&runtime, &interrupted.id).await;
+    assert!(
+        runtime
+            .get_session(&stopped.id)
+            .unwrap()
+            .progress
+            .contains("unlimited")
+    );
+    runtime.stop(&stopped.id).unwrap();
+    let stopped_driver = drivers.remove(0);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), stopped_driver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::Stopped
+    );
+    let interrupted_driver = drivers.remove(0);
+    interrupted_driver.abort();
+    let _ = interrupted_driver.await;
+    let saved = runtime.transcript(&interrupted.id).unwrap();
+    drop(runtime);
+    let provider = Arc::new(ScriptProvider::new(vec![Ok(completed(
+        "recovered-after-restart",
+    ))]));
+    let runtime = fixture.runtime(provider.clone(), tools.clone());
+    assert_eq!(
+        runtime.get_session(&stopped.id).unwrap().status,
+        SessionStatus::Stopped
+    );
+    assert_eq!(
+        runtime.get_session(&interrupted.id).unwrap().status,
+        SessionStatus::Ready
+    );
+    assert_eq!(
+        runtime.run(&interrupted.id).await.unwrap().status,
+        SessionStatus::Completed
+    );
+    assert_eq!(
+        provider.requests.lock().unwrap()[0].input,
+        vec![json!({"role":"user","content":"durable retry input"})]
+    );
+    assert!(saved.iter().any(|entry| entry.kind == "retry"));
+    assert!(tools.invocations.lock().unwrap().is_empty());
+}
+
+struct FlakyDiscovery {
+    attempts: AtomicUsize,
+    fail_until: usize,
+    error: &'static str,
+}
+impl ToolExecutor for FlakyDiscovery {
+    fn list_tools<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a [McpServerConfig],
+    ) -> BoxFuture<'a, Result<Vec<Value>, String>> {
+        Box::pin(async move {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < self.fail_until {
+                Err(self.error.into())
+            } else {
+                Ok(vec![])
+            }
+        })
+    }
+    fn call<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a [McpServerConfig],
+        _: &'a str,
+        _: Value,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        Box::pin(async { panic!("discovery retry must not execute a tool") })
+    }
+}
+#[tokio::test]
+async fn retryable_read_only_discovery_is_unlimited_but_invalid_auth_does_not_spin() {
+    for (error, succeeds) in [
+        ("MCP transport unavailable", true),
+        ("MCP HTTP status 503; retry_after_ms=1", true),
+        ("MCP HTTP status 401", false),
+    ] {
+        let fixture = Fixture::new(0);
+        let tools = Arc::new(FlakyDiscovery {
+            attempts: AtomicUsize::new(0),
+            fail_until: 24,
+            error,
+        });
+        let provider = Arc::new(ScriptProvider::new(vec![Ok(completed("discovered"))]));
+        let runtime = fixture.runtime(provider.clone(), tools.clone());
+        let session = runtime
+            .create_session("engineer", None, "discover")
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), runtime.run(&session.id))
+            .await
+            .unwrap();
+        if succeeds {
+            assert_eq!(outcome.unwrap().status, SessionStatus::Completed);
+            assert_eq!(tools.attempts.load(Ordering::SeqCst), 25);
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                runtime
+                    .transcript(&session.id)
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.kind == "retry")
+                    .count(),
+                24
+            );
+        } else {
+            assert!(outcome.is_err());
+            assert_eq!(tools.attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                runtime.get_session(&session.id).unwrap().status,
+                SessionStatus::Failed
+            );
+            assert!(provider.requests.lock().unwrap().is_empty());
+        }
+    }
 }

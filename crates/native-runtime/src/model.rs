@@ -30,10 +30,16 @@ pub struct AgentConfig {
     pub max_turns: Option<u64>,
     #[serde(default = "default_context")]
     pub context_window_tokens: u64,
-    #[serde(default = "default_retries")]
-    pub max_retries: u32,
+    /// Compatibility metadata only. Transient failures never exhaust a budget;
+    /// null is the explicit unlimited policy. Legacy numeric values are ignored.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
     #[serde(default = "default_retry_ms")]
     pub retry_initial_ms: u64,
+    #[serde(default = "default_retry_max_ms")]
+    pub retry_max_ms: u64,
+    #[serde(default = "default_retry_jitter_percent")]
+    pub retry_jitter_percent: u8,
     #[serde(default = "default_provider_url")]
     pub provider_url: String,
     #[serde(default = "default_api_key_env")]
@@ -55,11 +61,14 @@ fn default_output() -> Option<u32> {
 fn default_context() -> u64 {
     1050000
 }
-fn default_retries() -> u32 {
-    3
-}
 fn default_retry_ms() -> u64 {
     500
+}
+fn default_retry_max_ms() -> u64 {
+    60_000
+}
+fn default_retry_jitter_percent() -> u8 {
+    20
 }
 fn default_provider_url() -> String {
     "https://api.openai.com/v1/responses".into()
@@ -98,6 +107,8 @@ pub struct ProviderResponse {
 pub struct ProviderError {
     pub message: String,
     pub retryable: bool,
+    /// Server-requested delay, parsed from Retry-After; never a retry budget.
+    pub retry_after_ms: Option<u64>,
 }
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

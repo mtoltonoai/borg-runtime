@@ -3,6 +3,7 @@
 pub mod mcp;
 pub mod model;
 pub mod provider;
+mod retry;
 mod store;
 use anyhow::{Context, Result, bail};
 pub use model::*;
@@ -330,10 +331,42 @@ impl Runtime {
             self.inner
                 .store
                 .state(id, SessionStatus::Running, "Loading configured tools", None)?;
-            let mut tools = tokio::select! {
-                biased;
-                _=stop.notified()=>return self.inner.store.state(id,SessionStatus::Stopped,"Stopped before inference",None),
-                result=self.inner.tools.list_tools(id,&config.mcp_servers)=>result.map_err(anyhow::Error::msg)?,
+            // Only discovery/initialization is read-only and safe to retry here.
+            // Tool calls below retain the single-dispatch/unknown-outcome rule.
+            let mut discovery_attempt = 0u64;
+            let mut tools = loop {
+                let result = tokio::select! {
+                    biased;
+                    _=stop.notified()=>return self.inner.store.state(id,SessionStatus::Stopped,"Stopped before inference",None),
+                    result=self.inner.tools.list_tools(id,&config.mcp_servers)=>result,
+                };
+                match result {
+                    Ok(tools) => break tools,
+                    Err(error) => {
+                        let Some(retry_after) = mcp::discovery_retry_after(&error) else {
+                            return Err(anyhow::Error::msg(error));
+                        };
+                        discovery_attempt = discovery_attempt.saturating_add(1);
+                        if self
+                            .wait_retry(
+                                id,
+                                "tool_discovery",
+                                discovery_attempt,
+                                &config,
+                                &error,
+                                retry_after,
+                            )
+                            .await?
+                        {
+                            return self.inner.store.state(
+                                id,
+                                SessionStatus::Stopped,
+                                "Stopped during tool discovery retry",
+                                None,
+                            );
+                        }
+                    }
+                }
             };
             tools.extend(config.provider_tools.clone());
             let transcript = self.transcript(id)?;
@@ -365,7 +398,7 @@ impl Runtime {
                 endpoint: config.provider_url.clone(),
                 api_key_env: config.api_key_env.clone(),
             };
-            let mut retries = 0u32;
+            let mut retries = 0u64;
             let response = loop {
                 if self.inner.store.stopped(id)? {
                     return self.inner.store.state(
@@ -391,6 +424,7 @@ impl Runtime {
                         self.inner.store.record(id, "incomplete_response", &json!({"id":response.id,"status":response.status,"output":response.output,"usage":response.usage}))?;
                         Err(ProviderError {
                             retryable: response.status == "incomplete",
+                            retry_after_ms: None,
                             message: format!(
                                 "Provider response {} retained; no tools dispatched",
                                 response.status
@@ -401,33 +435,27 @@ impl Runtime {
                 };
                 match result {
                     Ok(response) => break response,
-                    Err(error) if error.retryable && retries < config.max_retries => {
-                        retries += 1;
-                        let delay = config
-                            .retry_initial_ms
-                            .saturating_mul(
-                                1u64.checked_shl(retries.saturating_sub(1))
-                                    .unwrap_or(u64::MAX),
+                    Err(error) if error.retryable => {
+                        // There is deliberately no retry budget. Numeric legacy
+                        // max_retries metadata cannot strand recoverable work.
+                        retries = retries.saturating_add(1);
+                        if self
+                            .wait_retry(
+                                id,
+                                "inference",
+                                retries,
+                                &config,
+                                &error.message,
+                                error.retry_after_ms,
                             )
-                            .min(60_000);
-                        self.inner.store.record(
-                            id,
-                            "retry",
-                            &json!({"retry":retries,"delay_ms":delay,"error":error.message}),
-                        )?;
-                        self.inner.store.state(
-                            id,
-                            SessionStatus::Retrying,
-                            &format!(
-                                "Transient inference failure; retry {retries}/{} in {delay}ms",
-                                config.max_retries
-                            ),
-                            Some(error.message),
-                        )?;
-                        tokio::select! {
-                            biased;
-                            _=stop.notified()=>return self.inner.store.state(id,SessionStatus::Stopped,"Stopped during inference retry",None),
-                            _=tokio::time::sleep(Duration::from_millis(delay))=>{}
+                            .await?
+                        {
+                            return self.inner.store.state(
+                                id,
+                                SessionStatus::Stopped,
+                                "Stopped during inference retry",
+                                None,
+                            );
                         }
                     }
                     Err(error) => {
@@ -460,6 +488,40 @@ impl Runtime {
             if finished {
                 return self.get_session(id);
             }
+        }
+    }
+    async fn wait_retry(
+        &self,
+        id: &str,
+        stage: &str,
+        attempt: u64,
+        config: &AgentConfig,
+        error: &str,
+        retry_after_ms: Option<u64>,
+    ) -> Result<bool> {
+        let delay = retry::delay_ms(config, attempt, retry_after_ms);
+        self.inner.store.record(
+            id,
+            "retry",
+            &json!({
+                "stage": stage, "retry": attempt, "retry_policy": "unlimited",
+                "delay_ms": delay, "retry_after_ms": retry_after_ms, "error": error,
+            }),
+        )?;
+        self.inner.store.state(
+            id,
+            SessionStatus::Retrying,
+            &format!("Transient {stage} failure; retry {attempt} (unlimited) in {delay}ms"),
+            Some(error.into()),
+        )?;
+        if self.inner.store.stopped(id)? {
+            return Ok(true);
+        }
+        let stop = self.notify(id);
+        tokio::select! {
+            biased;
+            _=stop.notified()=>Ok(true),
+            _=tokio::time::sleep(Duration::from_millis(delay))=>Ok(false),
         }
     }
     fn parse_calls(
@@ -531,6 +593,12 @@ pub fn read_config(path: impl AsRef<Path>) -> Result<RuntimeConfig> {
         }
         if agent.max_turns == Some(0) || agent.max_output_tokens == Some(0) {
             bail!("configured turn/output limits must be positive or absent")
+        }
+        if agent.retry_initial_ms == 0
+            || agent.retry_max_ms == 0
+            || agent.retry_jitter_percent > 100
+        {
+            bail!("retry delays must be positive and jitter percent at most 100")
         }
         let mut names = HashSet::new();
         for server in &agent.mcp_servers {
