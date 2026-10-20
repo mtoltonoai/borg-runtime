@@ -150,6 +150,10 @@ pub struct McpServerConfig {
     pub bound_agent_id: Option<String>,
     #[serde(default)]
     pub tools_allowlist: Option<Vec<String>>,
+    /// Native lifecycle target grants: empty means own identity; "*" permits
+    /// any metadata-defined identity. The caller's attribution never changes.
+    #[serde(default)]
+    pub allowed_agent_ids: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {

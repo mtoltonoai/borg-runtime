@@ -779,6 +779,7 @@ mod tests {
             headers_env: BTreeMap::new(),
             bound_agent_id: None,
             tools_allowlist: None,
+            allowed_agent_ids: Vec::new(),
         }
     }
 
