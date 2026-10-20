@@ -311,6 +311,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/projects/{project_id}/metrics", get(project_queue_metrics))
         .route("/system/link-rules", get(system_link_rules))
+        .route(
+            "/system/content-policy",
+            get(get_content_policy).post(set_content_policy),
+        )
         .route("/enforcement/preflight", get(enforcement_preflight))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
@@ -2826,6 +2830,32 @@ async fn list_awaiting(State(st): State<AppState>, Query(q): Query<AwaitingQuery
     ))
 }
 
+/// Shared, durable style metadata. This is NOT authorization policy: ordinary
+/// technical prose is accepted unless the deployment explicitly opts in.
+async fn get_content_policy(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::content_policy(&st.pool).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ContentPolicyBody {
+    enforce_style: bool,
+    principal: Option<String>,
+}
+
+body_schema!(ContentPolicyBody);
+inventory::submit! { Endpoint { method: "GET", path: "/api/system/content-policy", summary: "Read durable shared style policy; advisory by default.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/system/content-policy", summary: "Explicitly opt in/out of style enforcement; no service restart.", query: "", body: Some("ContentPolicyBody") } }
+
+async fn set_content_policy(
+    State(st): State<AppState>,
+    Json(body): Json<ContentPolicyBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_content_policy(&st.pool, body.enforce_style, body.principal.as_deref()).await?,
+    ))
+}
+
 async fn set_task_props(
     State(st): State<AppState>,
     Path(TaskRef(task_id)): Path<TaskRef>,
@@ -5237,8 +5267,8 @@ mod tests {
     #[test]
     fn inventory_collects_under_cargo_test() {
         // Previously-registered counts (frozen; bump intentionally when adding an endpoint/schema).
-        const EXPECTED_ENDPOINTS: usize = 176;
-        const EXPECTED_SCHEMAS: usize = 80;
+        const EXPECTED_ENDPOINTS: usize = 178;
+        const EXPECTED_SCHEMAS: usize = 81;
 
         let endpoints: Vec<&Endpoint> = inventory::iter::<Endpoint>.into_iter().collect();
         let schemas: Vec<&BodySchema> = inventory::iter::<BodySchema>.into_iter().collect();
@@ -5300,6 +5330,7 @@ mod tests {
             "ChannelReadBody",
             "CheckStopBody",
             "CommentBody",
+            "ContentPolicyBody",
             "CommentDocumentBody",
             "CrashReportBody",
             "CreateChannelBody",

@@ -323,3 +323,27 @@ services.task-board = {
   mcpAllowedHosts = [ "host.example.com" ];   # or [ "*" ] on a closed network
 };
 ```
+
+## Content style policy
+
+Style diagnostics are **advisory by default**. Ordinary technical acronyms
+(`GET`, `PM`, `POST`) and Unicode prose/titles are accepted without an override.
+`POST /api/lint` still reports style findings for authors who want them.
+
+The durable shared policy is metadata in `board_settings`, not a build flag:
+
+```sh
+curl -sS http://127.0.0.1:8079/api/system/content-policy
+# Explicit opt-in; use false to restore advisory mode. Takes effect immediately.
+curl -sS http://127.0.0.1:8079/api/system/content-policy \
+  -H 'Content-Type: application/json' \
+  -d '{"enforce_style":true,"principal":"operator"}'
+```
+
+An opted-in style refusal occurs before the write and is returned over MCP as a
+completed `isError` tool result with `committed:false` and actionable diagnostics.
+Native sessions can correct the input and continue without resolving an unknown
+mutation. Generic internal errors and transport loss are **not** converted to
+these results: their side effects still require receipt reconciliation. Existing
+`acknowledge_banned` and scoped phrase acknowledgements still work when policy is
+enforced. Changing style policy does not change authorization or project access.
