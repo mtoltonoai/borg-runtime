@@ -326,7 +326,7 @@ def install_locked(args):
         # uncertain Fleet create remains reserved on Board and is reconciled.
         if fleet_paused:
             run(["sudo", "-n", "systemctl", "stop", "borg-fleet.service"])
-        if any(c in components for c in ("native", "workspace", "session-workspace", "board")):
+        if any(c in components for c in ("native", "workspace", "session-workspace")):
             record["drain_journal"] = str(drain_journal)
             atomic_json(record_path, record)
             drain(base / "state" / "native.sqlite", args.runtime_url, drain_journal,

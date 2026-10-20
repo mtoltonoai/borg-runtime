@@ -158,6 +158,63 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("--session-root /state/workspaces --port 8791", unit)
         self.assertNotIn("--root ", unit)
 
+    def exercise_selected_install(self, components):
+        path = self.artifact()
+        (path / "native_drain.py").write_text("drain helper")
+        metadata = release.manifest(path, "a" * 40)
+        base = self.root / "state-root"
+        (base / "config").mkdir(parents=True)
+        for name in ("board.toml", "runtime.json", "native-fleet.toml"):
+            (base / "config" / name).write_text("existing config")
+        states = {"borg-" + component + ".service": {"ActiveState": "active", "UnitFileState": "enabled"}
+                  for component in release.COMPONENTS}
+        for component, executable in (("board", "task-board"), ("native", "borg-native"), ("fleet", "fleet")):
+            states["borg-" + component + ".service"]["executable_sha256"] = metadata["files"][executable]
+        calls = []
+        def command(args, **kwargs):
+            args = list(map(str, args)); calls.append(args)
+            if "--property=ExecStart" in args:
+                component = args[2].removeprefix("borg-").removesuffix(".service")
+                executable = {"board": "task-board", "native": "borg-native", "fleet": "fleet"}[component]
+                return "{ path=" + str(path / executable) + " ; argv[]=verified; }"
+            return ""
+        def backup(base, destination):
+            destination.mkdir(parents=True)
+            return []
+        def drained(database, runtime, journal, **kwargs):
+            release.atomic_json(journal, {"sessions": [], "state": "drained"})
+        args = argparse.Namespace(release=path, base=base, components=components,
+                                  host_id="agent-lab", user="mtolton", workspace="/workspace",
+                                  runtime_url="http://127.0.0.1:8787", wait_seconds=600)
+        import native_drain
+        with mock.patch.object(release, "run", side_effect=command), \
+             mock.patch.object(release, "service_state", return_value={"ActiveState": "active", "UnitFileState": "enabled"}), \
+             mock.patch.object(release, "inventory", return_value={"services": states}), \
+             mock.patch.object(release, "database_backup", side_effect=backup), \
+             mock.patch.object(release.shutil, "copy2"), \
+             mock.patch.object(release, "session_snapshot", return_value=[]) as snapshot, \
+             mock.patch.object(ready, "wait_ready"), \
+             mock.patch.object(native_drain, "drain", side_effect=drained) as drain, \
+             mock.patch.object(native_drain, "resume", return_value={"state": "resumed"}) as resume:
+            result = release.install(args)
+        return result, calls, snapshot, drain, resume
+
+    def test_selected_board_fleet_never_drains_or_restarts_native_workspaces(self):
+        result, calls, snapshot, drain, resume = self.exercise_selected_install("board,fleet")
+        self.assertEqual(result["status"], "verified")
+        snapshot.assert_not_called(); drain.assert_not_called(); resume.assert_not_called()
+        restarted = {c[-1] for c in calls if "restart" in c}
+        self.assertEqual(restarted, {"borg-board.service", "borg-fleet.service"})
+        self.assertTrue(any("stop" in c and c[-1] == "borg-fleet.service" for c in calls))
+        self.assertIn("backups", result)
+        self.assertIn("verified_before_resume", result)
+
+    def test_native_selected_install_retains_drain_resume_boundary(self):
+        result, calls, snapshot, drain, resume = self.exercise_selected_install("native")
+        self.assertEqual(result["status"], "verified")
+        drain.assert_called_once(); resume.assert_called_once(); snapshot.assert_called()
+        self.assertIn("borg-native.service", {c[-1] for c in calls if "restart" in c})
+
     def test_detached_launch_is_nonblocking_and_survives_calling_tool(self):
         path = self.artifact()
         args = argparse.Namespace(release=path, base=self.root, user="mtolton", host_id="agent-lab-2",
