@@ -11,11 +11,70 @@ pub struct RuntimeConfig {
     pub listen: String,
     #[serde(default)]
     pub bearer_token_env: Option<String>,
+    /// Host configuration is infrastructure only when Board is configured.
+    #[serde(default)]
     pub agents: Vec<AgentConfig>,
+    #[serde(default)]
+    pub board: Option<BoardConfig>,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub runtime_url: Option<String>,
 }
 fn default_listen() -> String {
     "127.0.0.1:8787".into()
 }
+/// Shared Task Board connection; credentials are environment references, never values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardConfig {
+    pub url: String,
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    #[serde(default = "default_board_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_report_interval")]
+    pub report_interval_ms: u64,
+}
+fn default_board_timeout() -> u64 {
+    10_000
+}
+fn default_report_interval() -> u64 {
+    5_000
+}
+
+/// Immutable dispatch binding. A supplied session_id is an idempotency key, not
+/// an agent identifier. Fleet allocates the workspace before creating a session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionOptions {
+    pub session_id: Option<String>,
+    pub host_id: Option<String>,
+    pub workspace_cwd: Option<PathBuf>,
+    pub workspace_mcp_url: Option<String>,
+    pub lifecycle_mcp_url: Option<String>,
+    pub generation: u64,
+    pub metadata: Value,
+}
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            host_id: None,
+            workspace_cwd: None,
+            workspace_mcp_url: None,
+            lifecycle_mcp_url: None,
+            generation: 0,
+            metadata: empty_object(),
+        }
+    }
+}
+fn empty_object() -> Value {
+    serde_json::json!({})
+}
+fn default_phase() -> String {
+    "idle".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub id: String,
@@ -48,6 +107,9 @@ pub struct AgentConfig {
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub provider_tools: Vec<Value>,
+    /// Non-secret provenance and versions of the last resolved Board profile.
+    #[serde(default)]
+    pub profile_source: Option<Value>,
 }
 fn default_model() -> String {
     "gpt-6-astra".into()
@@ -161,6 +223,34 @@ pub struct Session {
     pub turns: u64,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub runtime_url: Option<String>,
+    #[serde(default)]
+    pub workspace_cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub workspace_mcp_url: Option<String>,
+    #[serde(default)]
+    pub lifecycle_mcp_url: Option<String>,
+    #[serde(default = "empty_object")]
+    pub metadata: Value,
+    #[serde(default = "default_phase")]
+    pub phase: String,
+    /// Durable useful-work counter; neither heartbeats nor retries advance it.
+    #[serde(default)]
+    pub step: u64,
+    #[serde(default)]
+    pub last_progress_at: u64,
+    /// Live observation, recomputed by Runtime, not a persisted process lease.
+    #[serde(default)]
+    pub driver_running: bool,
+    #[serde(default)]
+    pub failure_kind: Option<String>,
+    #[serde(default)]
+    pub report_error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
