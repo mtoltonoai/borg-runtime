@@ -364,6 +364,221 @@ def task_snapshot_complete(snapshot: Snapshot, tid: int, owner: str | None) -> b
     return True
 
 
+def generation(row: dict) -> int:
+    value = row.get("generation", 0)
+    return value if type(value) is int and value >= 0 else 0
+
+
+class SessionLineage:
+    """Resolve retained session identity, never agent identity or request-id text.
+
+    All generations contribute ownership evidence. Conflicting anchors are not
+    resolved by list order or by borrowing another project's nearest live task.
+    Completed dispatch/session records remain valid lineage anchors.
+    """
+    def __init__(self, snapshot: Snapshot):
+        self.nodes: dict[str, list[tuple[int | None, str | None]]] = {}
+        for rows, sid_key, task_key in ((snapshot.dispatches, "session_id", "task_id"),
+                                        (snapshot.sessions, "id", "task")):
+            for row in rows:
+                sid = row.get(sid_key)
+                if not isinstance(sid, str) or not sid:
+                    continue
+                parent = object_value(row.get("metadata")).get("parent_session_id")
+                parent = parent if isinstance(parent, str) and parent else None
+                self.nodes.setdefault(sid, []).append((task_id(row.get(task_key)), parent))
+
+    def resolve(self, sid: str) -> tuple[int | None, list[str], str | None]:
+        chain, seen = [], set()
+        while sid:
+            if sid in seen:
+                return None, chain, "cyclic child session lineage"
+            seen.add(sid)
+            chain.append(sid)
+            rows = self.nodes.get(sid, [])
+            anchors = {tid for tid, _ in rows if tid}
+            parents = {parent for _, parent in rows if parent}
+            if len(anchors) > 1 or (not anchors and len(parents) > 1):
+                return None, chain, "conflicting child session lineage across retained generations"
+            if anchors:
+                return next(iter(anchors)), chain, None
+            if not parents:
+                return None, chain, "child session lineage has no retained task anchor"
+            sid = next(iter(parents))
+        return None, chain, "child session lineage unavailable"
+
+
+def child_resolution(dispatch: dict) -> bool:
+    """An owner can explicitly retire a historical failed receipt, not replay it.
+
+    A parent completing, a generic note, or an old generation's resolution is
+    not a child's disposition. The monitor never writes this acknowledgement.
+    """
+    value = object_value(object_value(dispatch.get("metadata")).get("recovery_resolution"))
+    return (dispatch.get("status") == "failed"
+            and type(value.get("generation")) is int
+            and value["generation"] == generation(dispatch)
+            and value.get("disposition") in {"resolved", "cancelled"}
+            and all(isinstance(value.get(k), str) and value[k].strip()
+                    for k in ("cause", "fix", "regression")))
+
+
+def dispatch_evidence(dispatch: dict) -> dict:
+    # Do not carry arbitrary metadata, error text, inputs or tool bodies forward.
+    evidence = {k: dispatch.get(k) for k in ("id", "session_id", "status", "host_id",
+        "runtime_url", "generation", "version", "created_at", "updated_at")}
+    stage = object_value(dispatch.get("metadata")).get("failure_stage")
+    evidence["failure_stage"] = stage if stage in {"provisioning", "launching", "runtime"} else None
+    evidence["error_present"] = bool(dispatch.get("error"))
+    return evidence
+
+
+def child_session(snapshot: Snapshot, dispatch: dict) -> tuple[dict | None, bool]:
+    """Ignore stale generations; refuse ambiguous same-generation observations."""
+    candidates = [s for s in snapshot.sessions if s["id"] == dispatch.get("session_id")
+                  and generation(s) >= generation(dispatch)]
+    if not candidates:
+        return None, False
+    newest = max(generation(s) for s in candidates)
+    candidates = [s for s in candidates if generation(s) == newest]
+    if len(candidates) != 1:
+        return None, True
+    return candidates[0], False
+
+
+def inspect_session(snapshot: Snapshot, session: dict, local: Policy,
+                    owner: str, tid: int) -> tuple[bool, list[Fault], list[dict]]:
+    """Shared observation policy for directly assigned work and independent children."""
+    now = snapshot.now
+    status, sid = session.get("status"), session["id"]
+    metadata = object_value(session.get("metadata"))
+    reason = hold(object_value(metadata.get("recovery")), now)
+    if status == "stopped" or reason:
+        return True, [], [{"scope": f"session:{sid}", "reason": reason or "explicitly stopped session"}]
+    last = epoch(session.get("last_progress_at")) or epoch(session.get("updated_at")) or now
+    age = max(0, now - last)
+    evidence = {key: session.get(key) for key in ("status", "phase", "driver_running",
+        "step", "turns", "generation", "last_progress_at", "updated_at", "host_id", "runtime_url", "failure_kind")}
+    evidence["error_present"] = bool(session.get("error"))
+    evidence["safe_action"] = "diagnose_without_replay"
+    if session.get("tool_receipts") is not None:
+        evidence["tool_receipts"] = session["tool_receipts"]
+        evidence["tool_receipts_verified"] = session.get("tool_receipts_verified", False)
+    kind, covered, waits = None, False, []
+    if status == "needs_resolution" or any(t.get("status") == "unknown" for t in session.get("tool_receipts", [])):
+        kind, covered = "unknown_tool_effect", True
+    elif status == "failed":
+        kind, covered = "session_failed", True
+    elif status == "waiting":
+        covered = True
+        if age >= local.progress_stall_seconds:
+            kind = "unexplained_session_wait"
+    elif status in ACTIVE:
+        covered = True
+        inference = session.get("phase") in {"awaiting-model", "streaming"} or "model response" in str(session.get("progress", "")).lower()
+        if session.get("driver_running") is False and age >= local.progress_stall_seconds:
+            kind = "driver_missing"
+        elif (inference or status == "retrying") and session.get("driver_running") is not False:
+            waits.append({"scope": f"session:{sid}", "reason": "live inference/retry; elapsed time is not process death"})
+            if local.live_wait_notice_seconds and age >= local.live_wait_notice_seconds:
+                kind = "long_live_wait"
+        elif age >= local.progress_stall_seconds:
+            kind = "progress_stalled"
+    faults = [Fault(kind, f"session:{sid}", int(snapshot.project["id"]), owner, tid, sid, evidence)] if kind else []
+    return covered, faults, waits
+
+
+def classify_children(snapshot: Snapshot) -> tuple[list[Fault], list[dict]]:
+    """Independent child execution is not covered or closed by its parent's state."""
+    lineage = SessionLineage(snapshot)
+    tasks = {int(t["id"]): t for t in snapshot.tasks}
+    current: dict[str, list[dict]] = {}
+    for dispatch in snapshot.dispatches:
+        sid = dispatch.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        previous = current.get(sid, [])
+        if not previous or generation(dispatch) > generation(previous[0]):
+            current[sid] = [dispatch]
+        elif generation(dispatch) == generation(previous[0]):
+            current[sid].append(dispatch)
+    faults, waits = [], []
+    for candidates in current.values():
+        for dispatch in candidates:
+            if task_id(dispatch.get("task_id")):
+                continue
+            scope = f"dispatch:{dispatch['id']}"
+            tid, chain, reason = lineage.resolve(dispatch["session_id"])
+            if reason:
+                waits.append({"scope": scope, "reason": reason})
+                continue
+            if tid not in tasks:
+                continue  # Ownership belongs to another project, never this one.
+            if len(candidates) != 1:
+                waits.append({"scope": scope, "reason": "conflicting current child dispatch receipts"})
+                continue
+            task = tasks[tid]
+            tm = object_value(task.get("metadata"))
+            owner = dispatch.get("agent_id")
+            agent = snapshot.agents.get(owner, {})
+            am = object_value(agent.get("metadata"))
+            dm = object_value(dispatch.get("metadata"))
+            local = Policy.from_metadata(effective_policy(snapshot, agent, task).__dict__, dm.get("recovery", {}))
+            reason = (hold(object_value(tm.get("recovery")), snapshot.now)
+                      or hold(object_value(am.get("recovery")), snapshot.now)
+                      or hold(object_value(dm.get("recovery")), snapshot.now))
+            if (not local.enabled or reason or task.get("monitor_exempt") or tm.get("monitor_exempt")
+                    or (agent and not agent_runs(agent))):
+                waits.append({"scope": scope, "reason": reason or "child recovery explicitly disabled or identity paused/retired"})
+                continue
+            if object_value(tm.get("recovery")).get("incident_key"):
+                waits.append({"scope": scope, "reason": "repair child belongs to bounded triage control-path supervision"})
+                continue
+            session, ambiguous = child_session(snapshot, dispatch)
+            if ambiguous:
+                waits.append({"scope": scope, "reason": "ambiguous child runtime observations at the same generation"})
+                continue
+            unknown = session and (session.get("status") == "needs_resolution" or any(
+                t.get("status") == "unknown" for t in session.get("tool_receipts", [])))
+            historical = not session or (generation(session) == generation(dispatch)
+                and session.get("status") in TERMINAL)
+            if child_resolution(dispatch) and historical and not unknown:
+                waits.append({"scope": scope, "reason": "failed child explicitly reconciled for this generation"})
+                continue
+            evidence = {"dispatch": dispatch_evidence(dispatch), "safe_action": "diagnose_without_replay",
+                "lineage": {"parent_session_ids": chain[1:], "source_task_id": tid,
+                            "source_project_id": snapshot.project["id"], "source_task_status": task.get("status")}}
+            kind = None
+            if session:
+                _, observations, session_waits = inspect_session(snapshot, session, local, owner, tid)
+                waits.extend(session_waits)
+                if observations:
+                    kind = observations[0].kind
+                    evidence.update(observations[0].evidence)
+            elif dispatch.get("status") == "failed":
+                # This is a definite Fleet failure, not proof of no native effects.
+                # Even if the endpoint is down, triage can inspect the retained receipt.
+                kind = "dispatch_failed"
+            elif dispatch.get("status") in {"stopped", "cancelled"}:
+                waits.append({"scope": scope, "reason": "child explicitly stopped/cancelled"})
+            elif dispatch.get("status") != "completed":
+                url = api_url(dispatch["runtime_url"])
+                age = snapshot.now - (epoch(dispatch.get("updated_at")) or epoch(dispatch.get("created_at")) or snapshot.now)
+                if not snapshot.endpoints.get(url, False):
+                    waits.append({"scope": scope, "reason": "incomplete child runtime observation; absence not proven"})
+                elif age >= local.dispatch_grace_seconds:
+                    kind = "dispatch_without_live_session"
+            if kind:
+                evidence["observation"] = kind
+                evidence["runtime_session_observed"] = session is not None
+                # One incident survives failed provisioning -> unknown tool -> live
+                # recovery transitions. Generation and observations stay evidence,
+                # not a new incident/create/dispatch intent on each poll.
+                faults.append(Fault("child_execution_fault", scope, int(snapshot.project["id"]),
+                    owner, tid, dispatch.get("session_id"), evidence))
+    return faults, waits
+
+
 def fault_observable(snapshot: Snapshot, fault: Fault) -> bool:
     if fault.depth:
         # A fallback control-path repair is observable again once every open
@@ -378,6 +593,22 @@ def fault_observable(snapshot: Snapshot, fault: Fault) -> bool:
                        and v.get("driver_running") is not False for v in snapshot.sessions) for t in primary)
     if fault.kind == "runtime_unreachable":
         return snapshot.endpoints.get(fault.subject, True)
+    if fault.kind == "child_execution_fault":
+        # Parent completion never proves child recovery. Preserve an unresolved
+        # observation when its own current runtime cannot be read.
+        did = object_value(fault.evidence.get("dispatch")).get("id")
+        dispatch = next((d for d in snapshot.dispatches if d.get("id") == did), None)
+        if not dispatch:
+            return False
+        tid, _, reason = SessionLineage(snapshot).resolve(dispatch.get("session_id"))
+        if reason or tid != fault.source_task_id:
+            return False  # Changed/ambiguous ownership is not proof of recovery.
+        if dispatch.get("status") in TERMINAL or child_resolution(dispatch):
+            return True
+        session, ambiguous = child_session(snapshot, dispatch)
+        if ambiguous:
+            return False
+        return session is not None or snapshot.endpoints.get(api_url(dispatch["runtime_url"]), False)
     source = next((t for t in snapshot.tasks if t["id"] == fault.source_task_id), None)
     if source and source.get("status") not in ACTIONABLE:
         return True
@@ -468,45 +699,10 @@ def classify(snapshot: Snapshot) -> tuple[list[Fault], list[dict]]:
             ancestor = tasks.get(ancestor, {}).get("parent_id")
         has_path = False
         for session in related:
-            status, sid = session.get("status"), session["id"]
-            metadata = object_value(session.get("metadata"))
-            reason = hold(object_value(metadata.get("recovery")), now)
-            if status == "stopped" or reason:
-                waits.append({"scope": f"session:{sid}", "reason": reason or "explicitly stopped session"})
-                has_path = True
-                continue
-            last = epoch(session.get("last_progress_at")) or epoch(session.get("updated_at")) or now
-            age = max(0, now - last)
-            evidence = {key: session.get(key) for key in ("status", "phase", "driver_running",
-                "step", "turns", "generation", "last_progress_at", "updated_at", "host_id", "runtime_url", "failure_kind")}
-            evidence["error_present"] = bool(session.get("error"))
-            evidence["safe_action"] = "diagnose_without_replay"
-            if session.get("tool_receipts") is not None:
-                evidence["tool_receipts"] = session["tool_receipts"]
-                evidence["tool_receipts_verified"] = session.get("tool_receipts_verified", False)
-            kind = None
-            if status == "needs_resolution" or any(t.get("status") == "unknown" for t in session.get("tool_receipts", [])):
-                kind, has_path = "unknown_tool_effect", True
-            elif status == "failed":
-                kind, has_path = "session_failed", True
-            elif status == "waiting":
-                has_path = True
-                if age >= local.progress_stall_seconds:
-                    kind = "unexplained_session_wait"
-            elif status in ACTIVE:
-                has_path = True
-                phase = session.get("phase")
-                inference = phase in {"awaiting-model", "streaming"} or "model response" in str(session.get("progress", "")).lower()
-                if session.get("driver_running") is False and age >= local.progress_stall_seconds:
-                    kind = "driver_missing"
-                elif (inference or status == "retrying") and session.get("driver_running") is not False:
-                    waits.append({"scope": f"session:{sid}", "reason": "live inference/retry; elapsed time is not process death"})
-                    if local.live_wait_notice_seconds and age >= local.live_wait_notice_seconds:
-                        kind = "long_live_wait"
-                elif age >= local.progress_stall_seconds:
-                    kind = "progress_stalled"
-            if kind:
-                faults.append(Fault(kind, f"session:{sid}", project_id, owner, tid, sid, evidence))
+            covered, observations, session_waits = inspect_session(snapshot, session, local, owner, tid)
+            has_path = has_path or covered
+            faults.extend(observations)
+            waits.extend(session_waits)
         if has_path:
             continue
         queued = [d for d in dispatch_by_task.get(tid, []) if d.get("agent_id") == owner and d.get("status") not in TERMINAL]
@@ -524,6 +720,9 @@ def classify(snapshot: Snapshot) -> tuple[list[Fault], list[dict]]:
         faults.append(Fault("missing_actionable_session", f"task:{tid}", project_id, owner, tid,
             evidence={"verified_endpoints": len(snapshot.endpoints), "task_status": task.get("status")},
             delay=local.missing_session_grace_seconds, observations=2))
+    child_faults, child_waits = classify_children(snapshot)
+    faults.extend(child_faults)
+    waits.extend(child_waits)
     return faults, waits
 
 

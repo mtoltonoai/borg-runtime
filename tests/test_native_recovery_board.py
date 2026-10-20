@@ -179,6 +179,83 @@ class RealBoardTests(unittest.TestCase):
             self.assertNotIn("recovery_task_id",observed["metadata"])
         self.assertNotIn("project_ids",json.loads(config.read_text()),"no config edit or restart was used")
 
+    def test_taskless_failed_child_outlives_parent_and_survives_real_monitor_restart(self):
+        # Real Board/Fleet durable dispatch rows; Native is an HTTP observation
+        # fixture. No production process, model call or original work is replayed.
+        def report(row, status, metadata=None, error=None):
+            return self.board.call("PATCH", f"/fleet/dispatches/{row['id']}", {
+                "host_id": row["host_id"], "generation": row["generation"],
+                "version": row["version"], "status": status,
+                "metadata": metadata or {}, "error": error})
+        parent = self.board.call("POST", "/fleet/dispatches", {
+            "request_id": f"task:{self.task['id']}:attempt:1", "agent_id": "engineer",
+            "task_id": self.task["id"]})
+        parent = report(parent, "running")
+        child = self.board.call("POST", "/fleet/dispatches", {
+            "request_id": "independent-child", "agent_id": "engineer",
+            "input": "Independent diagnostic child", "metadata": {"parent_session_id": parent["session_id"]}})
+        child = report(child, "failed", {"failure_stage": "provisioning"}, "known pre-native Git refusal")
+        self.assertIsNone(child["task_id"])
+        now = int(time.time()*1000)
+        self.sessions = [fixture.session(id=parent["session_id"], task=f"task_{self.task['id']}",
+            generation=parent["generation"], updated_at=now, last_progress_at=now)]
+        original_sessions = copy.deepcopy(self.sessions)
+        directory = Path(self.tmp.name)
+        config = directory / "child-monitor.json"
+        state_path = directory / "child-monitor.sqlite"
+        config.write_text(json.dumps({"board_url": self.board.base, "state_path": str(state_path),
+            "project_ids": [self.project["id"]], "http_timeout_seconds": 2}))
+
+        def run_monitor():
+            result = subprocess.run([sys.executable, str(fixture.MODULE), "--config", str(config), "--once"],
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            journal = r.Journal(state_path)
+            try:
+                rows = journal.rows()
+                outbox = [tuple(x) for x in journal.connection.execute("SELECT key,body FROM outbox ORDER BY key")]
+                return rows, outbox
+            finally:
+                journal.close()
+
+        rows, frozen = run_monitor()
+        self.assertEqual(len(rows), 1, "healthy parent must not mask independent failed child")
+        row = rows[0]
+        self.assertIsNotNone(row["dispatch_id"], row)
+        repair = self.board.call("GET", f"/tasks/{row['task_id']}")
+        self.assertEqual(repair["metadata"]["recovery"]["kind"], "child_execution_fault")
+        self.assertEqual(repair["metadata"]["recovery"]["source_task_id"], self.task["id"])
+        self.assertEqual(repair["metadata"]["recovery_evidence"]["dispatch"]["id"], child["id"])
+        self.assertEqual(self.sessions, original_sessions)
+        parent = report(parent, "completed")
+        self.board.call("PATCH", f"/tasks/{self.task['id']}", {"status": "done"})
+        self.sessions[0].update(status="completed", driver_running=False)
+        for _ in range(3):
+            restarted, restarted_frozen = run_monitor()
+            self.assertEqual([r["key"] for r in restarted], [row["key"]])
+            self.assertEqual(restarted_frozen, frozen, "completed parent cannot mutate frozen create/dispatch intent")
+        self.assertEqual(self.board.call("GET", f"/fleet/dispatches/{child['id']}"), child)
+        self.assertEqual(len(self.board.pages("/fleet/dispatches")), 3, "two original receipts and ONE triage")
+        self.assertEqual(len(self.board.call("GET", f"/tasks?project_id={self.project['id']}")), 2)
+        self.assertTrue(all(method == "GET" for method, _ in self.native_requests))
+
+        # Deliberate, generation-bound acknowledgement after a repair leaves the
+        # original failed receipt intact. Merely completing the parent did not.
+        resolution = {"generation": child["generation"], "disposition": "resolved",
+            "cause": "Git route refused before native launch", "fix": "tested route/config revision",
+            "regression": "real clone and no-effect reconciliation proof"}
+        child = report(child, "failed", {"recovery_resolution": resolution}, child["error"])
+        self.board.call("PATCH", f"/tasks/{repair['id']}", {"status": "done",
+            "metadata": {"recovery_resolution": resolution}})
+        for _ in range(2):
+            reconciled, _ = run_monitor()
+            self.assertEqual(reconciled[0]["state"], "closed")
+        retained = self.board.call("GET", f"/fleet/dispatches/{child['id']}")
+        self.assertEqual(retained["status"], "failed")
+        self.assertEqual(retained["session_id"], child["session_id"])
+        self.assertEqual(retained["error"], child["error"])
+        self.assertEqual(len(self.board.pages("/fleet/dispatches")), 3)
+
     def test_frozen_dispatch_receipt_survives_response_loss_and_real_board_reassignment(self):
         original = self.board.call
         sent = []

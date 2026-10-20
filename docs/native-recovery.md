@@ -42,6 +42,44 @@ also retries observation and idempotent control-plane operations indefinitely.
 It uses capped exponential jitter and honors a server Retry-After floor even
 when it exceeds the local cap. A finite retry count never makes work terminal.
 
+## Independent children and retained failure receipts
+
+A native child need not have its own Board task. For a taskless Fleet dispatch,
+recovery follows `metadata.parent_session_id` through retained Fleet dispatches
+and observed native sessions to a task anchor. Completed parents still supply
+that anchor: a child can outlive both the parent session and its Board task.
+Parent completion, a healthy sibling, or another live session under the same
+identity never closes an unresolved child failure.
+
+Each unresolved child has one `child_execution_fault` keyed by project and
+**dispatch ID**. `recovery_evidence.observation` distinguishes a failed dispatch,
+a missing current-generation session, an unknown tool effect, or stalled/live
+execution. Changes in those observations do not create a second repair/dispatch
+intent. Evidence includes the retained dispatch identity/generation/version,
+parent-session chain and source task/project, but not inputs, errors, credentials
+or tool result bodies. Even a known provisioning failure is diagnosis-only, not
+permission for the monitor to replay an original operation.
+
+A newer dispatch generation supersedes older receipts for the same session;
+older native observations cannot cover newer work. Conflicting ownership across
+generations, cycles, absent anchors and duplicate current-generation observations
+remain visible without guessing an owning project. Cross-project children are
+diagnosed only in their resolved task's project. Explicit child stops, pauses,
+verified waits and recovery policy still apply. Unreachable child endpoints do
+not prove absence, although a retained Fleet `failed` receipt remains a definite
+failure regardless of endpoint availability.
+
+To retire a historical failed child **without replaying it**, the repair owner
+can record `metadata.recovery_resolution` on the original Fleet dispatch through
+its host/generation/version-fenced report API. It must contain the exact current
+integer `generation`, `disposition` of `resolved` or `cancelled`, and nonempty
+`cause`, `fix`, and `regression` strings. This acknowledges the original failure;
+its failed status, session/request identity and retained receipts stay intact.
+A stale generation or incomplete evidence never suppresses a fresh failure.
+The monitor does not write this acknowledgement. It also accepts a subsequently
+verified completed/stopped/cancelled child or later healthy generation as symptom
+clearance; the owned repair still needs cause/fix/regression before closure.
+
 ## Durable incidents and no duplicate dispatch
 
 The local SQLite journal uses WAL, `synchronous=FULL`, and an OS process lock.
@@ -156,7 +194,7 @@ and journald status rather than a false healthy heartbeat.
 ## Tests and live drills
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_native_recovery.py' -v
+python3 -m unittest discover -s tests -p 'test_native_recovery*.py' -v
 BORG_TEST_BOARD_BINARY=/path/to/integrated/task-board \
   python3 -m unittest discover -s tests -p 'test_native_recovery_board.py' -v
 BORG_TEST_BOARD_BINARY=/path/to/integrated/task-board \
@@ -169,7 +207,10 @@ success, unknown effects, pauses/stand-down, scoped completeness, repeated
 closure/recurrence, frozen request intent after reassignment, and triage-storm
 prevention. The second starts an isolated **real Board with Fleet registry** and
 checks all monitor REST writes/reads, real placement/dispatch dedup, source links
-and lost-create receipt recovery. The third runs actual Board MCP through the
+and lost-create receipt recovery. It also creates a real taskless failed Fleet
+child, completes its parent, restarts the actual monitor process three times,
+verifies one incident/triage and unchanged original receipts, then explicitly
+reconciles the child without replay. The third runs actual Board MCP through the
 native durable loop for the technical-text/application-error incident.
 
 After deployment, inject faults only into disposable verification sessions or a
