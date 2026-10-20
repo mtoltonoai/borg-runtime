@@ -67,7 +67,8 @@ class ProbeTests(unittest.TestCase):
                 if path == '/api/health': return {'commit': revision, 'ok': True, 'db': True}
                 if path == '/api/fleet/hosts': return [{'host_id': h, 'fresh': True, 'enabled': True, 'capacity': 4, 'active': 1} for h in probe.HOSTS]
                 if path == '/api/projects': return self.projects
-                if path == '/api/tasks?project_id=42': return self.tasks
+                if path == '/api/tasks?project_id=42': return [{k: t[k] for k in ('id','title','assignee')} for t in self.tasks]
+                if path == '/api/tasks/73?comments_limit=0': return self.tasks[0]
                 if path.startswith('/api/agents/'):
                     name = path.rsplit('/', 1)[1]
                     if name not in self.agents: raise probe.ConfigError('Board HTTP 404')

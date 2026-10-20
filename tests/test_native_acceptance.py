@@ -301,7 +301,8 @@ class HTTPTests(unittest.TestCase):
 
     def test_collector_is_get_only_and_redacts_private_payloads(self):
         self.route("/api/health", {"ok": True, "db": True, "commit": REV})
-        self.route("/api/tasks?project_id=1", [{"id": 1, "description": "PRIVATE", "metadata": {"password": "PRIVATE"}}])
+        self.route("/api/tasks?project_id=1", [{"id": 1, "status": "in_progress"}])
+        self.route("/api/tasks/1?comments_limit=0", {"id": 1, "status": "in_progress", "description": "PRIVATE", "metadata": {"password": "PRIVATE", "recovery_task_id": 2}})
         self.route("/api/agents?limit=1000&offset=0", [{"id": "engineer", "charter": "PRIVATE", "metadata": {"api_key": "PRIVATE", "harness": "native"}}])
         self.route("/api/fleet/hosts", {"hosts": []})
         self.route("/api/fleet/dispatches?limit=1000&offset=0", [])
@@ -312,6 +313,7 @@ class HTTPTests(unittest.TestCase):
         result = audit.collect(self.base, {"lab": self.base})
         self.assertEqual(result["errors"], [])
         self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertEqual(result["board"]["tasks"][0]["metadata"]["recovery_task_id"], 2)
         self.assertEqual(result["runtimes"]["lab"]["tools"]["sid"][0]["result_sha256"], audit.digest({"output": "PRIVATE"}))
         self.assertTrue(all(method == "GET" for method, path in self.requests))
 

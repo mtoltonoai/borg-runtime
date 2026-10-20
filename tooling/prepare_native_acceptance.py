@@ -163,11 +163,18 @@ def start(board, runtimes, run_id, revision):
         lambda: board.request("POST", "/api/projects", desired["project"]),
         lambda row: metadata(row).get("acceptance_run_id") == run_id)
     task_body = {**desired["task"], "project_id": project["id"]}
-    task = ensure_record(
-        lambda: next((t for t in board.request("GET", f'/api/tasks?project_id={project["id"]}')
-                      if metadata(t).get("acceptance_run_id") == run_id), None),
+    def find_task():
+        # REST list rows are compact: metadata/description need not be present.
+        # Select by the stable title, then verify the FULL independent receipt.
+        candidates = [t for t in board.request("GET", f'/api/tasks?project_id={project["id"]}')
+                      if t.get("title") == task_body["title"]]
+        if len(candidates) > 1:
+            raise ConfigError("duplicate acceptance task titles; inspect original external reference")
+        return board.request("GET", f'/api/tasks/{candidates[0]["id"]}?comments_limit=0') if candidates else None
+    task = ensure_record(find_task,
         lambda: board.request("POST", "/api/tasks", task_body),
-        lambda row: row.get("assignee") == identity and row.get("description") == task_body["description"])
+        lambda row: row.get("assignee") == identity and row.get("description") == task_body["description"]
+            and metadata(row).get("acceptance_run_id") == run_id)
     return {"run_id": run_id, "revision": revision, "agent_id": identity,
             "fresh_registration": fresh_registration, "board_revision_observed": board_revision,
             "board_revision_verified": board_revision == revision, "project_id": project["id"], "task_id": task["id"],
