@@ -22,6 +22,7 @@ mod dream;
 mod dream_apply;
 mod drift;
 mod memory;
+mod native;
 mod notify;
 mod prose_lint;
 mod scan;
@@ -513,7 +514,8 @@ fn revive_frozen_candidate(
 /// box. Without it, the loose predicate ([`agent_host_matches`]): this-host-pinned OR unpinned run-anywhere.
 /// Pure — unit-tested.
 fn watchdog_manages_agent(md: Option<&serde_json::Value>, host: &str, pinned_only: bool) -> bool {
-    if agent_is_staged(md) {
+    if agent_is_staged(md) || md.is_some_and(|m| m["harness"] == "native") {
+        // Native engines have independent sessions, not one tmux pane per identity.
         return false;
     }
     if pinned_only {
@@ -1639,6 +1641,16 @@ fn up_board(launch: bool, pinned_only: bool) {
         eprintln!("fleet up-board: board roster query failed ({e})");
         std::process::exit(1);
     });
+    for agent in roster
+        .iter()
+        .filter(|a| a["metadata"]["harness"] == "native")
+    {
+        if let Some(id) = agent["id"].as_str() {
+            if let Err(error) = native::spin_up(id, launch) {
+                eprintln!("fleet up-board native {id}: {error}");
+            }
+        }
+    }
     let host = this_host();
     // Board-native agents (metadata.native == true) whose host-affinity matches this box → (id, is_offline).
     // Under --pinned-only, an agent whose host is not EXPLICITLY this box is excluded from the launch set and
@@ -1653,7 +1665,8 @@ fn up_board(launch: bool, pinned_only: bool) {
                 .and_then(|m| m.get("native"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            if !is_native || !agent_host_matches(md, &host) {
+            if !is_native || a["metadata"]["harness"] == "native" || !agent_host_matches(md, &host)
+            {
                 return None;
             }
             let id = a.get("id").and_then(serde_json::Value::as_str)?.to_string();
@@ -2854,6 +2867,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Persistently reconcile native sessions through shared Board placement, without tmux or document gates.
+    NativeWorker {
+        /// Run one reconciliation, wait for provisioning jobs, report observed state, then exit.
+        #[arg(long)]
+        once: bool,
+    },
     /// Refresh an agent's liveness stamp (prints `ok`, or `STOPPED`+exit 2 if a stop-file exists).
     Heartbeat {
         /// The agent name.
@@ -4101,6 +4120,12 @@ fn main() {
     config::set_path(cli.config.clone());
     let fleet = Fleet::resolve();
     match cli.cmd {
+        Cmd::NativeWorker { once } => {
+            if let Err(error) = native::run(once) {
+                eprintln!("fleet native-worker: {error}");
+                std::process::exit(1);
+            }
+        }
         Cmd::Heartbeat { name } => heartbeat(&fleet, &name),
         Cmd::Send {
             to,
@@ -5317,6 +5342,13 @@ fn spin_up(agent: &str, apply: bool, ignore_intent: bool) {
         eprintln!("fleet spin-up: {e}");
         std::process::exit(1);
     });
+    if rec["metadata"]["harness"] == "native" {
+        if let Err(error) = native::spin_up(agent, apply) {
+            eprintln!("fleet spin-up native: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(why) = spin_up_intent_refusal(&rec, ignore_intent) {
         eprintln!(
             "fleet spin-up: refusing '{agent}': {why}. Set its intent to run to resume it, or pass \
@@ -6017,6 +6049,12 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
         eprintln!("fleet spin-down: {e}");
         std::process::exit(1);
     });
+    if rec["metadata"]["harness"] == "native" {
+        eprintln!(
+            "fleet spin-down: native identity has independent sessions; use native session stop/drain controls, not a tmux identity kill"
+        );
+        std::process::exit(1);
+    }
     let is_native = rec
         .get("metadata")
         .and_then(|m| m.get("native"))
@@ -9348,6 +9386,7 @@ fn native_agent_ids(agents: &[serde_json::Value]) -> std::collections::BTreeSet<
                 .and_then(|m| m.get("native"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
+                || a["metadata"]["harness"] == "native"
         })
         .filter_map(|a| {
             a.get("id")
