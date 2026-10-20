@@ -128,6 +128,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("borg-board.service", worker)
         self.assertIn("borg-board.service", controller)
 
+    def test_monitor_only_update_does_not_stop_unselected_fleet(self):
+        self.assertFalse(release.pauses_fleet(["recovery"]))
+        self.assertTrue(release.pauses_fleet(["native"]))
+        self.assertTrue(release.pauses_fleet(["fleet", "recovery"]))
+
     def test_recovery_starts_even_when_watched_services_are_down(self):
         text = release.unit("recovery", Path("/release/abc"), Path("/state"), "agent-lab")
         self.assertNotIn("ExecStartPre", text)

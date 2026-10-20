@@ -280,6 +280,10 @@ def verify_running_images(snapshot, metadata, components):
                 raise RuntimeError(component + " running executable differs from release manifest")
 
 
+def pauses_fleet(components):
+    return bool(set(components) & {"board", "native", "workspace", "session-workspace", "fleet"})
+
+
 def install(args):
     args.base.mkdir(parents=True, exist_ok=True)
     lock_path = args.base / "state" / "deployment.lock"
@@ -320,11 +324,12 @@ def install_locked(args):
     atomic_json(record_path, record)
     before = []
     fleet_was_active = service_state("borg-fleet.service").get("ActiveState") == "active"
+    fleet_paused = fleet_was_active and pauses_fleet(components)
     from native_drain import drain, resume
     try:
         # Fence this host's scheduler before the native execution boundary. An
         # uncertain Fleet create remains reserved on Board and is reconciled.
-        if fleet_was_active:
+        if fleet_paused:
             run(["sudo", "-n", "systemctl", "stop", "borg-fleet.service"])
         if any(c in components for c in ("native", "workspace", "session-workspace", "board")):
             record["drain_journal"] = str(drain_journal)
@@ -390,7 +395,7 @@ def install_locked(args):
                 name = "borg-" + component + ".service"
                 run(["sudo", "-n", "systemctl", "enable", name])
                 run(["sudo", "-n", "systemctl", "restart", name])
-        if fleet_was_active and "fleet" not in components:
+        if fleet_paused and "fleet" not in components:
             run(["sudo", "-n", "systemctl", "start", "borg-fleet.service"])
         record["inventory"] = inventory(base)
         verify_running_images(record["inventory"], metadata, components)
