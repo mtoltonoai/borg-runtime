@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "roles": [
+    "pm",
+    "native-core",
+    "fleet-engineer",
+    "tools-engineer",
+    "recovery-engineer",
+    "integrator",
+    "native-engineer"
+  ],
+  "runtime_profile": {
+    "model": "gpt-6-astra",
+    "reasoning_effort": "max",
+    "max_output_tokens": 128000,
+    "context_window_tokens": 1050000,
+    "max_turns": null,
+    "max_retries": null,
+    "retry_initial_ms": 5000,
+    "retry_max_ms": 60000,
+    "retry_jitter_percent": 20,
+    "provider_url": "https://api.openai.com/v1/responses",
+    "api_key_env": "OPENAI_API_KEY"
+  },
+  "tools": [
+    {
+      "entry_id": "board",
+      "payload": {
+        "kind": "mcp",
+        "name": "board",
+        "url": "http://127.0.0.1:8079/mcp"
+      }
+    },
+    {
+      "entry_id": "workspace",
+      "payload": {
+        "kind": "mcp",
+        "name": "workspace",
+        "url": "http://127.0.0.1:8791/mcp/{session_id}",
+        "tools_allowlist": [
+          "workspace_list",
+          "workspace_read",
+          "workspace_run",
+          "workspace_write"
+        ]
+      }
+    },
+    {
+      "entry_id": "native",
+      "payload": {
+        "kind": "mcp",
+        "name": "native",
+        "url": "{runtime_url}/mcp/sessions/{session_id}",
+        "tools_allowlist": [
+          "session_create",
+          "session_list",
+          "session_get",
+          "session_steer",
+          "session_stop",
+          "session_resume",
+          "session_resolve_tool"
+        ]
+      }
+    },
+    {
+      "entry_id": "web",
+      "payload": {
+        "kind": "provider",
+        "tool": {
+          "type": "web_search"
+        }
+      }
+    }
+  ],
+  "agents": {
+    "pm": {
+      "role": "pm",
+      "metadata": {}
+    },
+    "native-core": {
+      "role": "native-core",
+      "metadata": {},
+      "remove_runtime_profile_if": {
+        "max_retries": null,
+        "retry_initial_ms": 1000,
+        "retry_max_ms": 60000,
+        "retry_jitter_percent": 20
+      }
+    },
+    "fleet-engineer": {
+      "role": "fleet-engineer",
+      "metadata": {}
+    },
+    "tools-engineer": {
+      "role": "tools-engineer",
+      "metadata": {}
+    },
+    "recovery-engineer": {
+      "role": "recovery-engineer",
+      "metadata": {}
+    },
+    "integrator": {
+      "role": "integrator",
+      "metadata": {}
+    }
+  },
+  "role_tool_overrides": {
+    "pm": {
+      "native": {
+        "allowed_agent_ids": [
+          "*"
+        ]
+      }
+    }
+  },
+  "retire_tool_entries": [
+    {
+      "entry_id": "web_search",
+      "expected_payload": {
+        "kind": "provider",
+        "tool": {
+          "type": "web_search"
+        }
+      }
+    }
+  ]
+}
