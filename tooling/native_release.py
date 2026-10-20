@@ -252,6 +252,18 @@ def inventory(base):
             "databases": [p.name for p in sorted((base / "state").glob("*.sqlite"))]}
 
 
+def verify_running_images(snapshot, metadata, components):
+    for component in components:
+        state = snapshot["services"]["borg-" + component + ".service"]
+        if state.get("ActiveState") != "active" or state.get("UnitFileState") != "enabled":
+            raise RuntimeError(component + " is not enabled/active")
+    for component, executable in (("native", "borg-native"), ("fleet", "fleet"), ("board", "task-board")):
+        if component in components:
+            observed = snapshot["services"]["borg-" + component + ".service"]
+            if observed.get("executable_sha256") != metadata["files"][executable]:
+                raise RuntimeError(component + " running executable differs from release manifest")
+
+
 def install(args):
     args.base.mkdir(parents=True, exist_ok=True)
     lock_path = args.base / "state" / "deployment.lock"
@@ -282,7 +294,8 @@ def install_locked(args):
     if "recovery" in components and not (release / "native_recovery.py").is_file():
         raise RuntimeError("recovery implementation missing from release")
     record = {"started_at": stamp(), "revision": metadata["revision"],
-              "host": args.host_id, "components": components, "status": "preparing"}
+              "host": args.host_id, "components": components, "status": "preparing",
+              "owner": "integrator", "task_id": 6, "before_inventory": inventory(base)}
     record_path = base / "state" / "deployments" / (record["started_at"] + ".json")
     drain_journal = record_path.with_suffix(".drain.json")
     backup = base / "backups" / record["started_at"]
@@ -316,6 +329,12 @@ def install_locked(args):
             run(["sudo", "-n", "install", "-m", "644", target, old])
         (base / "workspaces").mkdir(parents=True, exist_ok=True)
         run(["sudo", "-n", "systemctl", "daemon-reload"])
+        # Reject retained ExecStart overrides before launching any work.
+        for component, executable in (("native", "borg-native"), ("fleet", "fleet"), ("board", "task-board")):
+            if component in components:
+                effective = run(["systemctl", "show", "borg-" + component + ".service", "--property=ExecStart", "--value"])
+                if "path=" + str(release / executable) + " ;" not in effective:
+                    raise RuntimeError(component + " effective ExecStart overrides selected release")
         for component in COMPONENTS:
             if component not in components or component in ("fleet", "recovery"):
                 continue
@@ -340,6 +359,11 @@ def install_locked(args):
             after = session_snapshot(args.runtime_url)
             verify_preserved(before, after)
             record["after_sessions"] = after
+        # Prove actual images and preserved results BEFORE reopening sessions.
+        record["verified_before_resume"] = inventory(base)
+        verify_running_images(record["verified_before_resume"], metadata,
+                              [c for c in components if c not in ("fleet", "recovery")])
+        atomic_json(record_path, record)
         if drain_journal.exists():
             record["resume"] = resume(args.runtime_url, drain_journal)
         # Do not expose temporarily stopped sessions to Fleet terminal reporting.
@@ -351,30 +375,37 @@ def install_locked(args):
         if fleet_was_active and "fleet" not in components:
             run(["sudo", "-n", "systemctl", "start", "borg-fleet.service"])
         record["inventory"] = inventory(base)
-        for component in components:
-            state = record["inventory"]["services"]["borg-" + component + ".service"]
-            if state.get("ActiveState") != "active" or state.get("UnitFileState") != "enabled":
-                raise RuntimeError(component + " is not enabled/active")
-        for component, executable in (("native", "borg-native"), ("fleet", "fleet"), ("board", "task-board")):
-            if component in components:
-                observed = record["inventory"]["services"]["borg-" + component + ".service"]
-                if observed.get("executable_sha256") != metadata["files"][executable]:
-                    raise RuntimeError(component + " running executable differs from release manifest")
+        verify_running_images(record["inventory"], metadata, components)
         record.update(status="verified", finished_at=stamp(), committed_results_preserved=True)
     except Exception as error:
-        record.update(status="failed", error_type=type(error).__name__, finished_at=stamp())
-        # Never leave deployment-owned pauses silently parked after a recoverable
-        # install error. Resume original work if possible, but not unknown tools.
-        if drain_journal.exists():
+        record.update(status="recovery_pending", error_type=type(error).__name__, finished_at=stamp(),
+                      recovery_owner="integrator", recovery_task=6)
+        atomic_json(record_path, record)
+        # Resume on failure ONLY if the original known-running image is still
+        # running unchanged. A new/unverified image must never receive work.
+        current = inventory(base)
+        old = record["before_inventory"]["services"]["borg-native.service"]
+        now = current["services"]["borg-native.service"]
+        unchanged_native = (old.get("executable_sha256") is not None and
+                            now.get("executable_sha256") == old.get("executable_sha256") and
+                            now.get("ActiveState") == "active")
+        unchanged_board = True
+        if "board" in components:
+            old_board = record["before_inventory"]["services"]["borg-board.service"]
+            now_board = current["services"]["borg-board.service"]
+            unchanged_board = (old_board.get("executable_sha256") is not None and
+                               now_board.get("executable_sha256") == old_board.get("executable_sha256") and
+                               now_board.get("ActiveState") == "active")
+        if drain_journal.exists() and unchanged_native and unchanged_board:
             try:
                 record["resume_after_failure"] = resume(args.runtime_url, drain_journal)
             except Exception as resume_error:
                 record["resume_error_type"] = type(resume_error).__name__
-        if fleet_was_active:
-            try:
-                run(["sudo", "-n", "systemctl", "start", "borg-fleet.service"])
-            except Exception:
-                record["fleet_restart_failed"] = True
+        else:
+            record["resume_pending_verification"] = True
+        # Keep admission closed after failed activation. The task-6 owner and
+        # durable record identify the repair path; no silent unverified rollback.
+        record["failure_inventory"] = current
         raise
     finally:
         atomic_json(record_path, record)
