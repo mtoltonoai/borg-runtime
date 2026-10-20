@@ -33,6 +33,21 @@ class WorkspaceTests(unittest.TestCase):
         result = response["result"]
         return result["isError"], json.loads(result["content"][0]["text"])
 
+    def assert_process_stopped(self, pid):
+        path = Path("/proc") / str(pid) / "stat"
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                state = path.read_text().rsplit(") ", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                # A reaped child may disappear during open or read, not just
+                # before a separate exists() check. Other OS errors still fail.
+                return
+            if state == "Z":
+                return
+            self.assertLess(time.monotonic(), deadline, f"process {pid} still in state {state}")
+            time.sleep(0.01)
+
     def test_write_read_append_and_list_real_files(self):
         failed, result = self.call("workspace_write", path="sub/hello.txt", content="héllo")
         self.assertFalse(failed)
@@ -127,14 +142,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse((self.root / "escaped").exists())
         for name in ("parent.pid", "child.pid"):
             pid = int((self.root / name).read_text())
-            path = Path("/proc") / str(pid) / "stat"
-            deadline = time.monotonic() + 1
-            while path.exists() and time.monotonic() < deadline:
-                if path.read_text().split(") ", 1)[1].split()[0] == "Z":
-                    break
-                time.sleep(0.01)
-            if path.exists():
-                self.assertEqual(path.read_text().split(") ", 1)[1].split()[0], "Z")
+            self.assert_process_stopped(pid)
 
     def test_child_holding_pipe_cannot_outlive_deadline_after_shell_exits(self):
         command = shlex.join([sys.executable, "-c", "import time; time.sleep(30)"]) + " & exit 0"
@@ -151,14 +159,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 0)
         self.assertFalse(result["timed_out"])
         pid = int((self.root / "background.pid").read_text())
-        path = Path("/proc") / str(pid) / "stat"
-        deadline = time.monotonic() + 1
-        while path.exists() and time.monotonic() < deadline:
-            if path.read_text().split(") ", 1)[1].split()[0] == "Z":
-                break
-            time.sleep(0.01)
-        if path.exists():
-            self.assertEqual(path.read_text().split(") ", 1)[1].split()[0], "Z")
+        self.assert_process_stopped(pid)
 
     def test_notification_cannot_execute_a_tool(self):
         response = mcp.dispatch(self.workspace, {"jsonrpc": "2.0", "method": "tools/call",
