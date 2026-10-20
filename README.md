@@ -1,13 +1,14 @@
 # Borg Runtime
 
-Borg combines Fleet and Task Board. Their working code is maintained
-here as ordinary source components. A new native executor runs agent sessions
-directly against the Responses API.
+Borg combines one shared Task Board, persistent Fleet workers and a native
+Responses API executor. Their working code is maintained here as ordinary source
+components. Board metadata defines identities and execution profiles; Fleet
+places independent native sessions in isolated workspaces.
 
 | Component | Responsibility |
 | --- | --- |
 | `components/task-board` | Shared projects, tasks, agent definitions, documents, events and UI |
-| `components/fleet` | Existing agent process supervision and workspaces |
+| `components/fleet` | Native host capacity, durable dispatch and isolated session workspaces |
 | `crates/native-runtime` | Native Responses loop, independent sessions, durable conversation and tool recovery |
 | `tooling/workspace_mcp.py` | Files and commands exposed over MCP for a configured workspace |
 
@@ -18,9 +19,12 @@ the three Fleet changes needed for the new directory layout.
 ## Native executor
 
 Agent identities are separate from sessions: one identity can run multiple
-independent sessions concurrently. Definitions are metadata, initially in a JSON
-file, and reload at turn boundaries. Session state and transcripts live in
-SQLite. Task Board remains the authority for shared work.
+independent sessions concurrently, including on different hosts. The runtime
+loads charters, lifecycle intent, effective role/agent runtime profiles and tool
+grants from Task Board at inference boundaries. New identities need Board
+metadata, not a host JSON entry or per-identity environment edits. Task Board is
+the shared work and configuration authority; per-host SQLite retains independent
+session transcripts, tool receipts and reporting state.
 
 The native HTTP service provides session creation, status, transcript, steering,
 stop, resume and uncertain-tool resolution, with a small dashboard at `/`.
@@ -36,7 +40,7 @@ errors remain visible for repair, and uncertain tool writes are never retried. S
 recovers interrupted inference; a tool interrupted without a durable result
 requires resolution before another attempt.
 
-The example uses **`gpt-6-astra`, `max` reasoning, 128000 maximum output tokens
+The selected profile uses **`gpt-6-astra`, `max` reasoning, 128000 maximum output tokens
 and the full 1050000-token context window**. Input and output share that window:
 reserving all output leaves approximately 922000 tokens for input, including
 instructions, history and tools. There is no smaller local input allowance,
@@ -63,7 +67,27 @@ npm run build
 cd ../../..
 ```
 
-Start each service in its own terminal from the repository root:
+### Board-managed deployment
+
+The deployed path is Board metadata -> Fleet reservation -> isolated workspace
+and native session. Fleet workers run persistently on `agent-lab`, `agent-lab-2`,
+`agent-lab-3` and `agent-lab-4`, using the shared Board on `agent-lab`. An independent
+recovery controller also runs on `agent-lab`; it is not tied to a native session's
+lifetime. Host placement, capacity, roles, tools and recovery policy are metadata.
+
+Use the [persistent deployment guide](docs/native-deployment.md) for the
+infrastructure configuration, build/stage/activation commands and recorded rollout
+state. [Board metadata setup](docs/native-metadata-deployment.md) defines profiles
+and new identities; [Fleet](docs/native-fleet.md) provisions assigned tasks and
+[lifecycle MCP](docs/native-lifecycle-tools.md) creates independent concurrent
+sessions. These are the implemented execution path, not future integration work.
+
+### Local standalone development
+
+The JSON-only example below is for an isolated development setup, not the
+production identity source or a four-host placement test. Do not start a second
+Board for the deployed fleet. In a separate local setup, start each service in
+its own terminal from the repository root:
 
 ```sh
 tooling/run-task-board
@@ -89,8 +113,10 @@ MCP servers. Remove or replace those entries when using different tools. The
 workspace helper runs commands as its user; use a dedicated workspace/process
 boundary when isolation is required. Services bind to loopback by default.
 
-Run Fleet through `tooling/run-fleet`; see the
-[Fleet README](components/fleet/README.md) for its CLI and existing Codex setup.
+For Board-managed execution, use Fleet's persistent `native-worker` command
+and the configuration described above instead of posting directly to a chosen
+runtime. The [Fleet README](components/fleet/README.md) also covers its separate
+Codex tooling.
 
 ## Checks
 
@@ -102,17 +128,20 @@ The checks cover native recovery/concurrency and protocol behavior, workspace
 MCP paths/processes, Fleet, Task Board, and the built Task Board frontend.
 Component commands must run from their component directory.
 
-## Next integration work
+## Deployment evidence and remaining acceptance
 
-The native executor is the first engineering project. The initial implementation
-provides the conversation engine and MCP access; Fleet's launcher and Task Board
-metadata still need to become its integrated deployment and configuration path.
-Existing Fleet/Codex sessions can build that integration.
+The integrated Board/native/Fleet path is implemented and deployed across the
+four workers. Board's `/native` view consumes per-session reports and Fleet host
+and dispatch data; it does not replace the runtime's durable transcripts. See
+[architecture](docs/architecture.md) for component and authority boundaries.
 
-Keep delivery incremental: wire one native session through the board and Fleet,
-demonstrate parallel sessions and restart recovery, then have a session deliver
-and deploy a tested change. Deployment must report the actual revision and
-restart result. See [architecture](docs/architecture.md) for the boundaries.
+Implementation and enabled services are not final acceptance. Project 1 / task 6
+owns the remaining live Git-route, Board revision/projection and parent-child
+recovery-lineage verification. The [acceptance audit](docs/native-acceptance.md)
+requires actual revisions, load distribution, independent same-identity sessions,
+filesystem isolation, preserved receipts across restart, owned repairs and a
+native-authored tested change deployed and published. Missing evidence remains
+unproven; this documentation does not close those checks.
 
 ## Independent durable recovery
 

@@ -13,8 +13,20 @@ from unittest import mock
 
 TOOLING = Path(__file__).resolve().parents[1] / "tooling"
 sys.path.insert(0, str(TOOLING))
+import native_drain as drain
 import native_ready as ready
 import native_release as release
+
+
+# The current native deployment has no dependency on retired migration units.
+CURRENT_SERVICES = (
+    "borg-board.service", "borg-workspace.service", "borg-session-workspace.service",
+    "borg-native.service", "borg-fleet.service", "borg-recovery.service",
+    "borg-board-tunnel.service", "borg-native-routes.service",
+    "borg-native-controller-route.socket", "borg-native-controller-route.service",
+    "borg-native-builder-route.socket", "borg-native-builder-route.service",
+    "borg-pm-workspace.service",
+)
 
 
 class ReleaseTests(unittest.TestCase):
@@ -158,6 +170,106 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("--property=TimeoutStartSec=infinity", command)
         self.assertEqual(command[:3], ["sudo", "-n", "systemd-run"])
         self.assertTrue(result["launched"])
+
+    def test_inventory_only_observes_current_native_services(self):
+        state = self.root / "state"
+        state.mkdir()
+        (state / "native.sqlite").touch()
+        (state / "board.sqlite").touch()
+        with mock.patch.object(release, "service_state", return_value={"ActiveState": "inactive"}) as service:
+            observed = release.inventory(self.root)
+        self.assertEqual([call.args[0] for call in service.call_args_list], list(CURRENT_SERVICES))
+        self.assertEqual(list(observed["services"]), list(CURRENT_SERVICES))
+        self.assertEqual(observed["databases"], ["board.sqlite", "native.sqlite"])
+
+    def test_native_install_uses_current_checks_and_preserves_receipts(self):
+        path = self.artifact()
+        base = self.root / "persistent"
+        (base / "config").mkdir(parents=True)
+        (base / "config/runtime.json").write_text("{}")
+        (base / "state").mkdir()
+        database = base / "state/native.sqlite"
+        with sqlite3.connect(database) as db:
+            db.execute("CREATE TABLE results (content TEXT)")
+            db.execute("INSERT INTO results VALUES ('original tool receipt')")
+        inode = database.stat().st_ino
+        before = [{"id": "session-1", "agent_id": "engineer", "status": "stopped",
+                   "tools": {"call-1": "succeeded"}, "receipt_hashes": {"4": "original"}}]
+        args = argparse.Namespace(release=path, base=base, user="mtolton", host_id="agent-lab-2",
+                                  workspace="/workspace", runtime_url="http://fixture-runtime",
+                                  components="native", wait_seconds=1)
+        events = []
+        verify_receipts = release.verify_preserved
+        verify_images = release.verify_running_images
+
+        def current_service(name):
+            self.assertIn(name, CURRENT_SERVICES, "activation must not query retired migration units")
+            return {"ActiveState": "active", "UnitFileState": "enabled",
+                    "executable_sha256": release.sha256(path / "borg-native")}
+
+        def command(argv):
+            # Systemd/install is the only host-mutation boundary; never execute it.
+            if argv[-2:] == ["stop", "borg-fleet.service"]:
+                events.append("stop-fleet")
+            elif argv[-2:] == ["restart", "borg-native.service"]:
+                events.append("restart-native")
+            elif argv[-2:] == ["start", "borg-fleet.service"]:
+                events.append("start-fleet")
+            if "--property=ExecStart" in argv:
+                return "path=" + str(path / "borg-native") + " ;"
+            return ""
+
+        def drain_session(db, url, journal, wait_seconds):
+            self.assertEqual(db, database)
+            self.assertEqual(url, args.runtime_url)
+            events.append("drain")
+            release.atomic_json(journal, {"state": "drained"})
+
+        def probe_native(url):
+            self.assertEqual(url, args.runtime_url)
+            events.append("readiness")
+
+        def preserved(old, new):
+            verify_receipts(old, new)
+            events.append("receipts")
+
+        def images(snapshot, metadata, components):
+            verify_images(snapshot, metadata, components)
+            events.append("images")
+
+        def resume_session(url, journal):
+            self.assertEqual(url, args.runtime_url)
+            self.assertEqual(json.loads(journal.read_text())["state"], "drained")
+            events.append("resume")
+            return {"state": "resumed"}
+
+        with (
+            mock.patch.object(release, "service_state", side_effect=current_service),
+            mock.patch.object(release, "run", side_effect=command),
+            mock.patch.object(release.shutil, "copy2"),
+            mock.patch.object(release, "session_snapshot", return_value=before),
+            mock.patch.object(release, "require_quiet", wraps=release.require_quiet) as quiet,
+            mock.patch.object(release, "verify_preserved", side_effect=preserved),
+            mock.patch.object(release, "verify_running_images", side_effect=images),
+            mock.patch.object(drain, "drain", side_effect=drain_session),
+            mock.patch.object(drain, "resume", side_effect=resume_session),
+            mock.patch.object(ready, "probe_native", side_effect=probe_native),
+            mock.patch.object(sys, "path", sys.path[:]),
+        ):
+            result = release.install(args)
+        quiet.assert_called_once_with(before)
+        self.assertEqual(events, ["stop-fleet", "drain", "restart-native", "readiness",
+                                  "receipts", "images", "resume", "start-fleet", "images"])
+        self.assertEqual(result["status"], "verified")
+        self.assertTrue(result["committed_results_preserved"])
+        self.assertEqual(result["before_sessions"], result["after_sessions"])
+        self.assertEqual(json.loads(Path(result["evidence_path"]).read_text())["status"], "verified")
+        self.assertEqual(database.stat().st_ino, inode)
+        backup = base / "backups" / result["started_at"] / "native.sqlite"
+        for db_path in (database, backup):
+            with sqlite3.connect(db_path) as db:
+                self.assertEqual(db.execute("SELECT content FROM results").fetchall(),
+                                 [("original tool receipt",)])
 
     def test_unit_rejects_systemd_injection(self):
         with self.assertRaises(ValueError):
