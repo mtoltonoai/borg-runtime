@@ -31,6 +31,8 @@ From a clean committed checkout:
 # Locked dependency builds; independent component caches, without debug-symbol bloat.
 # BORG_BUILD_PROFILE=release is also supported; default dev builds are debug=0.
 tooling/build-native-release
+# For a native-only hotfix, skip all Fleet/Board/frontend builds:
+# BORG_BUILD_COMPONENTS=native tooling/build-native-release
 revision=$(git rev-parse HEAD)
 release="$PWD/.runtime/releases/$revision"
 python3 tooling/native_release.py verify --release "$release"

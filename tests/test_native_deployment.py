@@ -57,6 +57,26 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "full Git commit"):
             release.manifest(self.root, "main")
 
+    def test_native_only_manifest_requires_no_unrelated_build_outputs(self):
+        path = self.root / ("b" * 40)
+        path.mkdir()
+        for name in ("borg-native", "native_ready.py", "native_release.py", "native_drain.py"):
+            (path / name).write_text(name)
+        release.manifest(path, "b" * 40, ["native"])
+        value = release.verify(path)
+        self.assertEqual(value["components"], ["native"])
+        self.assertNotIn("fleet", value["files"])
+        self.assertNotIn("task-board", value["files"])
+
+    def test_actual_image_mismatch_is_rejected_before_admission(self):
+        metadata = {"files": {"borg-native": "expected"}}
+        snapshot = {"services": {"borg-native.service": {
+            "ActiveState": "active", "UnitFileState": "enabled", "executable_sha256": "wrong"}}}
+        with self.assertRaisesRegex(RuntimeError, "differs from release"):
+            release.verify_running_images(snapshot, metadata, ["native"])
+        snapshot["services"]["borg-native.service"]["executable_sha256"] = "expected"
+        release.verify_running_images(snapshot, metadata, ["native"])
+
     def test_missing_component_not_a_deliverable(self):
         path = self.artifact()
         (path / "fleet").unlink()

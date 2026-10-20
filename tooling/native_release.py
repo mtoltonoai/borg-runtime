@@ -78,11 +78,13 @@ def release_files(path):
     return result
 
 
-def manifest(path, revision):
+def manifest(path, revision, components=None):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("revision must be a full Git commit")
     value = {"schema": 1, "revision": revision, "built_at": stamp(),
              "files": release_files(path)}
+    if components is not None:
+        value["components"] = components
     atomic_json(path / "revision.json", value)
     return value
 
@@ -95,8 +97,19 @@ def verify(path):
         raise ValueError("invalid manifest")
     if release_files(path) != value.get("files"):
         raise ValueError("release contents do not match checksums")
-    for required in ("borg-native", "fleet", "task-board", "workspace_mcp.py",
-                     "native_ready.py", "native_release.py", "web/index.html"):
+    components = value.get("components", ["native", "fleet", "board", "workspace"])
+    if not components or any(c not in COMPONENTS for c in components):
+        raise ValueError("invalid release component set")
+    required_files = {"native_ready.py", "native_release.py"}
+    if "components" in value:
+        required_files.add("native_drain.py")
+    requirements = {"native": ["borg-native"], "fleet": ["fleet"],
+                    "board": ["task-board", "web/index.html"],
+                    "workspace": ["workspace_mcp.py"], "session-workspace": ["workspace_mcp.py"],
+                    "recovery": ["native_recovery.py"]}
+    for component in components:
+        required_files.update(requirements[component])
+    for required in sorted(required_files):
         if required not in value["files"]:
             raise ValueError(f"release missing {required}")
     return value
@@ -281,6 +294,8 @@ def install_locked(args):
     components = args.components.split(",")
     if any(c not in COMPONENTS for c in components):
         raise ValueError("invalid component selection")
+    if any(c not in metadata.get("components", COMPONENTS) for c in components):
+        raise ValueError("requested component was not built in this release")
     if any(c in components for c in ("board", "recovery")) and args.host_id != "agent-lab":
         raise ValueError("shared Board and recovery ledger belong only on agent-lab")
     for name in LEGACY:
@@ -447,7 +462,7 @@ def main():
         parser.error("--release required")
     try:
         if args.action == "manifest":
-            value = manifest(args.release, args.revision or "")
+            value = manifest(args.release, args.revision or "", args.components.split(","))
         elif args.action == "verify":
             value = verify(args.release)
         elif args.action == "inventory":
