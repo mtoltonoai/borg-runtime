@@ -31,6 +31,10 @@ def origin(host):
 def fleet_config(host, base=DEFAULT_BASE, capacity=4, project=None, ssh_config=DEFAULT_SSH):
     # JSON strings are also valid TOML basic strings for these absolute paths.
     project_line = f"project_id = {project}\n" if project is not None else ""
+    repository = str(Path(base) / "git/borg-runtime.git")
+    # The controller cannot hairpin through its own devbox SSH proxy. This is
+    # the SAME shared repository, not another mirror; clone disables hardlinks.
+    repo_url = repository if host == "agent-lab" else "ssh://borg-agent-lab" + repository
     return f'''# Generated connectivity only; identity/model/tools remain Board metadata.
 board_api = "http://127.0.0.1:8079/api"
 host = {json.dumps(host)}
@@ -42,7 +46,7 @@ workspace_mcp_url = "http://127.0.0.1:8791/mcp/{{session_id}}"
 capacity = {capacity}
 poll_seconds = 5
 ttl_seconds = 60
-{project_line}repo_url = "ssh://borg-agent-lab/home/dev-user/.local/share/borg/git/borg-runtime.git"
+{project_line}repo_url = {json.dumps(repo_url)}
 repo_ref = "main"
 git_ssh_config = {json.dumps(ssh_config)}
 http_timeout_seconds = 15
