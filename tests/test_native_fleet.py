@@ -88,6 +88,7 @@ class Engine:
         self.sessions = {}
         self.intents = {}
         self.calls = Counter()
+        self.requests = []
         self.effects = Counter()
         self.lose_before_once = False
         self.lose_after_once = False
@@ -119,6 +120,7 @@ class Engine:
                     pass
 
             def do_GET(self):
+                engine.requests.append(("GET", self.path))
                 if self.path == "/health":
                     return self.reply(200, {"status": "ok", "service": "borg-native", "host_id": engine.host, "ready": engine.ready, "draining": not engine.ready})
                 if self.path.startswith("/api/sessions/"):
@@ -129,6 +131,7 @@ class Engine:
                 self.reply(404, {"error": "not found"})
 
             def do_POST(self):
+                engine.requests.append(("POST", self.path))
                 if self.path != "/api/sessions":
                     return self.reply(404, {"error": "not found"})
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -438,6 +441,50 @@ provision_timeout_seconds=30
         host = next(h for h in http("GET", self.board_url + "/fleet/hosts") if h["host_id"] == self.hosts[3])
         self.assertFalse(host["enabled"])
         self.assertEqual(host["capacity"], 1)
+
+    def test_explicit_observer_reports_builder_terminal_without_foreign_launch(self):
+        builder = Engine("borg-builder")
+        self.engines.append(builder)
+        task = self.task("builder bootstrap")
+        sid = str(uuid.uuid4())
+        original = self.root / "builder-original"
+        original.mkdir()
+        (original / "retained").write_text("unchanged")
+        builder.sessions[sid] = {"id": sid, "agent_id": "engineer", "task": f'task_{task["id"]}',
+            "host_id": "borg-builder", "workspace_cwd": str(original), "generation": 0,
+            "status": "running", "progress": "builder inference", "error": None, "driver_running": True}
+        http("POST", self.board_url + "/fleet/hosts/borg-builder/heartbeat", {
+            "capacity": 0, "runtime_url": builder.url, "workspace_root": str(self.root / "builder-new-workspaces"),
+            "runtime_ready": True, "metadata": {"bootstrap_only": True, "observer_host": self.hosts[0]}})
+        http("PATCH", self.board_url + "/fleet/hosts/borg-builder", {"enabled": False})
+        row = http("POST", self.board_url + "/fleet/dispatches/adopt", {
+            "request_id": f'task:{task["id"]}:attempt:1', "agent_id": "engineer", "task_id": task["id"],
+            "session_id": sid, "host_id": "borg-builder", "runtime_url": builder.url,
+            "workspace_cwd": str(original), "generation": 0})
+        self.workers()
+        observed = self.dispatches()[0]
+        self.assertEqual(observed["host_id"], "borg-builder")
+        self.assertEqual(observed["metadata"]["observer_host"], self.hosts[0])
+        self.assertEqual(observed["progress"], "builder inference")
+        builder.sessions[sid].update(status="completed", progress="builder finished", driver_running=False)
+        self.workers()
+        observed = self.dispatches()[0]
+        self.assertEqual(observed["id"], row["id"])
+        self.assertEqual(observed["status"], "completed")
+        self.assertEqual(observed["progress"], "builder finished")
+        self.assertFalse(observed["metadata"]["runtime"]["driver_active"])
+        self.assertFalse(builder.calls, "observer must never create or replay the foreign engine")
+        self.assertEqual((original / "retained").read_text(), "unchanged")
+        self.assertFalse((original / ".fleet-workspace.json").exists())
+        host = next(h for h in http("GET", self.board_url + "/fleet/hosts") if h["host_id"] == "borg-builder")
+        self.assertEqual(host["capacity"], 0)
+        self.assertFalse(host["enabled"])
+        self.assertEqual(host["active"], 0)
+        del builder.sessions[sid]
+        self.workers()
+        self.assertEqual(self.dispatches()[0]["status"], "completed")
+        self.assertFalse(builder.calls)
+        self.assertTrue(all(method == "GET" for method, _ in builder.requests), "foreign controls are forbidden")
 
     def test_broken_default_git_route_is_excluded_across_restart_and_reproved_without_unpausing(self):
         bad = f"ssh://127.0.0.1:{free_port()}/not-a-repository"
