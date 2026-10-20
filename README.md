@@ -105,3 +105,12 @@ Keep delivery incremental: wire one native session through the board and Fleet,
 demonstrate parallel sessions and restart recovery, then have a session deliver
 and deploy a tested change. Deployment must report the actual revision and
 restart result. See [architecture](docs/architecture.md) for the boundaries.
+
+## Independent durable recovery
+
+`tooling/native_recovery.py` is a separately supervised Board/Fleet observer and
+repair-task dispatcher. It detects missing execution paths, failed/uncertain
+sessions and suspicious progress, preserves explicit waits and tool receipts,
+and retries transient control-plane outages indefinitely. It never blindly
+replays an original session. See [native recovery](docs/native-recovery.md) for
+the metadata/API contract, persistent systemd unit, tests and safe live drills.

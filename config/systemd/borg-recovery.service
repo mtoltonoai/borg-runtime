@@ -1,0 +1,21 @@
+[Unit]
+Description=Borg independent durable native recovery monitor
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/borg
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/borg/recovery.env
+ExecStart=/usr/bin/python3 %h/.local/share/borg/current/tooling/native_recovery.py --config %h/.config/borg/recovery.json
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
