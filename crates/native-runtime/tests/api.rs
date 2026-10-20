@@ -389,7 +389,10 @@ async fn unknown_tool_requires_explicit_result_without_another_tool_dispatch() {
         .await
         .unwrap();
     assert_eq!(missing_result.status(), 422);
-    assert_eq!(runtime.get_session(id).unwrap().status, SessionStatus::NeedsResolution);
+    assert_eq!(
+        runtime.get_session(id).unwrap().status,
+        SessionStatus::NeedsResolution
+    );
     assert_eq!(
         client
             .post(format!("{}/api/sessions/{id}/resume", server.url))

@@ -85,10 +85,12 @@ impl OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             // Do not read or expose an error body, even for malformed JSON/HTML.
-            return Err(failure(
+            let mut error = failure(
                 format!("provider returned HTTP {}", status.as_u16()),
                 status.as_u16() == 429 || status.as_u16() == 408 || status.is_server_error(),
-            ));
+            );
+            error.retry_after_ms = crate::retry::retry_after_ms(response.headers());
+            return Err(error);
         }
         let bytes = response.bytes().await.map_err(transport_error)?;
         let value: Value = serde_json::from_slice(&bytes)
@@ -116,6 +118,7 @@ fn failure(message: impl Into<String>, retryable: bool) -> ProviderError {
     ProviderError {
         message: message.into(),
         retryable,
+        retry_after_ms: None,
     }
 }
 
@@ -177,6 +180,7 @@ mod tests {
         status: u16,
         body: String,
         location: Option<String>,
+        retry_after: Option<String>,
         delay: Duration,
     }
 
@@ -218,6 +222,9 @@ mod tests {
                     .header("content-type", "application/json");
                 if let Some(location) = reply.location {
                     response = response.header("location", location);
+                }
+                if let Some(retry_after) = reply.retry_after {
+                    response = response.header("retry-after", retry_after);
                 }
                 response.body(Body::from(reply.body)).unwrap()
             }
@@ -268,8 +275,25 @@ mod tests {
             status,
             body: body.to_string(),
             location: None,
+            retry_after: None,
             delay: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_propagated_for_runtime_backoff_without_hidden_retry() {
+        let mock = Mock::start(Reply {
+            retry_after: Some("7".into()),
+            ..reply(429, Value::Null)
+        })
+        .await;
+        let error = provider(None)
+            .send(request(&mock.endpoint), KEY)
+            .await
+            .unwrap_err();
+        assert!(error.retryable);
+        assert_eq!(error.retry_after_ms, Some(7000));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

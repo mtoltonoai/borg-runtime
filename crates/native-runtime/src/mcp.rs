@@ -127,6 +127,26 @@ fn public_name(server: &str, tool: &str) -> Result<String, String> {
     Ok(name)
 }
 
+/// Classify *read-only discovery* errors. Never apply this to tools/call:
+/// transport loss after dispatch has an unknown side effect, not a retry grant.
+pub(crate) fn discovery_retry_after(error: &str) -> Option<Option<u64>> {
+    if matches!(
+        error,
+        "MCP transport unavailable"
+            | "MCP response transport unavailable"
+            | "MCP event stream ended before its response"
+            | "MCP JSON-RPC error -32603"
+    ) {
+        return Some(None);
+    }
+    let tail = error.strip_prefix("MCP HTTP status ")?;
+    let (status, hint) = tail
+        .split_once("; retry_after_ms=")
+        .map_or((tail, None), |(s, h)| (s, h.parse::<u64>().ok()));
+    let status: u16 = status.parse().ok()?;
+    matches!(status, 404 | 408 | 429 | 500..=599).then_some(hint)
+}
+
 fn allowed(server: &McpServerConfig, tool: &str) -> bool {
     server
         .tools_allowlist
@@ -299,7 +319,11 @@ impl ServerSession {
             }
             // Neither server bodies nor reqwest errors (which can contain URLs
             // or credentials) enter diagnostics.
-            return Err(format!("MCP HTTP status {status}"));
+            let delay = crate::retry::retry_after_ms(response.headers());
+            return Err(match delay {
+                Some(delay) => format!("MCP HTTP status {status}; retry_after_ms={delay}"),
+                None => format!("MCP HTTP status {status}"),
+            });
         }
         Ok(response)
     }
@@ -402,17 +426,17 @@ impl ServerSession {
             .ok_or("MCP request counter exhausted")?;
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut response = self.post(client, &request).await?;
-        if method == "initialize" {
-            if let Some(header) = response.headers().get("mcp-session-id") {
-                if header.as_bytes().is_empty()
-                    || !header.as_bytes().iter().all(|b| (0x21..=0x7e).contains(b))
-                {
-                    return Err("MCP session header is invalid".into());
-                }
-                let mut header = header.clone();
-                header.set_sensitive(true);
-                self.session_header = Some(header);
+        if method == "initialize"
+            && let Some(header) = response.headers().get("mcp-session-id")
+        {
+            if header.as_bytes().is_empty()
+                || !header.as_bytes().iter().all(|b| (0x21..=0x7e).contains(b))
+            {
+                return Err("MCP session header is invalid".into());
             }
+            let mut header = header.clone();
+            header.set_sensitive(true);
+            self.session_header = Some(header);
         }
         let kind = response
             .headers()
