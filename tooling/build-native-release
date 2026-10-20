@@ -24,7 +24,7 @@ if [[ -e "$output" ]]; then
   echo "Immutable release already exists: $output" >&2; exit 1
 fi
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
-export BORG_BUILD_REV="$revision" FLEET_BUILD_REV="$revision"
+export BORG_BUILD_REV="$revision" FLEET_BUILD_REV="$revision" TASK_BOARD_COMMIT="$revision"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}"
 if has native; then
