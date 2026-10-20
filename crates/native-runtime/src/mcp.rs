@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 const PROTOCOL: &str = "2025-06-18";
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CATALOG_PAGES: usize = 32;
+const SESSION_MISSING: &str = "MCP session rejected before tool dispatch";
 type SessionKey = (
     String,
     String,
@@ -138,6 +139,9 @@ fn public_name(server: &str, tool: &str) -> Result<String, String> {
 /// Classify *read-only discovery* errors. Never apply this to tools/call:
 /// transport loss after dispatch has an unknown side effect, not a retry grant.
 pub(crate) fn discovery_retry_after(error: &str) -> Option<Option<u64>> {
+    if error == SESSION_MISSING {
+        return Some(None);
+    }
     if matches!(
         error,
         "MCP transport unavailable"
@@ -220,39 +224,84 @@ impl ToolExecutor for McpToolExecutor {
             if !allowed(config, tool_name) {
                 return known_rejection("tools/call", -32601);
             }
-            let shared = self.session(session_id, config).await?;
+            let shared = match self.session(session_id, config).await {
+                Ok(session) => session,
+                Err(error) => return Ok(not_executed(&error)),
+            };
             let mut session = shared.lock().await;
-            session.initialize(&self.client).await?;
-            if !session.tools.contains_key(tool_name) {
-                // Tool discovery is safe to perform, but never infer permission
-                // from a provider-generated function name alone.
-                session.discover(&self.client).await?;
+            let mut renewed = false;
+            loop {
+                // These requests cannot dispatch a tool. Even a transport failure
+                // here is a known non-execution, not an unknown mutating outcome.
+                if let Err(error) = session.initialize(&self.client).await {
+                    return Ok(not_executed(&error));
+                }
+                if !session.tools.contains_key(tool_name)
+                    && let Err(error) = session.discover(&self.client).await
+                {
+                    return Ok(not_executed(&error));
+                }
+                if !session.tools.contains_key(tool_name) {
+                    return known_rejection("tools/call", -32601);
+                }
+                let result = session
+                    .rpc(
+                        &self.client,
+                        "tools/call",
+                        json!({
+                            "name": tool_name, "arguments": arguments,
+                            "_meta": {"borg/operation_id": operation_id}
+                        }),
+                    )
+                    .await;
+                let mut result = match result {
+                    Err(error) if error == SESSION_MISSING && !renewed => {
+                        // The verified RMCP response is emitted before tool dispatch.
+                        // Renew only once here, with the same operation identity.
+                        // Repeated expiry becomes a durable known-not-executed result.
+                        renewed = true;
+                        continue;
+                    }
+                    Err(error) if error == SESSION_MISSING => return Ok(not_executed(&error)),
+                    other => other?, // Arbitrary 404/5xx/transport loss remains unknown.
+                };
+                if !result.is_object()
+                    || !result.get("content").is_some_and(Value::is_array)
+                    || result.get("isError").is_some_and(|v| !v.is_boolean())
+                {
+                    return Err("MCP tool result has an invalid shape".into());
+                }
+                if renewed {
+                    let metadata = result
+                        .as_object_mut()
+                        .unwrap()
+                        .entry("_meta")
+                        .or_insert_with(|| json!({}));
+                    if let Some(metadata) = metadata.as_object_mut() {
+                        metadata.insert("borg/session_reinitialized".into(), json!(true));
+                    }
+                }
+                // isError is a tool result, not transport uncertainty. Preserve
+                // all original content/structuredContent/metadata for the log.
+                return Ok(result);
             }
-            if !session.tools.contains_key(tool_name) {
-                return known_rejection("tools/call", -32601);
-            }
-            let result = session
-                .rpc(
-                    &self.client,
-                    "tools/call",
-                    json!({
-                        "name": tool_name,
-                        "arguments": arguments,
-                        "_meta": {"borg/operation_id": operation_id}
-                    }),
-                )
-                .await?;
-            if !result.is_object()
-                || !result.get("content").is_some_and(Value::is_array)
-                || result.get("isError").is_some_and(|v| !v.is_boolean())
-            {
-                return Err("MCP tool result has an invalid shape".into());
-            }
-            // isError is a tool result, not transport uncertainty. Preserve all
-            // content/structuredContent/metadata for the model and durable log.
-            Ok(result)
         })
     }
+}
+
+async fn confirmed_missing_session(mut response: reqwest::Response) -> bool {
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len() + chunk.len() <= 128 => bytes.extend_from_slice(&chunk),
+            Ok(None) => return bytes == b"Not Found: Session not found",
+            _ => return false,
+        }
+    }
+}
+fn not_executed(error: &str) -> Value {
+    json!({"isError":true,"content":[{"type":"text","text":format!("Tool was not executed: {error}. Discovery/session setup must recover before a new attempt.")}],
+        "_meta":{"borg/not_executed":true,"borg/retryable":discovery_retry_after(error).is_some()}})
 }
 
 struct ServerSession {
@@ -331,15 +380,20 @@ impl ServerSession {
             .map_err(|_| "MCP transport unavailable")?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let delay = crate::retry::retry_after_ms(response.headers());
             if status == 404 && self.session_header.is_some() {
                 self.initialized = false;
                 self.session_header = None;
                 self.version = None;
                 self.tools.clear();
+                // RMCP's known session-not-found branch returns this exact body
+                // before forwarding any message to a handler. An arbitrary 404,
+                // proxy page, truncated body or RPC error is NOT this evidence.
+                if confirmed_missing_session(response).await {
+                    return Err(SESSION_MISSING.into());
+                }
             }
-            // Neither server bodies nor reqwest errors (which can contain URLs
-            // or credentials) enter diagnostics.
-            let delay = crate::retry::retry_after_ms(response.headers());
+            // Neither server bodies nor reqwest errors enter diagnostics.
             return Err(match delay {
                 Some(delay) => format!("MCP HTTP status {status}; retry_after_ms={delay}"),
                 None => format!("MCP HTTP status {status}"),
@@ -366,6 +420,8 @@ impl ServerSession {
         }
         self.session_header = None;
         self.version = None;
+        self.next_id = 1;
+        self.tools.clear();
         let result = self.rpc(client, "initialize", json!({
             "protocolVersion": PROTOCOL,
             "capabilities": {},
@@ -1160,8 +1216,105 @@ mod tests {
         );
     }
 
+    fn expired_session() -> Reply {
+        Reply {
+            status: 404,
+            kind: "text/plain",
+            extra: String::new(),
+            bytes: b"Not Found: Session not found".to_vec(),
+            sse_open: false,
+            delay: Duration::ZERO,
+        }
+    }
+
     #[tokio::test]
-    async fn mismatched_response_and_expired_session_do_not_dispatch_a_second_call() {
+    async fn confirmed_session_expiry_after_inference_renews_once_with_same_identity_and_operation()
+    {
+        let receipt = json!({"content":[{"type":"text","text":"one write receipt"}],"structuredContent":{"effects":1}});
+        let (url, task) = server(vec![
+            Reply::initialized("old"),
+            Reply::ack(),
+            Reply::tools(2),
+            expired_session(),
+            Reply::initialized("fresh"),
+            Reply::ack(),
+            Reply::tools(2),
+            Reply::json(3, receipt),
+        ])
+        .await;
+        let client = McpToolExecutor::new().unwrap();
+        let mut board = config(url);
+        board.bound_agent_id = Some("new-board-identity".into());
+        let servers = [board];
+        client.list_tools("native-session", &servers).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await; // inference exceeded old session lifetime
+        let result = client
+            .call(
+                "native-session",
+                &servers,
+                "files__write",
+                json!({"note":"once"}),
+                "stable-original-operation",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["structuredContent"]["effects"], 1);
+        assert_eq!(result["_meta"]["borg/session_reinitialized"], true);
+        let requests = task.await.unwrap();
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r.body["method"] == "tools/call")
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "first request was rejected before the handler, second executes once"
+        );
+        assert_eq!(calls[0].body["params"], calls[1].body["params"]);
+        assert!(calls[0].headers.contains("mcp-session-id: old\r\n"));
+        assert!(calls[1].headers.contains("mcp-session-id: fresh\r\n"));
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.headers.contains("x-fleet-agent: new-board-identity\r\n"))
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_during_session_renewal_is_definitively_not_executed_not_unknown() {
+        let mut unavailable = Reply::json(1, json!({"private":"not exposed"}));
+        unavailable.status = 503;
+        let (url, task) = server(vec![
+            Reply::initialized("old"),
+            Reply::ack(),
+            Reply::tools(2),
+            expired_session(),
+            unavailable,
+        ])
+        .await;
+        let client = McpToolExecutor::new().unwrap();
+        let servers = [config(url)];
+        client.list_tools("n", &servers).await.unwrap();
+        let result = client
+            .call("n", &servers, "files__write", json!({}), "original")
+            .await
+            .unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["_meta"]["borg/not_executed"], true);
+        assert_eq!(result["_meta"]["borg/retryable"], true);
+        assert!(!result.to_string().contains("private"));
+        assert_eq!(
+            task.await
+                .unwrap()
+                .iter()
+                .filter(|r| r.body["method"] == "tools/call")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_response_and_arbitrary_404_do_not_dispatch_a_second_call() {
         for status in [200, 404] {
             let mut reply = Reply::json(999, json!({"content":[]}));
             reply.status = status;
@@ -1189,6 +1342,163 @@ mod tests {
             );
             assert_eq!(task.await.unwrap().len(), 4);
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BORG_TEST_TASK_BOARD_URL root; real RMCP session is closed during simulated inference, then one comment is verified"]
+    async fn real_board_expiry_during_inference_preserves_one_mutating_receipt() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ExpiringModel {
+            executor: Arc<McpToolExecutor>,
+            endpoint: String,
+            agent: String,
+            task_id: i64,
+            note: String,
+            first: AtomicBool,
+        }
+        impl crate::Provider for ExpiringModel {
+            fn respond(
+                &self,
+                _: crate::ProviderRequest,
+            ) -> crate::BoxFuture<'_, Result<crate::ProviderResponse, crate::ProviderError>>
+            {
+                Box::pin(async move {
+                    let output = if self.first.swap(false, Ordering::SeqCst) {
+                        // Discovery finished; inference is active. Closing the real
+                        // server session deterministically simulates its idle expiry.
+                        let shared = self
+                            .executor
+                            .sessions
+                            .lock()
+                            .await
+                            .values()
+                            .next()
+                            .unwrap()
+                            .clone();
+                        let old = shared.lock().await.session_header.clone().unwrap();
+                        let response = reqwest::Client::new()
+                            .delete(&self.endpoint)
+                            .header("mcp-session-id", old)
+                            .header("mcp-protocol-version", PROTOCOL)
+                            .header("x-fleet-agent", &self.agent)
+                            .send()
+                            .await
+                            .unwrap();
+                        assert!(response.status().is_success());
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        vec![
+                            json!({"type":"function_call","call_id":"original-expiry-call","name":"board__comment_task",
+                            "arguments":json!({"task_id":self.task_id,"body":self.note,"acknowledge_banned":true}).to_string()}),
+                        ]
+                    } else {
+                        vec![
+                            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"receipt retained"}]}),
+                        ]
+                    };
+                    Ok(crate::ProviderResponse {
+                        id: None,
+                        output,
+                        usage: None,
+                        status: "completed".into(),
+                    })
+                })
+            }
+        }
+        let root = std::env::var("BORG_TEST_TASK_BOARD_URL")
+            .unwrap()
+            .trim_end_matches('/')
+            .to_string();
+        let client = reqwest::Client::new();
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let agent = format!("native-expiry-test-{suffix}");
+        let note = format!("expiry receipt {suffix}");
+        client.post(format!("{root}/api/agents")).json(&json!({"agent_id":agent,"charter":"expiry fixture","metadata":{"harness":"native-test-fixture","test_only":true}})).send().await.unwrap().error_for_status().unwrap();
+        let project:Value=client.post(format!("{root}/api/projects")).json(&json!({"name":format!("native expiry fixture {suffix}"),"metadata":{"test_only":true}})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let project_id = project["id"].as_i64().unwrap();
+        let task:Value=client.post(format!("{root}/api/tasks")).json(&json!({"project_id":project_id,"title":"expiry receipt fixture","assignee":agent,"metadata":{"test_only":true}})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        client
+            .patch(format!("{root}/api/tasks/{task_id}"))
+            .json(&json!({"status":"done"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let endpoint = format!("{root}/mcp");
+        let executor = Arc::new(McpToolExecutor::new().unwrap());
+        let model = Arc::new(ExpiringModel {
+            executor: executor.clone(),
+            endpoint: endpoint.clone(),
+            agent: agent.clone(),
+            task_id,
+            note: note.clone(),
+            first: AtomicBool::new(true),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("runtime.json");
+        std::fs::write(&config,serde_json::to_vec(&json!({"database_path":dir.path().join("native.sqlite"),"agents":[{"id":agent,"instructions":"expiry test","mcp_servers":[{"name":"board","url":endpoint,"tools_allowlist":["comment_task"]}]}]})).unwrap()).unwrap();
+        let runtime = crate::Runtime::with_backends(&config, model, executor).unwrap();
+        let session = runtime
+            .create_session(
+                &agent,
+                Some(format!("task_{task_id}")),
+                "append exactly one receipt",
+            )
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(30), runtime.run(&session.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, crate::SessionStatus::Completed);
+        let calls = runtime.tool_calls(&session.id).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "succeeded");
+        assert_eq!(
+            calls[0].result.as_ref().unwrap()["_meta"]["borg/session_reinitialized"],
+            true
+        );
+        assert_eq!(
+            runtime
+                .transcript(&session.id)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "tool_result")
+                .count(),
+            1
+        );
+        let task: Value = client
+            .get(format!("{root}/api/tasks/{task_id}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            task["comments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["body"] == note && c["author"] == agent)
+                .count(),
+            1
+        );
+        client
+            .patch(format!("{root}/api/projects/{project_id}"))
+            .json(&json!({"status":"archived"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        client.post(format!("{root}/api/agents/{agent}/lifecycle-intent")).json(&json!({"intent":"paused","intent_by":"native-core","reason":"expiry fixture completed"})).send().await.unwrap().error_for_status().unwrap();
+        eprintln!(
+            "real Board expiry test passed: session={}, task={}, exactly one comment/receipt, identity={}, fixture archived",
+            session.id, task_id, agent
+        );
     }
 
     #[test]
