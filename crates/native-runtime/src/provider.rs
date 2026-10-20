@@ -52,6 +52,16 @@ impl OpenAiProvider {
         request: ProviderRequest,
         api_key: &str,
     ) -> Result<ProviderResponse, ProviderError> {
+        let endpoint = reqwest::Url::parse(&request.endpoint)
+            .map_err(|_| failure("provider endpoint configuration is invalid", false))?;
+        if !matches!(endpoint.scheme(), "http" | "https")
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return Err(failure("provider endpoint configuration is invalid", false));
+        }
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
@@ -72,7 +82,7 @@ impl OpenAiProvider {
         // configuration failures. Never format reqwest errors: they contain URLs.
         let request = self
             .client
-            .post(&request.endpoint)
+            .post(endpoint)
             .bearer_auth(api_key)
             .json(&body)
             .build()
@@ -123,6 +133,9 @@ fn failure(message: impl Into<String>, retryable: bool) -> ProviderError {
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
+    if error.is_builder() {
+        return failure("provider request configuration is invalid", false);
+    }
     failure(
         if error.is_timeout() {
             "provider request timed out"
@@ -277,6 +290,25 @@ mod tests {
             location: None,
             retry_after: None,
             delay: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_endpoints_are_permanent_redacted_configuration_failures() {
+        for endpoint in [
+            "ftp://example.invalid/private-endpoint",
+            "file:///private-endpoint",
+            "not a URL private-endpoint",
+            "http://user:private-endpoint@example.invalid/",
+        ] {
+            let error = provider(None)
+                .send(request(endpoint), KEY)
+                .await
+                .unwrap_err();
+            assert!(!error.retryable);
+            assert_eq!(error.retry_after_ms, None);
+            assert_eq!(error.message, "provider endpoint configuration is invalid");
+            assert!(!error.message.contains("private-endpoint"));
         }
     }
 
