@@ -6,6 +6,7 @@ updated only when its desired entry changes. Credentials are environment names,
 never values. Rendering a host config does not activate it on a running actor.
 """
 import argparse
+import copy
 import json
 from pathlib import Path
 import urllib.parse
@@ -51,7 +52,10 @@ def seed(board_api, roles, entries, call=request, overwrite_existing=False):
             current = call(board_api, path)
             old = {entry["id"]: entry for entry in current.get("entries", [])}
             for position, entry in enumerate(desired):
-                want = {"enabled": True, "scope": None, "payload": entry["payload"], "position": position}
+                payload = copy.deepcopy(entry["payload"])
+                if role == "pm" and kind == "tool" and entry["entry_id"] == "native":
+                    payload.setdefault("allowed_agent_ids", ["*"])
+                want = {"enabled": True, "scope": None, "payload": payload, "position": position}
                 prior = old.get(entry["entry_id"], {})
                 unchanged = all(prior.get(key) == value for key, value in want.items())
                 changed = not unchanged and (overwrite_existing or not prior)

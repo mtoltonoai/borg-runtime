@@ -49,7 +49,7 @@ if has board; then
 fi
 if has workspace || has session-workspace; then install -m 755 tooling/workspace_mcp.py "$stage/workspace_mcp.py"; fi
 if has recovery; then install -m 755 tooling/native_recovery.py "$stage/native_recovery.py"; fi
-for file in native_ready.py native_release.py native_drain.py; do install -m 755 "tooling/$file" "$stage/$file"; done
+for file in native_ready.py native_release.py native_drain.py native_metadata.py native_profile_switch.py; do install -m 755 "tooling/$file" "$stage/$file"; done
 if [[ -f tooling/native_acceptance.py ]]; then install -m 755 tooling/native_acceptance.py "$stage/native_acceptance.py"; fi
 python3 tooling/native_release.py manifest --release "$stage" --revision "$revision" --components "$components" > /dev/null
 python3 tooling/native_release.py verify --release "$stage" > /dev/null

@@ -54,6 +54,17 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(len(posts), 5)
         self.assertTrue(all(not e["changed"] for e in second))
 
+    def test_fresh_pm_seed_grants_cross_identity_delegation_but_not_other_roles(self):
+        posts = []
+        def call(base, path, body=None):
+            if body is not None:
+                posts.append((path, body))
+            return {"version": 1, "entries": []}
+        metadata.seed("http://board/api", ["pm", "native-worker"], metadata.role_entries(), call)
+        native = {path: body["payload"] for path, body in posts if body["entry_id"] == "native"}
+        self.assertEqual(native["/roles/pm/config/tool"]["allowed_agent_ids"], ["*"])
+        self.assertNotIn("allowed_agent_ids", native["/roles/native-worker/config/tool"])
+
     def test_seeding_does_not_reenable_operator_withheld_grant(self):
         calls = []
         def call(base, path, body=None):

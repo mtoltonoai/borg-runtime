@@ -197,7 +197,7 @@ def unit(component, release, base, host_id, user="mtolton", workspace=None):
     dependencies = {
         "board": [], "workspace": [], "session-workspace": [], "native": [dependency, "borg-workspace.service", "borg-session-workspace.service"],
         "fleet": [dependency, "borg-native.service", "borg-session-workspace.service"],
-        "recovery": [dependency, "borg-native.service"],
+        "recovery": [],
     }[component]
     commands = {
         "board": f"{release}/task-board --config {base}/config/board.toml --web-dir {release}/web",
@@ -208,7 +208,7 @@ def unit(component, release, base, host_id, user="mtolton", workspace=None):
         "recovery": f"/usr/bin/python3 {release}/native_recovery.py --config {base}/config/native-recovery.json",
     }
     pre = ""
-    if component in ("native", "fleet", "recovery"):
+    if component in ("native", "fleet"):
         pre = f"ExecStartPre=/usr/bin/python3 {release}/native_ready.py --board-api http://127.0.0.1:8079/api"
         if component == "native":
             pre += " --workspace-url http://127.0.0.1:8766/mcp"
@@ -244,7 +244,7 @@ WantedBy=multi-user.target
 
 
 def service_state(name):
-    output = run(["systemctl", "show", name, "--property=Id,ActiveState,SubState,UnitFileState,MainPID,ExecMainStartTimestamp"])
+    output = run(["systemctl", "show", name, "--property=Id,ActiveState,SubState,UnitFileState,MainPID,ExecMainStartTimestamp,ExecStart"])
     state = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     pid = int(state.get("MainPID") or 0)
     if pid:
@@ -261,7 +261,10 @@ def inventory(base):
     return {"observed_at": stamp(), "host": os.uname().nodename,
             "services": {name: service_state(name) for name in
                          tuple("borg-" + c + ".service" for c in COMPONENTS) +
-                         ("borg-board-tunnel.service",) + LEGACY},
+                         ("borg-board-tunnel.service", "borg-native-routes.service",
+                          "borg-native-controller-route.socket", "borg-native-controller-route.service",
+                          "borg-native-builder-route.socket", "borg-native-builder-route.service",
+                          "borg-pm-workspace.service") + LEGACY},
             "databases": [p.name for p in sorted((base / "state").glob("*.sqlite"))]}
 
 

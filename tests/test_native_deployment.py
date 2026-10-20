@@ -128,6 +128,14 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("borg-board.service", worker)
         self.assertIn("borg-board.service", controller)
 
+    def test_recovery_starts_even_when_watched_services_are_down(self):
+        text = release.unit("recovery", Path("/release/abc"), Path("/state"), "agent-lab")
+        self.assertNotIn("ExecStartPre", text)
+        self.assertNotIn("borg-native.service", text)
+        self.assertNotIn("borg-board.service", text)
+        self.assertIn("After=network-online.target", text)
+        self.assertIn("Restart=always", text)
+
     def test_session_workspace_is_separate_from_bootstrap(self):
         unit = release.unit("session-workspace", Path("/release/abc"), Path("/state"), "agent-lab")
         self.assertIn("--session-root /state/workspaces --port 8791", unit)
