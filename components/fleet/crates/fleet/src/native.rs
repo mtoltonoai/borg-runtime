@@ -413,10 +413,36 @@ impl Worker {
                 t["id"].as_i64(),
             )
         });
-        for task in tasks
-            .iter()
-            .filter(|t| actionable(t) && !already_dispatched(t))
-        {
+        for summary in tasks.iter().filter(|t| actionable(t)) {
+            if summary["assignee"]
+                .as_str()
+                .is_none_or(|id| !eligible.contains(id))
+            {
+                continue;
+            }
+            // Older REST projections omit BOTH metadata and question blocking.
+            // Never infer attempt 1 or runnable work from absent authority fields.
+            let full;
+            let task = if summary.get("metadata").is_some_and(Value::is_object)
+                && summary
+                    .get("question_blocked")
+                    .is_some_and(Value::is_boolean)
+            {
+                summary
+            } else {
+                full = self
+                    .board
+                    .request(
+                        "GET",
+                        &format!("{}/tasks/{}", self.board_url, number(summary, "id")?),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                &full
+            };
+            if !actionable(task) || already_dispatched(task) {
+                continue;
+            }
             let Some(agent) = task["assignee"].as_str().filter(|id| eligible.contains(id)) else {
                 continue;
             };

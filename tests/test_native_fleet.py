@@ -439,6 +439,26 @@ provision_timeout_seconds=30
         self.assertFalse(host["enabled"])
         self.assertEqual(host["capacity"], 1)
 
+    def test_explicit_attempt_two_uses_authoritative_task_metadata(self):
+        task = self.task(metadata={"workspace": {"repo": str(self.root / "missing-repo")}})
+        self.workers()
+        failed = self.dispatches()[0]
+        self.assertEqual(failed["status"], "failed")
+        # The deployed older REST /tasks list omits metadata. Only GET /tasks/id
+        # contains the explicit repair attempt and the corrected workspace spec.
+        http("PATCH", self.board_url + f'/tasks/{task["id"]}', {"metadata": {
+            "native_attempt": 2, "workspace": {"repo": str(self.source)}}})
+        self.workers()
+        self.workers()
+        rows = self.dispatches()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], failed, "original failed attempt must remain unchanged")
+        self.assertEqual(rows[1]["request_id"], f'task:{task["id"]}:attempt:2')
+        self.assertEqual(rows[1]["metadata"]["native_attempt"], 2)
+        self.assertEqual(rows[1]["status"], "running")
+        self.assertNotEqual(rows[0]["session_id"], rows[1]["session_id"])
+        self.assertEqual(sum(sum(e.calls.values()) for e in self.engines), 1)
+
     def test_provision_failure_remains_owned_visible_and_not_retried_as_new_session(self):
         task = self.task(metadata={"workspace": {"repo": str(self.root / "missing-repo")}})
         self.workers()

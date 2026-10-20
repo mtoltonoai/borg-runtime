@@ -29,6 +29,8 @@ class NativeRouteTests(unittest.TestCase):
                 self.assertEqual(cfg["board_api"], patch["board"]["url"] + "/api")
                 self.assertIn("{session_id}", cfg["native"]["workspace_mcp_url"])
                 self.assertEqual(cfg["native"]["git_ssh_config"], routes.DEFAULT_SSH)
+                repository = "/home/dev-user/.local/share/borg/git/borg-runtime.git"
+                self.assertEqual(cfg["native"]["repo_url"], repository if host == "agent-lab" else "ssh://borg-agent-lab" + repository)
                 self.assertNotIn("project_id", cfg["native"], "shared fleet must admit metadata-defined new projects")
                 for key in ("agents", "model", "api_key", "max_turns", "max_output_tokens"):
                     self.assertNotIn(key, cfg["native"])

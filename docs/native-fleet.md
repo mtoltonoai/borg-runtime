@@ -270,3 +270,21 @@ This exercises Fleet provisioning against the actual configured SSH remote,
 then uses the resulting clone's persisted Git route independently and executes
 an actual workspace MCP shell tool. The native HTTP engine remains the explicit
 fault-injection fixture; live model/host acceptance is still separate.
+
+### Controller-local repository and authoritative task attempts
+
+The controller cannot reach its own devbox SSH proxy through the worker alias.
+Generated `agent-lab` config therefore uses the **local path to the same shared
+bare repository**. Other labs keep the SSH URL and existing host key config.
+Both paths use independent clones (`--no-local --no-hardlinks`), never a shared
+index/worktree. A real controller-local clone/checkout and origin read must pass
+before restoring a quarantined host's placement; do not count a configured path
+as proof.
+
+Older compact `/api/tasks` responses omit metadata and question blocking. Fleet
+now hydrates the authoritative task detail if either field is missing, before
+selecting `native_attempt`, deciding an explicit hold, or reusing a prior
+receipt. Newer Board list projections avoid that extra read. The real-process
+regression keeps a failed attempt1 byte-for-byte, fixes its task workspace spec,
+sets explicit attempt2 and confirms one new independent session, not a replay of
+the old failed UUID. No original failed dispatch is reset by this repair.
