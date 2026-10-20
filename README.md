@@ -29,8 +29,8 @@ indefinitely from committed state. `max_retries: null` is the explicit unlimited
 policy (and default); legacy numeric `max_retries` values are accepted but never
 terminate recoverable work. `retry_initial_ms`, `retry_max_ms` (default 60000),
 and `retry_jitter_percent` (default 20) control bounded exponential sleeps;
-`Retry-After` seconds or HTTP dates are respected within the configured sleep
-cap. Retry stage, count, error and next delay are durable and visible. Operator
+`Retry-After` seconds or HTTP dates are a minimum wait, even beyond the local
+backoff cap. Retry stage, count, error and next delay are durable and visible. Operator
 stop interrupts both inference and backoff. Permanent configuration/authentication
 errors remain visible for repair, and uncertain tool writes are never retried. Startup
 recovers interrupted inference; a tool interrupted without a durable result
