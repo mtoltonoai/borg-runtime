@@ -116,8 +116,15 @@ def start(board, runtimes, run_id, revision):
         raise ConfigError("a full integrated revision is required for a live acceptance run")
     if set(runtimes) != set(HOSTS):
         raise ConfigError("all four lab endpoints are required")
-    if board.request("GET", "/api/health").get("commit") != revision:
-        raise ConfigError("shared Board has not activated the selected integrated revision")
+    board_health = board.request("GET", "/api/health")
+    if board_health.get("ok") is not True or board_health.get("db") is not True:
+        raise ConfigError("shared Board database is not ready")
+    board_revision = board_health.get("commit")
+    if board_revision not in (revision, "unknown"):
+        raise ConfigError("shared Board reports a different integrated revision")
+    # The verified 175d295 deployment exposed a packaging-only missing stamp.
+    # Do not block functional probes on it; report it as an UNVERIFIED acceptance
+    # item. native_acceptance.audit still fails board_revision until repaired.
     before = {}
     for host, client in runtimes.items():
         before[host] = client.request("GET", "/health")
@@ -136,6 +143,7 @@ def start(board, runtimes, run_id, revision):
             if str(error) == "Board HTTP 404":
                 return None
             raise
+    fresh_registration = find_agent() is None
     agent = ensure_record(find_agent, lambda: board.request("POST", "/api/agents", desired["agent"]),
         lambda row: row.get("id") == identity and metadata(row).get("acceptance_run_id") == run_id
             and metadata(row).get("role") == "native-engineer" and metadata(row).get("harness") == "native")
@@ -160,10 +168,12 @@ def start(board, runtimes, run_id, revision):
                       if metadata(t).get("acceptance_run_id") == run_id), None),
         lambda: board.request("POST", "/api/tasks", task_body),
         lambda row: row.get("assignee") == identity and row.get("description") == task_body["description"])
-    return {"run_id": run_id, "revision": revision, "agent_id": identity, "project_id": project["id"], "task_id": task["id"],
+    return {"run_id": run_id, "revision": revision, "agent_id": identity,
+            "fresh_registration": fresh_registration, "board_revision_observed": board_revision,
+            "board_revision_verified": board_revision == revision, "project_id": project["id"], "task_id": task["id"],
             "marker": desired["marker"], "profiles": profiles,
             "instances": {h: v["instance_id"] for h, v in before.items()},
-            "scope": "fresh identity loaded on four unchanged processes; task admitted for MODEL self-delegation, not yet claimed complete"}
+            "scope": "identity profile observed on four unchanged processes; fresh_registration distinguishes first creation from a repeat; task admitted for MODEL self-delegation, not yet claimed complete"}
 
 
 def atomic_json(path, value):

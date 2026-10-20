@@ -64,7 +64,7 @@ class ProbeTests(unittest.TestCase):
                     elif path == '/api/tasks': self.tasks.append({**body, 'id': 73})
                     else: raise AssertionError(path)
                     return {}
-                if path == '/api/health': return {'commit': revision}
+                if path == '/api/health': return {'commit': revision, 'ok': True, 'db': True}
                 if path == '/api/fleet/hosts': return [{'host_id': h, 'fresh': True, 'enabled': True, 'capacity': 4, 'active': 1} for h in probe.HOSTS]
                 if path == '/api/projects': return self.projects
                 if path == '/api/tasks?project_id=42': return self.tasks
@@ -86,7 +86,10 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual((result['project_id'], result['task_id']), (42, 73))
         self.assertEqual(len(result['profiles']), 4)
         self.assertEqual(board.writes, ['/api/agents', '/api/projects', '/api/tasks'])
-        self.assertEqual(probe.start(board, runtimes, 'run-1', revision), result)
+        self.assertTrue(result['fresh_registration'])
+        repeated = probe.start(board, runtimes, 'run-1', revision)
+        self.assertFalse(repeated['fresh_registration'])
+        self.assertEqual(repeated['task_id'], result['task_id'])
         self.assertEqual(len(board.writes), 3)
 
     def test_conflicting_record_or_unconfirmed_write_is_not_success(self):

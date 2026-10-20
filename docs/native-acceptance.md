@@ -158,3 +158,14 @@ owners for real child receipts, overlap, host distribution and sentinel checks.
 The returned scope explicitly says the live demonstration is not yet complete.
 Also exercise PM cross-identity create/list/steer on a disposable session through
 its real bound lifecycle MCP endpoint; do not stop/cancel a live unknown tool.
+
+
+A verified live packaging issue in release `175d295` left the Board's
+compile-time commit label `unknown` although its actual executable checksum was
+verified by deployment. The cohort preparator permits functional probes in this
+specific unreported-label case and returns `board_revision_verified: false`;
+it still rejects a different known revision. This does not waive release
+provenance: the operational audit's `board_revision` check continues to fail
+until the integrator rebuilds/installs the correctly stamped Board. A repeated
+cohort start reports `fresh_registration: false`, rather than pretending an
+already existing identity was newly created again.
