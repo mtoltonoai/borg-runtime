@@ -127,3 +127,34 @@ Tests exercise actual loopback HTTP (including misleading HTML 200), secret
 redaction, missing/stale hosts, capacity/duplicate placement, profile regression,
 indefinite retry visibility, owned repair coverage, slow live inference, and
 lost/changed/duplicate receipts across a witnessed process restart.
+
+
+## Fresh identity/project live cohort
+
+`tooling/prepare_native_acceptance.py` prepares stable run IDs without remote
+writes. Once the integrator has activated the full release, start the cohort:
+
+```sh
+python3 tooling/prepare_native_acceptance.py
+python3 tooling/prepare_native_acceptance.py --start --revision FULL_INTEGRATED_SHA
+```
+
+It requires the actual four ready native hosts and shared Board at that revision,
+fresh Fleet heartbeats and four free slots. It registers a fresh Board-only
+`native-engineer` identity, verifies its full/unlimited inherited profile on all
+four **unchanged process instances**, then creates a new project and one owned
+actionable parent task. Fleet, not this script, schedules the parent. The parent
+model uses its own lifecycle MCP tool to create three same-identity children;
+all write/read the same relative marker in their isolated workspaces. Children
+attempt a forbidden parent-path read and report with runtime-bound Board identity.
+A declared 90-second parent tool barrier allows an actual overlap witness without
+repeated model polling. No model/context/output limit is lowered.
+
+The state file is `.runtime/acceptance/live-run.json`. Repeating `--start` reuses
+the same named identity/project and task external reference, even after a lost
+write reply; it does not manufacture child results or replay sessions. After
+starting, pass the recorded project/task/identity/run IDs to the tools and Fleet
+owners for real child receipts, overlap, host distribution and sentinel checks.
+The returned scope explicitly says the live demonstration is not yet complete.
+Also exercise PM cross-identity create/list/steer on a disposable session through
+its real bound lifecycle MCP endpoint; do not stop/cancel a live unknown tool.
