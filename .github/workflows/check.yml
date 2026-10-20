@@ -32,6 +32,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m unittest discover -s tests -v
+  native-task-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            components/task-board
+            components/fleet
+      - run: cargo build --locked --manifest-path components/task-board/Cargo.toml
+      - run: cargo build --locked --manifest-path components/fleet/Cargo.toml --bin fleet
+      - run: |
+          BORG_TEST_BOARD_BINARY="$PWD/components/task-board/target/debug/task-board" \
+          BORG_TEST_FLEET_BINARY="$PWD/components/fleet/target/debug/fleet" \
+          python3 -m unittest discover -s tests -p test_native_task_projection.py -v
   web:
     runs-on: ubuntu-latest
     defaults:

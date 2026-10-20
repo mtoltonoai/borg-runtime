@@ -11,6 +11,30 @@ means a legacy Board-managed roster entry.
 All paths below are relative to `/api`. Lists return plain JSON arrays.
 Timestamps are server-generated Unix seconds.
 
+`GET /tasks` is an unpaginated compact list, but retains parsed `metadata` plus
+boolean `question_blocked` and `effectively_blocked`. These match task detail:
+Fleet uses `metadata.native_attempt` and `metadata.native_dispatch`; recovery uses
+the repair links, incident keys, policy and explicit holds. An open blocking
+question prevents scheduling even when the stored status is `todo`. Description
+and comment bodies remain detail-only. Never interpret omitted execution fields
+as permission to dispatch or as an instruction to reset an attempt number.
+
+The task-list/detail contract is tested against an actual private Board/SQLite,
+four Fleet processes and real workspace MCP calls (only inference is a fixture):
+
+```sh
+BORG_TEST_BOARD_BINARY=/path/to/task-board \
+BORG_TEST_FLEET_BINARY=/path/to/fleet \
+python3 -m unittest discover -s tests -p test_native_task_projection.py -v
+```
+
+The regression retains a failed pre-native dispatch, records explicit
+reconciliation and canonical attempt 2, then proves the second attempt is
+scheduled exactly once without modifying the first receipt. It also records
+outbound HTTP requests to prove disabled tasks are filtered before reservation,
+and checks an open blocking question and its answer across the list/detail
+boundary. This does not authorize retrying unknown native/tool outcomes.
+
 - `POST /fleet/hosts/{host_id}/heartbeat`: `{capacity, runtime_url,
   workspace_root, runtime_ready, revision?, ttl_seconds?, metadata?}`.
   `runtime_url` includes `/api`. Capacity and TTL are seeded on first contact;

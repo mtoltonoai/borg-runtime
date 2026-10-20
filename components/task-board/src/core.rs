@@ -1098,7 +1098,6 @@ pub async fn resolve_agent(pool: &Pool, name: &str) -> anyhow::Result<Value> {
 /// and `meta_key`/`meta_value` (equality on a scalar metadata field, e.g. area/host — for routing
 /// a task to an owning vertical). Always bounded by `limit` (default 200, max 1000) + `offset`.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub async fn list_agents(
     pool: &Pool,
     status: Option<&str>,
@@ -4665,13 +4664,16 @@ pub async fn list_tasks(
     meta_value: Option<&str>,
     include_archived: bool,
 ) -> anyhow::Result<Value> {
-    let mut q = String::from(
-        // json_extract surfaces metadata.monitor_exempt as a lean derived column (1/0/null) so a
-        // list scan can read it without pulling full metadata; normalized to a bool below (#517
-        // sibling; consumed by v-fleet-tooling's nudge daemon + #506 watchdog).
-        "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at, \
-         blocked_on_kind, blocked_on_ref, json_extract(metadata, '$.monitor_exempt') AS monitor_exempt \
-         FROM tasks",
+    // Fleet and recovery read this projection directly. Keep execution metadata
+    // and derived blockers authoritative here; dropping them silently resets
+    // native_attempt to 1 and hides disabled dispatches/repair policy. The heavy
+    // description and comment bodies still stay out of this bounded row shape.
+    let mut q = format!(
+        "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at, metadata, \
+         blocked_on_kind, blocked_on_ref, json_extract(metadata, '$.monitor_exempt') AS monitor_exempt, \
+         EXISTS(SELECT 1 FROM comments WHERE comments.task_id=tasks.id \
+                AND {OPEN_BLOCKING_QUESTION}) AS question_blocked \
+         FROM tasks"
     );
     let mut conds: Vec<&str> = Vec::new();
     // Soft-archived tasks are hidden by default (like list_documents); include_archived shows them.
@@ -4763,6 +4765,20 @@ pub async fn list_tasks(
         .map(|r| {
             let mut v = row_to_json_ref(r, "task");
             if let Value::Object(ref mut m) = v {
+                // Match get_task: consumers need an object, not SQLite JSON text.
+                let meta: Value = m
+                    .get("metadata")
+                    .and_then(Value::as_str)
+                    .and_then(|text| serde_json::from_str(text).ok())
+                    .unwrap_or_else(|| json!({}));
+                m.insert("metadata".into(), meta);
+                let question_blocked = m.get("question_blocked").and_then(Value::as_i64) == Some(1);
+                let scalar_blocked = m.get("blocked_on_kind").and_then(Value::as_str).is_some();
+                m.insert("question_blocked".into(), Value::Bool(question_blocked));
+                m.insert(
+                    "effectively_blocked".into(),
+                    Value::Bool(scalar_blocked || question_blocked),
+                );
                 // An iceboxed task is monitor-exempt by its status alone (task_1221): the nudge daemon
                 // + #506 watchdog read this bool, so deriving it true for status=icebox makes them skip
                 // iceboxed tasks without a daemon-side change.
@@ -25165,6 +25181,103 @@ mod tests {
     /// (meta_key, meta_value) filters to tasks whose metadata JSON has that key equal to that value
     /// — the idempotency query "is there already an open task observing target X". Both must be set
     /// to apply, and it composes with the other filters (project_id + status).
+    /// Native schedulers/recovery consume the list, not only the detail route.
+    /// Keep the execution fields and derived blockers in both response shapes.
+    #[tokio::test]
+    async fn native_task_list_projection_preserves_metadata_and_blockers() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let project = create_project(&pool, "Native projection", None, Some("owner"), None).await?;
+        let pid = project["id"].as_i64().unwrap();
+        let metadata = json!({
+            "native_attempt": 2, "native_dispatch": false,
+            "recovery_task_id": 25,
+            "recovery": {"incident_key": "retained-incident", "enabled": false}
+        });
+        let task = create_task(
+            &pool,
+            pid,
+            "Retained work",
+            Some("heavy description"),
+            None,
+            None,
+            Some("owner"),
+            Some(metadata.clone()),
+            None,
+            None,
+        )
+        .await?;
+        let tid = task["id"].as_i64().unwrap();
+        async fn listed(pool: &Pool, pid: i64) -> anyhow::Result<Value> {
+            let rows = list_tasks(
+                pool,
+                Some(pid),
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await?;
+            Ok(rows[0].clone())
+        }
+        let before = listed(&pool, pid).await?;
+        assert_eq!(before["metadata"], metadata);
+        assert_eq!(
+            before["metadata"],
+            get_task_limited(&pool, tid, Some(0)).await?["metadata"]
+        );
+        assert_eq!(before["question_blocked"], false);
+        assert_eq!(before["effectively_blocked"], false);
+        assert!(before.get("description").is_none());
+        assert!(before.get("comments").is_none());
+        let comment = comment_task(
+            &pool,
+            tid,
+            "A blocking question",
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let cid = comment["comment_id"].as_i64().unwrap();
+        // Same stored-question read contract as derived_question_block. The
+        // HTTP/Fleet regression separately exercises the public question write.
+        sqlx::query("UPDATE comments SET type='question', state='open', payload=? WHERE id=?")
+            .bind(r#"{"blocking":true}"#)
+            .bind(cid)
+            .execute(&pool)
+            .await?;
+        let held = listed(&pool, pid).await?;
+        assert_eq!(held["question_blocked"], true);
+        assert_eq!(held["effectively_blocked"], true);
+        assert_eq!(
+            held["effectively_blocked"],
+            get_task_limited(&pool, tid, Some(0)).await?["effectively_blocked"]
+        );
+        sqlx::query("UPDATE comments SET state='answered' WHERE id=?")
+            .bind(cid)
+            .execute(&pool)
+            .await?;
+        assert_eq!(listed(&pool, pid).await?["question_blocked"], false);
+        assert_eq!(listed(&pool, pid).await?["effectively_blocked"], false);
+        sqlx::query("UPDATE tasks SET blocked_on_kind='external' WHERE id=?")
+            .bind(tid)
+            .execute(&pool)
+            .await?;
+        let external = listed(&pool, pid).await?;
+        assert_eq!(external["question_blocked"], false);
+        assert_eq!(external["effectively_blocked"], true);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn list_tasks_metadata_filter() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
