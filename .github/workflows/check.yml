@@ -1,9 +1,9 @@
 name: Check
 env:
   RUSTUP_TOOLCHAIN: stable
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
-  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 on: [push, pull_request]
 jobs:
   rust:
@@ -27,6 +27,10 @@ jobs:
         with:
           workspaces: ${{ matrix.component }}
       - run: cargo test --locked ${{ matrix.args }}
+      - if: matrix.component == '.'
+        run: cargo build --locked --bin borg-native
+      - if: matrix.component == '.'
+        run: BORG_NATIVE_TEST_BIN="$PWD/target/debug/borg-native" python3 -m unittest discover -s tests -p 'test_native_acceptance*.py' -v
   workspace:
     runs-on: ubuntu-latest
     steps:

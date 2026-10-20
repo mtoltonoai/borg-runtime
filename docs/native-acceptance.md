@@ -41,9 +41,10 @@ retry policies are failures, not silently skipped checks. A full expected Git
 revision is required to pass. Evidence is time-bounded; replaying an old healthy
 snapshot with `--snapshot-in` does not establish current readiness.
 
-The collector hashes completed tool results and stores only allowlisted
-operational fields. It does not retain raw tool arguments/results, instructions,
-transcripts, Board descriptions, arbitrary metadata or response error bodies.
+The collector hashes completed tool results and complete public `ToolCall`
+records, storing only the hashes and allowlisted operational fields. It does
+not retain raw tool arguments/results, instructions, transcripts, Board
+descriptions, arbitrary metadata or response error bodies.
 Keep snapshots in `.runtime/` (Git-ignored); do not commit live databases/logs.
 
 ## Contract and interpretation
@@ -91,9 +92,21 @@ boundary drain/roll/resume, then rerun the live command with:
 
 The comparison requires a changed process instance on every required host,
 preserved session identity/task bindings, and the same unique operation/call IDs
-and hashes for every previously completed tool. No completed receipts or an
-incomplete observation fails closed. This proves durable receipt preservation;
-it does **not** by itself prove that an external side effect ran exactly once.
+and hashes for every previously completed tool. `result_sha256` covers the
+output; `receipt_sha256` covers the entire public call, including name,
+arguments, status and error. Equal output is insufficient if the original call
+changed. Normal completed MCP `isError:true` responses are retained too.
+
+No completed receipts, a missing required call field, or an incomplete
+observation fails closed. Older result-only snapshots can still be audited for
+operational state but cannot establish full call preservation: capture a new
+complete baseline before the next planned restart. Do not manufacture hashes
+for an old snapshot from current data.
+
+This proves preservation of the public tool receipt, not that an external side
+effect ran exactly once. The public tool API does **not** expose frozen MCP
+server bindings; this audit cannot prove those endpoints unchanged. Verify
+frozen bindings separately when recovery changes placement or tool metadata.
 Unknown operations need explicit receipt reconciliation, never blind retry.
 
 ## Acceptance evidence still required
@@ -120,6 +133,8 @@ because unit tests, `systemctl is-active`, or health endpoints pass.
 
 ```sh
 python3 -m unittest discover -s tests -p test_native_acceptance.py -v
+BORG_NATIVE_TEST_BIN=/path/to/borg-native \
+  python3 -m unittest discover -s tests -p test_native_acceptance_runtime.py -v
 python3 -m unittest discover -s tests -v
 ```
 
@@ -128,6 +143,13 @@ redaction, missing/stale hosts, capacity/duplicate placement, profile regression
 indefinite retry visibility, owned repair coverage, slow live inference, and
 lost/changed/duplicate receipts across a witnessed process restart.
 
+The actual-native custody test runs one tool through the real engine and public
+HTTP API, restarts the disposable process on its durable SQLite database, and
+proves a completed application-error receipt is not replayed. A second restart
+with deliberately corrupted arguments in that **test-owned** database must
+fail custody despite unchanged result/call IDs. Evidence artifacts contain no
+arguments, result bodies or credentials. The model/MCP peer is a loopback
+fixture, not a live provider acceptance claim.
 
 ## Fresh identity/project live cohort
 
