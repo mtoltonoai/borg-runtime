@@ -295,7 +295,7 @@ class HTTPTests(unittest.TestCase):
         self.route("/api/tasks?project_id=1", [{"id": 1, "description": "PRIVATE", "metadata": {"password": "PRIVATE"}}])
         self.route("/api/agents?limit=1000&offset=0", [{"id": "engineer", "charter": "PRIVATE", "metadata": {"api_key": "PRIVATE", "harness": "native"}}])
         self.route("/api/fleet/hosts", {"hosts": []})
-        self.route("/api/fleet/dispatches", [])
+        self.route("/api/fleet/dispatches?limit=1000&offset=0", [])
         self.route("/health", {"status": "ok", "authorization": "PRIVATE"})
         self.route("/api/agents", [{"id": "engineer", "instructions": "PRIVATE", "api_key_env": "PRIVATE"}])
         self.route("/api/sessions", [{"id": "sid", "agent_id": "engineer", "error": "PRIVATE"}])
@@ -311,6 +311,18 @@ class HTTPTests(unittest.TestCase):
             "workspace_mcp_url": "http://user:PRIVATE@[::1]:8791/mcp/sid?token=PRIVATE#PRIVATE"}})
         self.assertNotIn("PRIVATE", json.dumps(result))
         self.assertEqual(result["placement"]["workspace_mcp_url"], "http://[::1]:8791/mcp/sid")
+
+    def test_dispatches_page_past_default_limit_and_detect_ignored_offset(self):
+        first = [{"request_id": f"request-{i}"} for i in range(1000)]
+        self.route("/api/fleet/dispatches?limit=1000&offset=0", first)
+        self.route("/api/fleet/dispatches?limit=1000&offset=1000", [{"request_id": "last"}])
+        result = audit.collect(self.base, {})
+        self.assertEqual(len(result["board"]["dispatches"]), 1001)
+        self.assertEqual(result["board"]["dispatches"][-1]["request_id"], "last")
+        self.route("/api/fleet/dispatches?limit=1000&offset=1000", first)
+        result = audit.collect(self.base, {})
+        self.assertIsNone(result["board"]["dispatches"])
+        self.assertIn("ignored pagination", next(e["error"] for e in result["errors"] if e["source"] == "board.dispatches"))
 
     def test_auth_bearing_base_urls_rejected(self):
         for url in ("http://user:password@localhost", "http://localhost?token=secret", "file:///tmp/foo", "http://localhost#secret"):

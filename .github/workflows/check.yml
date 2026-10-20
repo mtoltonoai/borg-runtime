@@ -40,4 +40,5 @@ jobs:
           cache: npm
           cache-dependency-path: components/task-board/web/package-lock.json
       - run: npm ci
+      - run: npm run test:native
       - run: npm run build

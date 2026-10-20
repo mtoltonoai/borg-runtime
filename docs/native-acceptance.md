@@ -50,7 +50,8 @@ Keep snapshots in `.runtime/` (Git-ignored); do not commit live databases/logs.
 
 - Board readiness is **`/api/health`** (`ok`, `db`, `commit`). `/health` may be the
   UI's HTML fallback and must never pass a readiness check.
-- Board `/api/fleet/hosts` and `/api/fleet/dispatches` return arrays. Hosts expose
+- Board `/api/fleet/hosts` and `/api/fleet/dispatches` return arrays. Dispatches default to 100 rows; the
+  collector requests 1000-row pages until exhaustion and rejects repeated IDs. Hosts expose
   configured capacity, runtime readiness, freshness/TTL, epoch-second heartbeat
   and deployed revision. Dispatches carry request/task/identity/host/session IDs,
   generation, workspace path and status. Reservations are counted until a

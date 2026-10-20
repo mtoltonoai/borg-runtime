@@ -241,8 +241,26 @@ def collect(board_url, runtimes, project=1, reader=None, board_token=None, nativ
     board["agents"] = agents
     board["hosts"] = read("board.hosts", board_url, "/api/fleet/hosts", board_token,
                           lambda v: [pick(r, HOST_FIELDS) for r in rows(v, "hosts")])
-    board["dispatches"] = read("board.dispatches", board_url, "/api/fleet/dispatches", board_token,
-                               lambda v: [pick(r, DISPATCH_FIELDS) for r in rows(v, "dispatches")])
+    dispatches = []
+    offset = 0
+    seen = set()
+    while True:
+        page = read("board.dispatches", board_url, f"/api/fleet/dispatches?limit=1000&offset={offset}", board_token,
+                    lambda v: rows(v, "dispatches"))
+        if page is None:
+            dispatches = None
+            break
+        ids = [v.get("request_id") for v in page]
+        if any(i is None or i in seen for i in ids) or len(set(ids)) != len(ids):
+            snapshot["errors"].append({"source": "board.dispatches", "error": "duplicate request IDs or ignored pagination"})
+            dispatches = None
+            break
+        seen.update(ids)
+        dispatches.extend(pick(value, DISPATCH_FIELDS) for value in page)
+        if len(page) < 1000:
+            break
+        offset += len(page)
+    board["dispatches"] = dispatches
     for host, url in runtimes.items():
         runtime = snapshot["runtimes"][host] = {}
         runtime["health"] = read(f"{host}.health", url, "/health", native_token,

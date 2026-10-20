@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:native": "node --experimental-strip-types --test scripts/native-fleet.test.mjs",
+    "test:native:browser": "node scripts/native-fleet-browser.mjs"
   },
   "dependencies": {
     "age-encryption": "^0.3.1",

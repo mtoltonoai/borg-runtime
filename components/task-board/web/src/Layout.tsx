@@ -279,6 +279,12 @@ export default function Layout() {
         >
           Agents
         </Link>
+        <Link
+          to="/native"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
+        >
+          Native Fleet
+        </Link>
         <a
           href={new URL('api', document.baseURI).href}
           className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
