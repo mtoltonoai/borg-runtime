@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Small stateless workspace MCP endpoint, using only the standard library.
+"""Session-bound workspace MCP endpoint, using only the standard library.
 
 Run: python3 tooling/workspace_mcp.py --root /path/to/workspace --port 8766
-POST /mcp uses JSON responses; notifications receive 202, GET receives 405.
+Or: python3 tooling/workspace_mcp.py --session-root /fleet/workspaces --port 8791
+Session mode binds POST /mcp/<canonical-UUID> to an existing, non-symlink child
+worktree. Fleet allocates it before creating the session; this separate service
+survives Fleet restarts. GET /health is read-only. MCP uses JSON responses;
+notifications receive 202, GET on an MCP route receives 405.
 File tools reject symlinks and traversal. Shell commands are TRUSTED development
 commands with cwd=root, not a security sandbox. Do not expose this to untrusted
 callers. Effect ownership/recovery belongs to the calling runtime, not this server.
@@ -20,6 +24,7 @@ import signal
 import stat
 import subprocess
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -64,9 +69,16 @@ def bounded_int(value, maximum, name):
 
 
 class Workspace:
-    def __init__(self, root):
-        self.root = Path(root).resolve(strict=True)
-        if not self.root.is_dir():
+    def __init__(self, root, root_fd=None):
+        # Session routing supplies an already opened O_NOFOLLOW directory. Pin
+        # that inode for the whole request, including shell cwd, rather than
+        # checking a path and then following a replacement symlink later.
+        self._root_fd = root_fd
+        self.root = Path(root) if root_fd is not None else Path(root).resolve(strict=True)
+        if root_fd is not None:
+            if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+                raise ValueError("workspace root must be a directory")
+        elif not self.root.is_dir():
             raise ValueError("workspace root must be a directory")
 
     def parts(self, path):
@@ -80,7 +92,7 @@ class Workspace:
     def directory(self, parts, create=False):
         """Walk directory descriptors, refusing symlinks even during replacement."""
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        fd = os.open(self.root, flags)
+        fd = os.dup(self._root_fd) if self._root_fd is not None else os.open(self.root, flags)
         try:
             for part in parts:
                 if create:
@@ -170,9 +182,11 @@ class Workspace:
         output = bytearray()
         total = 0
         timed_out = False
+        cwd = self.root if self._root_fd is None else f"/proc/self/fd/{self._root_fd}"
         process = subprocess.Popen(
-            ["/bin/sh", "-c", command], cwd=self.root, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+            ["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+            pass_fds=() if self._root_fd is None else (self._root_fd,))
         def exited():
             # Observe without reaping: the group leader's PID stays reserved
             # until cleanup, so killpg cannot target a newly reused group id.
@@ -263,14 +277,69 @@ def dispatch(workspace, message):
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+class SessionWorkspaces:
+    """Fleet-owned UUID worktrees, never created or selected by model arguments.
+
+    This is filesystem/cwd isolation, not a shell security sandbox. Commands are
+    still trusted development commands running under the service account.
+    """
+    def __init__(self, root):
+        self.root = Path(root).resolve(strict=True)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        self.fd = os.open(self.root, flags)
+
+    @staticmethod
+    def session_id(path):
+        prefix = "/mcp/"
+        if not path.startswith(prefix):
+            raise ToolFailure("session MCP path required")
+        value = path[len(prefix):]
+        try:
+            # No percent decoding, query strings, path separators or aliases.
+            if str(uuid.UUID(value)) != value:
+                raise ValueError("noncanonical session id")
+        except (ValueError, AttributeError):
+            raise ToolFailure("canonical UUID session id required") from None
+        return value
+
+    def open(self, path):
+        session_id = self.session_id(path)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(session_id, flags, dir_fd=self.fd)
+        try:
+            return Workspace(self.root / session_id, root_fd=fd)
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
 class WorkspaceServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, workspace, bearer_token=None):
+    def __init__(self, address, workspace=None, bearer_token=None, session_root=None):
+        if (workspace is None) == (session_root is None):
+            raise ValueError("choose exactly one workspace or session root")
         self.workspace = workspace
+        self.sessions = SessionWorkspaces(session_root) if session_root is not None else None
         self.bearer_token = bearer_token
-        super().__init__(address, Handler)
+        self.instance_id = str(uuid.uuid4())
+        try:
+            super().__init__(address, Handler)
+        except BaseException:
+            if self.sessions is not None:
+                self.sessions.close()
+            raise
+
+    def server_close(self):
+        super().server_close()
+        if self.sessions is not None:
+            self.sessions.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -296,9 +365,16 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def allowed(self):
-        if self.path != "/mcp":
-            self.reply(404)
-            return False
+        if self.path != "/health":
+            if self.server.sessions is not None:
+                try:
+                    self.server.sessions.session_id(self.path)
+                except ToolFailure:
+                    self.reply(404)
+                    return False
+            elif self.path != "/mcp":
+                self.reply(404)
+                return False
         token = self.server.bearer_token
         if token is not None and not hmac.compare_digest(
                 self.headers.get("Authorization", "").encode("utf-8"),
@@ -326,12 +402,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.allowed():
-            self.reply(405)
+            if self.path == "/health":
+                self.reply(200, {"status": "ok", "service": "borg-workspace",
+                                 "mode": "sessions" if self.server.sessions else "workspace",
+                                 "instance_id": self.server.instance_id,
+                                 "revision": os.environ.get("BORG_BUILD_REV", "unknown")})
+            else:
+                self.reply(405)
 
-    do_DELETE = do_GET
+    def do_DELETE(self):
+        if self.allowed():
+            self.reply(405)
 
     def do_POST(self):
         if not self.allowed():
+            return
+        if self.path == "/health":
+            self.reply(405)
             return
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
             self.reply(415)
@@ -356,20 +443,35 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError):
             self.reply(400, rpc_error(None, -32700, "Parse error"))
             return
-        if isinstance(message, list):
-            if not 1 <= len(message) <= 16:
-                self.reply(400, rpc_error(None, -32600, "Batch must contain 1 to 16 messages"))
-                return
-            result = [r for item in message if (r := dispatch(self.server.workspace, item)) is not None]
-            self.reply(200 if result else 202, result or None)
-        else:
-            result = dispatch(self.server.workspace, message)
-            self.reply(200 if result is not None else 202, result)
+        workspace = self.server.workspace
+        try:
+            if self.server.sessions is not None:
+                workspace = self.server.sessions.open(self.path)
+        except (ToolFailure, OSError, ValueError):
+            # Do not create missing directories, follow symlinks or disclose
+            # another workspace through error strings. Fleet must provision it.
+            self.reply(404, {"error": "Session workspace is not provisioned"})
+            return
+        try:
+            if isinstance(message, list):
+                if not 1 <= len(message) <= 16:
+                    self.reply(400, rpc_error(None, -32600, "Batch must contain 1 to 16 messages"))
+                    return
+                result = [r for item in message if (r := dispatch(workspace, item)) is not None]
+                self.reply(200 if result else 202, result or None)
+            else:
+                result = dispatch(workspace, message)
+                self.reply(200 if result is not None else 202, result)
+        finally:
+            if self.server.sessions is not None and workspace is not None:
+                os.close(workspace._root_fd)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True)
+    roots = parser.add_mutually_exclusive_group(required=True)
+    roots.add_argument("--root", help="One legacy workspace at /mcp")
+    roots.add_argument("--session-root", help="Fleet's existing UUID worktrees at /mcp/<session_id>")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--bearer-token-env", help="Name of environment variable containing an optional bearer token")
@@ -379,8 +481,12 @@ def main():
         parser.error("configured bearer token environment variable is empty")
     if args.host not in ("127.0.0.1", "localhost") and not token:
         parser.error("non-loopback binding requires --bearer-token-env")
-    with WorkspaceServer((args.host, args.port), Workspace(args.root), token) as server:
-        print(json.dumps({"listening": f"http://{args.host}:{server.server_port}/mcp", "root": str(server.workspace.root)}), flush=True)
+    workspace = Workspace(args.root) if args.root else None
+    with WorkspaceServer((args.host, args.port), workspace, token, args.session_root) as server:
+        root = server.sessions.root if server.sessions is not None else server.workspace.root
+        print(json.dumps({"listening": f"http://{args.host}:{server.server_port}/mcp",
+                          "mode": "sessions" if server.sessions else "workspace",
+                          "root": str(root), "instance_id": server.instance_id}), flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
