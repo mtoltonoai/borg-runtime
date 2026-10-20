@@ -90,3 +90,78 @@ from the production runtime. It neither provisions nor restarts the session.
 The integrator owns service rollout. Never stop a bootstrap process to collect a
 pending tool result. Roll out the Board registry, adopt live sessions, then enable
 workers; stage replacement engines and workspace services separately.
+
+## Persistent worker
+
+Build with `cd components/fleet && cargo build --locked --bin fleet` (Rust 1.99)
+and run `fleet --config /absolute/native-fleet.toml native-worker`. See
+`config/native-fleet.example.toml`. `--once` performs a bounded reconciliation,
+waits for that pass's provisioning jobs and reports observed session state; it
+is useful for smoke checks, not the persistent service command.
+
+`fleet spin-up <identity> --apply` routes `metadata.harness=native` directly to
+the Board broker. It does not consult legacy bootstrap documents, trust prompts
+or a tmux harness. The old watchdog excludes these identities. Native stop/drain
+controls target independent sessions, not an identity-wide tmux kill.
+
+The worker uses a process-scoped lock under `workspace_root`. It reads the Board
+agent catalog and actionable tasks, atomically reserves new attempts, polls
+its assigned dispatches, provisions UUID directories, probes the independent
+workspace MCP route, then creates the native session with its reserved UUID.
+Git setup runs in background jobs, so cloning cannot hold the heartbeat loop.
+Completed or uncertain engine outcomes are never sent back to provisioning.
+Runtime reachability failures retain their status/placement, and retrying live
+inference retains its capacity instead of being mistaken for a dead worker.
+Health `ready:false`/`draining:true` removes a runtime from new placement.
+
+REST `/tasks` currently returns a **complete, unpaginated list** even when
+`limit`/`offset` are supplied. The worker reads each task-status group once.
+`/agents` and `/fleet/dispatches` are genuinely paginated and are read to
+exhaustion. These different contracts must not be collapsed into one generic
+pagination loop: the old WIP assumption would stall forever at 100 tasks.
+
+Workspace creation uses a staging directory and an exclusive ownership marker,
+then renames into the final UUID directory. Repository clones have independent
+Git metadata, branches and working files (`--no-local --no-hardlinks`). Existing
+workspaces with a matching manifest are reused without checkout/reset/clean;
+unowned or partial trees are retained as visible provisioning failures for
+repair, never discarded. The marker is excluded from source commits. The
+native profile (model, full context, output tokens, reasoning and turn policy)
+remains in Board/runtime metadata; Fleet does not introduce another limit.
+
+For a user service, enable `Restart=always`, use an absolute Fleet binary/config
+path and `KillMode=control-group`. Only transient Git provisioning children
+belong to Fleet's service. The native engine and session workspace helper must
+be separate persistent services; restarting Fleet must not interrupt their
+active tool calls. The integrator owns the install/enable/start commands and
+safe bootstrap adoption sequence.
+
+Runtime observations are projected into `dispatch.metadata.runtime`:
+`phase`, `step`, `updated_at`, `last_progress_at`, and `driver_active` (from the
+engine's `driver_running`). Native engine timestamps retain their native
+millisecond units. `metadata.observed_at` and Board `updated_at` are seconds and
+indicate observation freshness, **not** actual model progress. Top-level
+`progress` and `error` are carried without declaring a slow inference dead.
+
+## Regression evidence
+
+- `cd components/task-board && cargo test --locked`: atomic multi-worker
+  placement, weighted capacity, freshness/drain, changed-intent/CAS conflicts,
+  adoption and database restart, independent same-identity workspaces, and a
+  3MiB request crossing the real REST boundary (64MiB transport allowance,
+  matching native rather than an accidental 1MiB/2MiB broker allowance).
+- `cd components/fleet && cargo test --locked -p fleet`: existing Fleet checks
+  plus native route/intent, payload stability, actual independent Git clones,
+  idempotent user-edit preservation, symlink/traversal rejection and locking.
+- `python3 tests/test_native_fleet.py`: **real Board and four Fleet processes,
+  actual Git and workspace MCP services**, with a fault-injecting native HTTP
+  fixture. Eight tasks under one identity reserve two per host. A lost response
+  after create causes no duplicate; a loss before commit retries the same UUID.
+  Each actual workspace tool runs once. Board/Fleet restarts preserve bindings
+  and edits; killing Fleet during a workspace shell tool does not interrupt it.
+  Bootstrap adoption/drain and visible owned provisioning failure are checked.
+  A 105-task backlog finishes scheduling at capacity and advances all four
+  heartbeats on the next pass instead of rereading the same list forever.
+
+The integration fixture is not evidence that a real model ran on four machines;
+that is a separate live deployment acceptance owned jointly with the integrator.

@@ -1,0 +1,31 @@
+# One persistent Fleet worker per host; all workers use the same Board.
+board_api = "http://127.0.0.1:8079/api"
+host = "agent-lab"
+
+[native]
+# Advertised address must resolve to this SAME runtime from every Fleet/lifecycle
+# client. This deployment uses SSH-authenticated loopback routes 17871..17874.
+runtime_url = "http://127.0.0.1:17871/api"
+workspace_root = "/home/dev-user/.local/share/borg/workspaces"
+workspace_mcp_url = "http://127.0.0.1:8791/mcp/{session_id}"
+# Capacity/TTL seed the Board's host record. Later administrative Board edits win.
+capacity = 4
+ttl_seconds = 60
+poll_seconds = 5
+project_id = 1
+
+# Task/agent metadata.workspace {repo,ref} overrides these host defaults.
+# Each session gets its own clone and native/session-<UUID> branch, never a shared
+# identity worktree. Omit repo_url to provision an empty workspace instead.
+repo_url = "ssh://borg-agent-lab/home/dev-user/.local/share/borg/git/borg-runtime.git"
+repo_ref = "main"
+
+# These are transport/setup timeouts, NOT inference or session turn budgets.
+http_timeout_seconds = 15
+provision_timeout_seconds = 300
+
+# Credential variable NAMES only. Supply values through the service environment;
+# never place a provider key, runtime bearer or Board token in this file or Git.
+# bearer_token_env = "BORG_NATIVE_BEARER"
+# board_bearer_token_env = "BORG_BOARD_BEARER"
+# workspace_bearer_token_env = "BORG_WORKSPACE_BEARER"

@@ -210,11 +210,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/fleet/dispatches",
-            get(crate::fleet::list_dispatches).post(crate::fleet::create_dispatch),
+            get(crate::fleet::list_dispatches)
+                .post(crate::fleet::create_dispatch)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
             "/fleet/dispatches/adopt",
-            post(crate::fleet::adopt_dispatch),
+            post(crate::fleet::adopt_dispatch)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
             "/fleet/dispatches/{id}",

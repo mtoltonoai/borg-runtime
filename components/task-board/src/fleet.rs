@@ -303,7 +303,7 @@ async fn reserve(pool: &Pool, body: &Create, adopt: Option<&Adopt>) -> Result<Va
         return Err(bad("metadata must be an object"));
     }
     if let Some(input) = &body.input {
-        text(input, "input", 1024 * 1024)?;
+        text(input, "input", 64 * 1024 * 1024)?;
     }
     if let Some(a) = adopt {
         text(&a.session_id, "session_id", 256)?;
@@ -1100,7 +1100,7 @@ mod tests {
                 .await
                 .unwrap();
             let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024)
                 .await
                 .unwrap();
             (status, serde_json::from_slice(&bytes).unwrap())
@@ -1125,6 +1125,20 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(rows.as_array().unwrap().len(), 1);
+        // The broker must not reintroduce Axum's default 2MiB body ceiling
+        // (or a smaller model-input allowance) ahead of the 64MiB native API.
+        let (code, large) = call(
+            app.clone(),
+            "POST",
+            "/fleet/dispatches",
+            json!({
+                "request_id":"large-input", "agent_id":"engineer", "input":"x".repeat(3*1024*1024)
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(large["input"].as_str().unwrap().len(), 3 * 1024 * 1024);
+
         let (code, error) = call(
             app,
             "PATCH",

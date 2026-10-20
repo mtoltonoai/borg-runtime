@@ -16,6 +16,8 @@ use serde::Deserialize;
 /// use site. Loaded once from the TOML config file (see [`get`]).
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
+    /// Persistent native worker settings; independent from the legacy tmux roster marker.
+    pub native: Option<crate::native::Settings>,
     /// tmux session the fleet's windows live in (default `main`).
     pub session: Option<String>,
     /// File-hub root for legacy runtime state (heartbeat/inbox/registry); default = git-common-dir of cwd.
